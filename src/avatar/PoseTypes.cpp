@@ -33,4 +33,42 @@ const char* BoneName(HumanoidBone bone) noexcept {
     return "unknown";
 }
 
+const char* BodyYawStateName(BodyYawState state) noexcept {
+    switch (state) {
+        case BodyYawState::Locked: return "LOCKED";
+        case BodyYawState::Turning: return "TURNING";
+        case BodyYawState::Settling: return "SETTLING";
+    }
+    return "LOCKED";
+}
+
+const char* FootStateName(FootState state) noexcept {
+    switch (state) {
+        case FootState::Planted: return "PLANTED";
+        case FootState::Stepping: return "STEPPING";
+    }
+    return "PLANTED";
+}
+
+const char* BodyModeName(BodyMode mode) noexcept {
+    switch (mode) {
+        case BodyMode::Grounded: return "GROUNDED";
+        case BodyMode::Airborne: return "AIRBORNE";
+    }
+    return "GROUNDED";
+}
+
+const char* StepReasonName(StepReason reason) noexcept {
+    switch (reason) {
+        case StepReason::None: return "none";
+        case StepReason::Support: return "support";
+        case StepReason::Position: return "position";
+        case StepReason::LegReach: return "leg-reach";
+        case StepReason::Yaw: return "yaw";
+        case StepReason::Translation: return "translation";
+        case StepReason::Landing: return "landing";
+    }
+    return "none";
+}
+
 } // namespace saberstage::avatar

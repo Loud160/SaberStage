@@ -58,6 +58,7 @@ if(SABERSTAGE_HOST_TESTS)
 
     add_executable(saberstage_camera_tests tests/CameraTests.cpp)
     target_link_libraries(saberstage_camera_tests PRIVATE saberstage_camera_core)
+    target_compile_definitions(saberstage_camera_tests PRIVATE SABERSTAGE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME saberstage.camera COMMAND saberstage_camera_tests)
 
     add_executable(saberstage_recording_state_tests tests/RecordingStateTests.cpp)

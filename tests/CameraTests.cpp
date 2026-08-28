@@ -25,6 +25,18 @@ bool Near(float left, float right, float epsilon = 0.002F) {
     return std::abs(left - right) <= epsilon;
 }
 
+float VectorLength(saberstage::camera::Vec3 value) {
+    return std::sqrt(value.x * value.x + value.y * value.y + value.z * value.z);
+}
+
+float DirectionDot(saberstage::camera::Vec3 left, saberstage::camera::Vec3 right) {
+    const auto leftLength = VectorLength(left);
+    const auto rightLength = VectorLength(right);
+    if (leftLength <= 0.00001F || rightLength <= 0.00001F) return 0.0F;
+    return (left.x * right.x + left.y * right.y + left.z * right.z) /
+        (leftLength * rightLength);
+}
+
 } // namespace
 
 int main() {
@@ -115,6 +127,46 @@ int main() {
         const auto looped = EvaluateMovementScript(looping, 5.5F, base, 60.0F);
         Check(!looped.complete && looped.pose.position.x > 0.0F && looped.pose.position.x < 10.0F,
               "looping script wraps deterministically without per-frame accumulation");
+    }
+
+    const auto inspectionOrbit = LoadMovementScript(
+        std::filesystem::path(SABERSTAGE_SOURCE_DIR) / "examples" / "MovementScripts",
+        "AvatarBodyInspectionOrbit.json");
+    Check(static_cast<bool>(inspectionOrbit), "avatar body-inspection orbit script parses through the runtime loader");
+    if (inspectionOrbit) {
+        Check(inspectionOrbit.script->syncToSong && inspectionOrbit.script->loop,
+              "inspection orbit is a looping song-time script");
+        Check(inspectionOrbit.script->frames.size() == 241 && Near(inspectionOrbit.script->durationSeconds, 240.0F),
+              "inspection orbit has a four-minute rise/fall cycle at one-second resolution");
+        const auto start = EvaluateMovementScript(*inspectionOrbit.script, 0.0F, {}, 70.0F);
+        const auto oneCircle = EvaluateMovementScript(*inspectionOrbit.script, 60.0F, {}, 70.0F);
+        const auto beforeReverse = EvaluateMovementScript(*inspectionOrbit.script, 119.0F, {}, 70.0F);
+        const auto apex = EvaluateMovementScript(*inspectionOrbit.script, 120.0F, {}, 70.0F);
+        const auto afterReverse = EvaluateMovementScript(*inspectionOrbit.script, 121.0F, {}, 70.0F);
+        const auto descending = EvaluateMovementScript(*inspectionOrbit.script, 180.0F, {}, 70.0F);
+        Check(Near(start.pose.position.x, oneCircle.pose.position.x) &&
+              Near(start.pose.position.z, oneCircle.pose.position.z) &&
+              oneCircle.pose.position.y > start.pose.position.y,
+              "inspection camera completes one orbit every 60 seconds while rising");
+        Check(Near(apex.pose.position.y, 2.05F) &&
+              Near(descending.pose.position.y, oneCircle.pose.position.y),
+              "inspection camera reaches above-head height then reverses vertically");
+        Check(Near(beforeReverse.pose.position.x, afterReverse.pose.position.x) &&
+              Near(beforeReverse.pose.position.z, afterReverse.pose.position.z) &&
+              afterReverse.pose.position.y < apex.pose.position.y,
+              "inspection camera retraces the orbit in reverse while descending");
+        for (const auto sample : {start, oneCircle, apex, descending}) {
+            const auto forward = Rotate(sample.pose.rotation, {0.0F, 0.0F, 1.0F});
+            const auto towardAvatar = Vec3{
+                -sample.pose.position.x,
+                1.10F - sample.pose.position.y,
+                -sample.pose.position.z};
+            Check(DirectionDot(forward, towardAvatar) > 0.999F,
+                  "inspection camera remains aimed at the avatar focus point");
+        }
+        Check(Rotate(start.pose.rotation, {0.0F, 0.0F, 1.0F}).y > 0.0F &&
+              Rotate(apex.pose.rotation, {0.0F, 0.0F, 1.0F}).y < 0.0F,
+              "inspection camera looks upward at knee height and downward above the head");
     }
 
     const auto unknown = ParseMovementScript(R"({"frames":[{"position":{"x":0,"y":0,"z":0},"rotation":{"x":0,"y":0,"z":0},"command":"exec"}]})");

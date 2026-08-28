@@ -6,6 +6,8 @@ namespace saberstage::avatar {
 
 class StaticTrackerlessAvatarSolver final {
 public:
+    void Reset(SolverPersistentState& state) const noexcept;
+
     bool Solve(
         const TrackingSample& tracking,
         const AvatarCalibration& avatar,

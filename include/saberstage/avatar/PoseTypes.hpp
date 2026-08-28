@@ -107,6 +107,48 @@ struct SolvedHumanoidPose {
     std::int32_t renderFrame = -1;
 };
 
+enum class BodyYawState : std::uint8_t {
+    Locked,
+    Turning,
+    Settling,
+};
+
+enum class FootState : std::uint8_t {
+    Planted,
+    Stepping,
+};
+
+enum class BodyMode : std::uint8_t {
+    Grounded,
+    Airborne,
+};
+
+enum class StepReason : std::uint8_t {
+    None,
+    Support,
+    Position,
+    LegReach,
+    Yaw,
+    Translation,
+    Landing,
+};
+
+const char* BodyYawStateName(BodyYawState state) noexcept;
+const char* FootStateName(FootState state) noexcept;
+const char* BodyModeName(BodyMode mode) noexcept;
+const char* StepReasonName(StepReason reason) noexcept;
+
+struct FootPersistentState {
+    FootState state = FootState::Planted;
+    Pose planted{};
+    Pose stepStart{};
+    Pose stepDestination{};
+    Pose current{};
+    StepReason reason = StepReason::None;
+    float stepProgress = 0.0F;
+    float stepDuration = 0.0F;
+};
+
 struct SolverPersistentState {
     Vec3 previousElbowPole[2]{};
     bool previousElbowPoleValid[2]{};
@@ -115,6 +157,27 @@ struct SolverPersistentState {
     Vec3 footAnchor[2]{};
     Quaternion footRotation[2]{};
     bool footAnchorsValid = false;
+    FootPersistentState feet[2]{};
+    BodyYawState bodyYawState = BodyYawState::Locked;
+    BodyMode bodyMode = BodyMode::Grounded;
+    float torsoYawRadians = 0.0F;
+    float torsoYawAnchorRadians = 0.0F;
+    float turnDwellSeconds = 0.0F;
+    float settleSeconds = 0.0F;
+    Vec3 pelvisPosition{};
+    Vec3 bodyTranslation{};
+    Vec3 bodyTranslationVelocity{};
+    Vec3 previousHeadPosition{};
+    float leanAmount = 0.0F;
+    float crouchAmount = 0.0F;
+    float translationDwellSeconds = 0.0F;
+    float doubleSupportSeconds = 0.0F;
+    float airborneEvidenceSeconds = 0.0F;
+    float landingEvidenceSeconds = 0.0F;
+    double lastStateTimestampSeconds = 0.0;
+    int lastSteppedFoot = -1;
+    bool bodyStateValid = false;
+    bool previousHeadPositionValid = false;
     std::uint64_t lastSolvedSequence = 0;
     std::int32_t lastSolvedRenderFrame = -1;
     std::uint32_t solvesThisFrame = 0;
@@ -127,6 +190,19 @@ struct SolverDiagnostics {
     Vec3 shoulderTarget[2]{};
     Vec3 elbowPole[2]{};
     Vec3 kneePole[2]{};
+    Vec3 idealFootPosition[2]{};
+    Pose stepDestination[2]{};
+    BodyYawState bodyYawState = BodyYawState::Locked;
+    FootState footState[2]{};
+    BodyMode bodyMode = BodyMode::Grounded;
+    StepReason stepReason[2]{};
+    float headBodyYawErrorDegrees = 0.0F;
+    float torsoYawDegrees = 0.0F;
+    float leanAmount = 0.0F;
+    float crouchAmount = 0.0F;
+    float bodyTranslationAmount = 0.0F;
+    float stepProgress[2]{};
+    float legReach[2]{};
     float spineError = 0.0F;
     std::uint8_t spineIterations = 0;
     bool limbReachable[4]{};
@@ -141,6 +217,7 @@ static_assert(std::is_trivially_copyable_v<TrackingSample>);
 static_assert(std::is_trivially_copyable_v<AvatarCalibration>);
 static_assert(std::is_trivially_copyable_v<PlayerCalibration>);
 static_assert(std::is_trivially_copyable_v<SolvedHumanoidPose>);
+static_assert(std::is_trivially_copyable_v<FootPersistentState>);
 static_assert(std::is_trivially_copyable_v<SolverPersistentState>);
 
 } // namespace saberstage::avatar

@@ -42,9 +42,11 @@
 #include "UnityEngine/Time.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Vector3.hpp"
+#include "beatsaber-hook/shared/utils/byref.hpp"
 #include "custom-types/shared/delegate.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <functional>
 #include <optional>
@@ -572,6 +574,7 @@ private:
     }
 
     std::optional<ScriptSample> SampleMovementScript() {
+        scriptClockValid_ = false;
         if (!script_) return std::nullopt;
         float clock = sessionTimeSeconds_;
         if (script_->syncToSong) {
@@ -588,16 +591,62 @@ private:
             clock = audioTimeSync_->get_songTime();
         }
         const auto& profile = settings_.Get().camera.Primary();
+        scriptClockSeconds_ = clock;
+        scriptClockValid_ = true;
         return EvaluateMovementScript(*script_, clock, BasePose(profile), profile.fovDegrees);
+    }
+
+    void LogScriptTelemetry(
+        const ScriptSample& scriptSample,
+        const MotionOutput& motion,
+        float deltaSeconds) {
+        if (!settings_.Get().general.diagnosticsEnabled || !scriptClockValid_ ||
+            !IsUnityObjectAlive(cameraObject_) || !IsUnityObjectAlive(spectatorCamera_)) {
+            scriptTelemetryWasActive_ = false;
+            scriptTelemetryElapsedSeconds_ = 0.0F;
+            return;
+        }
+
+        scriptTelemetryElapsedSeconds_ += deltaSeconds;
+        const auto shouldLog = !scriptTelemetryWasActive_ || scriptTelemetryElapsedSeconds_ >= 5.0F;
+        scriptTelemetryWasActive_ = true;
+        if (!shouldLog) return;
+        scriptTelemetryElapsedSeconds_ = std::fmod(scriptTelemetryElapsedSeconds_, 5.0F);
+
+        UnityEngine::Vector3 appliedPosition{};
+        UnityEngine::Quaternion appliedRotation{};
+        cameraObject_->get_transform()->GetPositionAndRotation(byref(appliedPosition), byref(appliedRotation));
+        const auto appliedEuler = appliedRotation.get_eulerAngles();
+        Logging::Logger.info(
+            "Camera script telemetry: clock={:.2f}s frame={}/{} local=({:.3f},{:.3f},{:.3f}) "
+            "evaluatedWorld=({:.3f},{:.3f},{:.3f}) appliedWorld=({:.3f},{:.3f},{:.3f}) "
+            "appliedEuler=({:.1f},{:.1f},{:.1f}) FOV={:.1f}",
+            scriptClockSeconds_,
+            scriptSample.frameIndex,
+            script_ ? script_->frames.size() : 0,
+            scriptSample.pose.position.x,
+            scriptSample.pose.position.y,
+            scriptSample.pose.position.z,
+            motion.worldPose.position.x,
+            motion.worldPose.position.y,
+            motion.worldPose.position.z,
+            appliedPosition.x,
+            appliedPosition.y,
+            appliedPosition.z,
+            appliedEuler.x,
+            appliedEuler.y,
+            appliedEuler.z,
+            spectatorCamera_->get_fieldOfView());
     }
 
     void ApplyMotion(Pose headPose, float deltaSeconds) {
         const auto& profile = settings_.Get().camera.Primary();
         if (!profile.enabled) return;
+        const auto scriptSample = SampleMovementScript();
         const auto motion = movement_.Evaluate(profile, {
             ResolveAnchor(headPose),
             BasePose(profile),
-            SampleMovementScript(),
+            scriptSample,
             ShortestAngleDegrees(forwardYawDegrees_, YawDegrees(headPose.rotation)),
             deltaSeconds,
         });
@@ -605,6 +654,12 @@ private:
         currentWorldPoseValid_ = true;
         cameraObject_->get_transform()->SetPositionAndRotation(ToUnity(motion.worldPose.position), ToUnity(motion.worldPose.rotation));
         spectatorCamera_->set_fieldOfView(motion.fovDegrees);
+        if (scriptSample && scriptSample->active) {
+            LogScriptTelemetry(*scriptSample, motion, deltaSeconds);
+        } else {
+            scriptTelemetryWasActive_ = false;
+            scriptTelemetryElapsedSeconds_ = 0.0F;
+        }
     }
 
     void ApplyRenderDemand(float deltaSeconds) {
@@ -678,6 +733,9 @@ private:
 
     void ReloadMovementScript() {
         script_.reset();
+        scriptClockValid_ = false;
+        scriptTelemetryWasActive_ = false;
+        scriptTelemetryElapsedSeconds_ = 0.0F;
         const auto& profile = settings_.Get().camera.Primary();
         if (profile.movementScriptFile.empty()) {
             movementScriptStatus_ = "No movement script selected.";
@@ -709,11 +767,15 @@ private:
     bool forwardAnchorValid_ = false;
     float forwardYawDegrees_ = 0.0F;
     float sessionTimeSeconds_ = 0.0F;
+    float scriptClockSeconds_ = 0.0F;
+    float scriptTelemetryElapsedSeconds_ = 0.0F;
     Pose staticAnchor_{};
     Pose currentWorldPose_{};
     Pose previousHeadPose_{};
     bool currentWorldPoseValid_ = false;
     bool previousHeadPoseValid_ = false;
+    bool scriptClockValid_ = false;
+    bool scriptTelemetryWasActive_ = false;
     MotionPipeline movement_;
     FrameDemandRegistry demands_;
     FrameScheduler scheduler_;

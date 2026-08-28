@@ -23,7 +23,7 @@ The parser does not include Unity headers. The solver does not know about glTF, 
 
 The current material pass consumes VRM 0.x MToon properties but intentionally uses built-in unlit opaque/cutout/transparent shaders. Base color, main texture, emission color/texture, VRM's offset-then-scale texture transform, blend class, and render queue are retained. MToon lighting ramps, rim lighting, matcaps, exact culling behavior, and outlines are not claimed yet. SpringBone metadata is parsed but simulation is not implemented in this milestone.
 
-Sparse accessors, external buffers/images, data URIs, non-triangle primitives, VRM 1.x, Draco compression, mesh merging, advanced SpringBones, body-yaw locomotion states, stepping, jumping, and FBT are outside this stop point. Unsupported or malformed input fails with a bounded error and does not replace the current avatar.
+Sparse accessors, external buffers/images, data URIs, non-triangle primitives, VRM 1.x, Draco compression, mesh merging, advanced SpringBones, terrain-aware feet, continuous locomotion, and FBT are outside this stop point. Unsupported or malformed input fails with a bounded error and does not replace the current avatar.
 
 ## Coordinates and skinning
 

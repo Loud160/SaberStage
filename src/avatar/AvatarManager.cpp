@@ -36,6 +36,25 @@ UnityEngine::Quaternion ToUnity(Quaternion value) noexcept { return {value.x, va
 Vec3 FromUnity(UnityEngine::Vector3 value) noexcept { return {value.x, value.y, value.z}; }
 Quaternion FromUnity(UnityEngine::Quaternion value) noexcept { return {value.x, value.y, value.z, value.w}; }
 
+Pose ReadPose(UnityEngine::Transform* transform) {
+    UnityEngine::Vector3 position{};
+    UnityEngine::Quaternion rotation{};
+    transform->GetPositionAndRotation(byref(position), byref(rotation));
+    return {FromUnity(position), FromUnity(rotation)};
+}
+
+bool TrackingOriginChanged(Pose previous, Pose current, float standingHeight) noexcept {
+    const auto positionThreshold = std::max(standingHeight * 0.35F, 0.35F);
+    if (Length(current.position - previous.position) > positionThreshold) return true;
+    auto previousForward = Rotate(previous.rotation, {0.0F, 0.0F, 1.0F});
+    auto currentForward = Rotate(current.rotation, {0.0F, 0.0F, 1.0F});
+    previousForward.y = 0.0F;
+    currentForward.y = 0.0F;
+    previousForward = Normalize(previousForward, {0.0F, 0.0F, 1.0F});
+    currentForward = Normalize(currentForward, previousForward);
+    return Dot(previousForward, currentForward) < 0.8660254F; // 30 degrees
+}
+
 bool IsAlive(UnityEngine::Object* object) noexcept {
     return object != nullptr && UnityEngine::Object::op_Inequality(object, nullptr);
 }
@@ -201,8 +220,12 @@ public:
             controllerToWrist_[1] = rightOffset;
             animator_->set_enabled(false);
             bound_ = true;
-            persistent_ = {};
+            solver_.Reset(persistent_);
             player_ = {};
+            lastTrackingOrigin_ = {};
+            lastTrackingOriginValid_ = false;
+            trackingWasReady_ = false;
+            resetOnTrackingRestore_ = false;
             FindTrackingTransforms();
             SampleTracking();
             RecalibrateNeutral();
@@ -244,11 +267,15 @@ public:
         player_ = {};
         sample_ = {};
         solved_ = {};
-        persistent_ = {};
+        solver_.Reset(persistent_);
         diagnostics_ = {};
         bound_ = false;
         nextTrackingDiscoveryFrame_ = 0;
         trackingFailureLogged_ = false;
+        lastTrackingOrigin_ = {};
+        lastTrackingOriginValid_ = false;
+        trackingWasReady_ = false;
+        resetOnTrackingRestore_ = false;
     }
 
     bool RecalibrateNeutral() noexcept {
@@ -263,7 +290,15 @@ public:
             origin.position = {sample_.head.pose.position.x, 0.0F, sample_.head.pose.position.z};
         }
         player_ = MeasureNeutralPlayer(sample_, origin, controllerToWrist_[0], controllerToWrist_[1]);
-        persistent_ = {};
+        solver_.Reset(persistent_);
+        if (IsAlive(originTransform_)) {
+            lastTrackingOrigin_ = ReadPose(originTransform_);
+            lastTrackingOriginValid_ = IsFinite(lastTrackingOrigin_.position) && IsFinite(lastTrackingOrigin_.rotation);
+        } else {
+            lastTrackingOrigin_ = origin;
+            lastTrackingOriginValid_ = true;
+        }
+        resetOnTrackingRestore_ = false;
         if (player_.valid) {
             Logging::Logger.info(
                 "Avatar player calibration: standingHmd={:.3f}m floor={:.3f}m",
@@ -277,6 +312,10 @@ public:
         try {
             const auto frame = UnityEngine::Time::get_frameCount();
             if (!TrackingSourcesReady()) {
+                if (trackingWasReady_) {
+                    trackingWasReady_ = false;
+                    resetOnTrackingRestore_ = true;
+                }
                 if (frame < nextTrackingDiscoveryFrame_) return;
                 nextTrackingDiscoveryFrame_ = frame + 60;
                 if (!FindTrackingTransforms()) return;
@@ -293,8 +332,46 @@ public:
             }
             sample_.renderFrame = frame;
             ++sample_.sequence;
-            if (!player_.valid) RecalibrateNeutral();
+            const auto trackingValid = sample_.head.valid && sample_.leftHand.valid && sample_.rightHand.valid;
+            if (!trackingValid) {
+                if (trackingWasReady_) resetOnTrackingRestore_ = true;
+                trackingWasReady_ = false;
+                return;
+            }
+
+            bool originChanged = false;
+            Pose currentOrigin{};
+            if (IsAlive(originTransform_)) {
+                currentOrigin = ReadPose(originTransform_);
+                if (lastTrackingOriginValid_ && player_.valid) {
+                    originChanged = TrackingOriginChanged(
+                        lastTrackingOrigin_, currentOrigin, player_.standingHmdHeight);
+                }
+                lastTrackingOrigin_ = currentOrigin;
+                lastTrackingOriginValid_ = IsFinite(currentOrigin.position) && IsFinite(currentOrigin.rotation);
+            }
+
+            const auto trackingJump = previous.head.valid && player_.valid &&
+                Length(sample_.head.pose.position - previous.head.pose.position) >
+                    std::max(player_.standingHmdHeight * 0.45F, 0.55F);
+            if (!player_.valid || originChanged) {
+                if (originChanged) {
+                    Logging::Logger.info("Avatar tracking origin changed; recalibrating and reseeding body state");
+                }
+                RecalibrateNeutral();
+            } else if (resetOnTrackingRestore_ || trackingJump) {
+                solver_.Reset(persistent_);
+                resetOnTrackingRestore_ = false;
+                if (trackingJump) {
+                    Logging::Logger.info("Avatar tracking discontinuity detected; solver state reseeded");
+                } else {
+                    Logging::Logger.info("Avatar tracking restored; solver state reseeded");
+                }
+            }
+            trackingWasReady_ = true;
         } catch (...) {
+            if (trackingWasReady_) resetOnTrackingRestore_ = true;
+            trackingWasReady_ = false;
             headTransform_ = nullptr;
             handTransforms_[0] = nullptr;
             handTransforms_[1] = nullptr;
@@ -491,7 +568,7 @@ public:
         try {
             Logging::Logger.info(
                 "Avatar diagnostics: sequence={} frameSolves={} reads={} writes={} nativeSolve={:.1f}us spinePasses={} spineError={:.5f} "
-                "armsReachable={}/{} legsReachable={}/{} pelvis=({:.3f},{:.3f},{:.3f})",
+                "armsReachable={}/{} legsReachable={}/{} body={} yaw={} error={:.1f}deg torso={:.1f}deg",
                 sample_.sequence,
                 diagnostics_.solveCountThisFrame,
                 diagnostics_.transformReads,
@@ -501,14 +578,43 @@ public:
                 diagnostics_.spineError,
                 diagnostics_.limbReachable[0], diagnostics_.limbReachable[1],
                 diagnostics_.limbReachable[2], diagnostics_.limbReachable[3],
+                BodyModeName(diagnostics_.bodyMode),
+                BodyYawStateName(diagnostics_.bodyYawState),
+                diagnostics_.headBodyYawErrorDegrees,
+                diagnostics_.torsoYawDegrees);
+            Logging::Logger.info(
+                "Avatar body: pelvis=({:.3f},{:.3f},{:.3f}) lean={:.3f} crouch={:.3f} translation={:.3f}",
                 diagnostics_.pelvis.position.x,
                 diagnostics_.pelvis.position.y,
-                diagnostics_.pelvis.position.z);
+                diagnostics_.pelvis.position.z,
+                diagnostics_.leanAmount,
+                diagnostics_.crouchAmount,
+                diagnostics_.bodyTranslationAmount);
             Logging::Logger.info(
                 "Avatar targets: head=({:.3f},{:.3f},{:.3f}) left=({:.3f},{:.3f},{:.3f}) right=({:.3f},{:.3f},{:.3f})",
                 diagnostics_.headTarget.position.x, diagnostics_.headTarget.position.y, diagnostics_.headTarget.position.z,
                 diagnostics_.handTarget[0].position.x, diagnostics_.handTarget[0].position.y, diagnostics_.handTarget[0].position.z,
                 diagnostics_.handTarget[1].position.x, diagnostics_.handTarget[1].position.y, diagnostics_.handTarget[1].position.z);
+            for (int side = 0; side < 2; ++side) {
+                Logging::Logger.info(
+                    "Avatar {} foot: state={} reason={} anchor=({:.3f},{:.3f},{:.3f}) ideal=({:.3f},{:.3f},{:.3f}) "
+                    "destination=({:.3f},{:.3f},{:.3f}) progress={:.2f} legReach={:.3f} kneePole=({:.3f},{:.3f},{:.3f})",
+                    side == 0 ? "left" : "right",
+                    FootStateName(diagnostics_.footState[side]),
+                    StepReasonName(diagnostics_.stepReason[side]),
+                    persistent_.footAnchor[side].x, persistent_.footAnchor[side].y, persistent_.footAnchor[side].z,
+                    diagnostics_.idealFootPosition[side].x,
+                    diagnostics_.idealFootPosition[side].y,
+                    diagnostics_.idealFootPosition[side].z,
+                    diagnostics_.stepDestination[side].position.x,
+                    diagnostics_.stepDestination[side].position.y,
+                    diagnostics_.stepDestination[side].position.z,
+                    diagnostics_.stepProgress[side],
+                    diagnostics_.legReach[side],
+                    diagnostics_.kneePole[side].x,
+                    diagnostics_.kneePole[side].y,
+                    diagnostics_.kneePole[side].z);
+            }
         } catch (...) {
         }
     }
@@ -664,6 +770,10 @@ private:
     bool bound_ = false;
     bool started_ = false;
     bool trackingFailureLogged_ = false;
+    Pose lastTrackingOrigin_{};
+    bool lastTrackingOriginValid_ = false;
+    bool trackingWasReady_ = false;
+    bool resetOnTrackingRestore_ = false;
 };
 
 AvatarManager::AvatarManager(camera::CameraManager& camera)
