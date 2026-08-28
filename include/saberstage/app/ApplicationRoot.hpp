@@ -21,6 +21,10 @@ namespace saberstage::recording {
 class RecordingController;
 }
 
+namespace saberstage::avatar {
+class AvatarManager;
+}
+
 namespace saberstage::app {
 
 class ApplicationRoot final {
@@ -37,6 +41,7 @@ public:
     camera::CameraManager& Camera() noexcept;
     preview::PreviewManager& Preview() noexcept;
     recording::RecordingController& Recording() noexcept;
+    avatar::AvatarManager& Avatar() noexcept;
 
 private:
     bool started_ = false;
@@ -44,6 +49,7 @@ private:
     std::unique_ptr<camera::CameraManager> camera_;
     std::unique_ptr<preview::PreviewManager> preview_;
     std::unique_ptr<recording::RecordingController> recording_;
+    std::unique_ptr<avatar::AvatarManager> avatar_;
     std::unique_ptr<ui::MenuController> menu_;
 };
 

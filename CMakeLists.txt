@@ -34,6 +34,23 @@ if(SABERSTAGE_HOST_TESTS)
     target_compile_definitions(saberstage_settings PRIVATE SABERSTAGE_HOST_BUILD=1)
     target_link_libraries(saberstage_settings PUBLIC saberstage_camera_core)
 
+    add_library(saberstage_avatar_core STATIC
+        src/avatar/AvatarSolver.cpp
+        src/avatar/Calibration.cpp
+        src/avatar/FabrikSpine.cpp
+        src/avatar/Math.cpp
+        src/avatar/PoseTypes.cpp
+        src/avatar/TwoBoneIK.cpp
+    )
+    target_include_directories(saberstage_avatar_core PUBLIC include)
+    target_compile_definitions(saberstage_avatar_core PRIVATE SABERSTAGE_HOST_BUILD=1)
+
+    add_library(saberstage_vrm_core STATIC
+        src/avatar/vrm/Vrm0Parser.cpp
+    )
+    target_include_directories(saberstage_vrm_core PUBLIC include "${SABERSTAGE_RAPIDJSON_DIR}")
+    target_compile_definitions(saberstage_vrm_core PRIVATE SABERSTAGE_HOST_BUILD=1)
+
     enable_testing()
     add_executable(saberstage_settings_tests tests/SettingsTests.cpp)
     target_link_libraries(saberstage_settings_tests PRIVATE saberstage_settings)
@@ -46,6 +63,14 @@ if(SABERSTAGE_HOST_TESTS)
     add_executable(saberstage_recording_state_tests tests/RecordingStateTests.cpp)
     target_include_directories(saberstage_recording_state_tests PRIVATE include)
     add_test(NAME saberstage.recording_state COMMAND saberstage_recording_state_tests)
+
+    add_executable(saberstage_avatar_tests tests/AvatarSolverTests.cpp)
+    target_link_libraries(saberstage_avatar_tests PRIVATE saberstage_avatar_core)
+    add_test(NAME saberstage.avatar COMMAND saberstage_avatar_tests)
+
+    add_executable(saberstage_vrm_tests tests/VrmParserTests.cpp)
+    target_link_libraries(saberstage_vrm_tests PRIVATE saberstage_vrm_core)
+    add_test(NAME saberstage.vrm COMMAND saberstage_vrm_tests)
     return()
 endif()
 

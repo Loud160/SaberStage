@@ -107,6 +107,33 @@ void AddFeature(Value& root, const char* name, const FeatureSettings& feature, D
     root.AddMember(Value(name, allocator), object, allocator);
 }
 
+AvatarControllerOffsetSettings AvatarControllerOffset(
+    const Value& object,
+    const char* name,
+    AvatarControllerOffsetSettings fallback,
+    bool& repaired) {
+    const auto* source = Member(object, name);
+    if (!source) return fallback;
+    if (!source->IsObject()) {
+        repaired = true;
+        return fallback;
+    }
+    fallback.position = Vector(*source, "position", fallback.position, repaired);
+    fallback.rotationDegrees = Vector(*source, "rotationDegrees", fallback.rotationDegrees, repaired);
+    return fallback;
+}
+
+void AddAvatarControllerOffset(
+    Value& object,
+    const char* name,
+    const AvatarControllerOffsetSettings& offset,
+    Document::AllocatorType& allocator) {
+    Value value(rapidjson::kObjectType);
+    AddVector(value, "position", offset.position, allocator);
+    AddVector(value, "rotationDegrees", offset.rotationDegrees, allocator);
+    object.AddMember(Value(name, allocator), value, allocator);
+}
+
 void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bool& repaired) {
     profile.profileId = String(source, "profileId", profile.profileId, repaired);
     profile.displayName = String(source, "displayName", profile.displayName, repaired);
@@ -264,7 +291,21 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
         }
     }
     settings.companion = Feature(document, "companion", settings.companion, repaired);
-    settings.avatar = Feature(document, "avatar", settings.avatar, repaired);
+    if (const auto* avatar = Member(document, "avatar")) {
+        if (!avatar->IsObject()) repaired = true;
+        else {
+            settings.avatar.enabled = Bool(*avatar, "enabled", settings.avatar.enabled, repaired);
+            settings.avatar.visible = Bool(*avatar, "visible", settings.avatar.visible, repaired);
+            settings.avatar.selectedPath = String(*avatar, "selectedPath", settings.avatar.selectedPath, repaired);
+            settings.avatar.selectedFile = String(*avatar, "selectedFile", settings.avatar.selectedFile, repaired);
+            settings.avatar.maximumTextureDimension = Int(
+                *avatar, "maximumTextureDimension", settings.avatar.maximumTextureDimension, repaired);
+            settings.avatar.leftControllerToWrist = AvatarControllerOffset(
+                *avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, repaired);
+            settings.avatar.rightControllerToWrist = AvatarControllerOffset(
+                *avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, repaired);
+        }
+    }
     settings.scenes = Feature(document, "scenes", settings.scenes, repaired);
     settings.broadcast = Feature(document, "broadcast", settings.broadcast, repaired);
     settings.chat = Feature(document, "chat", settings.chat, repaired);
@@ -308,7 +349,15 @@ std::string Encode(const SettingsDocument& settings) {
     document.AddMember("recording", recording, allocator);
 
     AddFeature(document, "companion", settings.companion, allocator);
-    AddFeature(document, "avatar", settings.avatar, allocator);
+    Value avatar(rapidjson::kObjectType);
+    avatar.AddMember("enabled", settings.avatar.enabled, allocator);
+    avatar.AddMember("visible", settings.avatar.visible, allocator);
+    avatar.AddMember("selectedPath", Value(settings.avatar.selectedPath.c_str(), allocator), allocator);
+    avatar.AddMember("selectedFile", Value(settings.avatar.selectedFile.c_str(), allocator), allocator);
+    avatar.AddMember("maximumTextureDimension", settings.avatar.maximumTextureDimension, allocator);
+    AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, allocator);
+    AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
+    document.AddMember("avatar", avatar, allocator);
     AddFeature(document, "scenes", settings.scenes, allocator);
     AddFeature(document, "broadcast", settings.broadcast, allocator);
     AddFeature(document, "chat", settings.chat, allocator);

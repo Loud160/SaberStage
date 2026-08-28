@@ -25,6 +25,7 @@ public:
     using CaptureExclusionHandler = std::function<void(bool excluded)>;
     using RuntimeCameraInvalidatedHandler = std::function<void()>;
     using RuntimeCameraReadyHandler = std::function<void()>;
+    using BeforeRenderHandler = std::function<void()>;
 
     CameraManager(settings::SettingsService& settings, std::filesystem::path movementScriptDirectory);
     ~CameraManager();
@@ -45,6 +46,8 @@ public:
     void EndExternalRenderOutput() noexcept;
     void SetRuntimeCameraInvalidatedHandler(RuntimeCameraInvalidatedHandler handler);
     void SetRuntimeCameraReadyHandler(RuntimeCameraReadyHandler handler);
+    void SetBeforeRenderHandler(BeforeRenderHandler handler);
+    void PrepareForSpectatorRender() noexcept;
     void SetPreviewCaptureExcluded(bool excluded) noexcept;
 
     bool RecenterCameraToCurrentForward() noexcept;

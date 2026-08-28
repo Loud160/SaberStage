@@ -1,6 +1,9 @@
 #include "saberstage/settings/SettingsModel.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <utility>
 
 namespace saberstage::settings {
@@ -96,6 +99,41 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
     RepairRange(settings.recording.framesPerSecond, 15, 60, defaults.recording.framesPerSecond, result);
     RepairRange(settings.recording.bitrateBitsPerSecond, 500'000, 80'000'000,
                 defaults.recording.bitrateBitsPerSecond, result);
+    if (settings.avatar.selectedFile.empty() || settings.avatar.selectedFile.size() > 128 ||
+        settings.avatar.selectedFile.find('/') != std::string::npos ||
+        settings.avatar.selectedFile.find('\\') != std::string::npos ||
+        settings.avatar.selectedFile.find("..") != std::string::npos ||
+        !settings.avatar.selectedFile.ends_with(".vrm")) {
+        settings.avatar.selectedFile = defaults.avatar.selectedFile;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    if (!settings.avatar.selectedPath.empty()) {
+        const std::filesystem::path selected(settings.avatar.selectedPath);
+        auto extension = selected.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        if (settings.avatar.selectedPath.size() > 1024 || !selected.is_absolute() ||
+            extension != ".vrm" || settings.avatar.selectedPath.find('\0') != std::string::npos) {
+            settings.avatar.selectedPath.clear();
+            result.changed = true;
+            ++result.repairedFields;
+        } else {
+            const auto normalized = selected.lexically_normal().string();
+            if (normalized != settings.avatar.selectedPath) {
+                settings.avatar.selectedPath = normalized;
+                result.changed = true;
+                ++result.repairedFields;
+            }
+        }
+    }
+    RepairRange(settings.avatar.maximumTextureDimension, 256, 2048,
+                defaults.avatar.maximumTextureDimension, result);
+    RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
+    RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
+    RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
+    RepairVector(settings.avatar.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
     return result;
 }
 

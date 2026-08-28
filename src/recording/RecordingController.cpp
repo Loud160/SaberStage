@@ -520,9 +520,10 @@ void RecordingController::RefreshAudioListenerOwnership() noexcept {
             if (!IsUnityObjectAlive(listener) || listener == captureAudioListener_ || !listener->get_enabled()) continue;
             auto* object = listener->get_gameObject().ptr();
             if (!IsUnityObjectAlive(object) || !object->get_activeInHierarchy()) continue;
-            if (std::find(disabledAudioListeners_.begin(), disabledAudioListeners_.end(), listener) ==
-                disabledAudioListeners_.end()) {
-                disabledAudioListeners_.push_back(listener);
+            const auto instanceId = listener->GetInstanceID();
+            if (std::find(disabledAudioListenerIds_.begin(), disabledAudioListenerIds_.end(), instanceId) ==
+                disabledAudioListenerIds_.end()) {
+                disabledAudioListenerIds_.push_back(instanceId);
             }
             listener->set_enabled(false);
         }
@@ -532,14 +533,20 @@ void RecordingController::RefreshAudioListenerOwnership() noexcept {
 }
 
 void RecordingController::RestoreAudioListenerOwnership() noexcept {
-    for (auto* listener : disabledAudioListeners_) {
-        try {
-            if (IsUnityObjectAlive(listener)) listener->set_enabled(true);
-        } catch (...) {
-            Logging::Logger.error("Could not restore a Beat Saber audio listener");
+    try {
+        for (auto* listener : UnityEngine::Resources::FindObjectsOfTypeAll<UnityEngine::AudioListener*>()) {
+            if (!IsUnityObjectAlive(listener) || listener == captureAudioListener_) continue;
+            const auto instanceId = listener->GetInstanceID();
+            if (std::find(disabledAudioListenerIds_.begin(), disabledAudioListenerIds_.end(), instanceId) ==
+                disabledAudioListenerIds_.end()) {
+                continue;
+            }
+            listener->set_enabled(true);
         }
+    } catch (...) {
+        Logging::Logger.error("Could not restore current Beat Saber audio listeners");
     }
-    disabledAudioListeners_.clear();
+    disabledAudioListenerIds_.clear();
 }
 
 bool RecordingController::TryTransition(
@@ -658,17 +665,28 @@ void RecordingController::CleanupCaptureObjects() noexcept {
     camera_.EndExternalRenderOutput();
     try {
         if (IsUnityObjectAlive(audioObject_)) audioObject_->SetActive(false);
+    } catch (...) {
+        Logging::Logger.error("Game-audio capture deactivation failed");
+    }
+    try {
         if (IsUnityObjectAlive(audioCapture_)) {
             audioCapture_->Save();
         }
+    } catch (...) {
+        Logging::Logger.error("Game-audio capture save failed");
+    }
+    // Restore only listeners that still exist in the current scene. This must
+    // happen before clearing/destroying the capture listener so it can be
+    // excluded from the live enumeration without retaining any stale wrapper.
+    RestoreAudioListenerOwnership();
+    try {
         if (IsUnityObjectAlive(audioObject_)) UnityEngine::Object::DestroyImmediate(audioObject_);
     } catch (...) {
-        Logging::Logger.error("Game-audio capture cleanup failed");
+        Logging::Logger.error("Game-audio capture object destruction failed");
     }
     audioCapture_ = nullptr;
     captureAudioListener_ = nullptr;
     audioObject_ = nullptr;
-    RestoreAudioListenerOwnership();
 
     StopVideoSegment();
     activeRuntimeCamera_ = nullptr;

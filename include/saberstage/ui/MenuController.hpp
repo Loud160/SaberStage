@@ -2,6 +2,7 @@
 
 #include <functional>
 #include <array>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -12,6 +13,7 @@ class ViewController;
 
 namespace BSML {
 class SliderSetting;
+class ModalView;
 }
 
 namespace TMPro {
@@ -56,10 +58,16 @@ private:
     static void BuildTabbedSettings(HMUI::ViewController* view);
     static void BuildPreviewPanel(HMUI::ViewController* view);
     static void BuildRecordingPanel(HMUI::ViewController* view);
+    void BuildAvatarFilePicker(HMUI::ViewController* view);
     static void SetEditorPreviewActive(bool active);
     void EditCamera(const std::function<void(camera::CameraProfile&)>& edit, std::string_view reason);
     void RefreshScriptStatus();
     void RefreshRecordingStatus();
+    void RefreshAvatarStatus();
+    void OpenAvatarFilePicker();
+    void BrowseAvatarDirectory(const std::filesystem::path& directory);
+    void SelectAvatarFile(const std::filesystem::path& path);
+    [[nodiscard]] std::filesystem::path ConfiguredAvatarPath() const;
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     static MenuController* active_;
@@ -73,6 +81,13 @@ private:
     std::array<UnityEngine::GameObject*, 2> recordingTabViewRoots_{};
     TMPro::TextMeshProUGUI* recordingStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingOutputText_ = nullptr;
+    TMPro::TextMeshProUGUI* avatarStatusText_ = nullptr;
+    TMPro::TextMeshProUGUI* avatarSelectionText_ = nullptr;
+    TMPro::TextMeshProUGUI* avatarPickerPathText_ = nullptr;
+    BSML::ModalView* avatarPickerModal_ = nullptr;
+    UnityEngine::GameObject* avatarPickerListContent_ = nullptr;
+    std::vector<UnityEngine::GameObject*> avatarPickerRows_;
+    std::filesystem::path avatarPickerDirectory_;
     UnityEngine::UI::Button* startRecordingButton_ = nullptr;
     UnityEngine::UI::Button* pauseRecordingButton_ = nullptr;
     UnityEngine::UI::Button* resumeRecordingButton_ = nullptr;

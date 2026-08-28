@@ -45,6 +45,9 @@ int main() {
     Check(defaults.preview.selectedCameraId == "primary", "preview targets the stable primary camera");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
     Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
+    Check(defaults.avatar.maximumTextureDimension == 1024, "VRM textures default to the Quest-conscious 1024 cap");
+    Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
+    Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
           "every scaffold description line fits the narrow menu budget");
     Check(saberstage::ui::copy::LineCount(saberstage::ui::copy::kScaffoldDescription) <= 8,
@@ -58,6 +61,9 @@ int main() {
     invalid.preview.selectedCameraId = "missing";
     invalid.preview.position.x = 2000.0F;
     invalid.recording.framesPerSecond = 1000;
+    invalid.avatar.selectedFile = "../outside.vrm";
+    invalid.avatar.selectedPath = "relative/outside.vrm";
+    invalid.avatar.maximumTextureDimension = 8192;
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -123,6 +129,10 @@ int main() {
     first.Edit().preview.scale = 1.5F;
     first.Edit().recording.gameplayOnly = true;
     first.Edit().recording.controllerShortcutEnabled = true;
+    first.Edit().avatar.selectedFile = "Black Heart.vrm";
+    first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
+    first.Edit().avatar.maximumTextureDimension = 512;
+    first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
     Check(Read(path).find("\"profiles\"") != std::string::npos,
@@ -144,6 +154,11 @@ int main() {
     Check(second.Get().recording.gameplayOnly, "gameplay-only recording preference survives restart");
     Check(second.Get().recording.controllerShortcutEnabled,
           "controller recording shortcut preference survives restart");
+    Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&
+              second.Get().avatar.selectedPath == "/sdcard/Download/Black Heart.vrm" &&
+              second.Get().avatar.maximumTextureDimension == 512 &&
+              second.Get().avatar.leftControllerToWrist.position.z == 0.03F,
+          "avatar selection, texture cap, and wrist calibration survive restart");
 
     auto normalizedPreview = Defaults();
     normalizedPreview.preview.rotationDegrees = {365.0F, -540.0F, 720.0F};

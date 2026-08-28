@@ -1,4 +1,5 @@
 #include "saberstage/preview/PreviewManager.hpp"
+#include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include "saberstage/Logging.hpp"
 #include "saberstage/camera/CameraManager.hpp"
@@ -9,7 +10,6 @@
 #include "bsml/shared/BSML/FloatingScreen/FloatingScreen.hpp"
 #include "bsml/shared/BSML/FloatingScreen/FloatingScreenHandle.hpp"
 #include "bsml/shared/BSML/FloatingScreen/Side.hpp"
-#include "bsml/shared/BSML/Tags/RawImageTag.hpp"
 #include "bsml/shared/BSML-Lite/Creation/Image.hpp"
 #include "bsml/shared/BSML-Lite/Creation/Text.hpp"
 #include "bsml/shared/Helpers/getters.hpp"
@@ -18,6 +18,7 @@
 #include "TMPro/FontStyles.hpp"
 #include "TMPro/TextAlignmentOptions.hpp"
 #include "UnityEngine/Camera.hpp"
+#include "UnityEngine/CanvasRenderer.hpp"
 #include "UnityEngine/Color.hpp"
 #include "UnityEngine/GameObject.hpp"
 #include "UnityEngine/Material.hpp"
@@ -39,6 +40,8 @@
 #include <cmath>
 #include <exception>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace saberstage::preview {
 namespace {
@@ -53,13 +56,6 @@ constexpr float kPreviewCanvasHeight =
     kPreviewHeaderHeight + kPreviewBodyHeight + kPreviewFooterHeight;
 constexpr float kCameraGizmoWidth = 28.0F;
 constexpr float kCameraGizmoHeight = 20.0F;
-
-class PublicRawImageTag final : public BSML::RawImageTag {
-public:
-    UnityEngine::GameObject* Create(UnityEngine::Transform* parent) const {
-        return CreateObject(parent);
-    }
-};
 
 bool IsAlive(UnityEngine::Object* object) {
     return object != nullptr && UnityEngine::Object::op_Inequality(object, nullptr);
@@ -175,21 +171,30 @@ float PoseDifference(camera::Pose left, camera::Pose right) {
     return position + rotation;
 }
 
-UnityEngine::UI::RawImage* CreateRawImage(
+UnityEngine::UI::RawImage* CreateWorldSpaceRawImage(
     UnityEngine::Transform* parent,
     UnityEngine::Vector2 position,
     UnityEngine::Vector2 size) {
     if (!IsAlive(parent)) return nullptr;
-    auto* object = PublicRawImageTag{}.Create(parent);
+    // Follow BigScreen's proven floating-panel path directly. The BSML tag is
+    // useful inside parsed view-controller layouts, but its added LayoutElement
+    // and retained parser defaults are unnecessary on a standalone world-space
+    // Canvas and made this surface behave differently from the working panel.
+    auto* object = UnityEngine::GameObject::New_ctor("SaberStage Floating Preview Image");
     if (!IsAlive(object)) return nullptr;
-    object->set_name("SaberStage Preview Image");
+    object->get_transform()->SetParent(parent, false);
     object->set_layer(5);
-    auto* image = object->GetComponent<UnityEngine::UI::RawImage*>();
+    auto* image = object->AddComponent<UnityEngine::UI::RawImage*>();
     if (!IsAlive(image)) {
         UnityEngine::Object::Destroy(object);
         return nullptr;
     }
     image->set_raycastTarget(false);
+    auto renderer = image->get_canvasRenderer();
+    if (IsAlive(renderer.ptr())) {
+        renderer->set_cull(false);
+        renderer->set_cullTransparentMesh(false);
+    }
     auto rect = image->get_rectTransform();
     CenterRect(rect.ptr());
     rect->set_anchoredPosition(position);
@@ -276,6 +281,7 @@ public:
     }
 
     void AttachDockedPreview(UnityEngine::UI::RawImage* image) {
+        RestoreCaptureRoots();
         dockedImage_ = image;
         dockedCaptureRoot_ = nullptr;
         if (IsAlive(dockedImage_)) {
@@ -293,6 +299,7 @@ public:
 
     void DetachDockedPreview() noexcept {
         try {
+            RestoreCaptureRoots();
             SetImageTexture(dockedImage_, nullptr);
             dockedImage_ = nullptr;
             dockedCaptureRoot_ = nullptr;
@@ -365,16 +372,12 @@ public:
     }
 
     void RefreshRenderDemand() {
-        const auto& profile = settings_.Get().camera.Primary();
-        const camera::RenderDemand demand{
-            std::string(camera::kPrimaryCameraId),
-            profile.requestedWidth,
-            profile.requestedHeight,
-            profile.requestedFramesPerSecond};
-        if (editorActive_) camera_.SetRenderDemand(std::string(kDockedDemand), demand);
+        if (editorActive_) {
+            camera_.SetRenderDemand(std::string(kDockedDemand), DockedPreviewRenderDemand());
+        }
         else camera_.RemoveRenderDemand(kDockedDemand);
         if (settings_.Get().preview.visible && IsAlive(floatingScreen_)) {
-            camera_.SetRenderDemand(std::string(kFloatingDemand), demand);
+            camera_.SetRenderDemand(std::string(kFloatingDemand), FloatingPreviewRenderDemand());
         }
         else camera_.RemoveRenderDemand(kFloatingDemand);
     }
@@ -385,12 +388,13 @@ private:
             ++captureExclusionDepth_;
             if (captureExclusionDepth_ != 1) return;
 
-            dockedCaptureRootWasActive_ =
-                IsAlive(dockedCaptureRoot_) && dockedCaptureRoot_->get_activeSelf();
-            floatingCaptureRootWasActive_ =
-                IsAlive(floatingCaptureRoot_) && floatingCaptureRoot_->get_activeSelf();
-            if (dockedCaptureRootWasActive_) dockedCaptureRoot_->SetActive(false);
-            if (floatingCaptureRootWasActive_) floatingCaptureRoot_->SetActive(false);
+            // Do not deactivate, fade, or move a world-space Canvas between
+            // layers around a manual render. Those hierarchy mutations force
+            // deferred Canvas registration/rebuild work and left the persistent
+            // popout blank. CanvasRenderer culling suppresses only the generated
+            // draw meshes for this one synchronous spectator render.
+            CullRootForCapture(dockedCaptureRoot_);
+            CullRootForCapture(floatingCaptureRoot_);
             return;
         }
 
@@ -401,34 +405,51 @@ private:
 
     void RestoreCaptureRoots() {
         captureExclusionDepth_ = 0;
-        if (dockedCaptureRootWasActive_ && IsAlive(dockedCaptureRoot_))
-            dockedCaptureRoot_->SetActive(true);
-        if (floatingCaptureRootWasActive_ && IsAlive(floatingCaptureRoot_))
-            floatingCaptureRoot_->SetActive(true);
-        dockedCaptureRootWasActive_ = false;
-        floatingCaptureRootWasActive_ = false;
+        for (const auto& [renderer, culled] : captureCullSnapshot_) {
+            if (IsAlive(renderer)) renderer->set_cull(culled);
+        }
+        captureCullSnapshot_.clear();
+    }
+
+    void CullRootForCapture(UnityEngine::GameObject* root) {
+        if (!IsAlive(root)) return;
+        for (auto* renderer : root->GetComponentsInChildren<UnityEngine::CanvasRenderer*>(true)) {
+            if (!IsAlive(renderer)) continue;
+            captureCullSnapshot_.emplace_back(renderer, renderer->get_cull());
+            renderer->set_cull(true);
+        }
     }
 
     bool EnsurePreviewMaterial() {
         if (IsAlive(previewMaterial_)) return true;
-        auto shader = UnityEngine::Shader::Find("Custom/LIV_Blit");
+        // The camera's post-effect texture contains correct RGB (Hollywood
+        // records it correctly) but its alpha channel is Beat Saber's bloom
+        // weight, not ordinary image opacity. UI materials alpha-blend with
+        // that channel and consequently show only emissive effects, pointers,
+        // and floor markers. Use Unity's opaque texture shader so the preview
+        // displays the final RGB regardless of the bloom-alpha contents.
+        auto shader = UnityEngine::Shader::Find("Unlit/Texture");
         if (!shader) {
             if (!previewMaterialFailureLogged_) {
                 previewMaterialFailureLogged_ = true;
-                Logging::Logger.error("Quest's opaque LIV preview shader is unavailable");
+                Logging::Logger.error("Unity's opaque texture shader is unavailable for camera previews");
             }
             return false;
         }
         previewMaterial_ = UnityEngine::Material::New_ctor(shader);
         if (!IsAlive(previewMaterial_)) return false;
         previewMaterial_->set_name("SaberStage Opaque Camera Preview");
+        previewMaterial_->set_color(UnityEngine::Color::get_white());
+        previewMaterial_->set_renderQueue(3000);
         UnityEngine::Object::DontDestroyOnLoad(previewMaterial_);
-        Logging::Logger.info("Using opaque RGB material for camera previews");
+        Logging::Logger.info("Using alpha-independent opaque RGB material for camera previews");
         return true;
     }
 
     void ApplyPreviewMaterial(UnityEngine::UI::RawImage* image) {
-        if (IsAlive(image) && EnsurePreviewMaterial()) image->set_material(previewMaterial_);
+        if (!IsAlive(image) || !EnsurePreviewMaterial()) return;
+        image->set_color(UnityEngine::Color::get_white());
+        image->set_material(previewMaterial_);
     }
 
     void ApplyVisibility() {
@@ -456,7 +477,7 @@ private:
 
         ConfigureImage(BSML::Lite::CreateImage(parent, whitePixel),
             {0.0F, bodyCenter}, {kPreviewWidth - 2.0F, kPreviewBodyHeight - 2.0F}, panelColor, true);
-        auto* preview = CreateRawImage(
+        auto* preview = CreateWorldSpaceRawImage(
             parent, {0.0F, bodyCenter}, {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F});
         if (!IsAlive(preview)) return nullptr;
 
@@ -570,11 +591,11 @@ private:
     }
 
     void DestroyFloatingPreview() noexcept {
+        RestoreCaptureRoots();
         if (IsAlive(floatingScreen_)) UnityEngine::Object::Destroy(floatingScreen_->get_gameObject());
         floatingScreen_ = nullptr;
         floatingImage_ = nullptr;
         floatingCaptureRoot_ = nullptr;
-        floatingCaptureRootWasActive_ = false;
         floatingPoseDirty_ = false;
         floatingStableSeconds_ = 0.0F;
     }
@@ -692,7 +713,8 @@ private:
         placementFailureLogged_ = false;
     }
 
-    static void SetImageTexture(UnityEngine::UI::RawImage* image, UnityEngine::RenderTexture* texture) {
+    void SetImageTexture(UnityEngine::UI::RawImage* image, UnityEngine::RenderTexture* texture) {
+        if (IsAlive(previewMaterial_)) previewMaterial_->set_mainTexture(texture);
         if (IsAlive(image)) image->set_texture(texture);
     }
 
@@ -708,10 +730,9 @@ private:
     bool floatingCreationFailureLogged_ = false;
     bool placementCreationFailureLogged_ = false;
     bool previewMaterialFailureLogged_ = false;
-    bool floatingCaptureRootWasActive_ = false;
-    bool dockedCaptureRootWasActive_ = false;
     int captureExclusionDepth_ = 0;
     float floatingStableSeconds_ = 0.0F;
+    std::vector<std::pair<UnityEngine::CanvasRenderer*, bool>> captureCullSnapshot_;
     camera::Pose lastFloatingPose_{};
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::Material* previewMaterial_ = nullptr;

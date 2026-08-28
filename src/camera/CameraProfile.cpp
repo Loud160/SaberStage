@@ -129,9 +129,10 @@ std::int32_t ResolveSpectatorCullingMask(
     // Camera2 and Quest's MRC path both keep Beat Saber's first-person-only
     // layer out of a third-person camera so HMD-only avatar geometry does not
     // leak into a displaced spectator view.
+    const auto mandatoryBroadcastLayers = kUiLayerMask | kAvatarLayerMask;
     const auto exclusions =
-        (profile.excludedLayersMask & ~kUiLayerMask) | kFirstPersonLayerMask;
-    return ((baseMask | kStandardSpectatorLayersMask) & ~exclusions) | kUiLayerMask;
+        (profile.excludedLayersMask & ~mandatoryBroadcastLayers) | kFirstPersonLayerMask;
+    return ((baseMask | kStandardSpectatorLayersMask) & ~exclusions) | mandatoryBroadcastLayers;
 }
 
 Pose BasePose(const CameraProfile& profile) noexcept {

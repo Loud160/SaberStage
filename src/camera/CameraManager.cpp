@@ -3,6 +3,7 @@
 #include "saberstage/Logging.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/camera/CameraRuntimeDriver.hpp"
+#include "saberstage/camera/CameraPreRenderDriver.hpp"
 #include "saberstage/camera/MotionPipeline.hpp"
 #include "saberstage/camera/MovementScript.hpp"
 #include "saberstage/camera/SpectatorRenderGuard.hpp"
@@ -74,8 +75,10 @@ public:
         // a partially completed start if an API call throws.
         started_ = true;
         RegisterCameraRuntimeDriverType();
+        RegisterCameraPreRenderDriverType();
         RegisterSpectatorRenderGuardType();
         BindCameraRuntimeDriver(&owner_);
+        BindCameraPreRenderDriver(&owner_);
         BindSpectatorRenderGuard(&owner_);
         driverObject_ = UnityEngine::GameObject::New_ctor("SaberStage Camera Runtime");
         UnityEngine::Object::DontDestroyOnLoad(driverObject_);
@@ -98,6 +101,7 @@ public:
             DestroyRuntimeCamera();
             UnbindSpectatorRenderGuard(&owner_);
             UnbindCameraRuntimeDriver(&owner_);
+            UnbindCameraPreRenderDriver(&owner_);
             if (IsUnityObjectAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
             driverObject_ = nullptr;
             demands_.Clear();
@@ -107,10 +111,12 @@ public:
             Logging::Logger.error("Camera manager shutdown failure: {}", exception.what());
             UnbindSpectatorRenderGuard(&owner_);
             UnbindCameraRuntimeDriver(&owner_);
+            UnbindCameraPreRenderDriver(&owner_);
         } catch (...) {
             Logging::Logger.error("Camera manager shutdown failed with a non-standard exception");
             UnbindSpectatorRenderGuard(&owner_);
             UnbindCameraRuntimeDriver(&owner_);
+            UnbindCameraPreRenderDriver(&owner_);
         }
     }
 
@@ -239,6 +245,19 @@ public:
         runtimeCameraReadyHandler_ = std::move(handler);
     }
 
+    void SetBeforeRenderHandler(CameraManager::BeforeRenderHandler handler) {
+        beforeRenderHandler_ = std::move(handler);
+    }
+
+    void PrepareForSpectatorRender() noexcept {
+        if (!beforeRenderHandler_) return;
+        try {
+            beforeRenderHandler_();
+        } catch (...) {
+            Logging::Logger.error("Spectator pre-render handler failed safely");
+        }
+    }
+
     void SetPreviewCaptureExcluded(bool excluded) noexcept {
         if (!captureExclusionHandler_) return;
         try {
@@ -361,6 +380,7 @@ private:
         cameraObject_->set_name("SaberStage Primary Spectator Camera");
         cameraObject_->set_tag("Untagged");
         spectatorCamera_->set_enabled(false);
+        cameraObject_->AddComponent<CameraPreRenderDriver*>();
 
         auto* cameraTransform = cameraObject_->get_transform().ptr();
         while (cameraTransform->get_childCount() > 0) {
@@ -700,6 +720,7 @@ private:
     CameraManager::CaptureExclusionHandler captureExclusionHandler_;
     CameraManager::RuntimeCameraInvalidatedHandler runtimeCameraInvalidatedHandler_;
     CameraManager::RuntimeCameraReadyHandler runtimeCameraReadyHandler_;
+    CameraManager::BeforeRenderHandler beforeRenderHandler_;
     std::optional<MovementScript> script_;
     std::string movementScriptStatus_ = "No movement script selected.";
     UnityEngine::GameObject* driverObject_ = nullptr;
@@ -742,6 +763,10 @@ void CameraManager::SetRuntimeCameraInvalidatedHandler(RuntimeCameraInvalidatedH
 void CameraManager::SetRuntimeCameraReadyHandler(RuntimeCameraReadyHandler handler) {
     impl_->SetRuntimeCameraReadyHandler(std::move(handler));
 }
+void CameraManager::SetBeforeRenderHandler(BeforeRenderHandler handler) {
+    impl_->SetBeforeRenderHandler(std::move(handler));
+}
+void CameraManager::PrepareForSpectatorRender() noexcept { impl_->PrepareForSpectatorRender(); }
 void CameraManager::SetPreviewCaptureExcluded(bool excluded) noexcept {
     impl_->SetPreviewCaptureExcluded(excluded);
 }

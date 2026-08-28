@@ -9,7 +9,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 5;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 7;
 
 enum class Subsystem {
     General,
@@ -54,6 +54,23 @@ struct FeatureSettings {
     bool enabled = false;
 };
 
+struct AvatarControllerOffsetSettings {
+    camera::Vec3 position{};
+    camera::Vec3 rotationDegrees{};
+};
+
+struct AvatarSettings {
+    bool enabled = false;
+    bool visible = true;
+    // Absolute path selected by the on-headset file browser. selectedFile is
+    // retained as a schema-6 fallback for existing mod-local configurations.
+    std::string selectedPath;
+    std::string selectedFile = "avatar.vrm";
+    std::int32_t maximumTextureDimension = 1024;
+    AvatarControllerOffsetSettings leftControllerToWrist;
+    AvatarControllerOffsetSettings rightControllerToWrist;
+};
+
 struct SettingsDocument {
     std::uint32_t schemaVersion = kCurrentSchemaVersion;
     GeneralSettings general;
@@ -61,7 +78,7 @@ struct SettingsDocument {
     PreviewSettings preview;
     RecordingSettings recording;
     FeatureSettings companion;
-    FeatureSettings avatar;
+    AvatarSettings avatar;
     FeatureSettings scenes;
     FeatureSettings broadcast;
     FeatureSettings chat;

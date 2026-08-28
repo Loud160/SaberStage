@@ -3,6 +3,7 @@
 #include "saberstage/camera/Math.hpp"
 #include "saberstage/camera/MotionPipeline.hpp"
 #include "saberstage/camera/MovementScript.hpp"
+#include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -59,12 +60,16 @@ int main() {
     const auto spectatorMask = ResolveSpectatorCullingMask(restrictedHeadsetMask, 1 << 4);
     Check((spectatorMask & kUiLayerMask) != 0,
           "spectator mask explicitly includes UI even when the headset mask does not");
-    Check((spectatorMask & (1 << 3)) != 0 && (spectatorMask & (1 << 12)) != 0,
+    Check((spectatorMask & kAvatarLayerMask) != 0 && (spectatorMask & (1 << 12)) != 0,
           "spectator mask includes third-person and saber layers needed for a useful shot");
     Check((spectatorMask & kFirstPersonLayerMask) == 0,
           "third-person spectator mask excludes headset-only hover and avatar meshes");
     Check((spectatorMask & (1 << 9)) == 0,
           "non-UI per-profile exclusions remain effective");
+    auto attemptedAvatarExclusion = DefaultCameraProfile();
+    attemptedAvatarExclusion.excludedLayersMask = kAvatarLayerMask;
+    Check((ResolveSpectatorCullingMask(attemptedAvatarExclusion, 0) & kAvatarLayerMask) != 0,
+          "SaberStage avatars remain mandatory in Primary camera and preview output");
     Check(Near(invalid.rotationDegrees.y, 5.0F), "profile rotation is normalized without losing intent");
     Check((invalid.requestedWidth & 1) == 0, "profile output dimensions are made even");
 
@@ -165,6 +170,14 @@ int main() {
     }
 
     FrameDemandRegistry demands;
+    const auto dockedPreviewDemand = saberstage::preview::DockedPreviewRenderDemand();
+    Check(dockedPreviewDemand.width == 1920 && dockedPreviewDemand.height == 1080 &&
+              dockedPreviewDemand.framesPerSecond == 15,
+          "the docked menu preview renders at 1080p with a bounded cadence");
+    const auto floatingPreviewDemand = saberstage::preview::FloatingPreviewRenderDemand();
+    Check(floatingPreviewDemand.width == 512 && floatingPreviewDemand.height == 288 &&
+              floatingPreviewDemand.framesPerSecond == 15,
+          "the movable preview retains its lower-cost standalone profile");
     Check(demands.Set("preview", {"primary", 640, 360, 30}), "preview demand is accepted");
     Check(demands.Set("capture", {"primary", 1920, 1080, 60}), "capture demand is accepted");
     const auto combined = demands.Combined("primary");

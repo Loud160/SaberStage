@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -115,7 +116,10 @@ private:
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::GameObject* audioObject_ = nullptr;
     UnityEngine::AudioListener* captureAudioListener_ = nullptr;
-    std::vector<UnityEngine::AudioListener*> disabledAudioListeners_;
+    // Unity component wrappers are not safe to retain across Beat Saber scene
+    // destruction. Remember stable instance IDs and resolve only currently
+    // live listeners when recording releases audio ownership.
+    std::vector<std::int32_t> disabledAudioListenerIds_;
     std::ofstream videoOutput_;
     std::thread finalizer_;
     std::atomic<RecordingState> state_{RecordingState::Idle};

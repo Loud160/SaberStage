@@ -11,11 +11,13 @@ namespace saberstage::camera {
 inline constexpr std::string_view kPrimaryCameraId = "primary";
 inline constexpr std::int32_t kUiLayerMask = 1 << 5;
 inline constexpr std::int32_t kFirstPersonLayerMask = 1 << 6;
+inline constexpr std::int32_t kAvatarLayer = 3;
+inline constexpr std::int32_t kAvatarLayerMask = 1 << kAvatarLayer;
 
 // Beat Saber uses dedicated layers for objects that a headset camera may
 // intentionally omit but a Camera2-style spectator view normally shows.
 inline constexpr std::int32_t kStandardSpectatorLayersMask =
-    (1 << 3) |  // third-person avatar
+    kAvatarLayerMask | // SaberStage/third-person avatar
     (1 << 4) |  // floor
     kUiLayerMask |
     (1 << 8) |  // notes
