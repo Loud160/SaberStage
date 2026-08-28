@@ -15,7 +15,10 @@ struct FabrikSpineInput {
     std::uint8_t jointCount = 0;
     Vec3 rootTarget{};
     Vec3 endTarget{};
+    // Mid-chain offset for one smooth anatomical bow. Internal guide points
+    // follow 4*t*(1-t), so the direction cannot alternate along the chain.
     Vec3 restPrebend{};
+    float curveGuideWeight = 0.55F;
     float maximumRootShift = 0.0F;
     float tolerance = 0.001F;
     std::uint8_t maximumIterations = 3;

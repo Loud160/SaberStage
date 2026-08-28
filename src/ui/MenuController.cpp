@@ -224,6 +224,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }
         if (active_) active_->RefreshAvatarStatus();
     });
+    BSML::Lite::CreateUIButton(container, "Log Solver Diagnostics", [] {
+        if (active_) active_->root_.Avatar().LogDiagnostics();
+    });
 
     auto* expressionActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
     expressionActions->set_spacing(1.0F);

@@ -8,6 +8,8 @@ The avatar load path is deliberately split into three layers:
 2. `VrmUnityRuntime` converts that representation into owned Unity objects and builds one humanoid `Animator`.
 3. `AvatarManager` binds the Animator to SaberStage's existing static trackerless solver and owns replacement, visibility, expressions, and unload.
 
+When VRM first-person metadata names a valid bone, `VrmUnityRuntime` transforms that bone's declared offset through the live constructed hierarchy and exposes the resulting world-space eye/view anchor to calibration. The solver maps the Quest HMD to this anchor and solves backward to the Head pivot; the parsed offset is no longer merely retained as metadata.
+
 The parser does not include Unity headers. The solver does not know about glTF, VRM, meshes, materials, or texture files. The runtime releases its CPU construction arrays after Unity accepts the mesh data rather than retaining a second full copy of all vertices, indices, bind poses, and morph deltas.
 
 ## Supported first-pass VRM data

@@ -74,6 +74,33 @@ float SmoothStep(float value) noexcept {
     return t * t * (3.0F - 2.0F * t);
 }
 
+float QuaternionAngleDegrees(Quaternion left, Quaternion right) noexcept {
+    left = Normalize(left);
+    right = Normalize(right);
+    const auto dot = std::abs(
+        left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w);
+    return 2.0F * std::acos(Clamp(dot, -1.0F, 1.0F)) * kRadiansToDegrees;
+}
+
+float SpineLength(const AvatarCalibration& avatar, float scale) noexcept {
+    float length = 0.0F;
+    for (std::uint8_t index = 0; index < avatar.spineSegmentCount; ++index) {
+        length += avatar.spineSegmentLengths[index] * scale;
+    }
+    return length;
+}
+
+Vec3 ClampAnatomicalLean(
+    Vec3 value,
+    Vec3 bodyRight,
+    Vec3 bodyForward,
+    float maximumLateral,
+    float maximumForward) noexcept {
+    const auto lateral = Clamp(Dot(value, bodyRight), -maximumLateral, maximumLateral);
+    const auto forward = Clamp(Dot(value, bodyForward), -maximumForward, maximumForward);
+    return bodyRight * lateral + bodyForward * forward;
+}
+
 Quaternion FacingRotation(const AvatarCalibration& avatar, const PlayerCalibration& player) noexcept {
     auto modelForward = avatar.modelForward;
     modelForward.y = 0.0F;
@@ -113,14 +140,6 @@ void BuildNeutralPose(
 }
 
 Quaternion PoseDelta(Quaternion from, Quaternion to) noexcept { return Multiply(to, Inverse(from)); }
-
-Pose TrackingTarget(Pose neutralTracking, Pose currentTracking, Pose neutralBone) noexcept {
-    const auto delta = PoseDelta(neutralTracking.rotation, currentTracking.rotation);
-    return {
-        currentTracking.position + Rotate(delta, neutralBone.position - neutralTracking.position),
-        Multiply(delta, neutralBone.rotation),
-    };
-}
 
 HumanoidBone BestChest(const AvatarCalibration& avatar) noexcept {
     if (Has(avatar, HumanoidBone::UpperChest)) return HumanoidBone::UpperChest;
@@ -286,23 +305,45 @@ Pose EstimatePelvis(
     const auto legReach = MinimumLegReach(avatar, scale);
     const auto eyeHeight = std::max(player.standingHmdHeight, kEpsilon);
     const auto bodyForward = Vec3{std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
+    const auto bodyRight = Vec3{std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
+    const auto spineReach = SpineLength(avatar, scale);
+    const auto maximumLateralLean = std::max(
+        legReach * 0.045F,
+        std::min({
+            legReach * tuning.leanRadiusLegFraction,
+            spineReach * tuning.maximumLateralLeanSpineFraction,
+            avatar.shoulderWidth * scale * tuning.maximumLateralLeanShoulderFraction,
+            eyeHeight * tuning.maximumLateralLeanEyeFraction}));
+    const auto maximumForwardLean = std::max(
+        legReach * 0.06F,
+        std::min(spineReach * 0.23F, eyeHeight * 0.13F));
 
     const auto horizontalHeadTranslation = Horizontal(tracking.head.pose.position - player.neutralHead.position);
     auto relativeLean = horizontalHeadTranslation - state.bodyTranslation;
     const auto heightLoss = std::max(0.0F, player.neutralHead.position.y - tracking.head.pose.position.y);
     const auto suppressTranslation =
         heightLoss > eyeHeight * tuning.verticalMotionTranslationSuppressionEyeFraction;
-    const auto leanRadius = std::max(legReach * tuning.leanRadiusLegFraction, avatar.hipWidth * scale * 0.55F);
-    const auto translationStart = std::max(legReach * tuning.translationStartLegFraction, leanRadius * 1.2F);
-    if (!suppressTranslation && Length(relativeLean) > translationStart) {
+    const auto translationStart = legReach * tuning.translationStartLegFraction;
+    const auto predictedHeadTranslation = horizontalHeadTranslation + ClampMagnitude(
+        Horizontal(tracking.head.linearVelocity) * tuning.supportPredictionSeconds,
+        legReach * tuning.maximumMovementLeadLegFraction);
+    if (!suppressTranslation && Length(predictedHeadTranslation - state.bodyTranslation) > translationStart) {
         state.translationDwellSeconds += deltaSeconds;
     } else {
         state.translationDwellSeconds = std::max(0.0F, state.translationDwellSeconds - deltaSeconds * 2.0F);
     }
 
+    const auto constrainedLean = ClampAnatomicalLean(
+        relativeLean,
+        bodyRight,
+        bodyForward,
+        maximumLateralLean,
+        maximumForwardLean);
+    const auto hardLimitExceeded = Length(relativeLean - constrainedLean) > kEpsilon;
     auto desiredBodyTranslation = state.bodyTranslation;
-    if (state.translationDwellSeconds >= tuning.translationDwellSeconds) {
-        desiredBodyTranslation = horizontalHeadTranslation - ClampMagnitude(relativeLean, leanRadius);
+    if (!suppressTranslation &&
+        (state.translationDwellSeconds >= tuning.translationDwellSeconds || hardLimitExceeded)) {
+        desiredBodyTranslation = horizontalHeadTranslation - constrainedLean;
     }
     const auto previousTranslation = state.bodyTranslation;
     state.bodyTranslation = Smooth(
@@ -315,11 +356,19 @@ Pose EstimatePelvis(
         ? (state.bodyTranslation - previousTranslation) / deltaSeconds
         : Vec3{};
 
-    relativeLean = ClampMagnitude(
+    relativeLean = ClampAnatomicalLean(
         horizontalHeadTranslation - state.bodyTranslation,
-        leanRadius * 1.5F);
-    const auto targetLeanAmount = Saturate(Length(relativeLean) / std::max(leanRadius, kEpsilon));
+        bodyRight,
+        bodyForward,
+        maximumLateralLean,
+        maximumForwardLean);
+    const auto lateralLean = Dot(relativeLean, bodyRight);
+    const auto targetLeanAmount = Saturate(
+        std::max(
+            std::abs(lateralLean) / std::max(maximumLateralLean, kEpsilon),
+            std::abs(Dot(relativeLean, bodyForward)) / std::max(maximumForwardLean, kEpsilon)));
     state.leanAmount = Smooth(state.leanAmount, targetLeanAmount, deltaSeconds, 0.08F);
+    state.lateralLeanMeters = lateralLean;
 
     const auto heightRise = std::max(0.0F, tracking.head.pose.position.y - player.neutralHead.position.y);
     const auto forwardDisplacement = std::max(0.0F, Dot(relativeLean, bodyForward));
@@ -329,6 +378,11 @@ Pose EstimatePelvis(
         : 0.0F;
     const auto targetCrouch = crouchSignal * (1.0F - 0.65F * bendBlend);
     state.crouchAmount = Smooth(state.crouchAmount, targetCrouch, deltaSeconds, 0.08F);
+    state.forwardHingeAmount = Smooth(
+        state.forwardHingeAmount,
+        crouchSignal * bendBlend,
+        deltaSeconds,
+        0.08F);
     const auto pelvisDropShare =
         tuning.crouchPelvisDropShare +
         (tuning.bendPelvisDropShare - tuning.crouchPelvisDropShare) * bendBlend;
@@ -338,23 +392,41 @@ Pose EstimatePelvis(
 
     auto desired = neutralPelvis.position;
     desired += state.bodyTranslation + relativeLean * tuning.pelvisLeanShare;
+    desired += bodyForward * (-legReach * tuning.squatPelvisSetbackLegFraction * state.crouchAmount);
     desired.y = neutralPelvis.position.y - pelvisDrop + heightRise * 0.9F;
 
     const auto supportCenter = state.footAnchorsValid
         ? (state.footAnchor[0] + state.footAnchor[1]) * 0.5F
         : Vec3{neutralPelvis.position.x, player.floorHeight, neutralPelvis.position.z};
+    const auto plantedSeparation = state.footAnchorsValid
+        ? Length(Horizontal(state.footAnchor[1] - state.footAnchor[0]))
+        : avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier;
+    const auto maximumLateralSupport = std::max(
+        plantedSeparation * 0.5F + legReach * tuning.supportMarginLegFraction,
+        legReach * tuning.maximumPelvisSupportOffsetLegFraction);
+    const auto maximumForwardSupport = legReach * tuning.maximumPelvisSupportOffsetLegFraction;
     auto supportOffset = Horizontal(desired - supportCenter);
-    const auto maximumSupportOffset = legReach * tuning.maximumPelvisSupportOffsetLegFraction;
-    if (Length(supportOffset) > maximumSupportOffset) {
-        supportOffset = Normalize(supportOffset) * maximumSupportOffset;
-        desired.x = supportCenter.x + supportOffset.x;
-        desired.z = supportCenter.z + supportOffset.z;
-    }
+    auto supportLateral = Dot(supportOffset, bodyRight);
+    auto supportForward = Dot(supportOffset, bodyForward);
+    supportLateral = Clamp(supportLateral, -maximumLateralSupport, maximumLateralSupport);
+    supportForward = Clamp(supportForward, -maximumForwardSupport, maximumForwardSupport);
+    supportOffset = bodyRight * supportLateral + bodyForward * supportForward;
+    desired.x = supportCenter.x + supportOffset.x;
+    desired.z = supportCenter.z + supportOffset.z;
 
-    float spineReach = 0.0F;
-    for (std::uint8_t index = 0; index < avatar.spineSegmentCount; ++index) {
-        spineReach += avatar.spineSegmentLengths[index] * scale;
-    }
+    const auto prediction = ClampMagnitude(
+        Horizontal(tracking.head.linearVelocity) * tuning.supportPredictionSeconds +
+            state.bodyTranslationVelocity * (tuning.supportPredictionSeconds * 0.5F),
+        legReach * tuning.maximumMovementLeadLegFraction);
+    const auto predictedOffset = Horizontal(desired + prediction - supportCenter);
+    const auto predictedLateral = std::abs(Dot(predictedOffset, bodyRight));
+    const auto predictedForward = std::abs(Dot(predictedOffset, bodyForward));
+    state.predictedSupportMargin = std::min(
+        maximumLateralSupport - predictedLateral,
+        maximumForwardSupport - predictedForward);
+    state.maximumSupportOffset = maximumLateralSupport;
+    state.pelvisSupportOffset = Length(supportOffset);
+
     const auto pelvisToHead = headTarget.position - desired;
     const auto pelvisToHeadDistance = Length(pelvisToHead);
     if (spineReach > kEpsilon && pelvisToHeadDistance > spineReach * 1.02F) {
@@ -366,6 +438,15 @@ Pose EstimatePelvis(
         desired,
         deltaSeconds,
         tuning.pelvisResponseSeconds);
+    auto smoothedSupportOffset = Horizontal(state.pelvisPosition - supportCenter);
+    const auto smoothedLateral = Clamp(
+        Dot(smoothedSupportOffset, bodyRight), -maximumLateralSupport, maximumLateralSupport);
+    const auto smoothedForward = Clamp(
+        Dot(smoothedSupportOffset, bodyForward), -maximumForwardSupport, maximumForwardSupport);
+    smoothedSupportOffset = bodyRight * smoothedLateral + bodyForward * smoothedForward;
+    state.pelvisPosition.x = supportCenter.x + smoothedSupportOffset.x;
+    state.pelvisPosition.z = supportCenter.z + smoothedSupportOffset.z;
+    state.pelvisSupportOffset = Length(smoothedSupportOffset);
     neutralPelvis.position = state.pelvisPosition;
     const auto neutralYaw = YawFromDirection(player.neutralForward);
     const auto bodyYawDelta = AngleDelta(neutralYaw, state.torsoYawRadians);
@@ -409,6 +490,7 @@ void SolveArm(
     float scale,
     Pose chest,
     Pose handTarget,
+    bool handFromSaberGrip,
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
     SolverPersistentState& state,
@@ -419,19 +501,29 @@ void SolveArm(
     const auto handBone = side == 0 ? HumanoidBone::LeftHand : HumanoidBone::RightHand;
     const auto chestBone = BestChest(avatar);
 
+    const auto& tuning = kDefaultBodySolverTuning;
     auto shoulder = Has(avatar, shoulderBone) ? Solved(output, shoulderBone).position : Solved(output, upperBone).position;
-    const auto armLength = (avatar.upperArmLength[side] + avatar.lowerArmLength[side]) * scale;
-    const auto reach = Length(handTarget.position - shoulder);
-    const auto reachExcess = std::max(0.0F, reach - armLength * 0.9F);
-    const auto elevation = std::max(0.0F, handTarget.position.y - shoulder.y);
-    const auto maximumClavicle = avatar.shoulderWidth * scale * 0.08F;
-    shoulder += Normalize(handTarget.position - shoulder) * std::min(reachExcess * 0.35F, maximumClavicle);
-    shoulder.y += std::min(elevation * 0.04F, maximumClavicle * 0.5F);
+    const auto upperArmLength = avatar.upperArmLength[side] * scale;
+    const auto lowerArmLength = avatar.lowerArmLength[side] * scale;
+    const auto armLength = upperArmLength + lowerArmLength;
+    const auto initialReach = Length(handTarget.position - shoulder);
+    const auto shoulderAssistStart = armLength * tuning.shoulderAssistStartReachRatio;
+    const auto maximumClavicle = avatar.shoulderWidth * scale * tuning.maximumShoulderAssistWidthFraction;
+    const auto shoulderAssist = std::min(
+        std::max(0.0F, initialReach - shoulderAssistStart),
+        maximumClavicle);
+    shoulder += Normalize(handTarget.position - shoulder) * shoulderAssist;
 
     const auto originalShoulder = Has(avatar, shoulderBone)
         ? Solved(output, shoulderBone).position
         : Solved(output, upperBone).position;
     const auto upperRoot = Solved(output, upperBone).position + (shoulder - originalShoulder);
+    const auto shoulderToTargetDistance = Length(handTarget.position - upperRoot);
+    const auto reachRatio = shoulderToTargetDistance / std::max(armLength, kEpsilon);
+    const auto stretch = Clamp(
+        shoulderToTargetDistance / std::max(armLength, kEpsilon),
+        1.0F,
+        tuning.maximumArmStretchFraction);
     const auto restPole = Rotate(
         PoseDelta(Rest(avatar, chestBone).world.rotation, chest.rotation),
         avatar.restElbowPole[side]);
@@ -442,9 +534,9 @@ void SolveArm(
         .currentEnd = Solved(neutralPose, handBone).position,
         .target = handTarget.position,
         .poleVector = pole,
-        .rootToMiddleLength = avatar.upperArmLength[side] * scale,
-        .middleToEndLength = avatar.lowerArmLength[side] * scale,
-        .soften = 0.97F,
+        .rootToMiddleLength = upperArmLength * stretch,
+        .middleToEndLength = lowerArmLength * stretch,
+        .soften = 1.0F,
     });
     if (!result.valid) return;
 
@@ -468,13 +560,130 @@ void SolveArm(
     hand.position = result.end;
     upper.rotation = AlignBone(neutralUpper, neutralLower, result.root, result.middle);
     lower.rotation = AlignBone(neutralLower, neutralHand, result.middle, result.end);
-    hand.rotation = handTarget.rotation;
+    const auto anatomicalHandRotation = Multiply(
+        PoseDelta(neutralLower.rotation, lower.rotation),
+        neutralHand.rotation);
+    const auto handSourceChanged =
+        state.gripToHandRotationValid[side] &&
+        state.previousHandWasSaberGrip[side] != handFromSaberGrip;
+    if (!state.gripToHandRotationValid[side] || handSourceChanged) {
+        state.gripToHandRotation[side] = Multiply(
+            Inverse(handTarget.rotation),
+            anatomicalHandRotation);
+        state.gripToHandRotationValid[side] = true;
+    }
+    if (handSourceChanged) {
+        // A saber-handle gameplay sample and a menu controller sample answer
+        // different reach questions. Start a fresh range when the authoritative
+        // source changes so the on-demand gameplay report is not polluted by
+        // earlier menu poses.
+        state.armReachRatioMinimum[side] = 0.0F;
+        state.armReachRatioMaximum[side] = 0.0F;
+        state.armReachRatioSum[side] = 0.0;
+        state.armReachSampleCount[side] = 0;
+    }
+    state.previousHandWasSaberGrip[side] = handFromSaberGrip;
+    const auto desiredHandRotation = Multiply(
+        handTarget.rotation,
+        state.gripToHandRotation[side]);
+    const auto wristDeviation = QuaternionAngleDegrees(anatomicalHandRotation, desiredHandRotation);
+    hand.rotation = wristDeviation > tuning.maximumWristDeviationDegrees
+        ? Slerp(
+            anatomicalHandRotation,
+            desiredHandRotation,
+            tuning.maximumWristDeviationDegrees / std::max(wristDeviation, kEpsilon))
+        : desiredHandRotation;
+
+    if (state.armReachSampleCount[side] == 0) {
+        state.armReachRatioMinimum[side] = reachRatio;
+        state.armReachRatioMaximum[side] = reachRatio;
+    } else {
+        state.armReachRatioMinimum[side] = std::min(state.armReachRatioMinimum[side], reachRatio);
+        state.armReachRatioMaximum[side] = std::max(state.armReachRatioMaximum[side], reachRatio);
+    }
+    state.armReachRatioSum[side] += reachRatio;
+    ++state.armReachSampleCount[side];
 
     if (diagnostics) {
         diagnostics->shoulderTarget[side] = shoulder;
         diagnostics->elbowPole[side] = pole;
         diagnostics->limbReachable[side] = result.reachable;
+        diagnostics->upperArmLength[side] = upperArmLength;
+        diagnostics->lowerArmLength[side] = lowerArmLength;
+        diagnostics->totalArmLength[side] = armLength;
+        diagnostics->shoulderToTargetDistance[side] = shoulderToTargetDistance;
+        diagnostics->armReachRatio[side] = reachRatio;
+        diagnostics->armReachRatioMinimum[side] = state.armReachRatioMinimum[side];
+        diagnostics->armReachRatioMaximum[side] = state.armReachRatioMaximum[side];
+        diagnostics->armReachRatioAverage[side] = static_cast<float>(
+            state.armReachRatioSum[side] /
+            static_cast<double>(state.armReachSampleCount[side]));
+        const auto upperDirection = Normalize(result.middle - result.root);
+        const auto lowerDirection = Normalize(result.end - result.middle);
+        diagnostics->elbowFlexionDegrees[side] = std::acos(
+            Clamp(Dot(upperDirection, lowerDirection), -1.0F, 1.0F)) * kRadiansToDegrees;
+        diagnostics->handTargetError[side] = Length(hand.position - handTarget.position);
+        diagnostics->wristRotationErrorDegrees[side] = QuaternionAngleDegrees(hand.rotation, desiredHandRotation);
+        diagnostics->gripToHandRotation[side] = state.gripToHandRotation[side];
+        diagnostics->handTargetFromSaberGrip[side] = handFromSaberGrip;
+        diagnostics->finalHand[side] = hand;
     }
+}
+
+float SignedAngleDegrees(Vec3 from, Vec3 to, Vec3 axis) noexcept {
+    const auto normalizedFrom = Normalize(from);
+    const auto normalizedTo = Normalize(to);
+    return std::atan2(
+        Dot(Cross(normalizedFrom, normalizedTo), Normalize(axis)),
+        Clamp(Dot(normalizedFrom, normalizedTo), -1.0F, 1.0F)) * kRadiansToDegrees;
+}
+
+void MeasureSpineCurvature(
+    const FabrikSpineResult& spine,
+    std::uint8_t jointCount,
+    Vec3 bodyForward,
+    Vec3 bodyRight,
+    SolverDiagnostics* diagnostics) noexcept {
+    if (!diagnostics || jointCount < 2) return;
+    const auto segmentCount = static_cast<std::uint8_t>(jointCount - 1);
+    diagnostics->spineSegmentDirectionCount = segmentCount;
+    for (std::uint8_t index = 0; index < segmentCount; ++index) {
+        diagnostics->spineSegmentDirections[index] = Normalize(
+            spine.positions[index + 1] - spine.positions[index],
+            {0.0F, 1.0F, 0.0F});
+    }
+    float previousForwardBend = 0.0F;
+    float previousLateralBend = 0.0F;
+    bool previousValid = false;
+    for (std::uint8_t index = 0; index + 1 < segmentCount; ++index) {
+        const auto forwardBend = SignedAngleDegrees(
+            diagnostics->spineSegmentDirections[index],
+            diagnostics->spineSegmentDirections[index + 1],
+            bodyRight);
+        const auto lateralBend = SignedAngleDegrees(
+            diagnostics->spineSegmentDirections[index],
+            diagnostics->spineSegmentDirections[index + 1],
+            bodyForward);
+        diagnostics->spineForwardBendDegrees[index] = forwardBend;
+        diagnostics->spineLateralBendDegrees[index] = lateralBend;
+        if (previousValid) {
+            for (const auto pair : {
+                    std::array<float, 2>{previousForwardBend, forwardBend},
+                    std::array<float, 2>{previousLateralBend, lateralBend}}) {
+                if (pair[0] * pair[1] < 0.0F) {
+                    diagnostics->maximumSpineReversalDegrees = std::max(
+                        diagnostics->maximumSpineReversalDegrees,
+                        std::abs(pair[0]) + std::abs(pair[1]));
+                }
+            }
+        }
+        previousForwardBend = forwardBend;
+        previousLateralBend = lateralBend;
+        previousValid = true;
+    }
+    diagnostics->spineReversalWarning =
+        diagnostics->maximumSpineReversalDegrees >
+        kDefaultBodySolverTuning.spineReversalWarningDegrees;
 }
 
 float HandChestYawContribution(
@@ -601,25 +810,38 @@ StepRequest EvaluateStepRequest(
     const auto& tuning = kDefaultBodySolverTuning;
     StepRequest request{};
     const auto positionError = Length(Horizontal(ideal.position - state.feet[side].planted.position));
-    ConsiderStepReason(
-        request,
-        positionError / std::max(legReach * tuning.footPositionErrorLegFraction, kEpsilon),
-        StepReason::Position);
     const auto supportError = Length(Horizontal(pelvis.position - supportCenter));
-    ConsiderStepReason(
-        request,
-        supportError / std::max(legReach * tuning.supportExitLegFraction, kEpsilon),
-        StepReason::Support);
-    const auto reachFraction = Length(hip.position - state.feet[side].planted.position) / std::max(legReach, kEpsilon);
-    // A nearly straight neutral leg is common in VRM rest poses. A reach-only
-    // step is useful only when the ideal stance has somewhere meaningfully
-    // different to land; otherwise it creates an in-place foot twitch without
-    // improving reach.
-    if (positionError > legReach * tuning.minimumUsefulStepLegFraction) {
+    const auto stationaryCrouch = state.crouchAmount > 0.12F &&
+        Length(state.bodyTranslation) < legReach * 0.04F;
+    if (!stationaryCrouch) {
         ConsiderStepReason(
             request,
-            reachFraction / tuning.safeLegExtensionFraction,
-            StepReason::LegReach);
+            positionError / std::max(legReach * tuning.footPositionErrorLegFraction, kEpsilon),
+            StepReason::Position);
+        ConsiderStepReason(
+            request,
+            supportError / std::max(legReach * tuning.supportExitLegFraction, kEpsilon),
+            StepReason::Support);
+        const auto predictedMarginThreshold = legReach * tuning.predictedStepMarginLegFraction;
+        if (state.predictedSupportMargin < predictedMarginThreshold) {
+            ConsiderStepReason(
+                request,
+                1.0F +
+                    (predictedMarginThreshold - state.predictedSupportMargin) /
+                        std::max(predictedMarginThreshold, kEpsilon),
+                StepReason::PredictedSupport);
+        }
+        const auto reachFraction = Length(hip.position - state.feet[side].planted.position) / std::max(legReach, kEpsilon);
+        // A nearly straight neutral leg is common in VRM rest poses. A reach-only
+        // step is useful only when the ideal stance has somewhere meaningfully
+        // different to land; otherwise it creates an in-place foot twitch without
+        // improving reach.
+        if (positionError > legReach * tuning.minimumUsefulStepLegFraction) {
+            ConsiderStepReason(
+                request,
+                reachFraction / tuning.safeLegExtensionFraction,
+                StepReason::LegReach);
+        }
     }
     const auto yawError = std::abs(AngleDelta(
         YawFromRotation(state.feet[side].planted.rotation),
@@ -628,7 +850,7 @@ StepRequest EvaluateStepRequest(
         request,
         yawError / tuning.footYawErrorDegrees,
         StepReason::Yaw);
-    if (state.translationDwellSeconds >= tuning.translationDwellSeconds) {
+    if (!stationaryCrouch && state.translationDwellSeconds >= tuning.translationDwellSeconds) {
         const auto translationError = Length(Horizontal(ideal.position - state.feet[side].planted.position));
         ConsiderStepReason(
             request,
@@ -835,6 +1057,7 @@ void UpdateFeet(
             diagnostics->stepReason[side] = state.feet[side].reason;
             diagnostics->stepDestination[side] = state.feet[side].stepDestination;
             diagnostics->stepProgress[side] = state.feet[side].stepProgress;
+            diagnostics->stepDuration[side] = state.feet[side].stepDuration;
         }
     }
 }
@@ -865,7 +1088,9 @@ void SolveLeg(
     const auto outward = right * (side == 0 ? -1.0F : 1.0F);
     const auto outwardBias =
         tuning.kneeOutwardBias + tuning.deepCrouchKneeOutwardAddition * state.crouchAmount;
-    auto bodyPole = Normalize(ProjectOnPlane(forward + outward * outwardBias, axis), forward);
+    auto bodyPole = Normalize(ProjectOnPlane(
+        forward * (1.0F + state.crouchAmount * 0.35F) + outward * outwardBias,
+        axis), forward);
     const auto neutralBodyYaw = YawFromRotation(Solved(neutralPose, HumanoidBone::Hips).rotation);
     const auto bodyDelta = AxisAngle(
         {0.0F, 1.0F, 0.0F},
@@ -874,7 +1099,10 @@ void SolveLeg(
         ProjectOnPlane(Rotate(bodyDelta, avatar.restKneePole[side]), axis),
         bodyPole);
     if (Dot(restPole, bodyPole) < 0.0F) restPole = -restPole;
-    auto targetPole = Normalize(Lerp(restPole, bodyPole, 0.65F), bodyPole);
+    auto targetPole = Normalize(Lerp(
+        restPole,
+        bodyPole,
+        0.65F + state.crouchAmount * 0.22F), bodyPole);
     auto history = state.previousKneePoleValid[side]
         ? Normalize(ProjectOnPlane(state.previousKneePole[side], axis), targetPole)
         : targetPole;
@@ -931,6 +1159,9 @@ bool PersistentStateFinite(const SolverPersistentState& state) noexcept {
         !IsFinite(state.torsoYawRadians) || !IsFinite(state.torsoYawAnchorRadians) ||
         !IsFinite(state.turnDwellSeconds) || !IsFinite(state.settleSeconds) ||
         !IsFinite(state.leanAmount) || !IsFinite(state.crouchAmount) ||
+        !IsFinite(state.forwardHingeAmount) || !IsFinite(state.lateralLeanMeters) ||
+        !IsFinite(state.pelvisSupportOffset) || !IsFinite(state.predictedSupportMargin) ||
+        !IsFinite(state.maximumSupportOffset) ||
         !IsFinite(state.translationDwellSeconds) || !IsFinite(state.doubleSupportSeconds) ||
         !IsFinite(state.airborneEvidenceSeconds) || !IsFinite(state.landingEvidenceSeconds)) {
         return false;
@@ -948,6 +1179,10 @@ bool PersistentStateFinite(const SolverPersistentState& state) noexcept {
             !IsFinite(state.feet[side].stepDuration) ||
             !IsFinite(state.footAnchor[side]) ||
             !IsFinite(state.footRotation[side]) ||
+            (state.gripToHandRotationValid[side] && !IsFinite(state.gripToHandRotation[side])) ||
+            !IsFinite(state.armReachRatioMinimum[side]) ||
+            !IsFinite(state.armReachRatioMaximum[side]) ||
+            !std::isfinite(state.armReachRatioSum[side]) ||
             (state.previousElbowPoleValid[side] && !IsFinite(state.previousElbowPole[side])) ||
             (state.previousKneePoleValid[side] && !IsFinite(state.previousKneePole[side]))) {
             return false;
@@ -1009,9 +1244,15 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto deltaSeconds = StateDeltaSeconds(tracking, state, newRenderFrame);
 
     const auto neutralHeadBone = Solved(neutralPose, HumanoidBone::Head);
-    const auto headTarget = TrackingTarget(player.neutralHead, tracking.head.pose, neutralHeadBone);
-    const auto leftHandTarget = Compose(tracking.leftHand.pose, player.controllerToWrist[0]);
-    const auto rightHandTarget = Compose(tracking.rightHand.pose, player.controllerToWrist[1]);
+    const auto eyeToHead = RelativeTo(player.neutralHead, neutralHeadBone);
+    const auto headToEye = RelativeTo(neutralHeadBone, player.neutralHead);
+    const auto headTarget = Compose(tracking.head.pose, eyeToHead);
+    const auto leftHandTarget = tracking.handIsSaberGrip[0]
+        ? tracking.leftHand.pose
+        : Compose(tracking.leftHand.pose, player.controllerToWrist[0]);
+    const auto rightHandTarget = tracking.handIsSaberGrip[1]
+        ? tracking.rightHand.pose
+        : Compose(tracking.rightHand.pose, player.controllerToWrist[1]);
     const auto yawError = UpdateBodyYaw(tracking, player, deltaSeconds, state);
     auto pelvis = EstimatePelvis(
         tracking,
@@ -1044,19 +1285,25 @@ bool StaticTrackerlessAvatarSolver::Solve(
     }
     spine.rootTarget = pelvis.position;
     spine.endTarget = headTarget.position;
-    spine.restPrebend = Rotate(pelvis.rotation, {0.0F, 0.0F, -avatar.hipWidth * scale * 0.08F});
+    const auto bodyForward = Vec3{
+        std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
+    const auto bodyRight = Vec3{
+        std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
+    const auto totalSpineLength = SpineLength(avatar, scale);
+    spine.restPrebend = bodyForward * (
+        totalSpineLength *
+        (kDefaultBodySolverTuning.spineForwardCurveFraction +
+         state.crouchAmount * kDefaultBodySolverTuning.spineCrouchCurveAdditionFraction));
+    spine.curveGuideWeight = kDefaultBodySolverTuning.spineGuideWeight;
     spine.maximumRootShift = std::min(avatar.lowerLegLength[0], avatar.lowerLegLength[1]) * scale * 0.12F;
-    spine.maximumIterations = 3;
+    spine.maximumIterations = 6;
     const auto spineResult = SolveFabrikSpine(spine);
     if (!spineResult.valid) return false;
+    MeasureSpineCurvature(spineResult, spine.jointCount, bodyForward, bodyRight, diagnostics);
 
     pelvis.position = spineResult.rootUsed;
     state.pelvisPosition = pelvis.position;
     float accumulatedSpineLength = 0.0F;
-    float totalSpineLength = 0.0F;
-    for (std::uint8_t index = 0; index + 1 < spine.jointCount; ++index) {
-        totalSpineLength += spine.segmentLengths[index];
-    }
     const auto neutralBodyYaw = YawFromDirection(player.neutralForward);
     const auto bodyYawDelta = AngleDelta(neutralBodyYaw, state.torsoYawRadians);
     const auto bodyDeltaRotation = AxisAngle({0.0F, 1.0F, 0.0F}, bodyYawDelta);
@@ -1109,8 +1356,12 @@ bool StaticTrackerlessAvatarSolver::Solve(
 
     // The proven head/hand targets and analytic arm path remain direct. Lower
     // body inference is solved around these targets, never by filtering them.
-    SolveArm(0, avatar, scale, Solved(output, chestBone), leftHandTarget, neutralPose, output, state, diagnostics);
-    SolveArm(1, avatar, scale, Solved(output, chestBone), rightHandTarget, neutralPose, output, state, diagnostics);
+    SolveArm(
+        0, avatar, scale, Solved(output, chestBone), leftHandTarget,
+        tracking.handIsSaberGrip[0], neutralPose, output, state, diagnostics);
+    SolveArm(
+        1, avatar, scale, Solved(output, chestBone), rightHandTarget,
+        tracking.handIsSaberGrip[1], neutralPose, output, state, diagnostics);
 
     const auto neutralHips = Solved(neutralPose, HumanoidBone::Hips);
     const auto solvedHips = Solved(output, HumanoidBone::Hips);
@@ -1156,6 +1407,8 @@ bool StaticTrackerlessAvatarSolver::Solve(
     state.previousHeadPosition = tracking.head.pose.position;
     state.previousHeadPositionValid = true;
     if (diagnostics) {
+        diagnostics->hmdTarget = tracking.head.pose;
+        diagnostics->avatarEye = Compose(headTarget, headToEye);
         diagnostics->headTarget = headTarget;
         diagnostics->handTarget[0] = leftHandTarget;
         diagnostics->handTarget[1] = rightHandTarget;
@@ -1166,7 +1419,17 @@ bool StaticTrackerlessAvatarSolver::Solve(
         diagnostics->torsoYawDegrees = state.torsoYawRadians * kRadiansToDegrees;
         diagnostics->leanAmount = state.leanAmount;
         diagnostics->crouchAmount = state.crouchAmount;
+        diagnostics->forwardHingeAmount = state.forwardHingeAmount;
+        diagnostics->lateralLeanMeters = state.lateralLeanMeters;
+        diagnostics->pelvisSupportOffset = state.pelvisSupportOffset;
+        diagnostics->predictedSupportMargin = state.predictedSupportMargin;
+        diagnostics->maximumSupportOffset = state.maximumSupportOffset;
         diagnostics->bodyTranslationAmount = Length(state.bodyTranslation);
+        diagnostics->bodyTranslation = state.bodyTranslation;
+        diagnostics->eyeTargetError = Length(
+            diagnostics->avatarEye.position - tracking.head.pose.position);
+        diagnostics->neckToHeadVector = Solved(output, HumanoidBone::Head).position -
+            Solved(output, HumanoidBone::Neck).position;
         diagnostics->spineError = spineResult.error;
         diagnostics->spineIterations = spineResult.iterations;
         diagnostics->solveCountThisFrame = state.solvesThisFrame;

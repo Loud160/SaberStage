@@ -54,6 +54,7 @@ struct TrackingSample {
     TrackedPose head{};
     TrackedPose leftHand{};
     TrackedPose rightHand{};
+    bool handIsSaberGrip[2]{};
     std::uint64_t sequence = 0;
     std::int32_t renderFrame = -1;
 };
@@ -84,14 +85,17 @@ struct AvatarCalibration {
     Vec3 restElbowPole[2]{};
     Vec3 restKneePole[2]{};
     Vec3 eyePosition{};
+    Pose headToEye{};
     float floorHeight = 0.0F;
     float eyeHeight = 0.0F;
+    float approximateArmSpan = 0.0F;
     Vec3 modelForward{0.0F, 0.0F, 1.0F};
     bool valid = false;
 };
 
 struct PlayerCalibration {
     Pose neutralHead{};
+    Pose neutralHand[2]{};
     Pose trackingOrigin{};
     Pose controllerToWrist[2]{};
     float standingHmdHeight = 0.0F;
@@ -126,6 +130,7 @@ enum class BodyMode : std::uint8_t {
 enum class StepReason : std::uint8_t {
     None,
     Support,
+    PredictedSupport,
     Position,
     LegReach,
     Yaw,
@@ -154,6 +159,13 @@ struct SolverPersistentState {
     bool previousElbowPoleValid[2]{};
     Vec3 previousKneePole[2]{};
     bool previousKneePoleValid[2]{};
+    Quaternion gripToHandRotation[2]{};
+    bool gripToHandRotationValid[2]{};
+    bool previousHandWasSaberGrip[2]{};
+    float armReachRatioMinimum[2]{};
+    float armReachRatioMaximum[2]{};
+    double armReachRatioSum[2]{};
+    std::uint64_t armReachSampleCount[2]{};
     Vec3 footAnchor[2]{};
     Quaternion footRotation[2]{};
     bool footAnchorsValid = false;
@@ -170,6 +182,11 @@ struct SolverPersistentState {
     Vec3 previousHeadPosition{};
     float leanAmount = 0.0F;
     float crouchAmount = 0.0F;
+    float forwardHingeAmount = 0.0F;
+    float lateralLeanMeters = 0.0F;
+    float pelvisSupportOffset = 0.0F;
+    float predictedSupportMargin = 0.0F;
+    float maximumSupportOffset = 0.0F;
     float translationDwellSeconds = 0.0F;
     float doubleSupportSeconds = 0.0F;
     float airborneEvidenceSeconds = 0.0F;
@@ -184,8 +201,11 @@ struct SolverPersistentState {
 };
 
 struct SolverDiagnostics {
+    Pose hmdTarget{};
+    Pose avatarEye{};
     Pose headTarget{};
     Pose handTarget[2]{};
+    Pose finalHand[2]{};
     Pose pelvis{};
     Vec3 shoulderTarget[2]{};
     Vec3 elbowPole[2]{};
@@ -200,8 +220,36 @@ struct SolverDiagnostics {
     float torsoYawDegrees = 0.0F;
     float leanAmount = 0.0F;
     float crouchAmount = 0.0F;
+    float forwardHingeAmount = 0.0F;
+    float lateralLeanMeters = 0.0F;
+    float pelvisSupportOffset = 0.0F;
+    float predictedSupportMargin = 0.0F;
+    float maximumSupportOffset = 0.0F;
     float bodyTranslationAmount = 0.0F;
+    Vec3 bodyTranslation{};
+    float upperArmLength[2]{};
+    float lowerArmLength[2]{};
+    float totalArmLength[2]{};
+    float shoulderToTargetDistance[2]{};
+    float armReachRatio[2]{};
+    float armReachRatioMinimum[2]{};
+    float armReachRatioAverage[2]{};
+    float armReachRatioMaximum[2]{};
+    float elbowFlexionDegrees[2]{};
+    float handTargetError[2]{};
+    float wristRotationErrorDegrees[2]{};
+    Quaternion gripToHandRotation[2]{};
+    bool handTargetFromSaberGrip[2]{};
+    float eyeTargetError = 0.0F;
+    Vec3 neckToHeadVector{};
+    std::array<Vec3, 5> spineSegmentDirections{};
+    std::array<float, 4> spineForwardBendDegrees{};
+    std::array<float, 4> spineLateralBendDegrees{};
+    std::uint8_t spineSegmentDirectionCount = 0;
+    float maximumSpineReversalDegrees = 0.0F;
+    bool spineReversalWarning = false;
     float stepProgress[2]{};
+    float stepDuration[2]{};
     float legReach[2]{};
     float spineError = 0.0F;
     std::uint8_t spineIterations = 0;

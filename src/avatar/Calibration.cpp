@@ -28,7 +28,9 @@ Vec3 BendPole(const HumanoidRestPose& rest, HumanoidBone root, HumanoidBone mid,
 
 } // namespace
 
-CalibrationResult MeasureAvatarRestPose(const HumanoidRestPose& rest) noexcept {
+CalibrationResult MeasureAvatarRestPose(
+    const HumanoidRestPose& rest,
+    std::optional<Pose> eyeAnchorOverride) noexcept {
     CalibrationResult result{};
     result.calibration.rest = rest;
 
@@ -108,14 +110,21 @@ CalibrationResult MeasureAvatarRestPose(const HumanoidRestPose& rest) noexcept {
         rest, HumanoidBone::RightUpperLeg, HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot,
         {0.0F, 0.0F, 1.0F});
 
-    if (Has(rest, HumanoidBone::LeftEye) && Has(rest, HumanoidBone::RightEye)) {
+    if (eyeAnchorOverride) {
+        calibration.eyePosition = eyeAnchorOverride->position;
+        calibration.headToEye = RelativeTo(Bone(rest, HumanoidBone::Head).world, *eyeAnchorOverride);
+    } else if (Has(rest, HumanoidBone::LeftEye) && Has(rest, HumanoidBone::RightEye)) {
         calibration.eyePosition =
             (Bone(rest, HumanoidBone::LeftEye).world.position + Bone(rest, HumanoidBone::RightEye).world.position) * 0.5F;
+        calibration.headToEye = RelativeTo(
+            Bone(rest, HumanoidBone::Head).world,
+            {calibration.eyePosition, Bone(rest, HumanoidBone::Head).world.rotation});
     } else {
         // A humanoid rig without eye bones still has a head origin. Unlike mesh
         // bounds, this remains a stable skeletal measurement. The loader can
         // provide explicit eye bones or an importer-measured eye offset later.
         calibration.eyePosition = Bone(rest, HumanoidBone::Head).world.position;
+        calibration.headToEye = {};
     }
 
     calibration.floorHeight = std::min(
@@ -128,6 +137,10 @@ CalibrationResult MeasureAvatarRestPose(const HumanoidRestPose& rest) noexcept {
         calibration.floorHeight = std::min(calibration.floorHeight, Bone(rest, HumanoidBone::RightToes).world.position.y);
     }
     calibration.eyeHeight = calibration.eyePosition.y - calibration.floorHeight;
+    calibration.approximateArmSpan =
+        calibration.shoulderWidth +
+        calibration.upperArmLength[0] + calibration.lowerArmLength[0] +
+        calibration.upperArmLength[1] + calibration.lowerArmLength[1];
 
     const auto minimumBone = 1.0e-4F;
     const auto lengthsValid =
@@ -152,6 +165,8 @@ PlayerCalibration MeasureNeutralPlayer(
     PlayerCalibration calibration{};
     if (!tracking.head.valid || !tracking.leftHand.valid || !tracking.rightHand.valid) return calibration;
     calibration.neutralHead = tracking.head.pose;
+    calibration.neutralHand[0] = tracking.leftHand.pose;
+    calibration.neutralHand[1] = tracking.rightHand.pose;
     calibration.trackingOrigin = trackingOrigin;
     calibration.controllerToWrist[0] = leftControllerToWrist;
     calibration.controllerToWrist[1] = rightControllerToWrist;

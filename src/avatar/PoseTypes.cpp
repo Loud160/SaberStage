@@ -62,6 +62,7 @@ const char* StepReasonName(StepReason reason) noexcept {
     switch (reason) {
         case StepReason::None: return "none";
         case StepReason::Support: return "support";
+        case StepReason::PredictedSupport: return "predicted-support";
         case StepReason::Position: return "position";
         case StepReason::LegReach: return "leg-reach";
         case StepReason::Yaw: return "yaw";

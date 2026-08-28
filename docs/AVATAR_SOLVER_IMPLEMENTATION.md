@@ -9,7 +9,7 @@ It does not add SlimeVR or other physical trackers, SpringBone physics, terrain 
 ## Native architecture
 
 ```text
-PlayerTransforms or active HMD camera + VRController pair
+PlayerTransforms/active HMD + controllers, or active Saber handles in gameplay
         |
         v
 three cached pose reads in Update
@@ -19,11 +19,11 @@ TrackingSample (one coherent, fixed-size native value)
         |
         v
 StaticTrackerlessAvatarSolver
-  - exact calibrated head and wrist targets
+  - exact calibrated avatar-eye and reachable hand-position targets
   - LOCKED / TURNING / SETTLING torso yaw
   - pelvis lean, persistent translation, crouch/bend estimate
-  - bounded FABRIK spine and conservative shoulders
-  - stateful elbow poles and two analytic arms
+  - single-curvature spine with bounded constrained-FABRIK fallback
+  - bounded shoulders, stateful elbow poles, and two analytic arms
   - two persistent PLANTED / STEPPING feet
   - GROUNDED / AIRBORNE body mode
   - two stateful knee poles and analytic legs
@@ -39,9 +39,9 @@ The spectator-camera pre-render hook can take one fresher three-pose sample and 
 
 ## Calibration and direct upper-body authority
 
-Humanoid binding measures arm and leg segments, shoulder and hip width, every available hips-to-head segment, feet/toes, rest bend directions, eye position, and skeletal floor. Player calibration stores neutral HMD pose, floor/tracking origin, forward, standing HMD height, and controller-to-wrist offsets. Scale remains `standing HMD height / avatar skeletal eye height`.
+Humanoid binding measures arm and leg segments, approximate arm span, shoulder and hip width, every available hips-to-head segment, feet/toes, rest bend directions, eye position, head-to-eye pose, and skeletal floor. The eye pose uses VRM's actual first-person bone plus offset through the constructed Unity hierarchy when available, then mapped eye bones/fallback geometry. Player calibration stores neutral HMD and hand poses, floor/tracking origin, forward, standing HMD height, and controller-to-wrist offsets. Scale remains `standing HMD height / avatar skeletal eye height`; arm dimensions are measured and reported separately rather than changing whole-avatar scale.
 
-Head position and rotation are reconstructed directly from the calibrated HMD delta. Wrist targets are direct controller poses composed with their calibration offsets. Neither is smoothed by the body estimator. The spine, shoulders, pelvis, and feet solve around these targets. Regression tests exercise head position/rotation, wrist position/rotation, elbow pole hemisphere, dynamic lower-body motion, and the pre-render second solve path.
+The Quest HMD drives the avatar eye/view anchor, and the desired Head bone pose is solved backward through the calibrated head-to-eye transform. In menus, wrist targets remain controller poses composed with their explicit calibration offsets. In gameplay, the active Beat Saber `Saber::_handleTransform` bypasses the controller-only offset and supplies the visible grip pose. Reachable hand positions have exact authority; bounded clavicle assistance and at most five-percent limb stretch are used before an unreachable target is clamped. A source-specific grip-to-hand-bone quaternion is calibrated against the anatomical rest chain, and hand rotation is limited to a 70-degree wrist deviation rather than copying controller/saber axes directly. Neither the eye nor reachable hand targets are smoothed by the body estimator.
 
 ## Body yaw and chest distribution
 
@@ -53,13 +53,13 @@ The persistent torso-yaw state machine has three states:
 
 The gameplay-forward direction is only a four-degree-per-second drift prior near the original anchor. It cannot pull an intentional 90/360-degree turn back to the note highway. Controller rotation never drives torso yaw. Hand midpoint adds at most a small chest-only yaw contribution, and its confidence fades to zero during fast saber movement.
 
-FABRIK connects the estimated pelvis to the exact head target with measured segment lengths, two normal passes, and three maximum passes. Accumulated chain length distributes body yaw, residual head rotation, side/forward bend, and the bounded hand-midpoint contribution. The final head rotation remains exact.
+For an ordinary reachable pelvis-to-head span, measured spine chords are laid along one solved circular arc. This preserves every segment length, both endpoints, and one continuous bend direction. Degenerate or unreachable spans use a fixed-size, maximum-eight-pass FABRIK fallback guided toward a smooth curve; an end-anchored root shift is permitted only for a genuinely unreachable chain. Signed adjacent forward/lateral bends are measured and a sharp direction reversal raises the objective spine-Z diagnostic. Accumulated chain length distributes body yaw, residual head rotation, side/forward bend, and the bounded hand-midpoint contribution. The final eye and head rotation targets remain exact without overwriting the neck-to-head connection after the chain solve.
 
 ## Pelvis, lean, crouch, and translation
 
-Horizontal HMD displacement is first measured relative to a persistent body translation. Motion inside a leg-length-scaled support radius is primarily lean: the spine bends while the pelvis follows only a small share and feet remain unchanged. Displacement outside the translation threshold must persist through a dwell, then moves a smoothed body origin. Pelvis motion is constrained against planted-foot support, leg reach, and measured spine reach.
+Horizontal HMD displacement is first measured relative to a persistent body translation. Motion inside a leg/spine/shoulder/eye-normalized anatomical limit is primarily lean: the spine bends while the pelvis follows only a small share and feet remain unchanged. The lateral lean has a hard believable maximum. Moderate sustained displacement begins moving the body/pelvis after a short dwell, while excess beyond the lean limit becomes translation immediately. Pelvis ground projection is clamped to a simple region around the planted support anchors, leg reach, and measured spine reach.
 
-The geometric vertical estimator compares HMD height loss with forward displacement in the current torso frame. Mostly vertical loss lowers the pelvis strongly for a squat. Simultaneous forward displacement blends toward a hip hinge with less pelvis drop and more spine bend. Maximum drop is normalized by measured leg reach; no fitted polynomial or inherited model constants are used.
+The geometric vertical estimator compares HMD height loss with forward displacement in the current torso frame. Mostly vertical loss lowers and slightly sets back the pelvis for a squat. Simultaneous forward displacement blends toward a hip hinge with less pelvis drop and more forward spine bend. Backward displacement cannot enter the forward-hinge term. Maximum drop and setback are normalized by measured leg reach; no fitted polynomial or inherited model constants are used.
 
 Only inferred pelvis/body values use frame-rate-independent exponential stabilization. Head and wrist targets remain direct.
 
@@ -74,12 +74,13 @@ Step requests independently score:
 - useful leg extension for which a materially better destination exists;
 - planted-to-ideal foot yaw divergence;
 - persistent body translation.
+- a short, capped prediction of support margin from HMD and body-translation velocity.
 
-The greater urgency wins, lateral velocity provides a small side-selection preference, and ties alternate after the first step. Destinations cannot cross the body centerline, are distance-capped by leg reach, and keep the known Beat Saber floor height. Only one foot steps at a time; after landing a short double-support interval prevents rapid alternation.
+The greater urgency wins, lateral velocity provides a small side-selection preference, and ties alternate after the first step. A predicted support-edge request can overlap ongoing pelvis translation instead of waiting for an extreme completed lean. Stationary vertical crouches suppress meaningless translation/support steps while preserving legitimate yaw steps. Destinations cannot cross the body centerline, are distance-capped by leg reach, and keep the known Beat Saber floor height. Only one foot steps at a time; after landing a short double-support interval prevents rapid alternation.
 
 A step uses cubic smoothstep for horizontal position, one parabolic lift arc, and quaternion interpolation for landing rotation. The final destination becomes the new fixed world anchor. The yaw error is an explicit trigger, so turn-in-place movement produces pivot steps without requiring translation.
 
-Legs use the existing analytic two-bone primitive. The hip root now comes from the solved moving pelvis rather than the neutral pose. Knee poles combine body-forward direction, side-specific outward bias, measured rest direction, and previous-frame hemisphere. History becomes strongest near extension and outward bias increases during deep crouches.
+Legs use the existing analytic two-bone primitive. The hip root comes from the solved moving pelvis. Knee poles combine body-forward direction, side-specific outward bias, measured rest direction, and previous-frame hemisphere. History becomes strongest near extension; crouches add forward knee direction and modest outward bias while retaining the measured hemisphere.
 
 ## Airborne handling
 
@@ -93,15 +94,15 @@ Legs use the existing analytic two-bone primitive. The hip root now comes from t
 
 `BodySolverTuning.hpp` contains every principal body threshold and rate under a named field. Most distance thresholds are fractions of measured leg reach, hip width, or calibrated eye height. Values are independently selected SaberStage starting points and must be tuned from Quest recordings; they are not copied from Basis, RenIK, Qavatars, or RootMotion Final IK.
 
-The existing on-demand diagnostic action now logs body mode, yaw state/error/estimate, pelvis, lean, crouch, body translation, both foot states/anchors/ideal positions/reasons/destinations/progress, leg reach, knee poles, solve time, solve count, Transform reads/writes, FABRIK passes/error, and limb reachability. Normal frames do not emit these logs.
+The Avatar panel's `Log Solver Diagnostics` action logs, without per-frame spam: HMD/head/eye poses and eye error; pelvis, lateral lean, crouch, forward hinge, translation and predicted support margin; each spine segment direction, signed adjacent bends and reversal warning; each arm's source, shoulder/target, measured lengths, reach ratio plus source-local min/average/max, elbow flexion/pole, hand error, target/grip-offset/final wrist quaternions and wrist error; and each foot's state, request reason, destination, progress/duration, leg reach, and knee pole. It also includes solve time/count, Transform reads/writes, spine error/passes, and limb reachability.
 
 ## Performance and validation status
 
 The hot path uses only fixed-size arrays and trivially copyable persistent values. It performs no bone discovery, reflection, physics query, or allocation during a solve. Host allocation instrumentation covers both the initial and a dynamic body/step update. Normal runtime input remains three cached pose reads and one write for each mapped/solved bone (normally about 20-24).
 
-Host tests cover calibration, FABRIK bounds/lengths, analytic limb reach/softening, direct upper-body regression, duplicate-sequence rejection, yaw lock/dwell/turn behavior, lean without skating, crouch-versus-forward-bend, planted anchors, one-foot-at-a-time stepping, support-foot stability, step lift/landing, explicit pivot steps, airborne entry/landing, deterministic reset/reseed, and zero heap allocations. The Android ARM64 library also compiles.
+Host tests cover calibration and explicit first-person eye anchors; smooth fixed-length spine solving; neutral, half-bent, near-chest, cross-body, near-full and unreachable arm targets; exact reachable grip position; bounded stretch, shoulder and wrist behavior; saber/controller source transitions and reach-range reset; HMD translation/yaw/pitch/roll with exact avatar-eye coincidence and neck length; pure squat, forward duck, backward lean, mirrored left/right lean and spine-reversal rejection; early translation/predicted-support stepping; planted anchors, one-foot-at-a-time steps, support-foot stability, step lift/landing, pivot steps, airborne entry/landing, deterministic reset/reseed, and zero heap allocations. All five CTest targets and all twenty repository/tooling tests pass, and the Android ARM64 library compiles.
 
-Black Heart head and arms were verified in an actual Beat Saber map before this pass. The new torso, pelvis, legs, steps, and airborne behavior have not yet been visually validated or timed on Quest; use the requested in-game matrix and recordings before treating these starting values as final.
+The first Black Heart full-body gameplay recording established the correction baseline: stick-straight arms, hand/saber separation, implausible wrists, head/neck discontinuity, waist/spine Z shapes, reversed-looking squat geometry, excessive lateral lean, and delayed steps. This correction pass is host-verified, ARM64-built, and receipt-deployed for the authorized retest, but it has not yet been visually evaluated. Typical gameplay reach ratios, Black Heart/player proportion mismatch, Quest-native solve time, and before/after visual success therefore remain intentionally unclaimed until the same-angle device pass.
 
 ## ozz provenance
 

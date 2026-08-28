@@ -576,6 +576,21 @@ public:
         }
     }
 
+    std::optional<RuntimeAnchor> FirstPersonAnchorWorld() const noexcept {
+        try {
+            if (!asset_.firstPerson.bone || *asset_.firstPerson.bone >= nodeTransforms_.size()) return std::nullopt;
+            auto* bone = nodeTransforms_[*asset_.firstPerson.bone];
+            if (!IsAlive(bone)) return std::nullopt;
+            const auto position = bone->TransformPoint(ToUnityPosition(asset_.firstPerson.boneOffset));
+            const auto rotation = bone->get_rotation();
+            return RuntimeAnchor{
+                {position.x, position.y, position.z},
+                {rotation.x, rotation.y, rotation.z, rotation.w}};
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
+
     VrmAsset asset_;
     RuntimeOptions options_;
     RuntimeStatistics stats_;
@@ -628,5 +643,8 @@ UnityEngine::Animator* VrmUnityRuntime::Animator() const noexcept { return impl_
 UnityEngine::GameObject* VrmUnityRuntime::Root() const noexcept { return impl_ ? impl_->root_ : nullptr; }
 const VrmAsset& VrmUnityRuntime::Asset() const noexcept { return impl_->asset_; }
 const RuntimeStatistics& VrmUnityRuntime::Statistics() const noexcept { return impl_->stats_; }
+std::optional<RuntimeAnchor> VrmUnityRuntime::FirstPersonAnchorWorld() const noexcept {
+    return impl_ ? impl_->FirstPersonAnchorWorld() : std::nullopt;
+}
 
 } // namespace saberstage::avatar::vrm

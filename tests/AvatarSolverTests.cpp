@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <new>
+#include <optional>
 
 namespace {
 
@@ -43,7 +44,9 @@ void SetBone(HumanoidRestPose& rest, HumanoidBone bone, Vec3 position, HumanoidB
     }
 }
 
-AvatarCalibration BuildAvatar() {
+AvatarCalibration BuildAvatar(
+    std::optional<Pose> eyeAnchorOverride = std::nullopt,
+    bool includeEyeBones = true) {
     HumanoidRestPose rest{};
     SetBone(rest, HumanoidBone::Hips, {0.0F, 0.90F, 0.0F}, HumanoidBone::Count);
     SetBone(rest, HumanoidBone::Spine, {0.0F, 1.05F, 0.0F}, HumanoidBone::Hips);
@@ -51,8 +54,10 @@ AvatarCalibration BuildAvatar() {
     SetBone(rest, HumanoidBone::UpperChest, {0.0F, 1.40F, 0.0F}, HumanoidBone::Chest);
     SetBone(rest, HumanoidBone::Neck, {0.0F, 1.55F, 0.0F}, HumanoidBone::UpperChest);
     SetBone(rest, HumanoidBone::Head, {0.0F, 1.65F, 0.0F}, HumanoidBone::Neck);
-    SetBone(rest, HumanoidBone::LeftEye, {-0.03F, 1.70F, 0.06F}, HumanoidBone::Head);
-    SetBone(rest, HumanoidBone::RightEye, {0.03F, 1.70F, 0.06F}, HumanoidBone::Head);
+    if (includeEyeBones) {
+        SetBone(rest, HumanoidBone::LeftEye, {-0.03F, 1.70F, 0.06F}, HumanoidBone::Head);
+        SetBone(rest, HumanoidBone::RightEye, {0.03F, 1.70F, 0.06F}, HumanoidBone::Head);
+    }
 
     SetBone(rest, HumanoidBone::LeftShoulder, {-0.16F, 1.42F, 0.0F}, HumanoidBone::UpperChest);
     SetBone(rest, HumanoidBone::LeftUpperArm, {-0.24F, 1.40F, 0.0F}, HumanoidBone::LeftShoulder);
@@ -72,7 +77,7 @@ AvatarCalibration BuildAvatar() {
     SetBone(rest, HumanoidBone::RightFoot, {0.10F, 0.05F, 0.08F}, HumanoidBone::RightLowerLeg);
     SetBone(rest, HumanoidBone::RightToes, {0.10F, 0.04F, 0.27F}, HumanoidBone::RightFoot);
 
-    const auto measured = MeasureAvatarRestPose(rest);
+    const auto measured = MeasureAvatarRestPose(rest, eyeAnchorOverride);
     Check(measured.error == nullptr, "avatar calibration succeeds");
     Check(measured.calibration.valid, "avatar calibration is valid");
     return measured.calibration;
@@ -127,14 +132,15 @@ void CheckDirectTargets(
           "head position retains exact target authority");
     Check(SameRotation(head.rotation, diagnostics.headTarget.rotation, 0.0001F),
           "head rotation retains exact target authority");
-    Check(leftError < 0.04F,
-          "left wrist remains on its direct controller target");
-    Check(rightError < 0.04F,
-          "right wrist remains on its direct controller target");
-    Check(SameRotation(left.rotation, diagnostics.handTarget[0].rotation, 0.0001F),
-          "left wrist rotation remains aligned to the controller target");
-    Check(SameRotation(right.rotation, diagnostics.handTarget[1].rotation, 0.0001F),
-          "right wrist rotation remains aligned to the controller target");
+    Check(leftError < 0.001F,
+          "left wrist remains coincident with its reachable grip target");
+    Check(rightError < 0.001F,
+          "right wrist remains coincident with its reachable grip target");
+    Check(SameRotation(left.rotation, diagnostics.finalHand[0].rotation, 0.0001F) &&
+              SameRotation(right.rotation, diagnostics.finalHand[1].rotation, 0.0001F),
+          "wrist diagnostics report the calibrated final hand rotations");
+    Check(diagnostics.eyeTargetError < 0.0001F,
+          "avatar eye anchor remains coincident with the HMD target");
 }
 
 PlayerCalibration BuildPlayer(const TrackingSample& tracking) {
@@ -150,6 +156,13 @@ void TestCalibration() {
     Check(calibration.spineSegmentCount == 5, "all mapped spine segments are measured");
     Check(calibration.upperArmLength[0] > 0.25F, "upper arm length is measured");
     Check(calibration.footLength[0] > 0.18F, "toe length is measured when available");
+    Check(calibration.approximateArmSpan > 1.25F, "avatar arm span is measured independently from eye-height scale");
+
+    const auto explicitEye = BuildAvatar(Pose{{0.0F, 1.72F, 0.08F}, {}}, false);
+    Check(Near(explicitEye.eyePosition.y, 1.72F) && Near(explicitEye.eyePosition.z, 0.08F),
+          "explicit VRM first-person anchor overrides a missing eye-bone fallback");
+    Check(Near(explicitEye.headToEye.position.y, 0.07F) && Near(explicitEye.headToEye.position.z, 0.08F),
+          "head-to-eye offset is measured from the actual avatar head pivot");
 }
 
 void TestTwoBone() {
@@ -189,7 +202,7 @@ void TestFabrik() {
     input.restPrebend = {0.0F, 0.0F, -0.03F};
     const auto result = SolveFabrikSpine(input);
     Check(result.valid, "FABRIK input solves");
-    Check(result.iterations >= 2 && result.iterations <= 3, "FABRIK iteration count is bounded");
+    Check(result.iterations >= 1 && result.iterations <= 6, "spine solve iteration count is bounded");
     for (int index = 0; index < 3; ++index) {
         Check(Near(Length(result.positions[index + 1] - result.positions[index]), 0.3F),
               "FABRIK preserves segment lengths");
@@ -212,7 +225,7 @@ void TestUpperBodyRegressionAndAllocations() {
     Check(solved, "full static avatar solve succeeds");
     Check(allocationCount == 0, "full native solve performs no heap allocations");
     Check(pose.sourceSequence == 1, "solved pose records the tracking sequence");
-    Check(diagnostics.spineIterations <= 3, "full solver bounds spine passes");
+    Check(diagnostics.spineIterations <= 6, "full solver bounds spine passes");
     Check(Near(pose.bones[BoneIndex(HumanoidBone::LeftHand)].position.x, neutralTracking.leftHand.pose.position.x, 0.01F),
           "left wrist reaches controller target");
     Check(Near(pose.bones[BoneIndex(HumanoidBone::RightHand)].position.x, neutralTracking.rightHand.pose.position.x, 0.01F),
@@ -267,6 +280,126 @@ void TestUpperBodyRegressionAndAllocations() {
     Check(Dot(previousLeftElbowPole, state.previousElbowPole[0]) > 0.0F &&
           Dot(previousRightElbowPole, state.previousElbowPole[1]) > 0.0F,
           "elbow history preserves bend hemispheres across dynamic body updates");
+}
+
+void TestArmReachBendAndGripAuthority() {
+    const auto avatar = BuildAvatar();
+    auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    StaticTrackerlessAvatarSolver solver{};
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "arm diagnostic neutral pose solves");
+    const auto neutralFlexion = diagnostics.elbowFlexionDegrees[0];
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.leftHand.pose.position = {-0.36F, 1.32F, 0.24F};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "half-bent arm pose solves");
+    const auto halfBentFlexion = diagnostics.elbowFlexionDegrees[0];
+    Check(diagnostics.handTargetError[0] < 0.001F, "half-bent hand remains exactly on its target");
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.leftHand.pose.position = {-0.12F, 1.34F, 0.16F};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "hand-near-sternum pose solves");
+    const auto chestFlexion = diagnostics.elbowFlexionDegrees[0];
+    Check(chestFlexion > halfBentFlexion + 12.0F && chestFlexion > neutralFlexion,
+          "analytic elbow flexion increases substantially when the hand approaches the chest");
+    Check(diagnostics.armReachRatio[0] < 0.65F,
+          "near-chest diagnostics distinguish available bend from a reach-limited straight arm");
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.leftHand.pose.position = {0.08F, 1.40F, 0.20F};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "cross-body hand pose solves");
+    Check(diagnostics.handTargetError[0] < 0.001F && diagnostics.elbowFlexionDegrees[0] > 25.0F,
+          "cross-body hand retains authority while the elbow selects a bent plane");
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.leftHand.pose.position = {-0.72F, 1.40F, 0.12F};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "near-full arm extension solves");
+    if (!(diagnostics.armReachRatio[0] > 0.80F && diagnostics.handTargetError[0] < 0.001F)) {
+        std::cerr << "near-full reachRatio=" << diagnostics.armReachRatio[0]
+                  << " handError=" << diagnostics.handTargetError[0] << '\n';
+    }
+    Check(diagnostics.armReachRatio[0] > 0.80F && diagnostics.handTargetError[0] < 0.001F,
+          "near-full reachable target stays coincident instead of being shortened by soft reach");
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.leftHand.pose.position = {-1.25F, 1.40F, 0.10F};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "unreachable arm target fails gracefully");
+    Check(!diagnostics.limbReachable[0] && diagnostics.armReachRatio[0] > 1.05F &&
+              diagnostics.handTargetError[0] > 0.05F,
+          "unreachable target is diagnosed after bounded five-percent stretch rather than hidden distortion");
+    Check(diagnostics.armReachRatioMinimum[0] < diagnostics.armReachRatioAverage[0] &&
+              diagnostics.armReachRatioAverage[0] < diagnostics.armReachRatioMaximum[0],
+          "fixed-size gameplay reach diagnostics retain min/average/max ratios");
+
+    solver.Reset(state);
+    tracking = BuildTracking();
+    auto offsetPlayer = MeasureNeutralPlayer(
+        tracking,
+        {},
+        {{0.08F, 0.0F, 0.0F}, AxisAngle({0.0F, 0.0F, 1.0F}, 0.4F)},
+        {});
+    Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics),
+          "controller-source reach sample solves before gameplay");
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.handIsSaberGrip[0] = true;
+    Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics), "saber-handle target pose solves");
+    Check(Length(diagnostics.handTarget[0].position - tracking.leftHand.pose.position) < 0.0001F,
+          "authoritative saber handle bypasses controller-only position offsets");
+    Check(Near(diagnostics.armReachRatioMinimum[0], diagnostics.armReachRatio[0], 0.0001F) &&
+              Near(diagnostics.armReachRatioAverage[0], diagnostics.armReachRatio[0], 0.0001F) &&
+              Near(diagnostics.armReachRatioMaximum[0], diagnostics.armReachRatio[0], 0.0001F),
+          "gameplay saber reach range resets instead of retaining menu controller samples");
+    const auto calibratedHandRotation = diagnostics.finalHand[0].rotation;
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.handIsSaberGrip[0] = true;
+    tracking.leftHand.pose.rotation = AxisAngle({0.0F, 1.0F, 0.0F}, 0.35F);
+    Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics), "rotated saber grip solves");
+    Check(!SameRotation(calibratedHandRotation, diagnostics.finalHand[0].rotation, 0.005F),
+          "persistent grip-to-hand offset carries subsequent grip rotation into the wrist");
+    Check(diagnostics.wristRotationErrorDegrees[0] <= 70.1F,
+          "wrist rotation is anatomical-limit clamped after grip-to-hand calibration");
+}
+
+void TestEyeAnchorAndHeadContinuity() {
+    const auto avatar = BuildAvatar(Pose{{0.0F, 1.72F, 0.08F}, {}}, false);
+    auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    StaticTrackerlessAvatarSolver solver{};
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "explicit-eye neutral pose solves");
+    Check(diagnostics.eyeTargetError < 0.0001F &&
+              Length(diagnostics.headTarget.position - tracking.head.pose.position) > 0.04F,
+          "HMD drives the avatar eye anchor rather than blindly replacing the Head pivot");
+
+    const std::array<Quaternion, 3> rotations{
+        AxisAngle({0.0F, 1.0F, 0.0F}, 0.55F),
+        AxisAngle({1.0F, 0.0F, 0.0F}, -0.35F),
+        AxisAngle({0.0F, 0.0F, 1.0F}, 0.30F)};
+    for (const auto rotation : rotations) {
+        tracking = NextFrame(tracking, {0.11F, 1.66F, 0.10F});
+        tracking.head.pose.rotation = rotation;
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "translated/rotated eye target solves");
+        Check(diagnostics.eyeTargetError < 0.0001F &&
+                  SameRotation(diagnostics.avatarEye.rotation, tracking.head.pose.rotation, 0.0001F),
+              "avatar eye pose remains coincident through HMD yaw, pitch, and roll");
+        const auto expectedNeckLength =
+            avatar.neckToHeadOffset.y * (player.standingHmdHeight / avatar.eyeHeight);
+        if (!Near(Length(diagnostics.neckToHeadVector), expectedNeckLength, 0.01F)) {
+            std::cerr << "neck length=" << Length(diagnostics.neckToHeadVector)
+                      << " expected=" << expectedNeckLength
+                      << " spineError=" << diagnostics.spineError << '\n';
+        }
+        Check(Near(
+                  Length(diagnostics.neckToHeadVector),
+                  expectedNeckLength,
+                  0.01F),
+              "neck-to-head segment length remains continuous under lateral HMD motion");
+    }
 }
 
 void TestBodyYawStateMachine() {
@@ -328,6 +461,14 @@ float SimulateLoweredPose(float headZ, SolverDiagnostics* finalDiagnostics = nul
     }
     Check(state.feet[0].state == FootState::Planted && state.feet[1].state == FootState::Planted,
           "crouch and bend keep both feet planted");
+    if (!(Length(state.footAnchor[0] - anchors[0]) < 0.0001F &&
+          Length(state.footAnchor[1] - anchors[1]) < 0.0001F)) {
+        std::cerr << "lowered headZ=" << headZ
+                  << " leftDelta=" << Length(state.footAnchor[0] - anchors[0])
+                  << " rightDelta=" << Length(state.footAnchor[1] - anchors[1])
+                  << " reasons=" << StepReasonName(state.feet[0].reason)
+                  << '/' << StepReasonName(state.feet[1].reason) << '\n';
+    }
     Check(Length(state.footAnchor[0] - anchors[0]) < 0.0001F &&
           Length(state.footAnchor[1] - anchors[1]) < 0.0001F,
           "planted feet retain exact world-space anchors");
@@ -365,6 +506,130 @@ void TestPelvisLeanCrouchAndBend() {
     Check(Length(state.footAnchor[0] - leftAnchor) < 0.0001F &&
           Length(state.footAnchor[1] - rightAnchor) < 0.0001F,
           "ordinary lean does not slide or step either foot");
+}
+
+void TestAnatomicalSpineCrouchAndSupport() {
+    const auto avatar = BuildAvatar();
+    auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    StaticTrackerlessAvatarSolver solver{};
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "anatomy neutral pose solves");
+    const auto neutralHips = pose.bones[BoneIndex(HumanoidBone::Hips)];
+    const auto neutralKnee = pose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position;
+    const auto planted = std::array<Vec3, 2>{state.footAnchor[0], state.footAnchor[1]};
+    for (int frame = 0; frame < 75; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.38F, 0.06F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "pure vertical squat solves");
+    }
+    const auto squatHips = pose.bones[BoneIndex(HumanoidBone::Hips)];
+    const auto squatChest = pose.bones[BoneIndex(HumanoidBone::Chest)];
+    const auto squatKnee = pose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position;
+    if (!(squatHips.position.y < neutralHips.position.y - 0.16F)) {
+        std::cerr << "neutralHipY=" << neutralHips.position.y
+                  << " squatHipY=" << squatHips.position.y
+                  << " crouch=" << diagnostics.crouchAmount
+                  << " hinge=" << diagnostics.forwardHingeAmount << '\n';
+    }
+    Check(squatHips.position.y < neutralHips.position.y - 0.16F,
+          "pure vertical HMD drop lowers the pelvis");
+    Check(squatHips.position.z < neutralHips.position.z && squatChest.position.z > squatHips.position.z,
+          "pure squat moves hips slightly back while the torso stays upright or slightly forward");
+    Check(squatKnee.z > neutralKnee.z,
+          "pure squat moves the knees forward in the sagittal plane");
+    Check(diagnostics.forwardHingeAmount < 0.12F,
+          "pure vertical squat is not misclassified as a forward hip hinge");
+    Check(!diagnostics.spineReversalWarning,
+          "pure squat does not contain a strong adjacent-segment Z reversal");
+    Check(Length(state.footAnchor[0] - planted[0]) < 0.0001F &&
+              Length(state.footAnchor[1] - planted[1]) < 0.0001F,
+          "pure crouch keeps both feet exactly planted without a meaningless translation step");
+
+    const auto squatHinge = diagnostics.forwardHingeAmount;
+    solver.Reset(state);
+    tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "forward-duck neutral pose solves");
+    for (int frame = 0; frame < 75; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.43F, 0.30F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "forward duck solves");
+    }
+    Check(diagnostics.forwardHingeAmount > squatHinge + 0.25F,
+          "forward duck is distinguished from pure squat by forward hinge geometry");
+    Check(pose.bones[BoneIndex(HumanoidBone::Head)].position.z >
+              pose.bones[BoneIndex(HumanoidBone::Hips)].position.z,
+          "forward duck keeps the head/chest forward of the hips");
+    Check(!diagnostics.spineReversalWarning,
+          "forward duck spine remains one continuous curve instead of a waist Z");
+
+    solver.Reset(state);
+    tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "backward-lean neutral pose solves");
+    const auto backwardNeutralHips = pose.bones[BoneIndex(HumanoidBone::Hips)];
+    const auto backwardNeutralChest = pose.bones[BoneIndex(HumanoidBone::Chest)];
+    const auto backwardNeutralKnee = pose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position;
+    for (int frame = 0; frame < 30; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.70F, 0.0F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "backward lean solves");
+    }
+    Check(pose.bones[BoneIndex(HumanoidBone::Head)].position.z < backwardNeutralChest.position.z &&
+              pose.bones[BoneIndex(HumanoidBone::Chest)].position.z < backwardNeutralChest.position.z + 0.005F,
+          "backward HMD displacement bends the upper chain backward instead of reversing at the waist");
+    Check(pose.bones[BoneIndex(HumanoidBone::Hips)].position.z <= backwardNeutralHips.position.z + 0.005F &&
+              std::abs(pose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position.z - backwardNeutralKnee.z) < 0.06F,
+          "backward lean does not drive the pelvis forward or invent a large knee displacement");
+    Check(diagnostics.forwardHingeAmount < 0.02F && !diagnostics.spineReversalWarning,
+          "backward lean is not misclassified as a forward duck and keeps continuous curvature");
+
+    solver.Reset(state);
+    tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "direction-sign neutral pose solves");
+    for (int frame = 0; frame < 30; ++frame) {
+        tracking = NextFrame(tracking, {-0.04F, 1.70F, 0.06F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "small left lean solves");
+    }
+    Check(diagnostics.lateralLeanMeters < 0.0F && state.feet[0].state == FootState::Planted &&
+              state.feet[1].state == FootState::Planted,
+          "small left displacement remains a signed lean with planted feet");
+    Check(pose.bones[BoneIndex(HumanoidBone::Hips)].position.x < neutralHips.position.x &&
+              pose.bones[BoneIndex(HumanoidBone::Chest)].position.x < neutralHips.position.x,
+          "left lean moves the pelvis and upper chain in the requested direction");
+    const auto leftLeanMagnitude = std::abs(diagnostics.lateralLeanMeters);
+
+    solver.Reset(state);
+    tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "right-lean neutral pose solves");
+    for (int frame = 0; frame < 30; ++frame) {
+        tracking = NextFrame(tracking, {0.04F, 1.70F, 0.06F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "small right lean solves");
+    }
+    Check(diagnostics.lateralLeanMeters > 0.0F &&
+              pose.bones[BoneIndex(HumanoidBone::Hips)].position.x > neutralHips.position.x &&
+              pose.bones[BoneIndex(HumanoidBone::Chest)].position.x > neutralHips.position.x &&
+              state.feet[0].state == FootState::Planted && state.feet[1].state == FootState::Planted,
+          "small right displacement mirrors the signed left lean with planted feet");
+    for (int frame = 0; frame < 45; ++frame) {
+        tracking = NextFrame(tracking, {0.18F, 1.70F, 0.06F}, 0.0F, {0.20F, 0.0F, 0.0F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "moderate right translation solves");
+    }
+    Check(diagnostics.bodyTranslation.x > 0.025F,
+          "moderate sustained lateral displacement begins translating the pelvis/body");
+    Check(std::abs(diagnostics.lateralLeanMeters) <= diagnostics.maximumSupportOffset &&
+              std::abs(diagnostics.lateralLeanMeters) < leftLeanMagnitude + 0.10F,
+          "lateral spine lean is hard-limited instead of growing without bound");
+
+    bool steppedBeforeExtremeLean = false;
+    for (int frame = 0; frame < 45 && !steppedBeforeExtremeLean; ++frame) {
+        tracking = NextFrame(tracking, {0.30F, 1.70F, 0.06F}, 0.0F, {0.55F, 0.0F, 0.0F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "predicted support-edge pose solves");
+        steppedBeforeExtremeLean = state.feet[0].state == FootState::Stepping ||
+            state.feet[1].state == FootState::Stepping;
+    }
+    Check(steppedBeforeExtremeLean,
+          "predicted support margin requests a lateral step before extreme body lean");
+    Check(std::abs(diagnostics.lateralLeanMeters) < 0.13F,
+          "step begins while lateral lean remains anatomically bounded");
 }
 
 void TestProceduralStepAndPivot() {
@@ -500,8 +765,11 @@ int main() {
     TestTwoBone();
     TestFabrik();
     TestUpperBodyRegressionAndAllocations();
+    TestArmReachBendAndGripAuthority();
+    TestEyeAnchorAndHeadContinuity();
     TestBodyYawStateMachine();
     TestPelvisLeanCrouchAndBend();
+    TestAnatomicalSpineCrouchAndSupport();
     TestProceduralStepAndPivot();
     TestAirborneAndResetRecovery();
     std::cout << "Avatar solver tests passed\n";

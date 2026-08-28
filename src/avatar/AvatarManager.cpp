@@ -8,6 +8,7 @@
 #include "saberstage/camera/CameraProfile.hpp"
 
 #include "GlobalNamespace/PlayerTransforms.hpp"
+#include "GlobalNamespace/Saber.hpp"
 #include "GlobalNamespace/VRController.hpp"
 #include "UnityEngine/Animator.hpp"
 #include "UnityEngine/Camera.hpp"
@@ -26,6 +27,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <optional>
 #include <unordered_set>
 
 namespace saberstage::avatar {
@@ -143,6 +145,15 @@ TrackedPose SampleControllerPose(
     return result;
 }
 
+std::optional<Pose> FirstPersonAnchor(const vrm::VrmUnityRuntime* runtime) noexcept {
+    if (!runtime) return std::nullopt;
+    const auto anchor = runtime->FirstPersonAnchorWorld();
+    if (!anchor) return std::nullopt;
+    return Pose{
+        {anchor->position.x, anchor->position.y, anchor->position.z},
+        {anchor->rotation.x, anchor->rotation.y, anchor->rotation.z, anchor->rotation.w}};
+}
+
 } // namespace
 
 class AvatarManager::Impl final {
@@ -180,7 +191,12 @@ public:
         started_ = false;
     }
 
-    bool BindAnimator(UnityEngine::Animator* animator, Pose leftOffset, Pose rightOffset, Vec3 modelForward) noexcept {
+    bool BindAnimator(
+        UnityEngine::Animator* animator,
+        Pose leftOffset,
+        Pose rightOffset,
+        Vec3 modelForward,
+        std::optional<Pose> eyeAnchor = std::nullopt) noexcept {
         try {
             if (!started_ || !IsAlive(animator) || !animator->get_isHuman()) {
                 Logging::Logger.error("Avatar binding rejected a missing or non-humanoid Animator");
@@ -207,7 +223,7 @@ public:
                 bone.world = {FromUnity(worldPosition), FromUnity(worldRotation)};
                 bone.local = {FromUnity(localPosition), FromUnity(localRotation)};
             }
-            const auto measured = MeasureAvatarRestPose(rest);
+            const auto measured = MeasureAvatarRestPose(rest, eyeAnchor);
             if (!measured.calibration.valid) {
                 Logging::Logger.error("Avatar rest-pose calibration failed: {}", measured.error ? measured.error : "unknown geometry failure");
                 animator_ = nullptr;
@@ -262,6 +278,10 @@ public:
         handTransforms_[1] = nullptr;
         handControllers_[0] = nullptr;
         handControllers_[1] = nullptr;
+        sabers_[0] = nullptr;
+        sabers_[1] = nullptr;
+        saberGripTransforms_[0] = nullptr;
+        saberGripTransforms_[1] = nullptr;
         originTransform_ = nullptr;
         calibration_ = {};
         player_ = {};
@@ -271,6 +291,7 @@ public:
         diagnostics_ = {};
         bound_ = false;
         nextTrackingDiscoveryFrame_ = 0;
+        nextSaberDiscoveryFrame_ = 0;
         trackingFailureLogged_ = false;
         lastTrackingOrigin_ = {};
         lastTrackingOriginValid_ = false;
@@ -323,13 +344,21 @@ public:
             const auto timestamp = static_cast<double>(UnityEngine::Time::get_unscaledTime());
             const auto previous = sample_;
             sample_.head = SamplePose(headTransform_, previous.head, timestamp);
-            if (IsAlive(handControllers_[0]) && IsAlive(handControllers_[1])) {
-                sample_.leftHand = SampleControllerPose(handControllers_[0], previous.leftHand, timestamp);
-                sample_.rightHand = SampleControllerPose(handControllers_[1], previous.rightHand, timestamp);
-            } else {
-                sample_.leftHand = SamplePose(handTransforms_[0], previous.leftHand, timestamp);
-                sample_.rightHand = SamplePose(handTransforms_[1], previous.rightHand, timestamp);
-            }
+            RefreshSaberGripTransforms(frame);
+            const auto leftGripReady = SaberGripReady(0);
+            const auto rightGripReady = SaberGripReady(1);
+            sample_.handIsSaberGrip[0] = leftGripReady;
+            sample_.handIsSaberGrip[1] = rightGripReady;
+            sample_.leftHand = leftGripReady
+                ? SamplePose(saberGripTransforms_[0], previous.leftHand, timestamp)
+                : (IsAlive(handControllers_[0])
+                    ? SampleControllerPose(handControllers_[0], previous.leftHand, timestamp)
+                    : SamplePose(handTransforms_[0], previous.leftHand, timestamp));
+            sample_.rightHand = rightGripReady
+                ? SamplePose(saberGripTransforms_[1], previous.rightHand, timestamp)
+                : (IsAlive(handControllers_[1])
+                    ? SampleControllerPose(handControllers_[1], previous.rightHand, timestamp)
+                    : SamplePose(handTransforms_[1], previous.rightHand, timestamp));
             sample_.renderFrame = frame;
             ++sample_.sequence;
             const auto trackingValid = sample_.head.valid && sample_.leftHand.valid && sample_.rightHand.valid;
@@ -377,6 +406,10 @@ public:
             handTransforms_[1] = nullptr;
             handControllers_[0] = nullptr;
             handControllers_[1] = nullptr;
+            sabers_[0] = nullptr;
+            sabers_[1] = nullptr;
+            saberGripTransforms_[0] = nullptr;
+            saberGripTransforms_[1] = nullptr;
             Logging::Logger.error("Avatar tracking sample failed; cached tracking handles were invalidated");
         }
     }
@@ -430,10 +463,19 @@ public:
             auto previous = std::move(vrmRuntime_);
             auto* previousAnimator = previous ? previous->Animator() : nullptr;
             if (bindSolver && !BindAnimator(
-                    candidate->Animator(), controllerToWrist_[0], controllerToWrist_[1], {0.0F, 0.0F, 1.0F})) {
+                    candidate->Animator(),
+                    controllerToWrist_[0],
+                    controllerToWrist_[1],
+                    {0.0F, 0.0F, 1.0F},
+                    FirstPersonAnchor(candidate.get()))) {
                 vrmRuntime_ = std::move(previous);
                 if (vrmRuntime_ && IsAlive(previousAnimator)) {
-                    BindAnimator(previousAnimator, controllerToWrist_[0], controllerToWrist_[1], {0.0F, 0.0F, 1.0F});
+                    BindAnimator(
+                        previousAnimator,
+                        controllerToWrist_[0],
+                        controllerToWrist_[1],
+                        {0.0F, 0.0F, 1.0F},
+                        FirstPersonAnchor(vrmRuntime_.get()));
                 }
                 if (error) *error = "VRM constructed, but its humanoid Animator could not bind to the SaberStage solver";
                 return false;
@@ -523,7 +565,11 @@ public:
             return false;
         }
         if (!BindAnimator(
-                vrmRuntime_->Animator(), controllerToWrist_[0], controllerToWrist_[1], {0.0F, 0.0F, 1.0F})) {
+                vrmRuntime_->Animator(),
+                controllerToWrist_[0],
+                controllerToWrist_[1],
+                {0.0F, 0.0F, 1.0F},
+                FirstPersonAnchor(vrmRuntime_.get()))) {
             if (error) *error = "loaded VRM Animator failed SaberStage humanoid calibration";
             return false;
         }
@@ -583,22 +629,90 @@ public:
                 diagnostics_.headBodyYawErrorDegrees,
                 diagnostics_.torsoYawDegrees);
             Logging::Logger.info(
-                "Avatar body: pelvis=({:.3f},{:.3f},{:.3f}) lean={:.3f} crouch={:.3f} translation={:.3f}",
+                "Avatar body: pelvis=({:.3f},{:.3f},{:.3f}) lean={:.3f} lateralLean={:.3f}m crouch={:.3f} "
+                "hinge={:.3f} translation=({:.3f},{:.3f},{:.3f}) supportOffset={:.3f}/{:.3f}m predictedMargin={:.3f}m",
                 diagnostics_.pelvis.position.x,
                 diagnostics_.pelvis.position.y,
                 diagnostics_.pelvis.position.z,
                 diagnostics_.leanAmount,
+                diagnostics_.lateralLeanMeters,
                 diagnostics_.crouchAmount,
-                diagnostics_.bodyTranslationAmount);
+                diagnostics_.forwardHingeAmount,
+                diagnostics_.bodyTranslation.x,
+                diagnostics_.bodyTranslation.y,
+                diagnostics_.bodyTranslation.z,
+                diagnostics_.pelvisSupportOffset,
+                diagnostics_.maximumSupportOffset,
+                diagnostics_.predictedSupportMargin);
             Logging::Logger.info(
-                "Avatar targets: head=({:.3f},{:.3f},{:.3f}) left=({:.3f},{:.3f},{:.3f}) right=({:.3f},{:.3f},{:.3f})",
+                "Avatar head/eye: HMD=({:.3f},{:.3f},{:.3f}) head=({:.3f},{:.3f},{:.3f}) "
+                "eye=({:.3f},{:.3f},{:.3f}) eyeError={:.4f}m neckToHead=({:.3f},{:.3f},{:.3f})",
+                diagnostics_.hmdTarget.position.x, diagnostics_.hmdTarget.position.y, diagnostics_.hmdTarget.position.z,
                 diagnostics_.headTarget.position.x, diagnostics_.headTarget.position.y, diagnostics_.headTarget.position.z,
-                diagnostics_.handTarget[0].position.x, diagnostics_.handTarget[0].position.y, diagnostics_.handTarget[0].position.z,
-                diagnostics_.handTarget[1].position.x, diagnostics_.handTarget[1].position.y, diagnostics_.handTarget[1].position.z);
+                diagnostics_.avatarEye.position.x, diagnostics_.avatarEye.position.y, diagnostics_.avatarEye.position.z,
+                diagnostics_.eyeTargetError,
+                diagnostics_.neckToHeadVector.x, diagnostics_.neckToHeadVector.y, diagnostics_.neckToHeadVector.z);
+            Logging::Logger.info(
+                "Avatar spine: segments={} forwardBends=({:.1f},{:.1f},{:.1f},{:.1f}) "
+                "lateralBends=({:.1f},{:.1f},{:.1f},{:.1f}) maxReversal={:.1f}deg warning={}",
+                diagnostics_.spineSegmentDirectionCount,
+                diagnostics_.spineForwardBendDegrees[0], diagnostics_.spineForwardBendDegrees[1],
+                diagnostics_.spineForwardBendDegrees[2], diagnostics_.spineForwardBendDegrees[3],
+                diagnostics_.spineLateralBendDegrees[0], diagnostics_.spineLateralBendDegrees[1],
+                diagnostics_.spineLateralBendDegrees[2], diagnostics_.spineLateralBendDegrees[3],
+                diagnostics_.maximumSpineReversalDegrees,
+                diagnostics_.spineReversalWarning);
+            for (std::uint8_t segment = 0; segment < diagnostics_.spineSegmentDirectionCount; ++segment) {
+                const auto direction = diagnostics_.spineSegmentDirections[segment];
+                Logging::Logger.info(
+                    "Avatar spine segment {} direction=({:.4f},{:.4f},{:.4f})",
+                    segment,
+                    direction.x,
+                    direction.y,
+                    direction.z);
+            }
+            for (int side = 0; side < 2; ++side) {
+                Logging::Logger.info(
+                    "Avatar {} arm: source={} shoulder=({:.3f},{:.3f},{:.3f}) target=({:.3f},{:.3f},{:.3f}) "
+                    "length={:.3f}+{:.3f}={:.3f} distance={:.3f} reachRatio={:.3f} range={:.3f}/{:.3f}/{:.3f} "
+                    "elbowFlex={:.1f}deg handError={:.4f}m wristError={:.1f}deg pole=({:.3f},{:.3f},{:.3f})",
+                    side == 0 ? "left" : "right",
+                    diagnostics_.handTargetFromSaberGrip[side] ? "saber-handle" : "controller",
+                    diagnostics_.shoulderTarget[side].x,
+                    diagnostics_.shoulderTarget[side].y,
+                    diagnostics_.shoulderTarget[side].z,
+                    diagnostics_.handTarget[side].position.x,
+                    diagnostics_.handTarget[side].position.y,
+                    diagnostics_.handTarget[side].position.z,
+                    diagnostics_.upperArmLength[side],
+                    diagnostics_.lowerArmLength[side],
+                    diagnostics_.totalArmLength[side],
+                    diagnostics_.shoulderToTargetDistance[side],
+                    diagnostics_.armReachRatio[side],
+                    diagnostics_.armReachRatioMinimum[side],
+                    diagnostics_.armReachRatioAverage[side],
+                    diagnostics_.armReachRatioMaximum[side],
+                    diagnostics_.elbowFlexionDegrees[side],
+                    diagnostics_.handTargetError[side],
+                    diagnostics_.wristRotationErrorDegrees[side],
+                    diagnostics_.elbowPole[side].x,
+                    diagnostics_.elbowPole[side].y,
+                    diagnostics_.elbowPole[side].z);
+                const auto targetRotation = diagnostics_.handTarget[side].rotation;
+                const auto finalRotation = diagnostics_.finalHand[side].rotation;
+                const auto gripOffset = diagnostics_.gripToHandRotation[side];
+                Logging::Logger.info(
+                    "Avatar {} wrist rotations: target=({:.4f},{:.4f},{:.4f},{:.4f}) "
+                    "gripToHand=({:.4f},{:.4f},{:.4f},{:.4f}) final=({:.4f},{:.4f},{:.4f},{:.4f})",
+                    side == 0 ? "left" : "right",
+                    targetRotation.x, targetRotation.y, targetRotation.z, targetRotation.w,
+                    gripOffset.x, gripOffset.y, gripOffset.z, gripOffset.w,
+                    finalRotation.x, finalRotation.y, finalRotation.z, finalRotation.w);
+            }
             for (int side = 0; side < 2; ++side) {
                 Logging::Logger.info(
                     "Avatar {} foot: state={} reason={} anchor=({:.3f},{:.3f},{:.3f}) ideal=({:.3f},{:.3f},{:.3f}) "
-                    "destination=({:.3f},{:.3f},{:.3f}) progress={:.2f} legReach={:.3f} kneePole=({:.3f},{:.3f},{:.3f})",
+                    "destination=({:.3f},{:.3f},{:.3f}) progress={:.2f}/{:.3f}s legReach={:.3f} kneePole=({:.3f},{:.3f},{:.3f})",
                     side == 0 ? "left" : "right",
                     FootStateName(diagnostics_.footState[side]),
                     StepReasonName(diagnostics_.stepReason[side]),
@@ -610,6 +724,7 @@ public:
                     diagnostics_.stepDestination[side].position.y,
                     diagnostics_.stepDestination[side].position.z,
                     diagnostics_.stepProgress[side],
+                    diagnostics_.stepDuration[side],
                     diagnostics_.legReach[side],
                     diagnostics_.kneePole[side].x,
                     diagnostics_.kneePole[side].y,
@@ -622,6 +737,41 @@ public:
     AvatarManager& owner_;
 
 private:
+    bool SaberGripReady(int side) const noexcept {
+        return IsAlive(sabers_[side]) && sabers_[side]->get_isActiveAndEnabled() &&
+            IsAlive(saberGripTransforms_[side]);
+    }
+
+    void RefreshSaberGripTransforms(std::int32_t frame) noexcept {
+        if (SaberGripReady(0) && SaberGripReady(1)) return;
+        if (frame < nextSaberDiscoveryFrame_) return;
+        nextSaberDiscoveryFrame_ = frame + 30;
+        sabers_[0] = nullptr;
+        sabers_[1] = nullptr;
+        saberGripTransforms_[0] = nullptr;
+        saberGripTransforms_[1] = nullptr;
+        try {
+            for (auto* saber : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::Saber*>()) {
+                if (!IsAlive(saber) || !saber->get_isActiveAndEnabled()) continue;
+                const auto side = saber->get_saberType().value__;
+                if (side < 0 || side > 1 || SaberGripReady(side)) continue;
+                auto handleReference = saber->__cordl_internal_get__handleTransform();
+                auto* handle = handleReference ? handleReference.ptr() : nullptr;
+                if (!IsAlive(handle)) continue;
+                sabers_[side] = saber;
+                saberGripTransforms_[side] = handle;
+            }
+            if (SaberGripReady(0) && SaberGripReady(1)) {
+                Logging::Logger.info("Avatar hand targets acquired from Beat Saber's visible saber handles");
+            }
+        } catch (...) {
+            sabers_[0] = nullptr;
+            sabers_[1] = nullptr;
+            saberGripTransforms_[0] = nullptr;
+            saberGripTransforms_[1] = nullptr;
+        }
+    }
+
     bool TrackingSourcesReady() const noexcept {
         if (!IsAlive(headTransform_)) return false;
         const auto transformHands = IsAlive(handTransforms_[0]) && IsAlive(handTransforms_[1]);
@@ -656,6 +806,10 @@ private:
         handTransforms_[1] = nullptr;
         handControllers_[0] = nullptr;
         handControllers_[1] = nullptr;
+        sabers_[0] = nullptr;
+        sabers_[1] = nullptr;
+        saberGripTransforms_[0] = nullptr;
+        saberGripTransforms_[1] = nullptr;
         originTransform_ = nullptr;
         std::size_t playerTransformCount = 0;
         for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::PlayerTransforms*>()) {
@@ -729,6 +883,11 @@ private:
     }
 
     void LogCalibration() const {
+        const auto scale = calibration_.eyeHeight > 1.0e-5F
+            ? player_.standingHmdHeight / calibration_.eyeHeight
+            : 1.0F;
+        const auto neutralControllerSpan = Length(
+            player_.neutralHand[1].position - player_.neutralHand[0].position);
         Logging::Logger.info(
             "Avatar rest calibration: eye={:.3f}m shoulders={:.3f}m hips={:.3f}m "
             "arms L={:.3f}+{:.3f} R={:.3f}+{:.3f} legs L={:.3f}+{:.3f} R={:.3f}+{:.3f} spineSegments={}",
@@ -740,6 +899,15 @@ private:
             calibration_.thighLength[0], calibration_.lowerLegLength[0],
             calibration_.thighLength[1], calibration_.lowerLegLength[1],
             calibration_.spineSegmentCount);
+        Logging::Logger.info(
+            "Avatar proportion calibration: avatarEye={:.3f}m scaledArmSpan={:.3f}m neutralControllerSpan={:.3f}m "
+            "headToEye=({:.3f},{:.3f},{:.3f})",
+            calibration_.eyeHeight,
+            calibration_.approximateArmSpan * scale,
+            neutralControllerSpan,
+            calibration_.headToEye.position.x * scale,
+            calibration_.headToEye.position.y * scale,
+            calibration_.headToEye.position.z * scale);
         for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
             if (calibration_.rest.bones[index].mapped) {
                 Logging::Logger.debug("Avatar mapped bone {}", BoneName(static_cast<HumanoidBone>(index)));
@@ -755,6 +923,8 @@ private:
     UnityEngine::Transform* headTransform_ = nullptr;
     UnityEngine::Transform* handTransforms_[2]{};
     GlobalNamespace::VRController* handControllers_[2]{};
+    GlobalNamespace::Saber* sabers_[2]{};
+    UnityEngine::Transform* saberGripTransforms_[2]{};
     UnityEngine::Transform* originTransform_ = nullptr;
     AvatarCalibration calibration_{};
     PlayerCalibration player_{};
@@ -766,6 +936,7 @@ private:
     StaticTrackerlessAvatarSolver solver_{};
     std::unique_ptr<vrm::VrmUnityRuntime> vrmRuntime_;
     std::int32_t nextTrackingDiscoveryFrame_ = 0;
+    std::int32_t nextSaberDiscoveryFrame_ = 0;
     bool animatorWasEnabled_ = false;
     bool bound_ = false;
     bool started_ = false;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -34,6 +35,11 @@ struct RuntimeStatistics {
     std::size_t textureDownscaleCount = 0;
 };
 
+struct RuntimeAnchor {
+    Float3 position{};
+    Float4 rotation{};
+};
+
 // Owns every Unity object created for one VRM. Destruction is centralized so
 // AvatarManager can unbind the humanoid first and then unload without leaving
 // meshes, materials, textures, or a hidden Animator behind.
@@ -57,6 +63,7 @@ public:
     [[nodiscard]] UnityEngine::GameObject* Root() const noexcept;
     [[nodiscard]] const VrmAsset& Asset() const noexcept;
     [[nodiscard]] const RuntimeStatistics& Statistics() const noexcept;
+    [[nodiscard]] std::optional<RuntimeAnchor> FirstPersonAnchorWorld() const noexcept;
 
 private:
     VrmUnityRuntime() = default;
