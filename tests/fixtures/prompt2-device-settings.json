@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "general": {
+    "diagnosticsEnabled": false
+  },
+  "camera": {
+    "profileId": "primary",
+    "fovDegrees": 92.0,
+    "requestedWidth": 1280,
+    "requestedHeight": 720,
+    "anchoredFloatEnabled": false
+  },
+  "preview": {
+    "visible": false,
+    "scale": 1.0
+  },
+  "recording": {
+    "framesPerSecond": 30,
+    "bitrateBitsPerSecond": 8000000
+  },
+  "companion": {
+    "enabled": false
+  },
+  "avatar": {
+    "enabled": false
+  },
+  "scenes": {
+    "enabled": false
+  },
+  "broadcast": {
+    "enabled": false
+  },
+  "chat": {
+    "enabled": false
+  }
+}

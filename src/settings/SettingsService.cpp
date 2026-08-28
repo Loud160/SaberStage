@@ -1,0 +1,443 @@
+#include "saberstage/settings/SettingsService.hpp"
+
+#include <rapidjson/document.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
+
+#include <fstream>
+#include <sstream>
+#include <system_error>
+#include <utility>
+
+namespace saberstage::settings {
+namespace {
+
+using rapidjson::Document;
+using rapidjson::Value;
+
+const Value* Member(const Value& object, const char* name) {
+    if (!object.IsObject()) return nullptr;
+    const auto iterator = object.FindMember(name);
+    return iterator == object.MemberEnd() ? nullptr : &iterator->value;
+}
+
+bool Bool(const Value& object, const char* name, bool fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (value->IsBool()) return value->GetBool();
+    repaired = true;
+    return fallback;
+}
+
+std::int32_t Int(const Value& object, const char* name, std::int32_t fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (value->IsInt()) return value->GetInt();
+    repaired = true;
+    return fallback;
+}
+
+float Float(const Value& object, const char* name, float fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (value->IsNumber()) return value->GetFloat();
+    repaired = true;
+    return fallback;
+}
+
+std::string String(const Value& object, const char* name, std::string fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (value->IsString()) return {value->GetString(), value->GetStringLength()};
+    repaired = true;
+    return fallback;
+}
+
+FeatureSettings Feature(const Value& root, const char* name, FeatureSettings fallback, bool& repaired) {
+    const auto* object = Member(root, name);
+    if (object == nullptr) return fallback;
+    if (!object->IsObject()) {
+        repaired = true;
+        return fallback;
+    }
+    fallback.enabled = Bool(*object, "enabled", fallback.enabled, repaired);
+    return fallback;
+}
+
+camera::Vec3 Vector(const Value& object, const char* name, camera::Vec3 fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (!value->IsObject()) {
+        repaired = true;
+        return fallback;
+    }
+    fallback.x = Float(*value, "x", fallback.x, repaired);
+    fallback.y = Float(*value, "y", fallback.y, repaired);
+    fallback.z = Float(*value, "z", fallback.z, repaired);
+    return fallback;
+}
+
+template <typename Enum, typename Parser>
+Enum EnumValue(const Value& object, const char* name, Enum fallback, Parser parser, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (!value->IsString()) {
+        repaired = true;
+        return fallback;
+    }
+    Enum parsed = fallback;
+    if (!parser(std::string_view(value->GetString(), value->GetStringLength()), parsed)) {
+        repaired = true;
+        return fallback;
+    }
+    return parsed;
+}
+
+void AddVector(Value& root, const char* name, camera::Vec3 vector, Document::AllocatorType& allocator) {
+    Value object(rapidjson::kObjectType);
+    object.AddMember("x", vector.x, allocator);
+    object.AddMember("y", vector.y, allocator);
+    object.AddMember("z", vector.z, allocator);
+    root.AddMember(Value(name, allocator), object, allocator);
+}
+
+void AddFeature(Value& root, const char* name, const FeatureSettings& feature, Document::AllocatorType& allocator) {
+    Value object(rapidjson::kObjectType);
+    object.AddMember("enabled", feature.enabled, allocator);
+    root.AddMember(Value(name, allocator), object, allocator);
+}
+
+void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bool& repaired) {
+    profile.profileId = String(source, "profileId", profile.profileId, repaired);
+    profile.displayName = String(source, "displayName", profile.displayName, repaired);
+    profile.enabled = Bool(source, "enabled", profile.enabled, repaired);
+    profile.referenceFrame = EnumValue(
+        source, "referenceFrame", profile.referenceFrame,
+        camera::TryParseReferenceFrame, repaired);
+    profile.followMode = EnumValue(
+        source, "followMode", profile.followMode,
+        camera::TryParseFollowMode, repaired);
+    profile.subjectAnchor = EnumValue(
+        source, "subjectAnchor", profile.subjectAnchor,
+        camera::TryParseSubjectAnchor, repaired);
+    profile.position = Vector(source, "position", profile.position, repaired);
+    profile.rotationDegrees = Vector(source, "rotationDegrees", profile.rotationDegrees, repaired);
+    profile.fovDegrees = Float(source, "fovDegrees", profile.fovDegrees, repaired);
+    profile.requestedWidth = Int(source, "requestedWidth", profile.requestedWidth, repaired);
+    profile.requestedHeight = Int(source, "requestedHeight", profile.requestedHeight, repaired);
+    profile.requestedFramesPerSecond = Int(
+        source, "requestedFramesPerSecond", profile.requestedFramesPerSecond, repaired);
+    profile.nearClipMeters = Float(source, "nearClipMeters", profile.nearClipMeters, repaired);
+    profile.farClipMeters = Float(source, "farClipMeters", profile.farClipMeters, repaired);
+    profile.positionSmoothingSeconds = Float(
+        source, "positionSmoothingSeconds", profile.positionSmoothingSeconds, repaired);
+    profile.rotationSmoothingSeconds = Float(
+        source, "rotationSmoothingSeconds", profile.rotationSmoothingSeconds, repaired);
+    profile.anchoredFloatEnabled = Bool(source, "anchoredFloatEnabled", profile.anchoredFloatEnabled, repaired);
+    profile.anchoredFloatDeadZoneDegrees = Float(
+        source, "anchoredFloatDeadZoneDegrees", profile.anchoredFloatDeadZoneDegrees, repaired);
+    profile.anchoredFloatMaxYawDegrees = Float(
+        source, "anchoredFloatMaxYawDegrees", profile.anchoredFloatMaxYawDegrees, repaired);
+    profile.anchoredFloatMaxOffsetMeters = Float(
+        source, "anchoredFloatMaxOffsetMeters", profile.anchoredFloatMaxOffsetMeters, repaired);
+    profile.anchoredFloatResponseSeconds = Float(
+        source, "anchoredFloatResponseSeconds", profile.anchoredFloatResponseSeconds, repaired);
+    profile.movementScriptEnabled = Bool(
+        source, "movementScriptEnabled", profile.movementScriptEnabled, repaired);
+    profile.movementScriptFile = String(
+        source, "movementScriptFile", profile.movementScriptFile, repaired);
+    profile.inheritMainCameraCulling = Bool(
+        source, "inheritMainCameraCulling", profile.inheritMainCameraCulling, repaired);
+    profile.excludedLayersMask = Int(
+        source, "excludedLayersMask", profile.excludedLayersMask, repaired);
+}
+
+Value EncodeCameraProfile(const camera::CameraProfile& profile, Document::AllocatorType& allocator) {
+    Value result(rapidjson::kObjectType);
+    result.AddMember("profileId", Value(profile.profileId.c_str(), allocator), allocator);
+    result.AddMember("displayName", Value(profile.displayName.c_str(), allocator), allocator);
+    result.AddMember("enabled", profile.enabled, allocator);
+    const auto referenceFrame = camera::ToString(profile.referenceFrame);
+    result.AddMember("referenceFrame", Value(referenceFrame.data(), static_cast<rapidjson::SizeType>(referenceFrame.size()), allocator), allocator);
+    const auto followMode = camera::ToString(profile.followMode);
+    result.AddMember("followMode", Value(followMode.data(), static_cast<rapidjson::SizeType>(followMode.size()), allocator), allocator);
+    const auto subjectAnchor = camera::ToString(profile.subjectAnchor);
+    result.AddMember("subjectAnchor", Value(subjectAnchor.data(), static_cast<rapidjson::SizeType>(subjectAnchor.size()), allocator), allocator);
+    AddVector(result, "position", profile.position, allocator);
+    AddVector(result, "rotationDegrees", profile.rotationDegrees, allocator);
+    result.AddMember("fovDegrees", profile.fovDegrees, allocator);
+    result.AddMember("requestedWidth", profile.requestedWidth, allocator);
+    result.AddMember("requestedHeight", profile.requestedHeight, allocator);
+    result.AddMember("requestedFramesPerSecond", profile.requestedFramesPerSecond, allocator);
+    result.AddMember("nearClipMeters", profile.nearClipMeters, allocator);
+    result.AddMember("farClipMeters", profile.farClipMeters, allocator);
+    result.AddMember("positionSmoothingSeconds", profile.positionSmoothingSeconds, allocator);
+    result.AddMember("rotationSmoothingSeconds", profile.rotationSmoothingSeconds, allocator);
+    result.AddMember("anchoredFloatEnabled", profile.anchoredFloatEnabled, allocator);
+    result.AddMember("anchoredFloatDeadZoneDegrees", profile.anchoredFloatDeadZoneDegrees, allocator);
+    result.AddMember("anchoredFloatMaxYawDegrees", profile.anchoredFloatMaxYawDegrees, allocator);
+    result.AddMember("anchoredFloatMaxOffsetMeters", profile.anchoredFloatMaxOffsetMeters, allocator);
+    result.AddMember("anchoredFloatResponseSeconds", profile.anchoredFloatResponseSeconds, allocator);
+    result.AddMember("movementScriptEnabled", profile.movementScriptEnabled, allocator);
+    result.AddMember("movementScriptFile", Value(profile.movementScriptFile.c_str(), allocator), allocator);
+    result.AddMember("inheritMainCameraCulling", profile.inheritMainCameraCulling, allocator);
+    result.AddMember("excludedLayersMask", profile.excludedLayersMask, allocator);
+    return result;
+}
+
+bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& sourceVersion,
+            bool& repaired, std::string& error) {
+    Document document;
+    document.Parse(json.data(), json.size());
+    if (document.HasParseError() || !document.IsObject()) {
+        error = "settings JSON is malformed or is not an object";
+        return false;
+    }
+
+    settings = Defaults();
+    const auto* schema = Member(document, "schemaVersion");
+    if (schema == nullptr) {
+        sourceVersion = 0;
+    } else if (schema->IsUint()) {
+        sourceVersion = schema->GetUint();
+    } else {
+        sourceVersion = 0;
+        repaired = true;
+    }
+
+    if (const auto* general = Member(document, "general")) {
+        if (!general->IsObject()) repaired = true;
+        else settings.general.diagnosticsEnabled = Bool(*general, "diagnosticsEnabled", settings.general.diagnosticsEnabled, repaired);
+    }
+    if (const auto* cameraObject = Member(document, "camera")) {
+        if (!cameraObject->IsObject()) repaired = true;
+        else {
+            const auto* profiles = Member(*cameraObject, "profiles");
+            if (profiles != nullptr) {
+                settings.camera.selectedCameraId = String(
+                    *cameraObject, "selectedCameraId", settings.camera.selectedCameraId, repaired);
+                if (!profiles->IsArray() || profiles->Empty() || profiles->Size() > 16) {
+                    repaired = true;
+                } else {
+                    settings.camera.profiles.clear();
+                    settings.camera.profiles.reserve(profiles->Size());
+                    for (const auto& sourceProfile : profiles->GetArray()) {
+                        if (!sourceProfile.IsObject()) {
+                            repaired = true;
+                            continue;
+                        }
+                        auto profile = camera::DefaultCameraProfile();
+                        DecodeCameraProfile(sourceProfile, profile, repaired);
+                        settings.camera.profiles.push_back(std::move(profile));
+                    }
+                }
+            } else {
+                // Schema 0/1 stored the primary profile directly under camera.
+                DecodeCameraProfile(*cameraObject, settings.camera.Primary(), repaired);
+            }
+        }
+    }
+    if (const auto* preview = Member(document, "preview")) {
+        if (!preview->IsObject()) repaired = true;
+        else {
+            settings.preview.visible = Bool(*preview, "visible", settings.preview.visible, repaired);
+            settings.preview.selectedCameraId = String(
+                *preview, "selectedCameraId", settings.preview.selectedCameraId, repaired);
+            settings.preview.position = Vector(
+                *preview, "position", settings.preview.position, repaired);
+            settings.preview.rotationDegrees = Vector(
+                *preview, "rotationDegrees", settings.preview.rotationDegrees, repaired);
+            settings.preview.scale = Float(*preview, "scale", settings.preview.scale, repaired);
+        }
+    }
+    if (const auto* recording = Member(document, "recording")) {
+        if (!recording->IsObject()) repaired = true;
+        else {
+            settings.recording.framesPerSecond = Int(*recording, "framesPerSecond", settings.recording.framesPerSecond, repaired);
+            settings.recording.bitrateBitsPerSecond = Int(*recording, "bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, repaired);
+            settings.recording.gameplayOnly = Bool(*recording, "gameplayOnly", settings.recording.gameplayOnly, repaired);
+            settings.recording.controllerShortcutEnabled = Bool(
+                *recording,
+                "controllerShortcutEnabled",
+                settings.recording.controllerShortcutEnabled,
+                repaired);
+        }
+    }
+    settings.companion = Feature(document, "companion", settings.companion, repaired);
+    settings.avatar = Feature(document, "avatar", settings.avatar, repaired);
+    settings.scenes = Feature(document, "scenes", settings.scenes, repaired);
+    settings.broadcast = Feature(document, "broadcast", settings.broadcast, repaired);
+    settings.chat = Feature(document, "chat", settings.chat, repaired);
+    settings.schemaVersion = sourceVersion;
+    return true;
+}
+
+std::string Encode(const SettingsDocument& settings) {
+    Document document(rapidjson::kObjectType);
+    auto& allocator = document.GetAllocator();
+    document.AddMember("schemaVersion", settings.schemaVersion, allocator);
+
+    Value general(rapidjson::kObjectType);
+    general.AddMember("diagnosticsEnabled", settings.general.diagnosticsEnabled, allocator);
+    document.AddMember("general", general, allocator);
+
+    Value cameraSettings(rapidjson::kObjectType);
+    cameraSettings.AddMember(
+        "selectedCameraId", Value(settings.camera.selectedCameraId.c_str(), allocator), allocator);
+    Value profiles(rapidjson::kArrayType);
+    for (const auto& profile : settings.camera.profiles) {
+        profiles.PushBack(EncodeCameraProfile(profile, allocator), allocator);
+    }
+    cameraSettings.AddMember("profiles", profiles, allocator);
+    document.AddMember("camera", cameraSettings, allocator);
+
+    Value preview(rapidjson::kObjectType);
+    preview.AddMember("visible", settings.preview.visible, allocator);
+    preview.AddMember(
+        "selectedCameraId", Value(settings.preview.selectedCameraId.c_str(), allocator), allocator);
+    AddVector(preview, "position", settings.preview.position, allocator);
+    AddVector(preview, "rotationDegrees", settings.preview.rotationDegrees, allocator);
+    preview.AddMember("scale", settings.preview.scale, allocator);
+    document.AddMember("preview", preview, allocator);
+
+    Value recording(rapidjson::kObjectType);
+    recording.AddMember("framesPerSecond", settings.recording.framesPerSecond, allocator);
+    recording.AddMember("bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, allocator);
+    recording.AddMember("gameplayOnly", settings.recording.gameplayOnly, allocator);
+    recording.AddMember("controllerShortcutEnabled", settings.recording.controllerShortcutEnabled, allocator);
+    document.AddMember("recording", recording, allocator);
+
+    AddFeature(document, "companion", settings.companion, allocator);
+    AddFeature(document, "avatar", settings.avatar, allocator);
+    AddFeature(document, "scenes", settings.scenes, allocator);
+    AddFeature(document, "broadcast", settings.broadcast, allocator);
+    AddFeature(document, "chat", settings.chat, allocator);
+
+    rapidjson::StringBuffer buffer;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
+    document.Accept(writer);
+    return {buffer.GetString(), buffer.GetSize()};
+}
+
+} // namespace
+
+SettingsService::SettingsService(std::filesystem::path path) : path_(std::move(path)) {}
+
+LoadResult SettingsService::Load() {
+    LoadResult result;
+    result.recoveredBackup = TryRecoverBackup();
+
+    std::ifstream input(path_, std::ios::binary);
+    if (!input) {
+        settings_ = Defaults();
+        result.message = "created defaults";
+        std::string error;
+        if (!Save(&error)) result.message = "defaults active but save failed: " + error;
+        return result;
+    }
+
+    std::ostringstream stream;
+    stream << input.rdbuf();
+    std::uint32_t sourceVersion = 0;
+    bool decodeRepaired = false;
+    std::string error;
+    SettingsDocument decoded;
+    if (!Decode(stream.str(), decoded, sourceVersion, decodeRepaired, error)) {
+        settings_ = Defaults();
+        result.repaired = true;
+        result.message = error + "; defaults restored";
+        Save(nullptr);
+        return result;
+    }
+    if (!Migrate(decoded, sourceVersion)) {
+        settings_ = Defaults();
+        result.unsupportedFutureSchema = true;
+        result.message = "unsupported future schema; defaults active without overwriting the file";
+        return result;
+    }
+
+    result.loadedExisting = true;
+    result.migrated = sourceVersion != kCurrentSchemaVersion;
+    const auto validation = ValidateAndRepair(decoded);
+    result.repaired = validation.changed || decodeRepaired;
+    settings_ = std::move(decoded);
+    result.message = "loaded";
+    if (result.migrated || result.repaired) Save(nullptr);
+    return result;
+}
+
+bool SettingsService::Save(std::string* error) const {
+    std::error_code ec;
+    std::filesystem::create_directories(path_.parent_path(), ec);
+    if (ec) {
+        if (error) *error = "cannot create settings directory: " + ec.message();
+        return false;
+    }
+
+    const auto temporary = std::filesystem::path(path_.string() + ".tmp");
+    const auto backup = std::filesystem::path(path_.string() + ".bak");
+    std::filesystem::remove(temporary, ec);
+    ec.clear();
+
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            if (error) *error = "cannot open temporary settings file";
+            return false;
+        }
+        const auto json = Encode(settings_);
+        output.write(json.data(), static_cast<std::streamsize>(json.size()));
+        output.flush();
+        if (!output) {
+            if (error) *error = "cannot write temporary settings file";
+            return false;
+        }
+    }
+
+    std::filesystem::remove(backup, ec);
+    ec.clear();
+    const bool hadTarget = std::filesystem::exists(path_, ec) && !ec;
+    if (hadTarget) {
+        std::filesystem::rename(path_, backup, ec);
+        if (ec) {
+            if (error) *error = "cannot stage previous settings: " + ec.message();
+            return false;
+        }
+    }
+
+    std::filesystem::rename(temporary, path_, ec);
+    if (ec) {
+        if (hadTarget) {
+            std::error_code restoreError;
+            std::filesystem::rename(backup, path_, restoreError);
+        }
+        if (error) *error = "cannot promote new settings: " + ec.message();
+        return false;
+    }
+    std::filesystem::remove(backup, ec);
+    return true;
+}
+
+bool SettingsService::Reset(Subsystem subsystem, std::string* error) {
+    ResetSubsystem(settings_, subsystem);
+    return Save(error);
+}
+
+bool SettingsService::FactoryReset(std::string* error) {
+    settings::FactoryReset(settings_);
+    return Save(error);
+}
+
+const SettingsDocument& SettingsService::Get() const noexcept { return settings_; }
+SettingsDocument& SettingsService::Edit() noexcept { return settings_; }
+const std::filesystem::path& SettingsService::Path() const noexcept { return path_; }
+
+bool SettingsService::TryRecoverBackup() {
+    std::error_code ec;
+    const auto backup = std::filesystem::path(path_.string() + ".bak");
+    if (std::filesystem::exists(path_, ec) || !std::filesystem::exists(backup, ec)) return false;
+    std::filesystem::rename(backup, path_, ec);
+    return !ec;
+}
+
+} // namespace saberstage::settings

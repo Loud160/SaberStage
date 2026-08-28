@@ -1,0 +1,83 @@
+#include "saberstage/recording/ControllerShortcut.hpp"
+#include "saberstage/recording/RecordingState.hpp"
+
+#include <cstdlib>
+#include <iostream>
+
+namespace {
+
+using saberstage::recording::CanPause;
+using saberstage::recording::CanResume;
+using saberstage::recording::CanStart;
+using saberstage::recording::CanStop;
+using saberstage::recording::CanTransition;
+using saberstage::recording::ControllerShortcut;
+using saberstage::recording::ControllerShortcutAction;
+using saberstage::recording::HasRecordingTimeline;
+using saberstage::recording::RecordingState;
+
+void Require(bool condition, const char* message) {
+    if (condition) return;
+    std::cerr << "FAILED: " << message << '\n';
+    std::exit(1);
+}
+
+} // namespace
+
+int main() {
+    Require(CanStart(RecordingState::Idle), "idle can start");
+    Require(CanStart(RecordingState::Failed), "failed session can retry");
+    Require(!CanStart(RecordingState::Finalizing), "finalizing cannot start");
+
+    Require(CanTransition(RecordingState::Idle, RecordingState::Starting), "start transition");
+    Require(CanTransition(RecordingState::Starting, RecordingState::Recording), "start success transition");
+    Require(CanTransition(RecordingState::Recording, RecordingState::Pausing), "pause request transition");
+    Require(CanTransition(RecordingState::Pausing, RecordingState::Paused), "pause completion transition");
+    Require(CanTransition(RecordingState::Paused, RecordingState::Resuming), "resume request transition");
+    Require(CanTransition(RecordingState::Resuming, RecordingState::Recording), "resume completion transition");
+    Require(CanTransition(RecordingState::Recording, RecordingState::Stopping), "stop transition");
+    Require(CanTransition(RecordingState::Stopping, RecordingState::Finalizing), "finalization transition");
+    Require(CanTransition(RecordingState::Finalizing, RecordingState::Idle), "save completion transition");
+
+    Require(!CanTransition(RecordingState::Paused, RecordingState::Starting), "paused cannot start again");
+    Require(!CanTransition(RecordingState::Finalizing, RecordingState::Stopping), "finalizing cannot stop twice");
+    Require(!CanTransition(RecordingState::Idle, RecordingState::Paused), "idle cannot become paused");
+
+    Require(CanPause(RecordingState::Recording), "recording can pause");
+    Require(!CanPause(RecordingState::Paused), "paused cannot pause twice");
+    Require(CanResume(RecordingState::Paused), "paused can resume");
+    Require(!CanResume(RecordingState::Recording), "recording cannot resume");
+    Require(CanStop(RecordingState::Recording), "recording can stop");
+    Require(CanStop(RecordingState::Paused), "paused recording can stop and save");
+    Require(!CanStop(RecordingState::Finalizing), "finalizing cannot stop");
+    Require(HasRecordingTimeline(RecordingState::Recording), "recording has elapsed timeline");
+    Require(HasRecordingTimeline(RecordingState::Paused), "paused retains elapsed timeline");
+    Require(!HasRecordingTimeline(RecordingState::Armed), "armed has not started a timeline");
+
+    ControllerShortcut shortcut;
+    Require(
+        shortcut.Update(true, true, true, 0.5) == ControllerShortcutAction::None,
+        "controller shortcut waits while held");
+    Require(
+        shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::None,
+        "too-short controller hold is ignored");
+    Require(shortcut.Update(true, true, true, 0.8) == ControllerShortcutAction::None,
+            "toggle shortcut waits for release");
+    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::ToggleRecording,
+            "short controller hold toggles recording once on release");
+    Require(shortcut.Update(true, true, false, 1.0) == ControllerShortcutAction::None,
+            "released shortcut does not rapidly repeat");
+    Require(shortcut.Update(true, true, true, 2.6) == ControllerShortcutAction::None,
+            "stop shortcut waits for release");
+    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::StopAndSave,
+            "long controller hold stops and saves");
+    Require(shortcut.Update(true, true, true, 1.0) == ControllerShortcutAction::None,
+            "shortcut can begin another hold");
+    Require(shortcut.Update(false, true, false, 0.0) == ControllerShortcutAction::None,
+            "disabling shortcut clears an in-progress hold");
+    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::None,
+            "disabled shortcut cannot fire after re-enable");
+
+    std::cout << "Recording state tests passed\n";
+    return 0;
+}

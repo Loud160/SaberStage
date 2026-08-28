@@ -1,0 +1,37 @@
+# QPM restore/build output
+extern/
+qpm.shared.json
+qpm.lock
+*.backup
+*.corrupt-after-lockup
+build/
+build-host/
+out/
+*.qmod
+mod.json
+qpm_defines.cmake
+extern.cmake
+
+# Native build/editor output
+compile_commands.json
+*.so
+*.a
+*.o
+*.obj
+*.pdb
+.cache/
+.clangd/
+.vs/
+.vscode/settings.json
+.idea/
+__pycache__/
+*.py[cod]
+
+# Operating systems and local diagnostics
+.DS_Store
+Thumbs.db
+*.log
+*.tombstone
+SaberStage Support Logs/
+SaberStage Recordings/
+artifacts/
