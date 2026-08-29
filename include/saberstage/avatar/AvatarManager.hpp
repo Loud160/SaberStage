@@ -1,9 +1,11 @@
 #pragma once
 
 #include "saberstage/avatar/AvatarSolver.hpp"
+#include "saberstage/avatar/calibration/PlayerCalibrationSession.hpp"
 #include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,7 +25,7 @@ namespace saberstage::avatar {
 // into the native solver.
 class AvatarManager final {
 public:
-    explicit AvatarManager(camera::CameraManager& camera);
+    AvatarManager(camera::CameraManager& camera, std::filesystem::path playerCalibrationPath);
     ~AvatarManager();
 
     AvatarManager(const AvatarManager&) = delete;
@@ -38,6 +40,19 @@ public:
         Vec3 modelForward = {0.0F, 0.0F, 1.0F}) noexcept;
     void UnbindHumanoidAnimator() noexcept;
     bool RecalibrateNeutral() noexcept;
+    bool PreparePlayerCalibration(calibration::CalibrationMode mode, std::string* error = nullptr) noexcept;
+    bool StartPreparedPlayerCalibration(
+        calibration::CalibrationProgression progression,
+        std::string* error = nullptr) noexcept;
+    bool StartPlayerCalibration(calibration::CalibrationMode mode, std::string* error = nullptr) noexcept;
+    bool StartPlayerCalibrationStep(std::string* error = nullptr) noexcept;
+    bool ContinuePlayerCalibration(std::string* error = nullptr) noexcept;
+    bool RetryPlayerCalibration(std::string* error = nullptr) noexcept;
+    bool RestartPlayerCalibration(std::string* error = nullptr) noexcept;
+    bool CompletePlayerCalibration(std::string* error = nullptr) noexcept;
+    void CancelPlayerCalibration() noexcept;
+    bool ResetPlayerCalibration(std::string* error = nullptr) noexcept;
+    void SetCalibrationStatusChangedHandler(std::function<void()> handler);
 
     bool LoadVrmAvatar(
         const std::filesystem::path& path,
@@ -56,12 +71,15 @@ public:
     void LogDiagnostics() const noexcept;
 
     [[nodiscard]] bool IsBound() const noexcept;
+    [[nodiscard]] bool IsPlayerCalibrationReady() const noexcept;
     [[nodiscard]] bool HasLoadedVrmAvatar() const noexcept;
     [[nodiscard]] const vrm::VrmAsset* LoadedVrmAsset() const noexcept;
     [[nodiscard]] const vrm::RuntimeStatistics* LoadedVrmStatistics() const noexcept;
     [[nodiscard]] const AvatarCalibration& Calibration() const noexcept;
     [[nodiscard]] const PlayerCalibration& Player() const noexcept;
     [[nodiscard]] const SolverDiagnostics& Diagnostics() const noexcept;
+    [[nodiscard]] const calibration::CalibrationStatus& CalibrationStatus() const noexcept;
+    [[nodiscard]] const calibration::PlayerCalibrationProfile& PlayerProfile() const noexcept;
 
 private:
     class Impl;

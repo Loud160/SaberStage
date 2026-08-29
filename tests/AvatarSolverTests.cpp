@@ -282,6 +282,257 @@ void TestUpperBodyRegressionAndAllocations() {
           "elbow history preserves bend hemispheres across dynamic body updates");
 }
 
+calibration::RuntimePlayerProfile BuildRuntimePlayerProfile() {
+    calibration::RuntimePlayerProfile profile{};
+    profile.valid = true;
+    profile.overallConfidence = 0.91F;
+    profile.controllerToGrip[0].position = {-0.018F, 0.0F, 0.042F};
+    profile.controllerToGrip[1].position = {0.024F, 0.0F, 0.048F};
+    profile.controllerToGripObserved[0] = true;
+    profile.controllerToGripObserved[1] = true;
+    profile.gripFitUsesSaber[0] = true;
+    profile.gripFitUsesSaber[1] = true;
+    profile.effectiveReachNormalized[0] = 0.43F;
+    profile.effectiveReachNormalized[1] = 0.45F;
+    profile.leanBoundaryNormalized[0] = 0.075F;
+    profile.leanBoundaryNormalized[1] = 0.085F;
+    profile.leanBoundaryNormalized[2] = 0.10F;
+    profile.leanBoundaryNormalized[3] = 0.07F;
+    for (int direction = 0; direction < 4; ++direction) {
+        profile.leanSignature[direction] = {
+            profile.leanBoundaryNormalized[direction],
+            0.004F,
+            0.01F,
+            0.10F,
+            0.10F,
+            0.94F,
+            2.4F,
+            0.92F,
+        };
+        profile.stepSignature[direction] = {
+            0.145F,
+            0.125F,
+            0.12F,
+            0.42F,
+            0.025F,
+            0.08F,
+            2.4F,
+            0.92F,
+        };
+    }
+    profile.crouch = {0.25F, 0.025F, 0.18F, 0.13F, 0.92F, 0.90F};
+    profile.turn = {28.0F, 0.12F, 0.12F, 110.0F, 0.93F, 0.93F};
+    profile.gripResidualDegrees[0] = 2.0F;
+    profile.gripResidualDegrees[1] = 2.5F;
+    return profile;
+}
+
+void TestRuntimePlayerProfileIntegration() {
+    const auto avatar = BuildAvatar();
+    auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    const auto profile = BuildRuntimePlayerProfile();
+    StaticTrackerlessAvatarSolver solver{};
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+
+    allocationCount = 0;
+    countAllocations = true;
+    const auto solved = solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics);
+    countAllocations = false;
+    Check(solved, "valid player-profile solve succeeds");
+    Check(allocationCount == 0, "valid player-profile gameplay solve performs no heap allocations");
+    Check(diagnostics.playerProfileValid && Near(diagnostics.playerProfileConfidence, 0.91F),
+          "diagnostics expose active player-profile confidence");
+    Check(Near(diagnostics.handTarget[0].position.x,
+               tracking.leftHand.pose.position.x + profile.controllerToGrip[0].position.x, 0.001F),
+          "menu controller target uses the fitted left controller-to-grip offset");
+    Check(Near(diagnostics.calibratedGripResidualDegrees[1], 2.5F),
+          "per-hand calibrated grip residual reaches diagnostics");
+    Check(diagnostics.motionClassification == MotionClassification::Unknown,
+          "a stationary calibrated pose is not mislabeled as a lean");
+
+    auto controllerFitProfile = profile;
+    controllerFitProfile.gripFitUsesSaber[0] = false;
+    controllerFitProfile.gripFitUsesSaber[1] = false;
+    controllerFitProfile.controllerToGripObserved[0] = false;
+    controllerFitProfile.controllerToGripObserved[1] = false;
+    auto saberA = BuildTracking(1.70F, 20, 20, 2.0);
+    saberA.handIsSaberGrip[0] = true;
+    saberA.handIsSaberGrip[1] = true;
+    saberA.controllerHand[0] = saberA.leftHand;
+    saberA.controllerHand[1] = saberA.rightHand;
+    auto saberB = saberA;
+    saberB.leftHand.pose.rotation = AxisAngle({0.0F, 1.0F, 0.0F}, 0.55F);
+    saberB.rightHand.pose.rotation = AxisAngle({0.0F, 1.0F, 0.0F}, -0.45F);
+    SolverPersistentState sourceStateA{};
+    SolverPersistentState sourceStateB{};
+    SolvedHumanoidPose sourcePoseA{};
+    SolvedHumanoidPose sourcePoseB{};
+    SolverDiagnostics sourceDiagnosticsA{};
+    SolverDiagnostics sourceDiagnosticsB{};
+    Check(solver.Solve(saberA, avatar, player, controllerFitProfile,
+              sourceStateA, sourcePoseA, &sourceDiagnosticsA) &&
+          solver.Solve(saberB, avatar, player, controllerFitProfile,
+              sourceStateB, sourcePoseB, &sourceDiagnosticsB),
+          "controller-fitted profiles solve with gameplay saber sources");
+    Check(SameRotation(sourceDiagnosticsA.finalHand[0].rotation,
+              sourceDiagnosticsB.finalHand[0].rotation, 0.001F) &&
+          SameRotation(sourceDiagnosticsA.finalHand[1].rotation,
+              sourceDiagnosticsB.finalHand[1].rotation, 0.001F),
+          "controller-derived anatomical correction is converted through live controller-to-saber rotation");
+
+    bool sawLeanClassification = false;
+    float strongestLeanMargin = -1.0F;
+    for (int frame = 0; frame < 30; ++frame) {
+        const auto amount = frame < 12
+            ? (frame + 1) / 12.0F
+            : std::max(0.0F, 1.0F - (frame - 11) / 15.0F);
+        tracking = NextFrame(
+            tracking,
+            {-0.115F * amount, 1.70F, 0.06F},
+            0.0F,
+            {frame < 12 ? -0.15F : 0.15F, 0.0F, 0.0F});
+        tracking.head.pose.rotation = AxisAngle({0.0F, 0.0F, 1.0F}, 0.10F * amount);
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "profile-informed lean sequence solves");
+        strongestLeanMargin = std::max(
+            strongestLeanMargin, diagnostics.leanConfidence - diagnostics.translationConfidence);
+        sawLeanClassification = sawLeanClassification ||
+            diagnostics.motionClassification == MotionClassification::Lean;
+    }
+    Check(sawLeanClassification && strongestLeanMargin > 0.05F,
+          "return-style head motion without controller translation classifies as lean");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 100, 100, 4.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "profile translation sequence seeds");
+    for (int frame = 0; frame < 32; ++frame) {
+        const auto amount = std::min(1.0F, (frame + 1) / 14.0F);
+        tracking = NextFrame(
+            tracking,
+            {0.22F * amount, 1.70F, 0.06F},
+            0.0F,
+            {0.35F, 0.0F, 0.0F});
+        tracking.leftHand.pose.position.x = -0.48F + 0.22F * amount;
+        tracking.rightHand.pose.position.x = 0.48F + 0.22F * amount;
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "profile-informed persistent translation sequence solves");
+    }
+    Check(diagnostics.motionClassification == MotionClassification::Translation &&
+          diagnostics.translationConfidence > diagnostics.leanConfidence,
+          "persistent HMD-plus-controller displacement classifies as body translation");
+    Check(diagnostics.stepSimilarity[1] > 0.30F,
+          "directional step signature contributes deterministic translation evidence");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 200, 200, 8.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "diagonal lean sequence seeds");
+    bool sawDiagonalLean = false;
+    for (int frame = 0; frame < 24; ++frame) {
+        const auto amount = frame < 10
+            ? (frame + 1) / 10.0F
+            : std::max(0.0F, 1.0F - (frame - 9) / 12.0F);
+        tracking = NextFrame(
+            tracking,
+            {-0.075F * amount, 1.70F, 0.06F + 0.075F * amount},
+            0.0F,
+            {frame < 10 ? -0.20F : 0.20F, 0.0F, frame < 10 ? 0.20F : -0.20F});
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "diagonal elliptical lean solves");
+        sawDiagonalLean = sawDiagonalLean ||
+            diagnostics.motionClassification == MotionClassification::Lean;
+    }
+    Check(sawDiagonalLean && diagnostics.bodyTranslationAmount < 0.08F,
+          "diagonal motion inside the smooth envelope remains a lean without sector discontinuity");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 300, 300, 12.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "slow step sequence seeds");
+    for (int frame = 0; frame < 55; ++frame) {
+        const auto amount = std::min(1.0F, (frame + 1) / 38.0F);
+        tracking = NextFrame(tracking, {-0.20F * amount, 1.70F, 0.06F}, 0.0F, {-0.10F, 0.0F, 0.0F});
+        tracking.leftHand.pose.position.x = -0.48F - 0.20F * amount;
+        tracking.rightHand.pose.position.x = 0.48F - 0.20F * amount;
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "slow deliberate side step solves");
+    }
+    Check(diagnostics.motionClassification == MotionClassification::Translation,
+          "slow deliberate persistent HMD-plus-controller motion classifies as translation");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 400, 400, 16.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "fast dodge sequence seeds");
+    for (int frame = 0; frame < 12; ++frame) {
+        const auto amount = std::min(1.0F, (frame + 1) / 6.0F);
+        tracking = NextFrame(tracking, {0.23F * amount, 1.70F, 0.06F}, 0.0F, {1.4F, 0.0F, 0.0F});
+        tracking.leftHand.pose.position.x = -0.48F + 0.23F * amount;
+        tracking.rightHand.pose.position.x = 0.48F + 0.23F * amount;
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "fast Beat Saber side dodge solves");
+    }
+    Check(diagnostics.motionClassification == MotionClassification::Translation,
+          "fast persistent side dodge reaches translation without waiting for extreme lean");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 500, 500, 20.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "head-only tilt sequence seeds");
+    for (int frame = 0; frame < 18; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.70F, 0.06F});
+        tracking.head.pose.rotation = AxisAngle({0.0F, 0.0F, 1.0F}, 0.28F);
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "head-only tilt solves");
+    }
+    Check(diagnostics.motionClassification != MotionClassification::Translation &&
+          diagnostics.bodyTranslationAmount < 0.01F,
+          "head-only tilt does not create a body step");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 600, 600, 24.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "controller-only arm sequence seeds");
+    for (int frame = 0; frame < 18; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.70F, 0.06F});
+        tracking.leftHand.pose.position = {-0.65F, 1.45F, 0.30F};
+        tracking.rightHand.pose.position = {0.65F, 1.45F, 0.30F};
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "controller-only arm movement solves");
+    }
+    Check(diagnostics.motionClassification != MotionClassification::Translation &&
+          diagnostics.bodyTranslationAmount < 0.01F,
+          "symmetric controller-only arm movement does not move the inferred body origin");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 700, 700, 28.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "profile crouch sequence seeds");
+    for (int frame = 0; frame < 24; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.30F, 0.06F});
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "profile vertical squat solves");
+    }
+    Check(diagnostics.motionClassification == MotionClassification::Crouch,
+          "profile vertical drop classifies as crouch");
+
+    solver.Reset(state);
+    tracking = BuildTracking(1.70F, 800, 800, 32.0);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "profile duck sequence seeds");
+    for (int frame = 0; frame < 24; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.39F, 0.27F});
+        Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+              "profile forward duck solves");
+    }
+    Check(diagnostics.motionClassification == MotionClassification::Duck,
+          "profile drop plus forward hinge classifies as duck");
+}
+
 void TestArmReachBendAndGripAuthority() {
     const auto avatar = BuildAvatar();
     auto tracking = BuildTracking();
@@ -765,6 +1016,7 @@ int main() {
     TestTwoBone();
     TestFabrik();
     TestUpperBodyRegressionAndAllocations();
+    TestRuntimePlayerProfileIntegration();
     TestArmReachBendAndGripAuthority();
     TestEyeAnchorAndHeadContinuity();
     TestBodyYawStateMachine();

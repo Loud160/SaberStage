@@ -2,22 +2,23 @@
 
 #include "saberstage/recording/ControllerShortcut.hpp"
 #include "saberstage/recording/RecordingState.hpp"
+#include "saberstage/settings/SettingsModel.hpp"
+#include "saberstage/broadcast/LivestreamState.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 namespace Hollywood {
-class AudioCapture;
 class CameraCapture;
 }
 
@@ -37,8 +38,21 @@ class SettingsService;
 
 namespace saberstage::recording {
 
+class AsyncVideoWriter;
+class DirectFfmpegCapture;
+class RealtimeAudioCapture;
+
+}
+
+namespace saberstage::broadcast {
+class DirectLivestreamSink;
+}
+
+namespace saberstage::recording {
+
 struct RecordingSnapshot {
     RecordingState state = RecordingState::Idle;
+    RecordingOutputType outputType = RecordingOutputType::Local;
     std::string status;
     std::filesystem::path outputDirectory;
     std::filesystem::path lastSavedFile;
@@ -71,16 +85,22 @@ public:
     bool Pause(std::string* error = nullptr);
     bool Resume(std::string* error = nullptr);
     bool Stop(std::string_view reason = "Stopped by user");
+    bool StartLivestream(std::string* error = nullptr);
+    void StopLivestream() noexcept;
+    bool SetStreamKey(std::string streamKey, std::string* error = nullptr);
+    void ClearStreamKey() noexcept;
+    [[nodiscard]] broadcast::LivestreamSnapshot LivestreamSnapshot() const;
     void Shutdown() noexcept;
     void Tick() noexcept;
     void SetStatusChangedHandler(StatusChangedHandler handler);
     [[nodiscard]] RecordingSnapshot Snapshot() const;
 
 private:
-    bool StartCapture(std::string* error);
+    bool StartCapture(std::string* error, bool forceContinuous = false);
     void StartVideoSegment();
     void StopVideoSegment() noexcept;
     void CreatePersistentAudioCapture();
+    void UpdateAudioCapturePose() noexcept;
     void RefreshAudioListenerOwnership() noexcept;
     void RestoreAudioListenerOwnership() noexcept;
     void HandleRuntimeCameraInvalidated() noexcept;
@@ -98,7 +118,9 @@ private:
         std::filesystem::path rawAudio,
         std::filesystem::path partialOutput,
         std::filesystem::path finalOutput,
-        std::int32_t framesPerSecond) noexcept;
+        std::int32_t framesPerSecond,
+        std::int32_t audioBitrateBitsPerSecond,
+        settings::RecordingBackend backend) noexcept;
     void CleanupCaptureObjects() noexcept;
     std::filesystem::path CreateUniqueBasePath() const;
 
@@ -111,7 +133,8 @@ private:
     std::filesystem::path finalOutputPath_;
     std::filesystem::path lastSavedFile_;
     Hollywood::CameraCapture* videoCapture_ = nullptr;
-    Hollywood::AudioCapture* audioCapture_ = nullptr;
+    DirectFfmpegCapture* directVideoCapture_ = nullptr;
+    RealtimeAudioCapture* audioCapture_ = nullptr;
     UnityEngine::Camera* activeRuntimeCamera_ = nullptr;
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::GameObject* audioObject_ = nullptr;
@@ -120,10 +143,10 @@ private:
     // destruction. Remember stable instance IDs and resolve only currently
     // live listeners when recording releases audio ownership.
     std::vector<std::int32_t> disabledAudioListenerIds_;
-    std::ofstream videoOutput_;
+    std::unique_ptr<AsyncVideoWriter> videoWriter_;
     std::thread finalizer_;
     std::atomic<RecordingState> state_{RecordingState::Idle};
-    std::atomic<bool> videoWriteFailed_{false};
+    std::atomic<bool> captureWriteFailed_{false};
     std::chrono::steady_clock::time_point recordingStarted_{};
     std::chrono::steady_clock::time_point pauseStarted_{};
     std::chrono::steady_clock::duration accumulatedPaused_{};
@@ -137,9 +160,14 @@ private:
     std::int32_t activeHeight_ = 0;
     std::int32_t activeFramesPerSecond_ = 0;
     std::int32_t activeBitrateBitsPerSecond_ = 0;
+    settings::RecordingBackend activeBackend_ = settings::RecordingBackend::Hollywood;
     float activeFovDegrees_ = 0.0F;
     bool gameplayOnlySession_ = false;
     ControllerShortcut controllerShortcut_;
+    std::uint32_t audioListenerRefreshFrame_ = 0;
+    mutable std::mutex livestreamMutex_;
+    std::unique_ptr<broadcast::DirectLivestreamSink> livestreamSink_;
+    std::string streamKey_;
     bool shuttingDown_ = false;
 };
 

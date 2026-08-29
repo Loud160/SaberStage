@@ -20,7 +20,7 @@ This restores dependencies, builds the platform-neutral settings code in WSL, ru
 & 'C:\Users\Owner\AppData\Local\Programs\QPM\qpm.exe' scripts qmod
 ```
 
-The build uses QPM's Ninja, the installed QPM NDK at `C:\Users\Owner\AppData\Roaming\QPM-RS\ndk\android-ndk-r27d`, and a user-local CMake at `C:\Users\Owner\AppData\Local\SaberStage\tools\cmake\cmake\data\bin\cmake.exe`. That CMake was installed as a user-local tool and is not part of the repository. Output is `SaberStage.qmod`. Packaging automatically verifies manifest identity, payload boundaries, dependency IDs, byte-for-byte library inclusion, ELF64/AArch64 identity, and Scotland2 entry-point names. Generated dependencies, manifests, binaries, and QMODs are intentionally ignored by Git.
+The build uses QPM's Ninja, the installed QPM NDK at `C:\Users\Owner\AppData\Roaming\QPM-RS\ndk\android-ndk-r27d`, and a user-local CMake at `C:\Users\Owner\AppData\Local\SaberStage\tools\cmake\cmake\data\bin\cmake.exe`. That CMake was installed as a user-local tool and is not part of the repository. On the first build, the script also invokes WSL to create the SHA-pinned private FFmpeg/Mbed TLS ARM64 runtime documented in `docs/DIRECT_FFMPEG_AND_LIVESTREAM.md`; later builds reuse the staged runtime. Output is `SaberStage.qmod`. Packaging automatically verifies manifest identity, payload boundaries, dependency IDs, byte-for-byte inclusion of SaberStage and all three private FFmpeg libraries, ELF64/AArch64 identity, and Scotland2 entry-point names. Generated dependencies, manifests, binaries, and QMODs are intentionally ignored by Git.
 
 ## Development install and smoke test
 
@@ -42,7 +42,7 @@ After an authorized recording test, copy recordings without deleting them from t
 python scripts\quest_tool.py pull-recordings
 ```
 
-The command creates a new timestamped folder under `SaberStage Recordings` in the repository.
+The command copies completed `SaberStage_*.mp4` files from the Quest's standard `/sdcard/Oculus/VideoShots` folder into a new timestamped folder under `SaberStage Recordings` in the repository. It does not copy the Quest recorder's unrelated videos and does not delete anything from the headset.
 
 Capture the support archive while launching Beat Saber and verify the exact checklist in `docs/TEST_PLAN.md`.
 

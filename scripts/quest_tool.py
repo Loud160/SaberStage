@@ -23,10 +23,15 @@ import zipfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PACKAGE = "com.beatgames.beatsaber"
 MOD_DATA = f"/sdcard/ModData/{PACKAGE}"
-REMOTE_LIBRARY = f"{MOD_DATA}/Modloader/mods/libsaberstage.so"
+REMOTE_LIBRARY = f"{MOD_DATA}/Modloader/early_mods/libsaberstage.so"
+REMOTE_FFMPEG_LIBRARIES = (
+    f"{MOD_DATA}/Modloader/libs/libavformat-saberstage9.so",
+    f"{MOD_DATA}/Modloader/libs/libavcodec-saberstage9.so",
+    f"{MOD_DATA}/Modloader/libs/libavutil-saberstage9.so",
+)
 RECEIPT_DIR = f"{MOD_DATA}/SaberStage/SourceInstall"
 RECEIPT = f"{RECEIPT_DIR}/receipt.json"
-REMOTE_RECORDINGS = f"{MOD_DATA}/Mods/SaberStage/Recordings"
+REMOTE_RECORDINGS = "/sdcard/Oculus/VideoShots"
 
 
 class ToolError(RuntimeError):
@@ -117,54 +122,106 @@ def local_hash(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def deploy(adb: Adb) -> None:
-    library = ROOT / "build" / "libsaberstage.so"
-    if not library.is_file():
-        raise ToolError("build/libsaberstage.so is missing. Complete the verified build first.")
-    expected = local_hash(library)
-    receipt = adb.read_json(RECEIPT)
-    current = adb.hash(REMOTE_LIBRARY)
+def deployment_payloads() -> tuple[tuple[pathlib.Path, str], ...]:
+    ffmpeg = ROOT / ".cache" / "dependencies" / "ffmpeg-hardware" / "lib"
+    return (
+        (ROOT / "build" / "libsaberstage.so", REMOTE_LIBRARY),
+        (ffmpeg / "libavformat-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[0]),
+        (ffmpeg / "libavcodec-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[1]),
+        (ffmpeg / "libavutil-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[2]),
+    )
 
-    if receipt is None and current is not None:
-        raise ToolError("libsaberstage.so already exists without a SaberStage source receipt. It may be MBF-managed; no files were changed.")
+
+def receipt_files(receipt: dict) -> dict[str, str]:
+    if receipt.get("schemaVersion") == 1:
+        path = receipt.get("path")
+        digest = receipt.get("installedSha256")
+        if path != REMOTE_LIBRARY or not isinstance(digest, str):
+            raise ToolError("The legacy SaberStage source receipt is unexpected; no files were changed.")
+        return {path: digest}
+    if receipt.get("schemaVersion") != 2 or not isinstance(receipt.get("files"), list):
+        raise ToolError("The SaberStage source receipt has an unsupported schema; no files were changed.")
+    files: dict[str, str] = {}
+    for item in receipt["files"]:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("installedSha256"), str):
+            raise ToolError("The SaberStage source receipt contains an invalid payload; no files were changed.")
+        if item["path"] in files:
+            raise ToolError("The SaberStage source receipt contains a duplicate payload; no files were changed.")
+        files[item["path"]] = item["installedSha256"]
+    return files
+
+
+def deploy(adb: Adb, launch: bool = True) -> None:
+    payloads = deployment_payloads()
+    missing = [str(local.relative_to(ROOT)) for local, _ in payloads if not local.is_file()]
+    if missing:
+        raise ToolError("Verified deployment payload is missing: " + ", ".join(missing))
+    expected = {remote: local_hash(local) for local, remote in payloads}
+    receipt = adb.read_json(RECEIPT)
+    owned: dict[str, str] = {}
     if receipt is not None:
-        if receipt.get("path") != REMOTE_LIBRARY or receipt.get("state") != "complete":
-            raise ToolError("The SaberStage source receipt is unexpected or incomplete; no files were changed.")
-        if current != receipt.get("installedSha256"):
-            raise ToolError("The installed library changed since source deployment; no files were overwritten.")
+        if receipt.get("state") != "complete":
+            raise ToolError("The SaberStage source receipt is incomplete; no files were changed.")
+        owned = receipt_files(receipt)
+        if not set(owned).issubset(expected):
+            raise ToolError("The SaberStage source receipt owns an unexpected path; no files were changed.")
+
+    for _, remote in payloads:
+        current = adb.hash(remote)
+        if remote not in owned and current is not None:
+            raise ToolError(
+                f"{pathlib.PurePosixPath(remote).name} already exists without a SaberStage source receipt. "
+                "It may be MBF-managed; no files were changed.")
+        if remote in owned and current != owned[remote]:
+            raise ToolError(
+                f"{pathlib.PurePosixPath(remote).name} changed since source deployment; no files were overwritten.")
 
     planned = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "state": "planned",
-        "path": REMOTE_LIBRARY,
-        "installedSha256": expected,
+        "files": [
+            {"path": remote, "installedSha256": expected[remote]}
+            for _, remote in payloads
+        ],
         "deployedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     adb.write_json(planned, RECEIPT)
-    adb.push(library, REMOTE_LIBRARY)
-    actual = adb.hash(REMOTE_LIBRARY)
-    if actual != expected:
-        raise ToolError("Quest library hash did not match the built library after push.")
+    for local, remote in payloads:
+        adb.push(local, remote)
+    for _, remote in payloads:
+        if adb.hash(remote) != expected[remote]:
+            raise ToolError(
+                f"Quest hash for {pathlib.PurePosixPath(remote).name} did not match the verified payload after push.")
     planned["state"] = "complete"
     adb.write_json(planned, RECEIPT)
-    adb.shell(f"am force-stop {PACKAGE}", check=False)
-    adb.shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1", check=False)
-    print(f"Verified source deployment: {REMOTE_LIBRARY}\nSHA-256: {expected}")
+    if launch:
+        adb.shell(f"am force-stop {PACKAGE}", check=False)
+        adb.shell(f"monkey -p {PACKAGE} -c android.intent.category.LAUNCHER 1", check=False)
+    print("Verified source deployment:")
+    for _, remote in payloads:
+        print(f"{remote}\nSHA-256: {expected[remote]}")
 
 
 def remove(adb: Adb) -> None:
     receipt = adb.read_json(RECEIPT)
-    current = adb.hash(REMOTE_LIBRARY)
     if receipt is None:
-        if current is None:
+        current = {remote: adb.hash(remote) for _, remote in deployment_payloads()}
+        if not any(current.values()):
             print("No receipt-owned SaberStage source install was found. Nothing was removed.")
             return
-        raise ToolError("libsaberstage.so exists without a source receipt. It may be MBF-managed; nothing was removed.")
-    if receipt.get("path") != REMOTE_LIBRARY or receipt.get("state") != "complete":
+        raise ToolError("SaberStage payload files exist without a source receipt. They may be MBF-managed; nothing was removed.")
+    if receipt.get("state") != "complete":
         raise ToolError("The source receipt is unexpected or incomplete; nothing was removed.")
-    if current != receipt.get("installedSha256"):
-        raise ToolError("The installed library no longer matches the receipt; nothing was removed.")
-    adb.shell(f"rm -f '{REMOTE_LIBRARY}' '{RECEIPT}'")
+    owned = receipt_files(receipt)
+    allowed = {remote for _, remote in deployment_payloads()}
+    if not set(owned).issubset(allowed):
+        raise ToolError("The source receipt owns an unexpected path; nothing was removed.")
+    for remote, digest in owned.items():
+        if adb.hash(remote) != digest:
+            raise ToolError(
+                f"{pathlib.PurePosixPath(remote).name} no longer matches the receipt; nothing was removed.")
+    quoted = " ".join(f"'{remote}'" for remote in (*owned, RECEIPT))
+    adb.shell(f"rm -f {quoted}")
     adb.shell(f"rmdir '{RECEIPT_DIR}' 2>/dev/null || true", check=False)
     print(f"Removed only receipt-owned source file: {REMOTE_LIBRARY}")
 
@@ -231,19 +288,32 @@ def collect_logs(adb: Adb, output_root: pathlib.Path | None) -> None:
 
 def pull_recordings(adb: Adb, output_root: pathlib.Path | None) -> None:
     if adb.shell(f"if [ -d '{REMOTE_RECORDINGS}' ]; then echo yes; fi") != "yes":
-        raise ToolError("The SaberStage Recordings folder does not exist on the Quest yet.")
+        raise ToolError("The Quest VideoShots folder does not exist yet.")
+    listing = adb.shell(
+        f"for file in '{REMOTE_RECORDINGS}'/SaberStage_*.mp4; do "
+        '[ -f "$file" ] && printf \'%s\\n\' "$file"; done'
+    )
+    recordings = [line.strip() for line in listing.splitlines() if line.strip()]
+    if not recordings:
+        raise ToolError("No completed SaberStage recordings were found in the Quest VideoShots folder.")
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     root = output_root or (ROOT / "SaberStage Recordings")
     destination = root / f"SaberStage-Recordings-{timestamp}"
     destination.mkdir(parents=True, exist_ok=False)
-    adb.pull(REMOTE_RECORDINGS, destination)
+    for remote in recordings:
+        adb.pull(remote, destination / pathlib.PurePosixPath(remote).name)
     print(f"Recordings copied to: {destination}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("deploy")
+    deploy_parser = subparsers.add_parser("deploy")
+    deploy_parser.add_argument(
+        "--no-launch",
+        action="store_true",
+        help="install and hash-verify the payload without stopping or launching Beat Saber",
+    )
     subparsers.add_parser("remove")
     logs = subparsers.add_parser("collect-logs")
     logs.add_argument("--output-root", type=pathlib.Path)
@@ -251,7 +321,7 @@ def main() -> int:
     recordings.add_argument("--output-root", type=pathlib.Path)
     args = parser.parse_args()
     adb = Adb()
-    if args.command == "deploy": deploy(adb)
+    if args.command == "deploy": deploy(adb, launch=not args.no_launch)
     elif args.command == "remove": remove(adb)
     elif args.command == "collect-logs": collect_logs(adb, args.output_root)
     else: pull_recordings(adb, args.output_root)

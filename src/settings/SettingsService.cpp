@@ -280,13 +280,52 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
     if (const auto* recording = Member(document, "recording")) {
         if (!recording->IsObject()) repaired = true;
         else {
+            settings.recording.backend = EnumValue(
+                *recording, "backend", settings.recording.backend,
+                [](std::string_view value, RecordingBackend& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.recording.resolution = EnumValue(
+                *recording, "resolution", settings.recording.resolution,
+                [](std::string_view value, RecordingResolution& parsed) { return TryParse(value, parsed); }, repaired);
             settings.recording.framesPerSecond = Int(*recording, "framesPerSecond", settings.recording.framesPerSecond, repaired);
             settings.recording.bitrateBitsPerSecond = Int(*recording, "bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, repaired);
+            settings.recording.peakBitrateBitsPerSecond = Int(
+                *recording, "peakBitrateBitsPerSecond", settings.recording.peakBitrateBitsPerSecond, repaired);
+            settings.recording.rateControl = EnumValue(
+                *recording, "rateControl", settings.recording.rateControl,
+                [](std::string_view value, RateControlMode& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.recording.encoderPriority = EnumValue(
+                *recording, "encoderPriority", settings.recording.encoderPriority,
+                [](std::string_view value, EncoderPriority& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.recording.h264Profile = EnumValue(
+                *recording, "h264Profile", settings.recording.h264Profile,
+                [](std::string_view value, H264Profile& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.recording.h264Level = EnumValue(
+                *recording, "h264Level", settings.recording.h264Level,
+                [](std::string_view value, H264Level& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.recording.keyframeIntervalSeconds = Int(
+                *recording, "keyframeIntervalSeconds", settings.recording.keyframeIntervalSeconds, repaired);
+            settings.recording.audioBitrateBitsPerSecond = Int(
+                *recording, "audioBitrateBitsPerSecond", settings.recording.audioBitrateBitsPerSecond, repaired);
             settings.recording.gameplayOnly = Bool(*recording, "gameplayOnly", settings.recording.gameplayOnly, repaired);
             settings.recording.controllerShortcutEnabled = Bool(
                 *recording,
                 "controllerShortcutEnabled",
                 settings.recording.controllerShortcutEnabled,
+                repaired);
+            settings.recording.worldControlsVisible = Bool(
+                *recording,
+                "worldControlsVisible",
+                settings.recording.worldControlsVisible,
+                repaired);
+            settings.recording.worldControlsPosition = Vector(
+                *recording,
+                "worldControlsPosition",
+                settings.recording.worldControlsPosition,
+                repaired);
+            settings.recording.worldControlsRotationDegrees = Vector(
+                *recording,
+                "worldControlsRotationDegrees",
+                settings.recording.worldControlsRotationDegrees,
                 repaired);
         }
     }
@@ -307,7 +346,26 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
         }
     }
     settings.scenes = Feature(document, "scenes", settings.scenes, repaired);
-    settings.broadcast = Feature(document, "broadcast", settings.broadcast, repaired);
+    if (const auto* broadcast = Member(document, "broadcast")) {
+        if (!broadcast->IsObject()) repaired = true;
+        else {
+            settings.broadcast.enabled = Bool(*broadcast, "enabled", settings.broadcast.enabled, repaired);
+            settings.broadcast.provider = EnumValue(
+                *broadcast, "provider", settings.broadcast.provider,
+                [](std::string_view value, LivestreamProvider& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.broadcast.serverUrl = String(
+                *broadcast, "serverUrl", settings.broadcast.serverUrl, repaired);
+            settings.broadcast.reconnectEnabled = Bool(
+                *broadcast, "reconnectEnabled", settings.broadcast.reconnectEnabled, repaired);
+            settings.broadcast.reconnectAttempts = Int(
+                *broadcast, "reconnectAttempts", settings.broadcast.reconnectAttempts, repaired);
+            settings.broadcast.reconnectInitialDelaySeconds = Int(
+                *broadcast,
+                "reconnectInitialDelaySeconds",
+                settings.broadcast.reconnectInitialDelaySeconds,
+                repaired);
+        }
+    }
     settings.chat = Feature(document, "chat", settings.chat, repaired);
     settings.schemaVersion = sourceVersion;
     return true;
@@ -342,10 +400,26 @@ std::string Encode(const SettingsDocument& settings) {
     document.AddMember("preview", preview, allocator);
 
     Value recording(rapidjson::kObjectType);
+    recording.AddMember("backend", Value(ToString(settings.recording.backend).data(), allocator), allocator);
+    recording.AddMember("resolution", Value(ToString(settings.recording.resolution).data(), allocator), allocator);
     recording.AddMember("framesPerSecond", settings.recording.framesPerSecond, allocator);
     recording.AddMember("bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, allocator);
+    recording.AddMember("peakBitrateBitsPerSecond", settings.recording.peakBitrateBitsPerSecond, allocator);
+    recording.AddMember("rateControl", Value(ToString(settings.recording.rateControl).data(), allocator), allocator);
+    recording.AddMember("encoderPriority", Value(ToString(settings.recording.encoderPriority).data(), allocator), allocator);
+    recording.AddMember("h264Profile", Value(ToString(settings.recording.h264Profile).data(), allocator), allocator);
+    recording.AddMember("h264Level", Value(ToString(settings.recording.h264Level).data(), allocator), allocator);
+    recording.AddMember("keyframeIntervalSeconds", settings.recording.keyframeIntervalSeconds, allocator);
+    recording.AddMember("audioBitrateBitsPerSecond", settings.recording.audioBitrateBitsPerSecond, allocator);
     recording.AddMember("gameplayOnly", settings.recording.gameplayOnly, allocator);
     recording.AddMember("controllerShortcutEnabled", settings.recording.controllerShortcutEnabled, allocator);
+    recording.AddMember("worldControlsVisible", settings.recording.worldControlsVisible, allocator);
+    AddVector(recording, "worldControlsPosition", settings.recording.worldControlsPosition, allocator);
+    AddVector(
+        recording,
+        "worldControlsRotationDegrees",
+        settings.recording.worldControlsRotationDegrees,
+        allocator);
     document.AddMember("recording", recording, allocator);
 
     AddFeature(document, "companion", settings.companion, allocator);
@@ -359,7 +433,17 @@ std::string Encode(const SettingsDocument& settings) {
     AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
     document.AddMember("avatar", avatar, allocator);
     AddFeature(document, "scenes", settings.scenes, allocator);
-    AddFeature(document, "broadcast", settings.broadcast, allocator);
+    Value broadcast(rapidjson::kObjectType);
+    broadcast.AddMember("enabled", settings.broadcast.enabled, allocator);
+    broadcast.AddMember("provider", Value(ToString(settings.broadcast.provider).data(), allocator), allocator);
+    broadcast.AddMember("serverUrl", Value(settings.broadcast.serverUrl.c_str(), allocator), allocator);
+    broadcast.AddMember("reconnectEnabled", settings.broadcast.reconnectEnabled, allocator);
+    broadcast.AddMember("reconnectAttempts", settings.broadcast.reconnectAttempts, allocator);
+    broadcast.AddMember(
+        "reconnectInitialDelaySeconds",
+        settings.broadcast.reconnectInitialDelaySeconds,
+        allocator);
+    document.AddMember("broadcast", broadcast, allocator);
     AddFeature(document, "chat", settings.chat, allocator);
 
     rapidjson::StringBuffer buffer;

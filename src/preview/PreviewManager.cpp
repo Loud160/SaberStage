@@ -12,12 +12,15 @@
 #include "bsml/shared/BSML/FloatingScreen/Side.hpp"
 #include "bsml/shared/BSML-Lite/Creation/Image.hpp"
 #include "bsml/shared/BSML-Lite/Creation/Text.hpp"
+#include "bsml/shared/BSML/Tags/RawImageTag.hpp"
 #include "bsml/shared/Helpers/getters.hpp"
 #include "bsml/shared/Helpers/utilities.hpp"
 #include "HMUI/ImageView.hpp"
 #include "TMPro/FontStyles.hpp"
 #include "TMPro/TextAlignmentOptions.hpp"
 #include "UnityEngine/Camera.hpp"
+#include "UnityEngine/Canvas.hpp"
+#include "UnityEngine/CanvasGroup.hpp"
 #include "UnityEngine/CanvasRenderer.hpp"
 #include "UnityEngine/Color.hpp"
 #include "UnityEngine/GameObject.hpp"
@@ -171,34 +174,41 @@ float PoseDifference(camera::Pose left, camera::Pose right) {
     return position + rotation;
 }
 
-UnityEngine::UI::RawImage* CreateWorldSpaceRawImage(
+class PublicRawImageTag final : public BSML::RawImageTag {
+public:
+    UnityEngine::GameObject* Create(UnityEngine::Transform* parent) const {
+        return CreateObject(parent);
+    }
+};
+
+UnityEngine::UI::RawImage* CreateWorldSpaceVideoSurface(
     UnityEngine::Transform* parent,
     UnityEngine::Vector2 position,
-    UnityEngine::Vector2 size) {
-    if (!IsAlive(parent)) return nullptr;
-    // Follow BigScreen's proven floating-panel path directly. The BSML tag is
-    // useful inside parsed view-controller layouts, but its added LayoutElement
-    // and retained parser defaults are unnecessary on a standalone world-space
-    // Canvas and made this surface behave differently from the working panel.
-    auto* object = UnityEngine::GameObject::New_ctor("SaberStage Floating Preview Image");
+    UnityEngine::Vector2 size,
+    UnityEngine::Material* material) {
+    if (!IsAlive(parent) || !IsAlive(material)) return nullptr;
+
+    // Use the exact UI graphic path proven by the docked/floor preview. The
+    // earlier standalone MeshRenderer quad bypassed the FloatingScreen canvas
+    // and remained blank on-device even though the shared texture was valid.
+    auto* object = PublicRawImageTag{}.Create(parent);
     if (!IsAlive(object)) return nullptr;
-    object->get_transform()->SetParent(parent, false);
+    object->set_name("SaberStage Floating Preview Video Surface");
     object->set_layer(5);
-    auto* image = object->AddComponent<UnityEngine::UI::RawImage*>();
+    auto* image = object->GetComponent<UnityEngine::UI::RawImage*>();
     if (!IsAlive(image)) {
         UnityEngine::Object::Destroy(object);
         return nullptr;
     }
+    image->set_color(UnityEngine::Color::get_white());
+    image->set_material(material);
+    image->set_maskable(false);
     image->set_raycastTarget(false);
-    auto renderer = image->get_canvasRenderer();
-    if (IsAlive(renderer.ptr())) {
-        renderer->set_cull(false);
-        renderer->set_cullTransparentMesh(false);
-    }
     auto rect = image->get_rectTransform();
-    CenterRect(rect.ptr());
+    CenterRect(rect);
     rect->set_anchoredPosition(position);
     rect->set_sizeDelta(size);
+    image->SetAllDirty();
     return image;
 }
 
@@ -235,7 +245,7 @@ public:
             camera_.SetCaptureExclusionHandler({});
             camera_.RemoveRenderDemand(kDockedDemand);
             camera_.RemoveRenderDemand(kFloatingDemand);
-            SetImageTexture(dockedImage_, nullptr);
+            SetDockedImageTexture(nullptr);
             DestroyFloatingPreview();
             DestroyPlacementPreview();
             if (IsAlive(previewMaterial_)) UnityEngine::Object::Destroy(previewMaterial_);
@@ -244,6 +254,9 @@ public:
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
             driverObject_ = nullptr;
             dockedImage_ = nullptr;
+            captureExcludedRoots_.clear();
+            cachedCaptureCanvasGroups_.clear();
+            cachedCaptureMeshRenderers_.clear();
             started_ = false;
             Logging::Logger.info("Preview manager stopped");
         } catch (const std::exception& exception) {
@@ -258,15 +271,18 @@ public:
     void Tick() noexcept {
         if (!started_) return;
         try {
+            // Camera rendering is synchronous on Unity's main thread. If an
+            // interrupted or exceptional render ever misses its matching
+            // post-render callback, recover HMD UI before the next ordinary
+            // frame instead of leaving registered HMD-only controls hidden.
+            if (captureExclusionDepth_ != 0) RestoreCaptureRoots();
             ApplyVisibility();
             EnsurePlacementPreview();
             UpdateExpandedHandleRotation(floatingScreen_);
             UpdateExpandedHandleRotation(placementScreen_);
             UpdatePlacementDrag();
             UpdateFloatingPersistence();
-            auto* texture = camera_.OutputTexture(camera::kPrimaryCameraId);
-            SetImageTexture(dockedImage_, texture);
-            SetImageTexture(floatingImage_, texture);
+            SetPreviewTexture(camera_.OutputTexture(camera::kPrimaryCameraId));
         } catch (const std::exception& exception) {
             if (!tickFailureLogged_) {
                 tickFailureLogged_ = true;
@@ -285,12 +301,18 @@ public:
         dockedImage_ = image;
         dockedCaptureRoot_ = nullptr;
         if (IsAlive(dockedImage_)) {
-            auto* parent = dockedImage_->get_transform()->get_parent().ptr();
-            if (IsAlive(parent)) {
-                dockedCaptureRoot_ = parent->get_gameObject().ptr();
-            }
+            // Exclude only the video graphic. The enclosing center preview
+            // view is ordinary menu UI and remains visible to the spectator.
+            dockedCaptureRoot_ = dockedImage_->get_gameObject().ptr();
             ApplyPreviewMaterial(dockedImage_);
+            SetPreviewTexture(camera_.OutputTexture(camera::kPrimaryCameraId));
+            dockedImage_->SetAllDirty();
+            UnityEngine::Canvas::ForceUpdateCanvases();
+            if (auto renderer = dockedImage_->get_canvasRenderer(); IsAlive(renderer.ptr())) {
+                renderer->set_cull(false);
+            }
         }
+        RefreshCaptureRendererCache();
         editorActive_ = image != nullptr;
         RefreshRenderDemand();
         EnsurePlacementPreview();
@@ -300,14 +322,32 @@ public:
     void DetachDockedPreview() noexcept {
         try {
             RestoreCaptureRoots();
-            SetImageTexture(dockedImage_, nullptr);
+            SetDockedImageTexture(nullptr);
             dockedImage_ = nullptr;
             dockedCaptureRoot_ = nullptr;
+            RefreshCaptureRendererCache();
             editorActive_ = false;
             camera_.RemoveRenderDemand(kDockedDemand);
             DestroyPlacementPreview();
         } catch (...) {
         }
+    }
+
+    void RegisterCaptureExcludedRoot(UnityEngine::GameObject* root) {
+        if (!IsAlive(root)) return;
+        if (std::find(captureExcludedRoots_.begin(), captureExcludedRoots_.end(), root) !=
+                captureExcludedRoots_.end()) {
+            return;
+        }
+        captureExcludedRoots_.push_back(root);
+        RefreshCaptureRendererCache();
+    }
+
+    void UnregisterCaptureExcludedRoot(UnityEngine::GameObject* root) noexcept {
+        captureExcludedRoots_.erase(
+            std::remove(captureExcludedRoots_.begin(), captureExcludedRoots_.end(), root),
+            captureExcludedRoots_.end());
+        RefreshCaptureRendererCache();
     }
 
     void SetFloatingVisible(bool visible) {
@@ -388,13 +428,39 @@ private:
             ++captureExclusionDepth_;
             if (captureExclusionDepth_ != 1) return;
 
-            // Do not deactivate, fade, or move a world-space Canvas between
-            // layers around a manual render. Those hierarchy mutations force
-            // deferred Canvas registration/rebuild work and left the persistent
-            // popout blank. CanvasRenderer culling suppresses only the generated
-            // draw meshes for this one synchronous spectator render.
-            CullRootForCapture(dockedCaptureRoot_);
-            CullRootForCapture(floatingCaptureRoot_);
+            // Do not clear or directly cull CanvasRenderer geometry. A newly
+            // created world-space Canvas can legitimately report itself culled
+            // before its first rebuild; restoring that value every spectator
+            // frame permanently stranded the popup preview and calibration UI
+            // in a blank/partially-built state on Quest. CanvasGroup alpha is
+            // the same non-destructive path used for transient Beat Saber UI:
+            // the HMD has already rendered, the spectator sees alpha zero, and
+            // no text/image mesh or raycast state is rebuilt.
+            captureCanvasGroupSnapshot_.clear();
+            capturePreviewCullSnapshot_.clear();
+            captureMeshSnapshot_.clear();
+            for (auto* group : cachedCaptureCanvasGroups_) {
+                if (!IsAlive(group)) continue;
+                captureCanvasGroupSnapshot_.emplace_back(group, group->get_alpha());
+                group->set_alpha(0.0F);
+            }
+            const auto cullPreview = [this](UnityEngine::UI::RawImage* image) {
+                if (!IsAlive(image)) return;
+                auto renderer = image->get_canvasRenderer();
+                if (!IsAlive(renderer.ptr())) return;
+                capturePreviewCullSnapshot_.emplace_back(renderer.ptr(), renderer->get_cull());
+                renderer->set_cull(true);
+            };
+            // Keep only the known-working docked/floor preview out of the
+            // spectator frame. The movable popout is deliberately visible to
+            // the camera and is never touched by this exclusion path, allowing
+            // its complete surface and recursive feed to be diagnosed.
+            cullPreview(dockedImage_);
+            for (auto* renderer : cachedCaptureMeshRenderers_) {
+                if (!IsAlive(renderer)) continue;
+                captureMeshSnapshot_.emplace_back(renderer, renderer->get_enabled());
+                renderer->set_enabled(false);
+            }
             return;
         }
 
@@ -405,19 +471,46 @@ private:
 
     void RestoreCaptureRoots() {
         captureExclusionDepth_ = 0;
-        for (const auto& [renderer, culled] : captureCullSnapshot_) {
+        for (const auto& [group, alpha] : captureCanvasGroupSnapshot_) {
+            if (IsAlive(group)) group->set_alpha(alpha);
+        }
+        captureCanvasGroupSnapshot_.clear();
+        for (const auto& [renderer, culled] : capturePreviewCullSnapshot_) {
             if (IsAlive(renderer)) renderer->set_cull(culled);
         }
-        captureCullSnapshot_.clear();
+        capturePreviewCullSnapshot_.clear();
+        for (const auto& [renderer, enabled] : captureMeshSnapshot_) {
+            if (IsAlive(renderer)) renderer->set_enabled(enabled);
+        }
+        captureMeshSnapshot_.clear();
     }
 
-    void CullRootForCapture(UnityEngine::GameObject* root) {
-        if (!IsAlive(root)) return;
-        for (auto* renderer : root->GetComponentsInChildren<UnityEngine::CanvasRenderer*>(true)) {
-            if (!IsAlive(renderer)) continue;
-            captureCullSnapshot_.emplace_back(renderer, renderer->get_cull());
-            renderer->set_cull(true);
-        }
+    void RefreshCaptureRendererCache() {
+        RestoreCaptureRoots();
+        cachedCaptureCanvasGroups_.clear();
+        cachedCaptureMeshRenderers_.clear();
+        auto cacheRoot = [this](UnityEngine::GameObject* root) {
+            if (!IsAlive(root)) return;
+            auto* group = root->GetComponent<UnityEngine::CanvasGroup*>();
+            if (!IsAlive(group)) group = root->AddComponent<UnityEngine::CanvasGroup*>();
+            if (IsAlive(group)) {
+                // These groups belong exclusively to SaberStage's spectator
+                // exclusion path. Establish their visible and interactive HMD
+                // baseline explicitly rather than relying on AddComponent's
+                // runtime defaults or a stale interrupted-render value.
+                group->set_alpha(1.0F);
+                group->set_interactable(true);
+                group->set_blocksRaycasts(true);
+                cachedCaptureCanvasGroups_.push_back(group);
+            }
+            for (auto* renderer : root->GetComponentsInChildren<UnityEngine::MeshRenderer*>(true)) {
+                if (IsAlive(renderer)) cachedCaptureMeshRenderers_.push_back(renderer);
+            }
+        };
+        cacheRoot(dockedCaptureRoot_);
+        for (auto* root : captureExcludedRoots_) cacheRoot(root);
+        captureCanvasGroupSnapshot_.reserve(cachedCaptureCanvasGroups_.size());
+        captureMeshSnapshot_.reserve(cachedCaptureMeshRenderers_.size());
     }
 
     bool EnsurePreviewMaterial() {
@@ -440,6 +533,9 @@ private:
         if (!IsAlive(previewMaterial_)) return false;
         previewMaterial_->set_name("SaberStage Opaque Camera Preview");
         previewMaterial_->set_color(UnityEngine::Color::get_white());
+        // Keep the preview material two-sided for retained world-space UI and
+        // camera-placement surfaces that may be viewed from either side.
+        previewMaterial_->SetInt("_Cull", 0);
         previewMaterial_->set_renderQueue(3000);
         UnityEngine::Object::DontDestroyOnLoad(previewMaterial_);
         Logging::Logger.info("Using alpha-independent opaque RGB material for camera previews");
@@ -464,7 +560,7 @@ private:
 
     UnityEngine::UI::RawImage* BuildMovablePreviewVisuals() {
         const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
-        if (!whitePixel) return nullptr;
+        if (!whitePixel || !EnsurePreviewMaterial()) return nullptr;
         auto* parent = floatingScreen_->get_transform().ptr();
         const UnityEngine::Color borderColor{0.0F, 0.80F, 1.0F, 1.0F};
         const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.98F};
@@ -475,10 +571,11 @@ private:
         constexpr float bodyBottom = -halfCanvas + kPreviewFooterHeight;
         constexpr float bodyCenter = (bodyTop + bodyBottom) * 0.5F;
 
-        ConfigureImage(BSML::Lite::CreateImage(parent, whitePixel),
-            {0.0F, bodyCenter}, {kPreviewWidth - 2.0F, kPreviewBodyHeight - 2.0F}, panelColor, true);
-        auto* preview = CreateWorldSpaceRawImage(
-            parent, {0.0F, bodyCenter}, {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F});
+        auto* preview = CreateWorldSpaceVideoSurface(
+            parent,
+            {0.0F, bodyCenter},
+            {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F},
+            previewMaterial_);
         if (!IsAlive(preview)) return nullptr;
 
         const auto addBorder = [&](UnityEngine::Vector2 position, UnityEngine::Vector2 size) {
@@ -571,18 +668,23 @@ private:
         floatingCreationFailureLogged_ = false;
         floatingScreen_->get_gameObject()->set_name("SaberStage Movable Preview");
         floatingScreen_->get_gameObject()->set_layer(5);
-        floatingCaptureRoot_ = floatingScreen_->get_gameObject().ptr();
         UnityEngine::Object::DontDestroyOnLoad(floatingScreen_->get_gameObject());
         floatingScreen_->set_HandleSide(BSML::Side::Top);
         floatingScreen_->set_HighlightHandle(false);
         HideAndExpandHandle(floatingScreen_, kPreviewWidth, kPreviewCanvasHeight);
         floatingImage_ = BuildMovablePreviewVisuals();
         if (!IsAlive(floatingImage_)) {
-            Logging::Logger.error("Could not create the movable preview image");
+            Logging::Logger.error("Could not create the movable preview video surface");
             DestroyFloatingPreview();
             return;
         }
-        ApplyPreviewMaterial(floatingImage_);
+        SetPreviewTexture(camera_.OutputTexture(camera::kPrimaryCameraId));
+        floatingImage_->SetAllDirty();
+        UnityEngine::Canvas::ForceUpdateCanvases();
+        if (auto renderer = floatingImage_->get_canvasRenderer(); IsAlive(renderer.ptr())) {
+            renderer->set_cull(false);
+        }
+        RefreshCaptureRendererCache();
         ApplyFloatingScale();
         lastFloatingPose_ = ReadPose(floatingScreen_->get_transform().ptr());
         floatingPoseDirty_ = false;
@@ -595,7 +697,7 @@ private:
         if (IsAlive(floatingScreen_)) UnityEngine::Object::Destroy(floatingScreen_->get_gameObject());
         floatingScreen_ = nullptr;
         floatingImage_ = nullptr;
-        floatingCaptureRoot_ = nullptr;
+        RefreshCaptureRendererCache();
         floatingPoseDirty_ = false;
         floatingStableSeconds_ = 0.0F;
     }
@@ -713,9 +815,17 @@ private:
         placementFailureLogged_ = false;
     }
 
-    void SetImageTexture(UnityEngine::UI::RawImage* image, UnityEngine::RenderTexture* texture) {
+    void SetDockedImageTexture(UnityEngine::RenderTexture* texture) {
+        if (IsAlive(dockedImage_)) dockedImage_->set_texture(texture);
+    }
+
+    void SetPreviewTexture(UnityEngine::RenderTexture* texture) {
         if (IsAlive(previewMaterial_)) previewMaterial_->set_mainTexture(texture);
-        if (IsAlive(image)) image->set_texture(texture);
+        if (IsAlive(floatingImage_) && floatingImage_->get_texture() != texture) {
+            floatingImage_->set_texture(texture);
+            floatingImage_->SetMaterialDirty();
+        }
+        SetDockedImageTexture(texture);
     }
 
     PreviewManager& owner_;
@@ -732,13 +842,17 @@ private:
     bool previewMaterialFailureLogged_ = false;
     int captureExclusionDepth_ = 0;
     float floatingStableSeconds_ = 0.0F;
-    std::vector<std::pair<UnityEngine::CanvasRenderer*, bool>> captureCullSnapshot_;
+    std::vector<std::pair<UnityEngine::CanvasGroup*, float>> captureCanvasGroupSnapshot_;
+    std::vector<std::pair<UnityEngine::CanvasRenderer*, bool>> capturePreviewCullSnapshot_;
+    std::vector<std::pair<UnityEngine::MeshRenderer*, bool>> captureMeshSnapshot_;
+    std::vector<UnityEngine::CanvasGroup*> cachedCaptureCanvasGroups_;
+    std::vector<UnityEngine::MeshRenderer*> cachedCaptureMeshRenderers_;
+    std::vector<UnityEngine::GameObject*> captureExcludedRoots_;
     camera::Pose lastFloatingPose_{};
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::Material* previewMaterial_ = nullptr;
     BSML::FloatingScreen* floatingScreen_ = nullptr;
     UnityEngine::UI::RawImage* floatingImage_ = nullptr;
-    UnityEngine::GameObject* floatingCaptureRoot_ = nullptr;
     BSML::FloatingScreen* placementScreen_ = nullptr;
     UnityEngine::UI::RawImage* dockedImage_ = nullptr;
     UnityEngine::GameObject* dockedCaptureRoot_ = nullptr;
@@ -758,5 +872,11 @@ void PreviewManager::SetFloatingScale(float scale) { impl_->SetFloatingScale(sca
 bool PreviewManager::ResetFloatingPreview(std::string* error) { return impl_->ResetFloatingPreview(error); }
 void PreviewManager::ApplySettings() { impl_->ApplySettings(); }
 void PreviewManager::RefreshRenderDemand() { impl_->RefreshRenderDemand(); }
+void PreviewManager::RegisterCaptureExcludedRoot(UnityEngine::GameObject* root) {
+    impl_->RegisterCaptureExcludedRoot(root);
+}
+void PreviewManager::UnregisterCaptureExcludedRoot(UnityEngine::GameObject* root) noexcept {
+    impl_->UnregisterCaptureExcludedRoot(root);
+}
 
 } // namespace saberstage::preview

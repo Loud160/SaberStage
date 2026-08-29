@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <string_view>
 
 namespace {
 
@@ -14,6 +15,8 @@ using saberstage::recording::CanTransition;
 using saberstage::recording::ControllerShortcut;
 using saberstage::recording::ControllerShortcutAction;
 using saberstage::recording::HasRecordingTimeline;
+using saberstage::recording::RecordingOutputType;
+using saberstage::recording::RecordingOutputTypeName;
 using saberstage::recording::RecordingState;
 
 void Require(bool condition, const char* message) {
@@ -25,6 +28,13 @@ void Require(bool condition, const char* message) {
 } // namespace
 
 int main() {
+    Require(RecordingOutputTypeName(RecordingOutputType::Local) == std::string_view("LOCAL"),
+            "local recording output has the compact world-panel label");
+    Require(RecordingOutputTypeName(RecordingOutputType::LiveStream) == std::string_view("LIVE STREAM"),
+            "future live output has the compact world-panel label");
+    Require(RecordingOutputTypeName(RecordingOutputType::LocalAndLive) == std::string_view("LOCAL + LIVE"),
+            "simultaneous safety recording and broadcast has a clear compact label");
+
     Require(CanStart(RecordingState::Idle), "idle can start");
     Require(CanStart(RecordingState::Failed), "failed session can retry");
     Require(!CanStart(RecordingState::Finalizing), "finalizing cannot start");

@@ -58,6 +58,18 @@ const char* BodyModeName(BodyMode mode) noexcept {
     return "GROUNDED";
 }
 
+const char* MotionClassificationName(MotionClassification classification) noexcept {
+    switch (classification) {
+        case MotionClassification::Unknown: return "UNKNOWN";
+        case MotionClassification::Lean: return "LEAN";
+        case MotionClassification::Translation: return "TRANSLATION";
+        case MotionClassification::Crouch: return "CROUCH";
+        case MotionClassification::Duck: return "DUCK";
+        case MotionClassification::Turn: return "TURN";
+    }
+    return "UNKNOWN";
+}
+
 const char* StepReasonName(StepReason reason) noexcept {
     switch (reason) {
         case StepReason::None: return "none";

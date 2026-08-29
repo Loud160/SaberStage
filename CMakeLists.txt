@@ -41,8 +41,10 @@ if(SABERSTAGE_HOST_TESTS)
         src/avatar/Math.cpp
         src/avatar/PoseTypes.cpp
         src/avatar/TwoBoneIK.cpp
+        src/avatar/calibration/PlayerCalibrationProfile.cpp
+        src/avatar/calibration/PlayerCalibrationSession.cpp
     )
-    target_include_directories(saberstage_avatar_core PUBLIC include)
+    target_include_directories(saberstage_avatar_core PUBLIC include "${SABERSTAGE_RAPIDJSON_DIR}")
     target_compile_definitions(saberstage_avatar_core PRIVATE SABERSTAGE_HOST_BUILD=1)
 
     add_library(saberstage_vrm_core STATIC
@@ -69,6 +71,10 @@ if(SABERSTAGE_HOST_TESTS)
     target_link_libraries(saberstage_avatar_tests PRIVATE saberstage_avatar_core)
     add_test(NAME saberstage.avatar COMMAND saberstage_avatar_tests)
 
+    add_executable(saberstage_player_calibration_tests tests/PlayerCalibrationTests.cpp)
+    target_link_libraries(saberstage_player_calibration_tests PRIVATE saberstage_avatar_core)
+    add_test(NAME saberstage.player_calibration COMMAND saberstage_player_calibration_tests)
+
     add_executable(saberstage_vrm_tests tests/VrmParserTests.cpp)
     target_link_libraries(saberstage_vrm_tests PRIVATE saberstage_vrm_core)
     add_test(NAME saberstage.vrm COMMAND saberstage_vrm_tests)
@@ -78,6 +84,11 @@ endif()
 include(qpm_defines.cmake)
 project(${COMPILE_ID} LANGUAGES C CXX)
 
+# A configure-time UTC identity changes on every normal build.ps1 invocation.
+# The mod version alone cannot distinguish two uncommitted headset test builds,
+# which made visual regressions unnecessarily difficult to verify.
+string(TIMESTAMP SABERSTAGE_BUILD_NUMBER "%Y%m%d-%H%M%S" UTC)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -85,6 +96,7 @@ add_compile_options(-frtti -fexceptions -Wall -Wextra)
 add_compile_definitions(
     VERSION="${MOD_VERSION}"
     MOD_ID="${MOD_ID}"
+    SABERSTAGE_BUILD_NUMBER="${SABERSTAGE_BUILD_NUMBER}"
     SABERSTAGE_TARGET_GAME_VERSION="1.40.8_7379"
     SABERSTAGE_QPM_VERSION="1.5.11"
     SABERSTAGE_NDK_VERSION="27.3.13750724"
@@ -104,6 +116,26 @@ target_include_directories(${COMPILE_ID} PRIVATE
 )
 target_link_libraries(${COMPILE_ID} PRIVATE -llog)
 include(extern.cmake)
+
+set(SABERSTAGE_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/ffmpeg-hardware")
+set(SABERSTAGE_FFMPEG_LIBS
+    "${SABERSTAGE_FFMPEG_DIR}/lib/libavformat-saberstage9.so"
+    "${SABERSTAGE_FFMPEG_DIR}/lib/libavcodec-saberstage9.so"
+    "${SABERSTAGE_FFMPEG_DIR}/lib/libavutil-saberstage9.so")
+foreach(SABERSTAGE_FFMPEG_LIB IN LISTS SABERSTAGE_FFMPEG_LIBS)
+    if(NOT EXISTS "${SABERSTAGE_FFMPEG_LIB}")
+        message(FATAL_ERROR
+            "SaberStage's private hardware FFmpeg runtime is missing. "
+            "Run scripts/build-ffmpeg-hardware.ps1 before building the mod.")
+    endif()
+endforeach()
+target_include_directories(${COMPILE_ID} SYSTEM PRIVATE "${SABERSTAGE_FFMPEG_DIR}/include")
+target_link_libraries(${COMPILE_ID} PRIVATE
+    ${SABERSTAGE_FFMPEG_LIBS}
+    -landroid
+    -lEGL
+    -lGLESv3
+    -lmediandk)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set_property(TARGET ${COMPILE_ID} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)

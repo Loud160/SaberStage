@@ -7,6 +7,10 @@ namespace UnityEngine::UI {
 class RawImage;
 }
 
+namespace UnityEngine {
+class GameObject;
+}
+
 namespace saberstage::camera {
 class CameraManager;
 }
@@ -36,6 +40,8 @@ public:
     bool ResetFloatingPreview(std::string* error = nullptr);
     void ApplySettings();
     void RefreshRenderDemand();
+    void RegisterCaptureExcludedRoot(UnityEngine::GameObject* root);
+    void UnregisterCaptureExcludedRoot(UnityEngine::GameObject* root) noexcept;
 
 private:
     class Impl;

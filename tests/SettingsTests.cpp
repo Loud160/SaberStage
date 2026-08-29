@@ -45,6 +45,17 @@ int main() {
     Check(defaults.preview.selectedCameraId == "primary", "preview targets the stable primary camera");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
     Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
+    Check(!defaults.recording.worldControlsVisible, "movable recording controls default off");
+    Check(defaults.recording.backend == RecordingBackend::Hollywood,
+          "existing hardware recording backend remains the migration-safe default");
+    Check(defaults.recording.resolution == RecordingResolution::P1080 &&
+              defaults.recording.framesPerSecond == 30,
+          "recording defaults protect gameplay with 1080p30 output");
+    Check(defaults.recording.peakBitrateBitsPerSecond >= defaults.recording.bitrateBitsPerSecond,
+          "default peak bitrate is not below target bitrate");
+    Check(defaults.broadcast.provider == LivestreamProvider::Twitch &&
+              defaults.broadcast.serverUrl.rfind("rtmp://", 0) == 0,
+          "livestream defaults use Twitch's ordinary RTMP ingest endpoint");
     Check(defaults.avatar.maximumTextureDimension == 1024, "VRM textures default to the Quest-conscious 1024 cap");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
@@ -61,6 +72,9 @@ int main() {
     invalid.preview.selectedCameraId = "missing";
     invalid.preview.position.x = 2000.0F;
     invalid.recording.framesPerSecond = 1000;
+    invalid.recording.bitrateBitsPerSecond = 20'000'000;
+    invalid.recording.peakBitrateBitsPerSecond = 5'000'000;
+    invalid.broadcast.reconnectAttempts = 1000;
     invalid.avatar.selectedFile = "../outside.vrm";
     invalid.avatar.selectedPath = "relative/outside.vrm";
     invalid.avatar.maximumTextureDimension = 8192;
@@ -68,6 +82,11 @@ int main() {
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
     Check((invalid.camera.Primary().requestedWidth & 1) == 0, "odd encoder dimension becomes even");
+    Check(invalid.recording.framesPerSecond == 30, "recording FPS repairs to a supported hardware rate");
+    Check(invalid.recording.peakBitrateBitsPerSecond == invalid.recording.bitrateBitsPerSecond,
+          "recording peak bitrate repairs to at least the target bitrate");
+    Check(invalid.broadcast.reconnectAttempts == defaults.broadcast.reconnectAttempts,
+          "livestream reconnect count repairs to its bounded default");
 
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
@@ -129,6 +148,23 @@ int main() {
     first.Edit().preview.scale = 1.5F;
     first.Edit().recording.gameplayOnly = true;
     first.Edit().recording.controllerShortcutEnabled = true;
+    first.Edit().recording.worldControlsVisible = true;
+    first.Edit().recording.worldControlsPosition = {0.45F, 1.35F, 1.55F};
+    first.Edit().recording.worldControlsRotationDegrees = {4.0F, 170.0F, -2.0F};
+    first.Edit().recording.backend = RecordingBackend::DirectFfmpegHardware;
+    first.Edit().recording.resolution = RecordingResolution::P1440;
+    first.Edit().recording.framesPerSecond = 60;
+    first.Edit().recording.bitrateBitsPerSecond = 16'000'000;
+    first.Edit().recording.peakBitrateBitsPerSecond = 20'000'000;
+    first.Edit().recording.rateControl = RateControlMode::VariableBitrate;
+    first.Edit().recording.encoderPriority = EncoderPriority::Performance;
+    first.Edit().recording.h264Profile = H264Profile::Main;
+    first.Edit().recording.h264Level = H264Level::L42;
+    first.Edit().recording.keyframeIntervalSeconds = 3;
+    first.Edit().recording.audioBitrateBitsPerSecond = 192'000;
+    first.Edit().broadcast.provider = LivestreamProvider::YouTube;
+    first.Edit().broadcast.serverUrl = "rtmps://a.rtmps.youtube.com/live2";
+    first.Edit().broadcast.reconnectAttempts = 12;
     first.Edit().avatar.selectedFile = "Black Heart.vrm";
     first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
     first.Edit().avatar.maximumTextureDimension = 512;
@@ -154,6 +190,28 @@ int main() {
     Check(second.Get().recording.gameplayOnly, "gameplay-only recording preference survives restart");
     Check(second.Get().recording.controllerShortcutEnabled,
           "controller recording shortcut preference survives restart");
+    Check(second.Get().recording.worldControlsVisible &&
+              second.Get().recording.worldControlsPosition.x == 0.45F &&
+              second.Get().recording.worldControlsRotationDegrees.y == 170.0F,
+          "movable recording controls visibility and pose survive restart");
+    Check(second.Get().recording.backend == RecordingBackend::DirectFfmpegHardware &&
+              second.Get().recording.resolution == RecordingResolution::P1440 &&
+              second.Get().recording.framesPerSecond == 60 &&
+              second.Get().recording.bitrateBitsPerSecond == 16'000'000 &&
+              second.Get().recording.peakBitrateBitsPerSecond == 20'000'000 &&
+              second.Get().recording.rateControl == RateControlMode::VariableBitrate &&
+              second.Get().recording.encoderPriority == EncoderPriority::Performance &&
+              second.Get().recording.h264Profile == H264Profile::Main &&
+              second.Get().recording.h264Level == H264Level::L42 &&
+              second.Get().recording.keyframeIntervalSeconds == 3 &&
+              second.Get().recording.audioBitrateBitsPerSecond == 192'000,
+          "all direct hardware encoder controls survive restart");
+    Check(second.Get().broadcast.provider == LivestreamProvider::YouTube &&
+              second.Get().broadcast.serverUrl == "rtmps://a.rtmps.youtube.com/live2" &&
+              second.Get().broadcast.reconnectAttempts == 12,
+          "livestream service, endpoint, and reconnect settings survive restart");
+    Check(Read(path).find("streamKey") == std::string::npos,
+          "stream keys are never persisted in settings JSON");
     Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&
               second.Get().avatar.selectedPath == "/sdcard/Download/Black Heart.vrm" &&
               second.Get().avatar.maximumTextureDimension == 512 &&
@@ -179,6 +237,8 @@ int main() {
     Check(!migration.Get().recording.gameplayOnly, "older settings migrate to continuous recording by default");
     Check(!migration.Get().recording.controllerShortcutEnabled,
           "older settings migrate with the controller shortcut disabled");
+    Check(!migration.Get().recording.worldControlsVisible,
+          "older settings migrate with movable recording controls disabled");
 
     Write(path, R"({"schemaVersion":1,"camera":{"fovDegrees":"invalid","requestedWidth":1281},"chat":{"enabled":"invalid"}})");
     SettingsService wrongTypes(path);

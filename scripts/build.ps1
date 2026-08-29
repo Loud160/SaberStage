@@ -7,9 +7,14 @@ $qpm = 'C:\Users\Owner\AppData\Local\Programs\QPM\qpm.exe'
 $ndk = 'C:\Users\Owner\AppData\Roaming\QPM-RS\ndk\android-ndk-r27d'
 $cmake = 'C:\Users\Owner\AppData\Local\SaberStage\tools\cmake\cmake\data\bin\cmake.exe'
 $ninja = 'C:\Users\Owner\AppData\Local\Programs\QPM\ninja.exe'
+$ffmpegReady = Join-Path $repo '.cache\dependencies\ffmpeg-hardware\saberstage-ffmpeg-9.0.1.ready'
 
 Push-Location $repo
 try {
+    if (-not (Test-Path -LiteralPath $ffmpegReady)) {
+        & (Join-Path $PSScriptRoot 'build-ffmpeg-hardware.ps1')
+        if ($LASTEXITCODE -ne 0) { throw "private FFmpeg hardware runtime build failed with exit code $LASTEXITCODE" }
+    }
     & $qpm restore
     if ($LASTEXITCODE -ne 0) { throw "qpm restore failed with exit code $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $ndk)) { throw "Android NDK r27d not found at $ndk" }

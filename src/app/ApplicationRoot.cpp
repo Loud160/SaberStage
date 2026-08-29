@@ -12,6 +12,12 @@
 namespace saberstage::app {
 namespace {
 
+// Match the Meta Quest system recorder so finished SaberStage captures appear
+// in the same headset folder users already recognize and can browse without
+// entering Beat Saber's ModData tree. SaberStage's filename prefix keeps its
+// captures distinguishable from recordings made by the system recorder.
+const std::filesystem::path kQuestVideoShotsDirectory{"/sdcard/Oculus/VideoShots"};
+
 avatar::Pose AvatarOffsetPose(const settings::AvatarControllerOffsetSettings& offset) {
     constexpr float degreesToRadians = 0.01745329251994329577F;
     const auto pitch = avatar::AxisAngle({1.0F, 0.0F, 0.0F}, offset.rotationDegrees.x * degreesToRadians);
@@ -56,12 +62,14 @@ bool ApplicationRoot::Start() {
     }
 
     recording_ = std::make_unique<recording::RecordingController>(
-        settings_, *camera_, settings_.Path().parent_path() / "Recordings");
+        settings_, *camera_, kQuestVideoShotsDirectory);
 
     // Avatar support is additive. A failure in the new framework must never
     // take the already-working camera, preview, or recording controls down
     // with it while avatar integration is still under development.
-    avatar_ = std::make_unique<avatar::AvatarManager>(*camera_);
+    avatar_ = std::make_unique<avatar::AvatarManager>(
+        *camera_,
+        settings_.Path().parent_path() / "PlayerCalibration.json");
     if (!avatar_->Start()) {
         Logging::Logger.error(
             "Avatar manager failed to start; camera and recording remain available");

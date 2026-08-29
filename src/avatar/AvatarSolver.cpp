@@ -207,9 +207,21 @@ float StateDeltaSeconds(
 float UpdateBodyYaw(
     const TrackingSample& tracking,
     const PlayerCalibration& player,
+    const calibration::RuntimePlayerProfile& profile,
     float deltaSeconds,
     SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
+    const auto softNeckConeDegrees = profile.valid
+        ? profile.turn.softNeckConeDegrees : tuning.softNeckConeDegrees;
+    const auto hardNeckConeDegrees = profile.valid
+        ? Clamp(profile.turn.softNeckConeDegrees + 27.0F, 48.0F, 68.0F)
+        : tuning.hardNeckConeDegrees;
+    const auto turnDwellSeconds = profile.valid
+        ? profile.turn.turnDwellSeconds : tuning.turnDwellSeconds;
+    const auto settleHoldSeconds = profile.valid
+        ? profile.turn.settleHoldSeconds : tuning.settleHoldSeconds;
+    const auto normalTurnRate = profile.valid
+        ? profile.turn.bodyYawDegreesPerSecond : tuning.normalTorsoYawDegreesPerSecond;
     const auto neutralBodyYaw = YawFromDirection(player.neutralForward);
     const auto neutralHeadYaw = YawFromRotation(player.neutralHead.rotation);
     const auto currentHeadYaw = YawFromRotation(tracking.head.pose.rotation);
@@ -219,12 +231,12 @@ float UpdateBodyYaw(
     const auto headSpeedDegrees = Length(tracking.head.angularVelocity) * kRadiansToDegrees;
 
     if (state.bodyYawState == BodyYawState::Locked) {
-        if (errorDegrees >= tuning.hardNeckConeDegrees) {
+        if (errorDegrees >= hardNeckConeDegrees) {
             state.bodyYawState = BodyYawState::Turning;
             state.turnDwellSeconds = 0.0F;
-        } else if (errorDegrees >= tuning.softNeckConeDegrees) {
+        } else if (errorDegrees >= softNeckConeDegrees) {
             state.turnDwellSeconds += deltaSeconds;
-            if (state.turnDwellSeconds >= tuning.turnDwellSeconds) {
+            if (state.turnDwellSeconds >= turnDwellSeconds) {
                 state.bodyYawState = BodyYawState::Turning;
                 state.turnDwellSeconds = 0.0F;
             }
@@ -235,7 +247,7 @@ float UpdateBodyYaw(
             // degree turn back toward the note highway.
             if (std::abs(AngleDelta(neutralBodyYaw, state.torsoYawAnchorRadians)) * kRadiansToDegrees <=
                     tuning.gameplayPriorConeDegrees &&
-                errorDegrees < tuning.softNeckConeDegrees) {
+                errorDegrees < softNeckConeDegrees) {
                 state.torsoYawAnchorRadians = MoveTowardsAngle(
                     state.torsoYawAnchorRadians,
                     neutralBodyYaw,
@@ -251,10 +263,10 @@ float UpdateBodyYaw(
             tuning.residualNeckDegrees * kDegreesToRadians,
             yawError);
         const auto target = WrapRadians(headYaw - residual);
-        const auto emergency = std::abs(yawError) * kRadiansToDegrees >= tuning.hardNeckConeDegrees;
+        const auto emergency = std::abs(yawError) * kRadiansToDegrees >= hardNeckConeDegrees;
         const auto rate = (emergency
             ? tuning.emergencyTorsoYawDegreesPerSecond
-            : tuning.normalTorsoYawDegreesPerSecond) * kDegreesToRadians;
+            : normalTurnRate) * kDegreesToRadians;
         state.torsoYawRadians = MoveTowardsAngle(state.torsoYawRadians, target, rate * deltaSeconds);
         yawError = AngleDelta(state.torsoYawRadians, headYaw);
         if (std::abs(yawError) * kRadiansToDegrees <= tuning.settleConeDegrees) {
@@ -265,19 +277,19 @@ float UpdateBodyYaw(
 
     if (state.bodyYawState == BodyYawState::Settling) {
         yawError = AngleDelta(state.torsoYawRadians, headYaw);
-        if (std::abs(yawError) * kRadiansToDegrees > tuning.softNeckConeDegrees) {
+        if (std::abs(yawError) * kRadiansToDegrees > softNeckConeDegrees) {
             state.bodyYawState = BodyYawState::Turning;
             state.settleSeconds = 0.0F;
         } else {
             state.torsoYawRadians = MoveTowardsAngle(
                 state.torsoYawRadians,
                 headYaw,
-                tuning.normalTorsoYawDegreesPerSecond * 0.55F * kDegreesToRadians * deltaSeconds);
+                normalTurnRate * 0.55F * kDegreesToRadians * deltaSeconds);
             yawError = AngleDelta(state.torsoYawRadians, headYaw);
             if (std::abs(yawError) * kRadiansToDegrees <= tuning.settleConeDegrees &&
                 headSpeedDegrees <= tuning.settleHeadSpeedDegreesPerSecond) {
                 state.settleSeconds += deltaSeconds;
-                if (state.settleSeconds >= tuning.settleHoldSeconds) {
+                if (state.settleSeconds >= settleHoldSeconds) {
                     state.bodyYawState = BodyYawState::Locked;
                     state.torsoYawAnchorRadians = state.torsoYawRadians;
                     state.turnDwellSeconds = 0.0F;
@@ -292,10 +304,46 @@ float UpdateBodyYaw(
     return AngleDelta(state.torsoYawRadians, headYaw);
 }
 
+float HeadRollRadians(Quaternion rotation) noexcept {
+    const auto up = Rotate(rotation, {0.0F, 1.0F, 0.0F});
+    return std::atan2(-up.x, up.y);
+}
+
+float HeadPitchRadians(Quaternion rotation) noexcept {
+    const auto forward = Rotate(rotation, {0.0F, 0.0F, 1.0F});
+    return std::asin(Clamp(-forward.y, -1.0F, 1.0F));
+}
+
+int MotionDirection(float lateral, float forward) noexcept {
+    if (std::abs(lateral) >= std::abs(forward)) return lateral < 0.0F ? 0 : 1;
+    return forward >= 0.0F ? 2 : 3;
+}
+
+float SignatureSimilarity(
+    const calibration::DirectionalMotionSignature& signature,
+    float displacement,
+    float midpoint,
+    float speed,
+    float tilt,
+    float persistence) noexcept {
+    if (signature.confidence <= 0.0F) return 0.0F;
+    const auto Similarity = [](float value, float reference, float minimumScale) noexcept {
+        const auto scale = std::max(std::abs(reference), minimumScale);
+        return 1.0F - Saturate(std::abs(value - reference) / (scale * 1.5F));
+    };
+    return signature.confidence * (
+        Similarity(displacement, signature.peakDisplacementNormalized, 0.035F) * 0.30F +
+        Similarity(midpoint, signature.controllerMidpointNormalized, 0.025F) * 0.20F +
+        Similarity(speed, signature.peakSpeedNormalized, 0.08F) * 0.15F +
+        Similarity(tilt, signature.headTiltRadians, 0.08F) * 0.15F +
+        Similarity(persistence, 1.0F - signature.returnFraction, 0.20F) * 0.20F);
+}
+
 Pose EstimatePelvis(
     const TrackingSample& tracking,
     const AvatarCalibration& avatar,
     const PlayerCalibration& player,
+    const calibration::RuntimePlayerProfile& profile,
     Pose headTarget,
     Pose neutralPelvis,
     float deltaSeconds,
@@ -307,27 +355,95 @@ Pose EstimatePelvis(
     const auto bodyForward = Vec3{std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
     const auto bodyRight = Vec3{std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
     const auto spineReach = SpineLength(avatar, scale);
-    const auto maximumLateralLean = std::max(
+    const auto hardMaximumLateralLean = std::max(
         legReach * 0.045F,
         std::min({
             legReach * tuning.leanRadiusLegFraction,
             spineReach * tuning.maximumLateralLeanSpineFraction,
             avatar.shoulderWidth * scale * tuning.maximumLateralLeanShoulderFraction,
             eyeHeight * tuning.maximumLateralLeanEyeFraction}));
-    const auto maximumForwardLean = std::max(
+    const auto hardMaximumForwardLean = std::max(
         legReach * 0.06F,
         std::min(spineReach * 0.23F, eyeHeight * 0.13F));
 
     const auto horizontalHeadTranslation = Horizontal(tracking.head.pose.position - player.neutralHead.position);
+    const auto preliminaryLateral = Dot(horizontalHeadTranslation - state.bodyTranslation, bodyRight);
+    const auto preliminaryForward = Dot(horizontalHeadTranslation - state.bodyTranslation, bodyForward);
+    const auto lateralBoundary = profile.valid
+        ? eyeHeight * profile.leanBoundaryNormalized[preliminaryLateral < 0.0F ? 0 : 1]
+        : hardMaximumLateralLean;
+    const auto forwardBoundary = profile.valid
+        ? eyeHeight * profile.leanBoundaryNormalized[preliminaryForward >= 0.0F ? 2 : 3]
+        : hardMaximumForwardLean;
+    const auto maximumLateralLean = std::max(
+        legReach * 0.035F,
+        std::min(hardMaximumLateralLean, lateralBoundary));
+    const auto maximumForwardLean = std::max(
+        legReach * 0.045F,
+        std::min(hardMaximumForwardLean, forwardBoundary));
     auto relativeLean = horizontalHeadTranslation - state.bodyTranslation;
     const auto heightLoss = std::max(0.0F, player.neutralHead.position.y - tracking.head.pose.position.y);
     const auto suppressTranslation =
         heightLoss > eyeHeight * tuning.verticalMotionTranslationSuppressionEyeFraction;
-    const auto translationStart = legReach * tuning.translationStartLegFraction;
+    const auto controllerMidpoint = (tracking.leftHand.pose.position + tracking.rightHand.pose.position) * 0.5F;
+    const auto neutralControllerMidpoint = (player.neutralHand[0].position + player.neutralHand[1].position) * 0.5F;
+    const auto controllerTranslation = Horizontal(controllerMidpoint - neutralControllerMidpoint - state.bodyTranslation);
+    const auto lateral = Dot(relativeLean, bodyRight);
+    const auto forward = Dot(relativeLean, bodyForward);
+    const auto normalizedLateral = lateral / std::max(
+        eyeHeight * profile.leanBoundaryNormalized[lateral < 0.0F ? 0 : 1], kEpsilon);
+    const auto normalizedForward = forward / std::max(
+        eyeHeight * profile.leanBoundaryNormalized[forward >= 0.0F ? 2 : 3], kEpsilon);
+    state.leanEnvelopeUtilization = profile.valid
+        ? std::sqrt(normalizedLateral * normalizedLateral + normalizedForward * normalizedForward)
+        : Length(relativeLean) / std::max(legReach * tuning.translationStartLegFraction, kEpsilon);
+    const auto displacementNormalized = Length(relativeLean) / eyeHeight;
+    const auto midpointNormalized = Length(controllerTranslation) / eyeHeight;
+    const auto speedNormalized = Length(Horizontal(tracking.head.linearVelocity)) / eyeHeight;
+    const auto direction = MotionDirection(lateral, forward);
+    const auto tilt = direction < 2
+        ? std::abs(HeadRollRadians(tracking.head.pose.rotation) - HeadRollRadians(player.neutralHead.rotation))
+        : std::abs(HeadPitchRadians(tracking.head.pose.rotation) - HeadPitchRadians(player.neutralHead.rotation));
+    if (displacementNormalized > 0.012F) state.motionDisplacementSeconds += deltaSeconds;
+    else state.motionDisplacementSeconds = std::max(0.0F, state.motionDisplacementSeconds - deltaSeconds * 3.0F);
+    const auto persistence = Saturate(state.motionDisplacementSeconds / 0.28F);
+    for (int index = 0; index < 4; ++index) {
+        state.stepSimilarity[index] = profile.valid ? SignatureSimilarity(
+            profile.stepSignature[index],
+            displacementNormalized,
+            midpointNormalized,
+            speedNormalized,
+            tilt,
+            persistence) : 0.0F;
+    }
+    const auto leanSimilarity = profile.valid ? SignatureSimilarity(
+        profile.leanSignature[direction],
+        displacementNormalized,
+        midpointNormalized,
+        speedNormalized,
+        tilt,
+        1.0F - persistence) : 0.0F;
+    const auto stepSimilarity = state.stepSimilarity[direction];
+    const auto rawLeanConfidence = profile.valid
+        ? Saturate((1.15F - state.leanEnvelopeUtilization) * 0.65F + leanSimilarity * 0.55F - stepSimilarity * 0.25F)
+        : Saturate(1.0F - state.leanEnvelopeUtilization);
+    const auto rawTranslationConfidence = profile.valid
+        ? Saturate((state.leanEnvelopeUtilization - 0.58F) * 0.85F + persistence * 0.30F +
+            midpointNormalized / 0.10F * 0.18F + stepSimilarity * 0.65F - leanSimilarity * 0.25F)
+        : Saturate(state.leanEnvelopeUtilization - 0.65F);
+    state.leanConfidence = Smooth(state.leanConfidence, rawLeanConfidence, deltaSeconds, 0.06F);
+    state.translationConfidence = Smooth(
+        state.translationConfidence, rawTranslationConfidence, deltaSeconds, 0.06F);
+
+    const auto translationStart = profile.valid
+        ? std::max(eyeHeight * 0.025F, std::min(maximumLateralLean, maximumForwardLean) * 0.62F)
+        : legReach * tuning.translationStartLegFraction;
     const auto predictedHeadTranslation = horizontalHeadTranslation + ClampMagnitude(
         Horizontal(tracking.head.linearVelocity) * tuning.supportPredictionSeconds,
         legReach * tuning.maximumMovementLeadLegFraction);
-    if (!suppressTranslation && Length(predictedHeadTranslation - state.bodyTranslation) > translationStart) {
+    if (!suppressTranslation &&
+        (Length(predictedHeadTranslation - state.bodyTranslation) > translationStart ||
+         (profile.valid && state.translationConfidence > 0.48F))) {
         state.translationDwellSeconds += deltaSeconds;
     } else {
         state.translationDwellSeconds = std::max(0.0F, state.translationDwellSeconds - deltaSeconds * 2.0F);
@@ -342,7 +458,8 @@ Pose EstimatePelvis(
     const auto hardLimitExceeded = Length(relativeLean - constrainedLean) > kEpsilon;
     auto desiredBodyTranslation = state.bodyTranslation;
     if (!suppressTranslation &&
-        (state.translationDwellSeconds >= tuning.translationDwellSeconds || hardLimitExceeded)) {
+        (state.translationDwellSeconds >= (profile.valid ? 0.035F : tuning.translationDwellSeconds) ||
+         hardLimitExceeded || (profile.valid && state.translationConfidence > 0.62F))) {
         desiredBodyTranslation = horizontalHeadTranslation - constrainedLean;
     }
     const auto previousTranslation = state.bodyTranslation;
@@ -372,9 +489,15 @@ Pose EstimatePelvis(
 
     const auto heightRise = std::max(0.0F, tracking.head.pose.position.y - player.neutralHead.position.y);
     const auto forwardDisplacement = std::max(0.0F, Dot(relativeLean, bodyForward));
-    const auto crouchSignal = Saturate(heightLoss / (eyeHeight * tuning.crouchHeightEyeFraction));
+    const auto crouchHeightFraction = profile.valid && profile.crouch.squatConfidence > 0.0F
+        ? Clamp(profile.crouch.squatDropNormalized * 1.15F, 0.20F, 0.40F)
+        : tuning.crouchHeightEyeFraction;
+    const auto crouchSignal = Saturate(heightLoss / (eyeHeight * crouchHeightFraction));
+    const auto forwardBendFraction = profile.valid && profile.crouch.duckConfidence > 0.0F
+        ? Clamp(profile.crouch.duckForwardNormalized, 0.08F, 0.24F)
+        : tuning.forwardBendEyeFraction;
     const auto bendBlend = crouchSignal > 0.0F
-        ? Saturate(forwardDisplacement / (eyeHeight * tuning.forwardBendEyeFraction))
+        ? Saturate(forwardDisplacement / (eyeHeight * forwardBendFraction))
         : 0.0F;
     const auto targetCrouch = crouchSignal * (1.0F - 0.65F * bendBlend);
     state.crouchAmount = Smooth(state.crouchAmount, targetCrouch, deltaSeconds, 0.08F);
@@ -488,8 +611,11 @@ void SolveArm(
     int side,
     const AvatarCalibration& avatar,
     float scale,
+    float playerHeight,
+    const calibration::RuntimePlayerProfile& profile,
     Pose chest,
     Pose handTarget,
+    Quaternion sourceToCanonicalHand,
     bool handFromSaberGrip,
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
@@ -503,11 +629,22 @@ void SolveArm(
 
     const auto& tuning = kDefaultBodySolverTuning;
     auto shoulder = Has(avatar, shoulderBone) ? Solved(output, shoulderBone).position : Solved(output, upperBone).position;
-    const auto upperArmLength = avatar.upperArmLength[side] * scale;
-    const auto lowerArmLength = avatar.lowerArmLength[side] * scale;
+    const auto measuredArmLength =
+        (avatar.upperArmLength[side] + avatar.lowerArmLength[side]) * scale;
+    const auto calibratedReach = profile.valid
+        ? profile.effectiveReachNormalized[side] * playerHeight
+        : measuredArmLength;
+    const auto calibratedCompensation = profile.valid
+        ? Clamp(calibratedReach / std::max(measuredArmLength, kEpsilon), 1.0F, tuning.maximumArmStretchFraction)
+        : 1.0F;
+    const auto upperArmLength = avatar.upperArmLength[side] * scale * calibratedCompensation;
+    const auto lowerArmLength = avatar.lowerArmLength[side] * scale * calibratedCompensation;
     const auto armLength = upperArmLength + lowerArmLength;
     const auto initialReach = Length(handTarget.position - shoulder);
-    const auto shoulderAssistStart = armLength * tuning.shoulderAssistStartReachRatio;
+    const auto shoulderAssistStart = armLength * (profile.valid
+        ? std::max(0.84F, tuning.shoulderAssistStartReachRatio -
+            std::max(0.0F, calibratedReach / std::max(measuredArmLength, kEpsilon) - 1.0F) * 0.25F)
+        : tuning.shoulderAssistStartReachRatio);
     const auto maximumClavicle = avatar.shoulderWidth * scale * tuning.maximumShoulderAssistWidthFraction;
     const auto shoulderAssist = std::min(
         std::max(0.0F, initialReach - shoulderAssistStart),
@@ -567,9 +704,20 @@ void SolveArm(
         state.gripToHandRotationValid[side] &&
         state.previousHandWasSaberGrip[side] != handFromSaberGrip;
     if (!state.gripToHandRotationValid[side] || handSourceChanged) {
-        state.gripToHandRotation[side] = Multiply(
-            Inverse(handTarget.rotation),
-            anatomicalHandRotation);
+        if (profile.valid) {
+            const auto canonicalRest = FromToRotation(
+                {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F},
+                Normalize(neutralHand.position - neutralLower.position,
+                    {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F}));
+            const auto canonicalToAvatar = Multiply(Inverse(canonicalRest), neutralHand.rotation);
+            state.gripToHandRotation[side] = Multiply(
+                sourceToCanonicalHand,
+                canonicalToAvatar);
+        } else {
+            state.gripToHandRotation[side] = Multiply(
+                Inverse(handTarget.rotation),
+                anatomicalHandRotation);
+        }
         state.gripToHandRotationValid[side] = true;
     }
     if (handSourceChanged) {
@@ -627,6 +775,9 @@ void SolveArm(
         diagnostics->gripToHandRotation[side] = state.gripToHandRotation[side];
         diagnostics->handTargetFromSaberGrip[side] = handFromSaberGrip;
         diagnostics->finalHand[side] = hand;
+        diagnostics->calibratedGripResidualDegrees[side] = profile.gripResidualDegrees[side];
+        diagnostics->calibratedEffectiveReachRatio[side] =
+            calibratedReach / std::max(measuredArmLength, kEpsilon);
     }
 }
 
@@ -855,6 +1006,15 @@ StepRequest EvaluateStepRequest(
         ConsiderStepReason(
             request,
             translationError / std::max(legReach * tuning.translationStartLegFraction, kEpsilon),
+            StepReason::Translation);
+    }
+    if (!stationaryCrouch && state.translationConfidence > 0.50F) {
+        const auto directionalSimilarity = std::max(
+            state.stepSimilarity[side],
+            std::max(state.stepSimilarity[2], state.stepSimilarity[3]) * 0.75F);
+        ConsiderStepReason(
+            request,
+            state.translationConfidence * (0.85F + directionalSimilarity * 0.65F),
             StepReason::Translation);
     }
     return request;
@@ -1162,7 +1322,10 @@ bool PersistentStateFinite(const SolverPersistentState& state) noexcept {
         !IsFinite(state.forwardHingeAmount) || !IsFinite(state.lateralLeanMeters) ||
         !IsFinite(state.pelvisSupportOffset) || !IsFinite(state.predictedSupportMargin) ||
         !IsFinite(state.maximumSupportOffset) ||
-        !IsFinite(state.translationDwellSeconds) || !IsFinite(state.doubleSupportSeconds) ||
+        !IsFinite(state.translationDwellSeconds) || !IsFinite(state.motionDisplacementSeconds) ||
+        !IsFinite(state.leanConfidence) || !IsFinite(state.translationConfidence) ||
+        !IsFinite(state.leanEnvelopeUtilization) || !IsFinite(state.previousControllerMidpoint) ||
+        !IsFinite(state.doubleSupportSeconds) ||
         !IsFinite(state.airborneEvidenceSeconds) || !IsFinite(state.landingEvidenceSeconds)) {
         return false;
     }
@@ -1188,6 +1351,9 @@ bool PersistentStateFinite(const SolverPersistentState& state) noexcept {
             return false;
         }
     }
+    for (float similarity : state.stepSimilarity) {
+        if (!IsFinite(similarity)) return false;
+    }
     return true;
 }
 
@@ -1211,6 +1377,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const TrackingSample& tracking,
     const AvatarCalibration& avatar,
     const PlayerCalibration& player,
+    const calibration::RuntimePlayerProfile& profile,
     SolverPersistentState& state,
     SolvedHumanoidPose& output,
     SolverDiagnostics* diagnostics) const noexcept {
@@ -1247,17 +1414,35 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto eyeToHead = RelativeTo(player.neutralHead, neutralHeadBone);
     const auto headToEye = RelativeTo(neutralHeadBone, player.neutralHead);
     const auto headTarget = Compose(tracking.head.pose, eyeToHead);
-    const auto leftHandTarget = tracking.handIsSaberGrip[0]
-        ? tracking.leftHand.pose
-        : Compose(tracking.leftHand.pose, player.controllerToWrist[0]);
-    const auto rightHandTarget = tracking.handIsSaberGrip[1]
-        ? tracking.rightHand.pose
-        : Compose(tracking.rightHand.pose, player.controllerToWrist[1]);
-    const auto yawError = UpdateBodyYaw(tracking, player, deltaSeconds, state);
+    Pose handTarget[2]{};
+    Quaternion sourceToCanonicalHand[2]{};
+    for (int side = 0; side < 2; ++side) {
+        const auto& authoritative = side == 0 ? tracking.leftHand : tracking.rightHand;
+        const auto& controller = tracking.controllerHand[side].valid
+            ? tracking.controllerHand[side] : authoritative;
+        if (tracking.handIsSaberGrip[side]) {
+            handTarget[side] = authoritative.pose;
+            sourceToCanonicalHand[side] = profile.gripFitUsesSaber[side]
+                ? profile.gripToCanonicalHand[side]
+                : Multiply(
+                    Inverse(authoritative.pose.rotation),
+                    Multiply(controller.pose.rotation, profile.gripToCanonicalHand[side]));
+        } else {
+            const auto controllerToTarget = profile.valid && profile.controllerToGripObserved[side]
+                ? profile.controllerToGrip[side]
+                : player.controllerToWrist[side];
+            handTarget[side] = Compose(authoritative.pose, controllerToTarget);
+            sourceToCanonicalHand[side] = profile.gripFitUsesSaber[side]
+                ? profile.gripToCanonicalHand[side]
+                : Multiply(Inverse(controllerToTarget.rotation), profile.gripToCanonicalHand[side]);
+        }
+    }
+    const auto yawError = UpdateBodyYaw(tracking, player, profile, deltaSeconds, state);
     auto pelvis = EstimatePelvis(
         tracking,
         avatar,
         player,
+        profile,
         headTarget,
         Solved(neutralPose, HumanoidBone::Hips),
         deltaSeconds,
@@ -1357,10 +1542,12 @@ bool StaticTrackerlessAvatarSolver::Solve(
     // The proven head/hand targets and analytic arm path remain direct. Lower
     // body inference is solved around these targets, never by filtering them.
     SolveArm(
-        0, avatar, scale, Solved(output, chestBone), leftHandTarget,
+        0, avatar, scale, player.standingHmdHeight, profile, Solved(output, chestBone), handTarget[0],
+        sourceToCanonicalHand[0],
         tracking.handIsSaberGrip[0], neutralPose, output, state, diagnostics);
     SolveArm(
-        1, avatar, scale, Solved(output, chestBone), rightHandTarget,
+        1, avatar, scale, player.standingHmdHeight, profile, Solved(output, chestBone), handTarget[1],
+        sourceToCanonicalHand[1],
         tracking.handIsSaberGrip[1], neutralPose, output, state, diagnostics);
 
     const auto neutralHips = Solved(neutralPose, HumanoidBone::Hips);
@@ -1410,8 +1597,8 @@ bool StaticTrackerlessAvatarSolver::Solve(
         diagnostics->hmdTarget = tracking.head.pose;
         diagnostics->avatarEye = Compose(headTarget, headToEye);
         diagnostics->headTarget = headTarget;
-        diagnostics->handTarget[0] = leftHandTarget;
-        diagnostics->handTarget[1] = rightHandTarget;
+        diagnostics->handTarget[0] = handTarget[0];
+        diagnostics->handTarget[1] = handTarget[1];
         diagnostics->pelvis = Solved(output, HumanoidBone::Hips);
         diagnostics->bodyYawState = state.bodyYawState;
         diagnostics->bodyMode = state.bodyMode;
@@ -1426,6 +1613,29 @@ bool StaticTrackerlessAvatarSolver::Solve(
         diagnostics->maximumSupportOffset = state.maximumSupportOffset;
         diagnostics->bodyTranslationAmount = Length(state.bodyTranslation);
         diagnostics->bodyTranslation = state.bodyTranslation;
+        diagnostics->playerProfileValid = profile.valid;
+        diagnostics->playerProfileConfidence = profile.overallConfidence;
+        diagnostics->leanConfidence = state.leanConfidence;
+        diagnostics->translationConfidence = state.translationConfidence;
+        diagnostics->leanEnvelopeUtilization = state.leanEnvelopeUtilization;
+        for (int direction = 0; direction < 4; ++direction) {
+            diagnostics->stepSimilarity[direction] = state.stepSimilarity[direction];
+        }
+        diagnostics->bodyTurnConfidence = profile.valid
+            ? Saturate(std::abs(yawError) * kRadiansToDegrees /
+                std::max(profile.turn.softNeckConeDegrees, 1.0F))
+            : 0.0F;
+        diagnostics->motionClassification = state.crouchAmount > 0.20F
+            ? (state.forwardHingeAmount > state.crouchAmount * 0.45F
+                ? MotionClassification::Duck : MotionClassification::Crouch)
+            : (state.bodyYawState == BodyYawState::Turning
+                ? MotionClassification::Turn
+                : (state.leanEnvelopeUtilization < 0.12F &&
+                        state.translationConfidence < 0.20F
+                    ? MotionClassification::Unknown
+                    : (state.translationConfidence > state.leanConfidence
+                        ? MotionClassification::Translation
+                        : MotionClassification::Lean)));
         diagnostics->eyeTargetError = Length(
             diagnostics->avatarEye.position - tracking.head.pose.position);
         diagnostics->neckToHeadVector = Solved(output, HumanoidBone::Head).position -
@@ -1435,6 +1645,17 @@ bool StaticTrackerlessAvatarSolver::Solve(
         diagnostics->solveCountThisFrame = state.solvesThisFrame;
     }
     return true;
+}
+
+bool StaticTrackerlessAvatarSolver::Solve(
+    const TrackingSample& tracking,
+    const AvatarCalibration& avatar,
+    const PlayerCalibration& player,
+    SolverPersistentState& state,
+    SolvedHumanoidPose& output,
+    SolverDiagnostics* diagnostics) const noexcept {
+    static constexpr calibration::RuntimePlayerProfile genericProfile{};
+    return Solve(tracking, avatar, player, genericProfile, state, output, diagnostics);
 }
 
 } // namespace saberstage::avatar

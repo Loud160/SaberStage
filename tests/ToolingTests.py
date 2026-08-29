@@ -24,7 +24,11 @@ SPEC.loader.exec_module(QUEST_TOOL)
 class FakeAdb:
     def __init__(self, receipt=None, remote_hash=None):
         self.receipt = copy.deepcopy(receipt)
-        self.remote_hash = remote_hash
+        self.remote_hashes = (
+            dict(remote_hash)
+            if isinstance(remote_hash, dict)
+            else ({QUEST_TOOL.REMOTE_LIBRARY: remote_hash} if remote_hash is not None else {})
+        )
         self.receipt_writes = []
         self.pushes = []
         self.shell_commands = []
@@ -34,8 +38,9 @@ class FakeAdb:
         return copy.deepcopy(self.receipt)
 
     def hash(self, remote):
-        self.assert_path(remote, QUEST_TOOL.REMOTE_LIBRARY)
-        return self.remote_hash
+        if remote not in {item[1] for item in QUEST_TOOL.deployment_payloads()}:
+            raise AssertionError(f"unexpected deployment path {remote!r}")
+        return self.remote_hashes.get(remote)
 
     def write_json(self, value, remote):
         self.assert_path(remote, QUEST_TOOL.RECEIPT)
@@ -43,9 +48,10 @@ class FakeAdb:
         self.receipt_writes.append(copy.deepcopy(value))
 
     def push(self, local, remote):
-        self.assert_path(remote, QUEST_TOOL.REMOTE_LIBRARY)
+        if remote not in {item[1] for item in QUEST_TOOL.deployment_payloads()}:
+            raise AssertionError(f"unexpected deployment path {remote!r}")
         self.pushes.append((pathlib.Path(local), remote))
-        self.remote_hash = hashlib.sha256(pathlib.Path(local).read_bytes()).hexdigest()
+        self.remote_hashes[remote] = hashlib.sha256(pathlib.Path(local).read_bytes()).hexdigest()
 
     def shell(self, command, check=True):
         self.shell_commands.append((command, check))
@@ -71,10 +77,15 @@ class ReceiptSafetyTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="saberstage-tool-tests-")
         self.previous_root = QUEST_TOOL.ROOT
         QUEST_TOOL.ROOT = pathlib.Path(self.temporary.name)
-        (QUEST_TOOL.ROOT / "build").mkdir()
-        self.library = QUEST_TOOL.ROOT / "build/libsaberstage.so"
-        self.library.write_bytes(b"SaberStage test library")
-        self.expected_hash = hashlib.sha256(self.library.read_bytes()).hexdigest()
+        self.payloads = QUEST_TOOL.deployment_payloads()
+        for index, (local, _) in enumerate(self.payloads):
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_bytes(f"SaberStage test payload {index}".encode())
+        self.library = self.payloads[0][0]
+        self.expected_hashes = {
+            remote: hashlib.sha256(local.read_bytes()).hexdigest()
+            for local, remote in self.payloads
+        }
 
     def tearDown(self):
         QUEST_TOOL.ROOT = self.previous_root
@@ -100,11 +111,21 @@ class ReceiptSafetyTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             QUEST_TOOL.deploy(adb)
         self.assertEqual([item["state"] for item in adb.receipt_writes], ["planned", "complete"])
-        self.assertEqual(adb.receipt_writes[-1]["installedSha256"], self.expected_hash)
-        self.assertEqual(adb.pushes, [(self.library, QUEST_TOOL.REMOTE_LIBRARY)])
+        self.assertEqual(adb.receipt_writes[-1]["schemaVersion"], 2)
+        self.assertEqual(
+            {item["path"]: item["installedSha256"] for item in adb.receipt_writes[-1]["files"]},
+            self.expected_hashes,
+        )
+        self.assertEqual(adb.pushes, list(self.payloads))
         commands = [command for command, _ in adb.shell_commands]
         self.assertEqual(commands[-2], f"am force-stop {QUEST_TOOL.PACKAGE}")
         self.assertEqual(commands[-1], f"monkey -p {QUEST_TOOL.PACKAGE} -c android.intent.category.LAUNCHER 1")
+
+    def test_deploy_can_verify_without_launching_game(self):
+        adb = FakeAdb()
+        with contextlib.redirect_stdout(io.StringIO()):
+            QUEST_TOOL.deploy(adb, launch=False)
+        self.assertEqual(adb.shell_commands, [])
 
     def test_remove_refuses_unreceipted_existing_library(self):
         adb = FakeAdb(receipt=None, remote_hash="unowned")
@@ -140,6 +161,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertEqual(template["name"], "SaberStage")
         self.assertEqual(template["author"], "Loud160 (AKA Whisp)")
         self.assertEqual(template["packageVersion"], "1.40.8_7379")
+        self.assertEqual(
+            set(template["libraryFiles"]),
+            {"libavformat-saberstage9.so", "libavcodec-saberstage9.so", "libavutil-saberstage9.so"},
+        )
         dependencies = {item["id"] for item in qpm["dependencies"]}
         self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types", "hollywood", "paper2_scotland2"} <= dependencies)
 
@@ -201,7 +226,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         main = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
         camera = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
         self.assertIn("Hollywood::CameraCapture", controller)
-        self.assertIn("Hollywood::AudioCapture", controller)
+        self.assertIn("RealtimeAudioCapture", controller)
+        self.assertIn("DirectFfmpegCapture", controller)
+        self.assertIn("MuxDirectFfmpegRecording", controller)
         self.assertIn("Hollywood::MuxFilesSync", controller)
         self.assertIn("RecordingState::Armed", controller)
         self.assertIn("settings_.Get().recording.gameplayOnly", controller)
@@ -224,9 +251,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn('"Stop & Save"', pause_menu)
         self.assertIn("PauseMenuManager_ShowMenu", main)
         self.assertIn("PauseMenuRecordingControls", main)
-        self.assertIn('"Record", "Files"', menu)
+        self.assertIn('"Record", "Live Stream", "Files"', menu)
         self.assertIn('"Gameplay Only"', menu)
-        self.assertIn("continuously through menus, songs, and results", menu)
+        self.assertIn("record menus, results, and songs continuously", menu)
         self.assertIn("externalOutputActive_", camera)
         self.assertIn("Keeping spectator encoder alive across scene transition", camera)
         self.assertIn("RefreshRuntimeCameraFromMain", camera)
@@ -257,8 +284,25 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn('CreateUIButton(recordPage, "Stop & Save"', menu)
         self.assertIn('CreateUIButton(recordPage, "Pause Recording"', menu)
         self.assertIn('CreateUIButton(recordPage, "Resume Recording"', menu)
-        self.assertIn("ConfigureLayout(active_->startRecordingButton_", menu)
-        self.assertIn("ConfigureLayout(active_->stopRecordingButton_", menu)
+        self.assertIn("ConfigureRightPanelButton(active_->startRecordingButton_", menu)
+        self.assertIn("ConfigureRightPanelButton(active_->stopRecordingButton_", menu)
+
+    def test_movable_recording_panel_is_compact_persistent_and_capture_excluded(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        settings = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
+        self.assertIn('"Floating Recording Controls"', menu)
+        self.assertIn('"▶"', menu)
+        self.assertIn('"Ⅱ"', menu)
+        self.assertIn('"■"', menu)
+        self.assertIn("RecordingOutputTypeName(snapshot.outputType)", menu)
+        self.assertIn("RecordingElapsed(snapshot.elapsedSeconds)", menu)
+        self.assertIn("HideAndPlaceWorldPanelHandleInPadding", menu)
+        self.assertIn("kRecordingPanelBodySize", menu)
+        self.assertIn("RegisterCaptureExcludedRoot(screenObject)", menu)
+        self.assertNotIn("SaberStage Recording Grab Bar", menu)
+        self.assertIn('"worldControlsVisible"', settings)
+        self.assertIn('"worldControlsPosition"', settings)
+        self.assertIn('"worldControlsRotationDegrees"', settings)
 
     def test_avatar_is_mandatory_in_primary_camera_and_preview_uses_primary_output(self):
         profile = (ROOT / "src/camera/CameraProfile.cpp").read_text(encoding="utf-8")
@@ -285,8 +329,12 @@ class RepositoryInvariantTests(unittest.TestCase):
 
     def test_recording_retrieval_is_nondestructive_and_timestamped(self):
         tooling = (ROOT / "scripts/quest_tool.py").read_text(encoding="utf-8")
+        application = (ROOT / "src/app/ApplicationRoot.cpp").read_text(encoding="utf-8")
         self.assertIn('subparsers.add_parser("pull-recordings")', tooling)
-        self.assertIn("adb.pull(REMOTE_RECORDINGS, destination)", tooling)
+        self.assertIn('REMOTE_RECORDINGS = "/sdcard/Oculus/VideoShots"', tooling)
+        self.assertIn('kQuestVideoShotsDirectory{"/sdcard/Oculus/VideoShots"}', application)
+        self.assertIn("SaberStage_*.mp4", tooling)
+        self.assertIn("adb.pull(remote, destination / pathlib.PurePosixPath(remote).name)", tooling)
         self.assertNotIn("rm -rf", tooling)
 
     def test_recording_audio_ownership_does_not_retain_unity_wrappers_across_scenes(self):
@@ -298,7 +346,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("FindObjectsOfTypeAll<UnityEngine::AudioListener*>()", controller)
         self.assertIn("RestoreAudioListenerOwnership();", controller)
 
-    def test_spectator_camera_excludes_preview_and_transitional_ui_surfaces(self):
+    def test_spectator_camera_keeps_popout_visible_but_excludes_docked_preview(self):
         camera = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
         profile = (ROOT / "include/saberstage/camera/CameraProfile.hpp").read_text(encoding="utf-8")
         preview = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
@@ -316,15 +364,27 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("ImageEffectController", camera)
         self.assertIn("SetCaptureExcluded(excluded)", preview)
         self.assertIn("captureExclusionDepth_", preview)
-        self.assertIn("GetComponentsInChildren<UnityEngine::CanvasRenderer*>(true)", preview)
-        self.assertIn("renderer->set_cull(true)", preview)
-        self.assertIn("captureCullSnapshot_", preview)
-        self.assertIn("CreateWorldSpaceRawImage", preview)
-        self.assertIn("object->AddComponent<UnityEngine::UI::RawImage*>()", preview)
+        self.assertIn("cachedCaptureCanvasGroups_", preview)
+        self.assertIn("group->set_alpha(0.0F)", preview)
+        self.assertIn("captureCanvasGroupSnapshot_", preview)
+        self.assertIn("capturePreviewCullSnapshot_", preview)
+        self.assertIn("cullPreview(dockedImage_)", preview)
+        self.assertNotIn("cullPreview(floatingImage_)", preview)
+        self.assertNotIn("cacheRoot(floatingCaptureRoot_)", preview)
+        self.assertNotIn("UnityEngine::GameObject* floatingCaptureRoot_", preview)
+        self.assertIn("Canvas::ForceUpdateCanvases()", preview)
+        self.assertIn("renderer->set_cull(false)", preview)
+        self.assertIn("CreateWorldSpaceVideoSurface", preview)
+        self.assertIn("PublicRawImageTag{}.Create(parent)", preview)
+        self.assertIn("image->set_material(material)", preview)
+        self.assertIn("floatingImage_->set_texture(texture)", preview)
+        self.assertIn("floatingImage_->SetMaterialDirty()", preview)
+        self.assertNotIn("GameObject::CreatePrimitive(UnityEngine::PrimitiveType::Quad)", preview)
+        self.assertIn("GetComponentsInChildren<UnityEngine::MeshRenderer*>(true)", preview)
+        self.assertIn("captureMeshSnapshot_", preview)
         self.assertNotIn("dockedCaptureRoot_->SetActive(false)", preview)
         self.assertNotIn("floatingCaptureRoot_->SetActive(false)", preview)
-        self.assertNotIn('#include "UnityEngine/CanvasGroup.hpp"', preview)
-        self.assertNotIn("set_alpha(0.0F)", preview)
+        self.assertIn('#include "UnityEngine/CanvasGroup.hpp"', preview)
         self.assertNotIn("object->set_layer(kCaptureExcludedLayer)", preview)
         self.assertIn("RestoreCaptureRoots()", preview)
         self.assertIn('Shader::Find("Unlit/Texture")', preview)
@@ -348,6 +408,82 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("BSML::Helpers::GetDiContainer() != nullptr", source)
         self.assertIn("if (!existed && FloatingUiServicesReady()) CreateFloatingPreview();", source)
         self.assertIn("if (!FloatingUiServicesReady()) return;", source)
+
+    def test_calibration_wizard_uses_bigscreen_panel_and_is_review_gated(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        avatar = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
+        session = (ROOT / "src/avatar/calibration/PlayerCalibrationSession.cpp").read_text(encoding="utf-8")
+        self.assertIn('"SaberStage Player Calibration"', menu)
+        self.assertIn("HideAndFitCalibrationPanelHandleAboveControls", menu)
+        self.assertIn("calibrationPanelScreen_->set_HandleSide(BSML::Side::Top)", menu)
+        self.assertIn("calibrationPanelScreen_->set_HighlightHandle(false)", menu)
+        self.assertIn("a physics hit there wins over Unity's UI raycast", menu)
+        self.assertIn('"Recenter Panel",', menu)
+        self.assertIn('introductionActions->get_transform(), "Start Automatic"', menu)
+        self.assertIn('introductionActions->get_transform(), "Start Step-by-Step"', menu)
+        self.assertIn("WAITING FOR AVATAR TRACKING", menu)
+        self.assertIn("NATURAL READY POSE", menu)
+        self.assertIn("MOVE INTO THE POSE DURING THIS COUNTDOWN", menu)
+        self.assertIn("DO NOT MOVE DURING THIS COUNTDOWN", menu)
+        self.assertIn("MEASURING - HOLD STILL", menu)
+        self.assertIn("MEASURING - MOVE NOW", menu)
+        self.assertIn("calibrationPanelAutomaticStartButton_->set_interactable(trackingReady)", menu)
+        self.assertIn("calibrationPanelStepByStepStartButton_->set_interactable(trackingReady)", menu)
+        self.assertIn("IsPlayerCalibrationReady()", menu)
+        self.assertIn("Preparing only opens the explanatory calibration wizard", avatar)
+        self.assertIn('if (!bound_ || !trackingWasReady_) {\n            if (error) *error = "valid HMD/controller tracking is required to start calibration";', avatar)
+        self.assertIn('stepStartActions->get_transform(), "Start Step"', menu)
+        self.assertIn('continueActions->get_transform(), "Continue"', menu)
+        self.assertIn('reviewActions->get_transform(), "Complete"', menu)
+        self.assertIn(
+            'createActionContainer("SaberStage Calibration Review Actions", 2.0F)', menu)
+        self.assertIn("ConfigureCalibrationButton(reviewComplete, {30.0F, 7.0F})", menu)
+        self.assertIn("BSML::Lite::SetButtonTextSize(button, 3.4F)", menu)
+        self.assertIn("kCalibrationPanelScale", menu)
+        self.assertIn("ConfigureCalibrationPanelText", menu)
+        self.assertIn("const float contentWidth = kCalibrationPanelSize.x - 8.0F", menu)
+        self.assertIn("auto* rootLayout = BSML::Lite::CreateVerticalLayoutGroup(panelParent)", menu)
+        self.assertIn("NeutralizeContentSizeFitter(rootLayout)", menu)
+        self.assertIn("rootRect->set_sizeDelta(kCalibrationPanelSize)", menu)
+        self.assertIn("SaberStage \" VERSION \"  |  Build \" SABERSTAGE_BUILD_NUMBER", menu)
+        self.assertIn("calibrationPanelGeometryAuditFrames_ = 2", menu)
+        self.assertIn("LogCalibrationPanelGeometry()", menu)
+        self.assertIn("rootLayout->set_childControlWidth(true)", menu)
+        self.assertIn("ConfigureLayout(text, -1.0F, preferredHeight", menu)
+        self.assertNotIn('"SaberStage Calibration Content"', menu)
+        self.assertNotIn("curved->SetRadius(10000.0F)", menu)
+        self.assertNotIn("text->SetAllDirty()", menu)
+        self.assertIn("photographed single glyph and line-shaped button captions", menu)
+        self.assertNotIn("UpdateCalibrationPanelFollow", menu)
+        self.assertNotIn("kCalibrationPanelFollowSeconds", menu)
+        self.assertIn("horizontalHeadRotation", menu)
+        self.assertNotIn("headEuler.y + 180.0F", menu)
+        self.assertIn("transform->SetPositionAndRotation(targetPosition, targetRotation)", menu)
+        self.assertIn("PlayCalibrationClip(calibrationTickClip_)", avatar)
+        self.assertIn("PlayCalibrationClip(calibrationShutterClip_)", avatar)
+        self.assertIn("set_ignoreListenerPause(true)", avatar)
+        self.assertNotIn("PlayOneShot(calibration", avatar)
+        self.assertIn("status_.phase = CalibrationPhase::Review", session)
+        self.assertIn("status_.phase = CalibrationPhase::Introduction", session)
+        self.assertIn("status_.phase = CalibrationPhase::AwaitingStepStart", session)
+        self.assertIn("status_.phase = CalibrationPhase::AwaitingContinue", session)
+        self.assertIn("bool PlayerCalibrationSession::Complete", session)
+        self.assertLess(
+            session.index("bool PlayerCalibrationSession::Complete"),
+            session.index("SavePlayerCalibrationProfile(profilePath_, profile_"),
+        )
+
+    def test_recording_side_panel_overrides_center_panel_prefab_widths(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        self.assertIn("layout->set_preferredWidth(48.0F)", menu)
+        self.assertIn("ConfigureFullWidthRightPanelInput(active_->livestreamKeyInput_, 512)", menu)
+        self.assertIn('CreateRightPanelSubheader(livestreamPage->get_transform(), "Server Address")', menu)
+        self.assertIn('CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Key")', menu)
+        self.assertIn('"Show Stream Key"', menu)
+        self.assertIn("display.assign(display.size(), '*')", menu)
+        self.assertIn("rows->set_childForceExpandWidth(false)", menu)
+        self.assertIn("scroll->set_sizeDelta({-6.0F, -22.0F})", menu)
+        self.assertIn("ConfigureRightPanelButton(active_->startRecordingButton_)", menu)
 
     def test_development_launchers_are_present(self):
         expected = {

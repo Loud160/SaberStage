@@ -54,6 +54,8 @@ struct TrackingSample {
     TrackedPose head{};
     TrackedPose leftHand{};
     TrackedPose rightHand{};
+    TrackedPose controllerHand[2]{};
+    TrackedPose saberGrip[2]{};
     bool handIsSaberGrip[2]{};
     std::uint64_t sequence = 0;
     std::int32_t renderFrame = -1;
@@ -127,6 +129,15 @@ enum class BodyMode : std::uint8_t {
     Airborne,
 };
 
+enum class MotionClassification : std::uint8_t {
+    Unknown,
+    Lean,
+    Translation,
+    Crouch,
+    Duck,
+    Turn,
+};
+
 enum class StepReason : std::uint8_t {
     None,
     Support,
@@ -141,6 +152,7 @@ enum class StepReason : std::uint8_t {
 const char* BodyYawStateName(BodyYawState state) noexcept;
 const char* FootStateName(FootState state) noexcept;
 const char* BodyModeName(BodyMode mode) noexcept;
+const char* MotionClassificationName(MotionClassification classification) noexcept;
 const char* StepReasonName(StepReason reason) noexcept;
 
 struct FootPersistentState {
@@ -188,6 +200,13 @@ struct SolverPersistentState {
     float predictedSupportMargin = 0.0F;
     float maximumSupportOffset = 0.0F;
     float translationDwellSeconds = 0.0F;
+    float motionDisplacementSeconds = 0.0F;
+    float leanConfidence = 0.0F;
+    float translationConfidence = 0.0F;
+    float leanEnvelopeUtilization = 0.0F;
+    float stepSimilarity[4]{};
+    Vec3 previousControllerMidpoint{};
+    bool previousControllerMidpointValid = false;
     float doubleSupportSeconds = 0.0F;
     float airborneEvidenceSeconds = 0.0F;
     float landingEvidenceSeconds = 0.0F;
@@ -248,6 +267,16 @@ struct SolverDiagnostics {
     std::uint8_t spineSegmentDirectionCount = 0;
     float maximumSpineReversalDegrees = 0.0F;
     bool spineReversalWarning = false;
+    MotionClassification motionClassification = MotionClassification::Unknown;
+    bool playerProfileValid = false;
+    float playerProfileConfidence = 0.0F;
+    float leanConfidence = 0.0F;
+    float translationConfidence = 0.0F;
+    float leanEnvelopeUtilization = 0.0F;
+    float stepSimilarity[4]{};
+    float bodyTurnConfidence = 0.0F;
+    float calibratedGripResidualDegrees[2]{};
+    float calibratedEffectiveReachRatio[2]{};
     float stepProgress[2]{};
     float stepDuration[2]{};
     float legReach[2]{};

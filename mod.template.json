@@ -11,9 +11,13 @@
   "description": "Early-development clean-room Quest camera, avatar, recording, and broadcast foundation.",
   "isLibrary": false,
   "dependencies": [],
-  "modFiles": [],
-  "lateModFiles": ["${binary}"],
-  "libraryFiles": [],
+  "modFiles": ["${binary}"],
+  "lateModFiles": [],
+  "libraryFiles": [
+    "libavformat-saberstage9.so",
+    "libavcodec-saberstage9.so",
+    "libavutil-saberstage9.so"
+  ],
   "fileCopies": [],
   "copyExtensions": []
 }

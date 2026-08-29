@@ -1,5 +1,7 @@
 # Prompt 17 — Direct Quest livestream architecture and proof of concept
 
+> Implementation checkpoint: the right panel now has a functional `Live Stream` tab for Twitch, YouTube, Kick, and custom RTMP/RTMPS endpoints. `DirectLivestreamSink` uses bounded asynchronous queues, the required state machine, reconnect backoff, visible queue/drop health, session-only masked credentials, and a single Direct FFmpeg/MediaCodec H.264 encode shared with local safety recording. Host tests and the ARM64 build are required before deployment; 720p30/1080p30 service broadcasts, A/V sync, reconnect, certificate verification, memory, and gameplay cost still require explicit on-headset validation. Android Keystore persistence is intentionally not claimed; keys are currently never written to disk.
+
 Add direct livestreaming from the Quest without requiring a PC.
 
 Do not redesign or destabilize the completed companion Wi-Fi/USB architecture. This phase adds another bounded sink to the existing media fan-out.

@@ -51,7 +51,7 @@ Host inspection of the supplied Black Heart fixture found 24 material texture re
 
 Schema-6 settings that contain only the old `selectedFile` value retain a compatibility fallback under `/sdcard/ModData/com.beatgames.beatsaber/Mods/SaberStage/Avatars`. New selections use the absolute `selectedPath` field. Validation rejects relative paths, non-`.vrm` extensions, embedded nulls, and unreasonably long paths.
 
-`Load Rest Pose` constructs the selected file without IK so import, orientation, skinning, and materials can be judged independently. `Bind Solver` then passes its Animator through the existing binding seam. `Unload` releases it, `Visible` controls the avatar root, `Recalibrate Neutral` refreshes three-point calibration, and the expression buttons exercise morph binding. Successful selection is opt-in for later startup auto-load; a missing, unreadable, or rejected file never prevents camera, preview, or recording startup.
+`Load Avatar` constructs the selected file without IK so import, orientation, skinning, and materials can be judged independently. `Attach Tracking` then passes its Animator through the existing binding seam. `Unload Avatar` releases it, `Visible` controls the avatar root, `Resync Player Pose` refreshes the transient standing-height/floor/tracking reference without deleting the saved Basic or Advanced player profile, and the expression buttons exercise morph binding. Successful selection is opt-in for later startup auto-load; a missing, unreadable, or rejected file never prevents camera, preview, or recording startup.
 
 ## Cache recommendation
 

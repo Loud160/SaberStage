@@ -11,6 +11,8 @@
 #include "GlobalNamespace/Saber.hpp"
 #include "GlobalNamespace/VRController.hpp"
 #include "UnityEngine/Animator.hpp"
+#include "UnityEngine/AudioClip.hpp"
+#include "UnityEngine/AudioSource.hpp"
 #include "UnityEngine/Camera.hpp"
 #include "UnityEngine/GameObject.hpp"
 #include "UnityEngine/HumanBodyBones.hpp"
@@ -21,6 +23,7 @@
 #include "UnityEngine/Vector3.hpp"
 #include "UnityEngine/Quaternion.hpp"
 #include "beatsaber-hook/shared/utils/byref.hpp"
+#include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,6 +31,7 @@
 #include <cmath>
 #include <exception>
 #include <optional>
+#include <limits>
 #include <unordered_set>
 
 namespace saberstage::avatar {
@@ -59,6 +63,28 @@ bool TrackingOriginChanged(Pose previous, Pose current, float standingHeight) no
 
 bool IsAlive(UnityEngine::Object* object) noexcept {
     return object != nullptr && UnityEngine::Object::op_Inequality(object, nullptr);
+}
+
+template <typename Generator>
+UnityEngine::AudioClip* CreateCalibrationClip(
+    const char* name,
+    float durationSeconds,
+    Generator&& generator) {
+    constexpr int sampleRate = 48000;
+    const auto sampleCount = std::max(1, static_cast<int>(std::lround(durationSeconds * sampleRate)));
+    ArrayW<float> samples(static_cast<il2cpp_array_size_t>(sampleCount));
+    for (int index = 0; index < sampleCount; ++index) {
+        samples[static_cast<il2cpp_array_size_t>(index)] = std::clamp(
+            generator(static_cast<float>(index) / sampleRate), -0.95F, 0.95F);
+    }
+    auto clipReference = UnityEngine::AudioClip::Create(name, sampleCount, 1, sampleRate, false, false);
+    auto* clip = clipReference ? clipReference.ptr() : nullptr;
+    if (!IsAlive(clip) || !clip->SetData(samples, 0)) {
+        if (IsAlive(clip)) UnityEngine::Object::Destroy(clip);
+        return nullptr;
+    }
+    UnityEngine::Object::DontDestroyOnLoad(clip);
+    return clip;
 }
 
 struct UnityBoneMap {
@@ -158,7 +184,13 @@ std::optional<Pose> FirstPersonAnchor(const vrm::VrmUnityRuntime* runtime) noexc
 
 class AvatarManager::Impl final {
 public:
-    Impl(AvatarManager& owner, camera::CameraManager& camera) : owner_(owner), camera_(camera) {}
+    Impl(
+        AvatarManager& owner,
+        camera::CameraManager& camera,
+        std::filesystem::path playerCalibrationPath)
+        : owner_(owner),
+          camera_(camera),
+          calibrationSession_(std::move(playerCalibrationPath)) {}
 
     bool Start() {
         if (started_) return true;
@@ -171,7 +203,11 @@ public:
         }
         UnityEngine::Object::DontDestroyOnLoad(driverObject_);
         driverObject_->AddComponent<AvatarRuntimeDriver*>();
+        InitializeCalibrationAudio();
         camera_.SetBeforeRenderHandler([this] { EnsureSolvedForSpectatorRender(); });
+        const auto profileLoad = calibrationSession_.Load();
+        Logging::Logger.info("Player calibration: {}", profileLoad.message);
+        calibrationStatusRevision_ = calibrationSession_.Status().revision;
         started_ = true;
         Logging::Logger.info("Avatar solver runtime ready; waiting for one humanoid Animator binding");
         return true;
@@ -183,6 +219,7 @@ public:
         UnloadVrmAvatar();
         UnbindAnimator();
         UnbindAvatarRuntimeDriver(&owner_);
+        DestroyCalibrationAudio();
         try {
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
         } catch (...) {
@@ -328,6 +365,85 @@ public:
         return player_.valid;
     }
 
+    bool PreparePlayerCalibration(calibration::CalibrationMode mode, std::string* error) noexcept {
+        // Preparing only opens the explanatory calibration wizard. It does not
+        // begin a countdown or record a pose, so tracking is intentionally not
+        // a prerequisite here. StartPreparedPlayerCalibration remains the hard
+        // safety boundary for avatar binding and valid HMD/controller tracking.
+        const auto prepared = calibrationSession_.Prepare(mode, error);
+        NotifyCalibrationStatus();
+        return prepared;
+    }
+
+    bool StartPreparedPlayerCalibration(
+        calibration::CalibrationProgression progression,
+        std::string* error) noexcept {
+        if (!bound_ || !trackingWasReady_) {
+            if (error) *error = "valid HMD/controller tracking is required to start calibration";
+            return false;
+        }
+        const auto started = calibrationSession_.StartPrepared(progression, error);
+        NotifyCalibrationStatus();
+        return started;
+    }
+
+    bool StartPlayerCalibration(calibration::CalibrationMode mode, std::string* error) noexcept {
+        if (!bound_ || !trackingWasReady_) {
+            if (error) *error = "load and bind an avatar with valid HMD/controller tracking first";
+            return false;
+        }
+        const auto started = calibrationSession_.Start(mode, error);
+        NotifyCalibrationStatus();
+        return started;
+    }
+
+    bool StartPlayerCalibrationStep(std::string* error) noexcept {
+        const auto started = calibrationSession_.StartCurrentStep(error);
+        NotifyCalibrationStatus();
+        return started;
+    }
+
+    bool ContinuePlayerCalibration(std::string* error) noexcept {
+        const auto continued = calibrationSession_.Continue(error);
+        NotifyCalibrationStatus();
+        return continued;
+    }
+
+    bool RetryPlayerCalibration(std::string* error) noexcept {
+        const auto retried = calibrationSession_.Retry(error);
+        NotifyCalibrationStatus();
+        return retried;
+    }
+
+    bool RestartPlayerCalibration(std::string* error) noexcept {
+        const auto restarted = calibrationSession_.Restart(error);
+        NotifyCalibrationStatus();
+        return restarted;
+    }
+
+    bool CompletePlayerCalibration(std::string* error) noexcept {
+        const auto completed = calibrationSession_.Complete(error);
+        if (completed) solver_.Reset(persistent_);
+        NotifyCalibrationStatus();
+        return completed;
+    }
+
+    void CancelPlayerCalibration() noexcept {
+        calibrationSession_.Cancel();
+        NotifyCalibrationStatus();
+    }
+
+    bool ResetPlayerCalibration(std::string* error) noexcept {
+        const auto reset = calibrationSession_.ResetProfile(error);
+        solver_.Reset(persistent_);
+        NotifyCalibrationStatus();
+        return reset;
+    }
+
+    void SetCalibrationStatusChangedHandler(std::function<void()> handler) {
+        calibrationStatusChanged_ = std::move(handler);
+    }
+
     void SampleTracking() noexcept {
         if (!bound_) return;
         try {
@@ -347,18 +463,26 @@ public:
             RefreshSaberGripTransforms(frame);
             const auto leftGripReady = SaberGripReady(0);
             const auto rightGripReady = SaberGripReady(1);
+            sample_.controllerHand[0] = IsAlive(handControllers_[0])
+                ? SampleControllerPose(handControllers_[0], previous.controllerHand[0], timestamp)
+                : SamplePose(handTransforms_[0], previous.controllerHand[0], timestamp);
+            sample_.controllerHand[1] = IsAlive(handControllers_[1])
+                ? SampleControllerPose(handControllers_[1], previous.controllerHand[1], timestamp)
+                : SamplePose(handTransforms_[1], previous.controllerHand[1], timestamp);
+            sample_.saberGrip[0] = leftGripReady
+                ? SamplePose(saberGripTransforms_[0], previous.saberGrip[0], timestamp)
+                : TrackedPose{};
+            sample_.saberGrip[1] = rightGripReady
+                ? SamplePose(saberGripTransforms_[1], previous.saberGrip[1], timestamp)
+                : TrackedPose{};
             sample_.handIsSaberGrip[0] = leftGripReady;
             sample_.handIsSaberGrip[1] = rightGripReady;
             sample_.leftHand = leftGripReady
-                ? SamplePose(saberGripTransforms_[0], previous.leftHand, timestamp)
-                : (IsAlive(handControllers_[0])
-                    ? SampleControllerPose(handControllers_[0], previous.leftHand, timestamp)
-                    : SamplePose(handTransforms_[0], previous.leftHand, timestamp));
+                ? sample_.saberGrip[0]
+                : sample_.controllerHand[0];
             sample_.rightHand = rightGripReady
-                ? SamplePose(saberGripTransforms_[1], previous.rightHand, timestamp)
-                : (IsAlive(handControllers_[1])
-                    ? SampleControllerPose(handControllers_[1], previous.rightHand, timestamp)
-                    : SamplePose(handTransforms_[1], previous.rightHand, timestamp));
+                ? sample_.saberGrip[1]
+                : sample_.controllerHand[1];
             sample_.renderFrame = frame;
             ++sample_.sequence;
             const auto trackingValid = sample_.head.valid && sample_.leftHand.valid && sample_.rightHand.valid;
@@ -398,6 +522,13 @@ public:
                 }
             }
             trackingWasReady_ = true;
+            calibrationSession_.Update(sample_);
+            if (calibrationSession_.Status().revision != calibrationStatusRevision_) {
+                NotifyCalibrationStatus();
+                if (calibrationSession_.Status().phase == calibration::CalibrationPhase::Complete) {
+                    solver_.Reset(persistent_);
+                }
+            }
         } catch (...) {
             if (trackingWasReady_) resetOnTrackingRestore_ = true;
             trackingWasReady_ = false;
@@ -419,7 +550,9 @@ public:
         try {
             SolverDiagnostics current{};
             const auto solveStart = std::chrono::steady_clock::now();
-            if (!solver_.Solve(sample_, calibration_, player_, persistent_, solved_, &current)) {
+            if (!solver_.Solve(
+                    sample_, calibration_, player_, calibrationSession_.RuntimeProfile(),
+                    persistent_, solved_, &current)) {
                 if (current.duplicateSequenceSkipped) diagnostics_.duplicateSequenceSkipped = true;
                 return;
             }
@@ -546,7 +679,7 @@ public:
                 Logging::Logger.info("VRM humanoid validated and trackerless solver binding succeeded");
             } else {
                 Logging::Logger.info(
-                    "VRM humanoid validated; avatar is intentionally in rest pose until Bind Solver is selected");
+                    "VRM humanoid validated; avatar is intentionally in rest pose until Attach Tracking is selected");
             }
             return true;
         } catch (const std::exception& exception) {
@@ -603,12 +736,19 @@ public:
     }
 
     bool IsBound() const noexcept { return bound_; }
+    bool IsPlayerCalibrationReady() const noexcept { return bound_ && trackingWasReady_; }
     bool HasLoadedVrmAvatar() const noexcept { return vrmRuntime_ != nullptr; }
     const vrm::VrmAsset* LoadedVrmAsset() const noexcept { return vrmRuntime_ ? &vrmRuntime_->Asset() : nullptr; }
     const vrm::RuntimeStatistics* LoadedVrmStatistics() const noexcept { return vrmRuntime_ ? &vrmRuntime_->Statistics() : nullptr; }
     const AvatarCalibration& Calibration() const noexcept { return calibration_; }
     const PlayerCalibration& Player() const noexcept { return player_; }
     const SolverDiagnostics& Diagnostics() const noexcept { return diagnostics_; }
+    const calibration::CalibrationStatus& CalibrationStatus() const noexcept {
+        return calibrationSession_.Status();
+    }
+    const calibration::PlayerCalibrationProfile& PlayerProfile() const noexcept {
+        return calibrationSession_.Profile();
+    }
 
     void LogDiagnostics() const noexcept {
         try {
@@ -645,6 +785,22 @@ public:
                 diagnostics_.maximumSupportOffset,
                 diagnostics_.predictedSupportMargin);
             Logging::Logger.info(
+                "Avatar player profile: valid={} confidence={:.3f} sampleConfidence={:.3f} motion={} "
+                "leanConfidence={:.3f} translationConfidence={:.3f} envelope={:.3f} "
+                "stepSimilarity=({:.3f},{:.3f},{:.3f},{:.3f}) turnConfidence={:.3f}",
+                diagnostics_.playerProfileValid,
+                diagnostics_.playerProfileConfidence,
+                calibrationSession_.Status().lastSampleConfidence,
+                MotionClassificationName(diagnostics_.motionClassification),
+                diagnostics_.leanConfidence,
+                diagnostics_.translationConfidence,
+                diagnostics_.leanEnvelopeUtilization,
+                diagnostics_.stepSimilarity[0],
+                diagnostics_.stepSimilarity[1],
+                diagnostics_.stepSimilarity[2],
+                diagnostics_.stepSimilarity[3],
+                diagnostics_.bodyTurnConfidence);
+            Logging::Logger.info(
                 "Avatar head/eye: HMD=({:.3f},{:.3f},{:.3f}) head=({:.3f},{:.3f},{:.3f}) "
                 "eye=({:.3f},{:.3f},{:.3f}) eyeError={:.4f}m neckToHead=({:.3f},{:.3f},{:.3f})",
                 diagnostics_.hmdTarget.position.x, diagnostics_.hmdTarget.position.y, diagnostics_.hmdTarget.position.z,
@@ -675,7 +831,8 @@ public:
                 Logging::Logger.info(
                     "Avatar {} arm: source={} shoulder=({:.3f},{:.3f},{:.3f}) target=({:.3f},{:.3f},{:.3f}) "
                     "length={:.3f}+{:.3f}={:.3f} distance={:.3f} reachRatio={:.3f} range={:.3f}/{:.3f}/{:.3f} "
-                    "elbowFlex={:.1f}deg handError={:.4f}m wristError={:.1f}deg pole=({:.3f},{:.3f},{:.3f})",
+                    "calibratedReach={:.3f} gripResidual={:.1f}deg elbowFlex={:.1f}deg "
+                    "handError={:.4f}m wristError={:.1f}deg pole=({:.3f},{:.3f},{:.3f})",
                     side == 0 ? "left" : "right",
                     diagnostics_.handTargetFromSaberGrip[side] ? "saber-handle" : "controller",
                     diagnostics_.shoulderTarget[side].x,
@@ -692,6 +849,8 @@ public:
                     diagnostics_.armReachRatioMinimum[side],
                     diagnostics_.armReachRatioAverage[side],
                     diagnostics_.armReachRatioMaximum[side],
+                    diagnostics_.calibratedEffectiveReachRatio[side],
+                    diagnostics_.calibratedGripResidualDegrees[side],
                     diagnostics_.elbowFlexionDegrees[side],
                     diagnostics_.handTargetError[side],
                     diagnostics_.wristRotationErrorDegrees[side],
@@ -737,6 +896,206 @@ public:
     AvatarManager& owner_;
 
 private:
+    void InitializeCalibrationAudio() noexcept {
+        try {
+            if (!IsAlive(driverObject_)) return;
+            calibrationAudioSource_ = driverObject_->AddComponent<UnityEngine::AudioSource*>();
+            if (!IsAlive(calibrationAudioSource_)) return;
+            calibrationAudioSource_->set_playOnAwake(false);
+            calibrationAudioSource_->set_loop(false);
+            calibrationAudioSource_->set_spatialBlend(0.0F);
+            // Calibration runs from menu UI where Unity may pause ordinary
+            // scene listeners. These cues are interaction feedback, not scene
+            // audio, so keep them audible during that pause and use a strong
+            // 2D level that remains clear beside Beat Saber's preview music.
+            calibrationAudioSource_->set_ignoreListenerPause(true);
+            calibrationAudioSource_->set_volume(0.90F);
+            calibrationAudioSource_->set_priority(32);
+
+            calibrationTickClip_ = CreateCalibrationClip(
+                "SaberStage Calibration Tick", 0.14F, [](float time) {
+                    constexpr float twoPi = 6.28318530717958647692F;
+                    const auto attack = std::min(1.0F, time / 0.003F);
+                    const auto decay = std::exp(-time * 24.0F);
+                    return (std::sin(twoPi * 880.0F * time) +
+                        0.30F * std::sin(twoPi * 1320.0F * time)) * attack * decay * 0.48F;
+                });
+            calibrationToneClip_ = CreateCalibrationClip(
+                "SaberStage Calibration Measurement Tone", 0.25F, [](float time) {
+                    constexpr float twoPi = 6.28318530717958647692F;
+                    return std::sin(twoPi * 440.0F * time) * 0.16F;
+                });
+            calibrationShutterClip_ = CreateCalibrationClip(
+                "SaberStage Calibration Shutter", 0.32F, [](float time) {
+                    constexpr float twoPi = 6.28318530717958647692F;
+                    const auto pulse = [&](float start, float duration, float frequency, float amplitude) {
+                        const auto local = time - start;
+                        if (local < 0.0F || local >= duration) return 0.0F;
+                        const auto envelope = std::sin(3.14159265358979323846F * local / duration) *
+                            std::exp(-local * 9.0F);
+                        return (std::sin(twoPi * frequency * local) +
+                            0.50F * std::sin(twoPi * frequency * 1.83F * local) +
+                            0.25F * std::sin(twoPi * frequency * 2.47F * local)) *
+                            envelope * amplitude;
+                    };
+                    return pulse(0.0F, 0.11F, 520.0F, 0.40F) +
+                        pulse(0.13F, 0.15F, 760.0F, 0.34F);
+                });
+            if (!IsAlive(calibrationTickClip_) || !IsAlive(calibrationToneClip_) ||
+                !IsAlive(calibrationShutterClip_)) {
+                Logging::Logger.warn("One or more generated player-calibration audio cues could not be created");
+            } else {
+                Logging::Logger.info("Player-calibration countdown, measurement, and shutter audio cues are ready");
+            }
+        } catch (...) {
+            calibrationAudioSource_ = nullptr;
+            Logging::Logger.warn("Player-calibration audio initialization failed; visual guidance remains available");
+        }
+    }
+
+    void StopCalibrationTone() noexcept {
+        try {
+            if (!IsAlive(calibrationAudioSource_)) return;
+            calibrationAudioSource_->Stop(true);
+            calibrationAudioSource_->set_loop(false);
+            calibrationAudioSource_->set_clip(nullptr);
+        } catch (...) {
+        }
+    }
+
+    void PlayCalibrationClip(UnityEngine::AudioClip* clip) noexcept {
+        // Do not use AudioSource::PlayOneShot on this Quest/Unity build. The
+        // generated two-argument binding reached Unity's native helper with a
+        // null native AudioSource during a completed calibration step and
+        // crashed UnityMain. The ordinary clip/Play path is already used by
+        // the measurement tone and has the same low-overhead result for these
+        // short, mutually exclusive calibration cues.
+        if (!IsAlive(calibrationAudioSource_) || !IsAlive(clip)) return;
+        calibrationAudioSource_->Stop(true);
+        calibrationAudioSource_->set_loop(false);
+        calibrationAudioSource_->set_clip(clip);
+        calibrationAudioSource_->Play();
+    }
+
+    void DestroyCalibrationAudio() noexcept {
+        StopCalibrationTone();
+        try {
+            if (IsAlive(calibrationTickClip_)) UnityEngine::Object::Destroy(calibrationTickClip_);
+            if (IsAlive(calibrationToneClip_)) UnityEngine::Object::Destroy(calibrationToneClip_);
+            if (IsAlive(calibrationShutterClip_)) UnityEngine::Object::Destroy(calibrationShutterClip_);
+        } catch (...) {
+        }
+        calibrationTickClip_ = nullptr;
+        calibrationToneClip_ = nullptr;
+        calibrationShutterClip_ = nullptr;
+        calibrationAudioSource_ = nullptr;
+    }
+
+    void HandleCalibrationCue() noexcept {
+        const auto& status = calibrationSession_.Status();
+        if (status.cueRevision == calibrationCueRevision_) return;
+        calibrationCueRevision_ = status.cueRevision;
+        try {
+            if (!IsAlive(calibrationAudioSource_)) return;
+            switch (status.cue) {
+                case calibration::CalibrationCue::CountdownTick:
+                    if (IsAlive(calibrationTickClip_)) {
+                        PlayCalibrationClip(calibrationTickClip_);
+                    }
+                    break;
+                case calibration::CalibrationCue::MeasurementStarted:
+                    if (IsAlive(calibrationToneClip_)) {
+                        calibrationAudioSource_->Stop(true);
+                        calibrationAudioSource_->set_clip(calibrationToneClip_);
+                        calibrationAudioSource_->set_loop(true);
+                        calibrationAudioSource_->Play();
+                    }
+                    break;
+                case calibration::CalibrationCue::MeasurementCompleted:
+                    StopCalibrationTone();
+                    if (IsAlive(calibrationShutterClip_)) {
+                        PlayCalibrationClip(calibrationShutterClip_);
+                    }
+                    break;
+                case calibration::CalibrationCue::None:
+                    break;
+            }
+        } catch (...) {
+            Logging::Logger.warn("Player-calibration audio cue playback failed");
+        }
+    }
+
+    void NotifyCalibrationStatus() noexcept {
+        const auto& status = calibrationSession_.Status();
+        HandleCalibrationCue();
+        if (lastCalibrationPhase_ == calibration::CalibrationPhase::Capturing &&
+            status.phase != calibration::CalibrationPhase::Capturing &&
+            status.cue != calibration::CalibrationCue::MeasurementCompleted) {
+            StopCalibrationTone();
+        }
+        if (status.validationRevision != calibrationValidationRevision_) {
+            calibrationValidationRevision_ = status.validationRevision;
+            if (!status.validationDetails.empty()) {
+                if (status.lastCaptureAccepted) {
+                    Logging::Logger.info("Player calibration result: {}", status.validationDetails);
+                } else {
+                    Logging::Logger.warn("Player calibration result: {}", status.validationDetails);
+                }
+            }
+        }
+        if (status.phase != lastCalibrationPhase_ || status.stepIndex != lastCalibrationStepIndex_) {
+            if (status.phase == calibration::CalibrationPhase::Introduction) {
+                Logging::Logger.info(
+                    "Player calibration introduction opened: mode={} steps={}",
+                    status.mode == calibration::CalibrationMode::Basic ? "basic" : "advanced",
+                    status.stepCount);
+            } else if (status.phase == calibration::CalibrationPhase::AwaitingStepStart) {
+                Logging::Logger.info(
+                    "Player calibration step {}/{} '{}' waiting for Start Step",
+                    status.stepIndex + 1,
+                    status.stepCount,
+                    calibration::CalibrationStepName(status.step));
+            } else if (status.phase == calibration::CalibrationPhase::Preparing) {
+                Logging::Logger.info(
+                    "Player calibration step {}/{} '{}': {}",
+                    status.stepIndex + 1,
+                    status.stepCount,
+                    calibration::CalibrationStepName(status.step),
+                    calibration::CalibrationInstruction(status.step));
+            } else if (status.phase == calibration::CalibrationPhase::Capturing) {
+                Logging::Logger.info(
+                    "Player calibration measuring step {}/{} '{}'",
+                    status.stepIndex + 1,
+                    status.stepCount,
+                    calibration::CalibrationStepName(status.step));
+            } else if (status.phase == calibration::CalibrationPhase::AwaitingContinue) {
+                Logging::Logger.info(
+                    "Player calibration step {}/{} '{}' accepted; waiting for Continue",
+                    status.stepIndex + 1,
+                    status.stepCount,
+                    calibration::CalibrationStepName(status.step));
+            } else if (status.phase == calibration::CalibrationPhase::AwaitingRetry ||
+                       status.phase == calibration::CalibrationPhase::Failed) {
+                Logging::Logger.warn("Player calibration paused: {}", status.message);
+            } else if (status.phase == calibration::CalibrationPhase::Review) {
+                Logging::Logger.info(
+                    "Player calibration ready for review with quality {:.1f}%",
+                    calibrationSession_.Profile().overallConfidence * 100.0F);
+            } else if (status.phase == calibration::CalibrationPhase::Complete) {
+                Logging::Logger.info(
+                    "Player calibration completed with quality {:.1f}%",
+                    calibrationSession_.Profile().overallConfidence * 100.0F);
+            }
+            lastCalibrationPhase_ = status.phase;
+            lastCalibrationStepIndex_ = status.stepIndex;
+        }
+        calibrationStatusRevision_ = calibrationSession_.Status().revision;
+        try {
+            if (calibrationStatusChanged_) calibrationStatusChanged_();
+        } catch (...) {
+        }
+    }
+
     bool SaberGripReady(int side) const noexcept {
         return IsAlive(sabers_[side]) && sabers_[side]->get_isActiveAndEnabled() &&
             IsAlive(saberGripTransforms_[side]);
@@ -934,6 +1293,17 @@ private:
     SolverPersistentState persistent_{};
     SolverDiagnostics diagnostics_{};
     StaticTrackerlessAvatarSolver solver_{};
+    calibration::PlayerCalibrationSession calibrationSession_;
+    std::function<void()> calibrationStatusChanged_;
+    std::uint64_t calibrationStatusRevision_ = 0;
+    std::uint64_t calibrationCueRevision_ = 0;
+    std::uint64_t calibrationValidationRevision_ = 0;
+    calibration::CalibrationPhase lastCalibrationPhase_ = calibration::CalibrationPhase::Idle;
+    std::size_t lastCalibrationStepIndex_ = std::numeric_limits<std::size_t>::max();
+    UnityEngine::AudioSource* calibrationAudioSource_ = nullptr;
+    UnityEngine::AudioClip* calibrationTickClip_ = nullptr;
+    UnityEngine::AudioClip* calibrationToneClip_ = nullptr;
+    UnityEngine::AudioClip* calibrationShutterClip_ = nullptr;
     std::unique_ptr<vrm::VrmUnityRuntime> vrmRuntime_;
     std::int32_t nextTrackingDiscoveryFrame_ = 0;
     std::int32_t nextSaberDiscoveryFrame_ = 0;
@@ -947,8 +1317,10 @@ private:
     bool resetOnTrackingRestore_ = false;
 };
 
-AvatarManager::AvatarManager(camera::CameraManager& camera)
-    : impl_(std::make_unique<Impl>(*this, camera)) {}
+AvatarManager::AvatarManager(
+    camera::CameraManager& camera,
+    std::filesystem::path playerCalibrationPath)
+    : impl_(std::make_unique<Impl>(*this, camera, std::move(playerCalibrationPath))) {}
 
 AvatarManager::~AvatarManager() { Stop(); }
 bool AvatarManager::Start() { return impl_->Start(); }
@@ -962,6 +1334,41 @@ bool AvatarManager::BindHumanoidAnimator(
 }
 void AvatarManager::UnbindHumanoidAnimator() noexcept { impl_->UnbindAnimator(); }
 bool AvatarManager::RecalibrateNeutral() noexcept { return impl_->RecalibrateNeutral(); }
+bool AvatarManager::PreparePlayerCalibration(
+    calibration::CalibrationMode mode,
+    std::string* error) noexcept {
+    return impl_->PreparePlayerCalibration(mode, error);
+}
+bool AvatarManager::StartPreparedPlayerCalibration(
+    calibration::CalibrationProgression progression,
+    std::string* error) noexcept {
+    return impl_->StartPreparedPlayerCalibration(progression, error);
+}
+bool AvatarManager::StartPlayerCalibration(calibration::CalibrationMode mode, std::string* error) noexcept {
+    return impl_->StartPlayerCalibration(mode, error);
+}
+bool AvatarManager::StartPlayerCalibrationStep(std::string* error) noexcept {
+    return impl_->StartPlayerCalibrationStep(error);
+}
+bool AvatarManager::ContinuePlayerCalibration(std::string* error) noexcept {
+    return impl_->ContinuePlayerCalibration(error);
+}
+bool AvatarManager::RetryPlayerCalibration(std::string* error) noexcept {
+    return impl_->RetryPlayerCalibration(error);
+}
+bool AvatarManager::RestartPlayerCalibration(std::string* error) noexcept {
+    return impl_->RestartPlayerCalibration(error);
+}
+bool AvatarManager::CompletePlayerCalibration(std::string* error) noexcept {
+    return impl_->CompletePlayerCalibration(error);
+}
+void AvatarManager::CancelPlayerCalibration() noexcept { impl_->CancelPlayerCalibration(); }
+bool AvatarManager::ResetPlayerCalibration(std::string* error) noexcept {
+    return impl_->ResetPlayerCalibration(error);
+}
+void AvatarManager::SetCalibrationStatusChangedHandler(std::function<void()> handler) {
+    impl_->SetCalibrationStatusChangedHandler(std::move(handler));
+}
 bool AvatarManager::LoadVrmAvatar(
     const std::filesystem::path& path,
     std::uint32_t maximumTextureDimension,
@@ -983,11 +1390,20 @@ void AvatarManager::SolveAndWrite() noexcept { impl_->SolveAndWrite(); }
 void AvatarManager::EnsureSolvedForSpectatorRender() noexcept { impl_->EnsureSolvedForSpectatorRender(); }
 void AvatarManager::LogDiagnostics() const noexcept { impl_->LogDiagnostics(); }
 bool AvatarManager::IsBound() const noexcept { return impl_->IsBound(); }
+bool AvatarManager::IsPlayerCalibrationReady() const noexcept {
+    return impl_->IsPlayerCalibrationReady();
+}
 bool AvatarManager::HasLoadedVrmAvatar() const noexcept { return impl_->HasLoadedVrmAvatar(); }
 const vrm::VrmAsset* AvatarManager::LoadedVrmAsset() const noexcept { return impl_->LoadedVrmAsset(); }
 const vrm::RuntimeStatistics* AvatarManager::LoadedVrmStatistics() const noexcept { return impl_->LoadedVrmStatistics(); }
 const AvatarCalibration& AvatarManager::Calibration() const noexcept { return impl_->Calibration(); }
 const PlayerCalibration& AvatarManager::Player() const noexcept { return impl_->Player(); }
 const SolverDiagnostics& AvatarManager::Diagnostics() const noexcept { return impl_->Diagnostics(); }
+const calibration::CalibrationStatus& AvatarManager::CalibrationStatus() const noexcept {
+    return impl_->CalibrationStatus();
+}
+const calibration::PlayerCalibrationProfile& AvatarManager::PlayerProfile() const noexcept {
+    return impl_->PlayerProfile();
+}
 
 } // namespace saberstage::avatar

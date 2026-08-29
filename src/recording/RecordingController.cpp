@@ -4,7 +4,12 @@
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/camera/FrameDemand.hpp"
+#include "saberstage/broadcast/DirectLivestreamSink.hpp"
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
+#include "saberstage/recording/AsyncVideoWriter.hpp"
+#include "saberstage/recording/DirectFfmpegCapture.hpp"
+#include "saberstage/recording/DirectFfmpegMuxer.hpp"
+#include "saberstage/recording/RealtimeAudioCapture.hpp"
 #include "saberstage/settings/SettingsService.hpp"
 
 #include "GlobalNamespace/OVRInput.hpp"
@@ -56,6 +61,8 @@ RecordingController::RecordingController(
     std::filesystem::path outputDirectory)
     : settings_(settings), camera_(camera), outputDirectory_(std::move(outputDirectory)) {
     RegisterRecordingRuntimeDriverType();
+    RegisterDirectFfmpegCaptureType();
+    RegisterRealtimeAudioCaptureType();
     BindRecordingRuntimeDriver(this);
     driverObject_ = UnityEngine::GameObject::New_ctor("SaberStage Recording Runtime");
     UnityEngine::Object::DontDestroyOnLoad(driverObject_);
@@ -88,7 +95,7 @@ bool RecordingController::Start(std::string* error) {
     return StartCapture(error);
 }
 
-bool RecordingController::StartCapture(std::string* error) {
+bool RecordingController::StartCapture(std::string* error, bool forceContinuous) {
     if (!TryTransition(
         {RecordingState::Idle, RecordingState::Failed, RecordingState::Armed},
         RecordingState::Starting,
@@ -99,7 +106,7 @@ bool RecordingController::StartCapture(std::string* error) {
 
     const auto& profile = settings_.Get().camera.Primary();
     const auto& recording = settings_.Get().recording;
-    gameplayOnlySession_ = recording.gameplayOnly;
+    gameplayOnlySession_ = recording.gameplayOnly && !forceContinuous;
     if (!profile.enabled) {
         SetState(RecordingState::Failed, "Primary camera is disabled.");
         if (error) *error = "Primary camera is disabled";
@@ -120,17 +127,17 @@ bool RecordingController::StartCapture(std::string* error) {
     rawAudioPath_ = std::filesystem::path(base.string() + ".partial.wav");
     partialOutputPath_ = std::filesystem::path(base.string() + ".partial.mp4");
     finalOutputPath_ = std::filesystem::path(base.string() + ".mp4");
-    videoWriteFailed_.store(false);
-    activeWidth_ = profile.requestedWidth;
-    activeHeight_ = profile.requestedHeight;
+    captureWriteFailed_.store(false);
+    settings::ResolutionDimensions(recording.resolution, activeWidth_, activeHeight_);
     activeFramesPerSecond_ = recording.framesPerSecond;
     activeBitrateBitsPerSecond_ = recording.bitrateBitsPerSecond;
+    activeBackend_ = recording.backend;
     activeFovDegrees_ = profile.fovDegrees;
 
     if (!camera_.SetRenderDemand(std::string(kRecordingDemandId), {
             std::string(camera::kPrimaryCameraId),
-            profile.requestedWidth,
-            profile.requestedHeight,
+            activeWidth_,
+            activeHeight_,
             recording.framesPerSecond})) {
         const std::string message = "Primary camera rejected the recording output settings.";
         SetState(RecordingState::Failed, message);
@@ -149,8 +156,8 @@ bool RecordingController::StartCapture(std::string* error) {
     activeRuntimeCamera_ = runtimeCamera;
 
     try {
-        videoOutput_.open(rawVideoPath_, std::ios::binary | std::ios::trunc);
-        if (!videoOutput_) throw std::runtime_error("cannot open temporary H.264 output");
+        videoWriter_ = std::make_unique<AsyncVideoWriter>(rawVideoPath_);
+        if (videoWriter_->Failed()) throw std::runtime_error("cannot open temporary H.264 output");
         StartVideoSegment();
 
         CreatePersistentAudioCapture();
@@ -161,14 +168,14 @@ bool RecordingController::StartCapture(std::string* error) {
         SetState(
             RecordingState::Recording,
             "Recording Primary camera with game audio at " +
-                std::to_string(profile.requestedWidth) + " x " +
-                std::to_string(profile.requestedHeight) + " / " +
+                std::to_string(activeWidth_) + " x " +
+                std::to_string(activeHeight_) + " / " +
                 std::to_string(recording.framesPerSecond) + " FPS.");
         Logging::Logger.info(
             "Recording started: camera={}, {}x{}@{}, bitrate={}, work={}",
             camera::kPrimaryCameraId,
-            profile.requestedWidth,
-            profile.requestedHeight,
+            activeWidth_,
+            activeHeight_,
             recording.framesPerSecond,
             recording.bitrateBitsPerSecond,
             rawVideoPath_.string());
@@ -193,6 +200,13 @@ bool RecordingController::StartCapture(std::string* error) {
 }
 
 bool RecordingController::Pause(std::string* error) {
+    {
+        const auto livestream = LivestreamSnapshot();
+        if (broadcast::CanStop(livestream.state)) {
+            if (error) *error = "Local pause is unavailable while live. Stop the live stream first.";
+            return false;
+        }
+    }
     if (!TryTransition(
         {RecordingState::Recording},
         RecordingState::Pausing,
@@ -282,33 +296,53 @@ void RecordingController::StartVideoSegment() {
     if (!IsUnityObjectAlive(activeRuntimeCamera_)) {
         throw std::runtime_error("spectator camera is unavailable");
     }
-    if (!videoOutput_.is_open()) {
+    if (!videoWriter_) {
         throw std::runtime_error("temporary H.264 output is not open");
     }
-    if (IsUnityObjectAlive(videoCapture_)) {
+    if (IsUnityObjectAlive(videoCapture_) || IsUnityObjectAlive(directVideoCapture_)) {
         throw std::runtime_error("video encoder segment is already active");
     }
 
-    videoCapture_ = activeRuntimeCamera_->get_gameObject()->AddComponent<Hollywood::CameraCapture*>();
-    if (!IsUnityObjectAlive(videoCapture_)) {
-        throw std::runtime_error("cannot attach Hollywood video encoder");
+    if (activeBackend_ == settings::RecordingBackend::Hollywood) {
+        videoCapture_ = activeRuntimeCamera_->get_gameObject()->AddComponent<Hollywood::CameraCapture*>();
+        if (!IsUnityObjectAlive(videoCapture_)) {
+            throw std::runtime_error("cannot attach Hollywood video encoder");
+        }
+        videoCapture_->onOutputUnit = [this](std::uint8_t* data, std::size_t length) {
+            if (!videoWriter_ || data == nullptr || length == 0) return;
+            if (!videoWriter_->TrySubmit(data, length)) captureWriteFailed_.store(true);
+        };
+        videoCapture_->Init(
+            activeWidth_,
+            activeHeight_,
+            activeFramesPerSecond_,
+            activeBitrateBitsPerSecond_,
+            activeFovDegrees_,
+            false);
+        if (!IsUnityObjectAlive(videoCapture_->texture)) {
+            throw std::runtime_error("Hollywood did not create an encoder texture");
+        }
+        camera_.SetExternalOutputTexture(videoCapture_->texture);
+        return;
     }
-    videoCapture_->onOutputUnit = [this](std::uint8_t* data, std::size_t length) {
-        if (data == nullptr || length == 0) return;
-        videoOutput_.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(length));
-        if (!videoOutput_) videoWriteFailed_.store(true);
-    };
-    videoCapture_->Init(
-        activeWidth_,
-        activeHeight_,
-        activeFramesPerSecond_,
-        activeBitrateBitsPerSecond_,
+
+    directVideoCapture_ = activeRuntimeCamera_->get_gameObject()->AddComponent<DirectFfmpegCapture*>();
+    if (!IsUnityObjectAlive(directVideoCapture_)) {
+        throw std::runtime_error("cannot attach the direct FFmpeg hardware encoder");
+    }
+    directVideoCapture_->Init(
+        settings_.Get().recording,
         activeFovDegrees_,
-        false);
-    if (!IsUnityObjectAlive(videoCapture_->texture)) {
-        throw std::runtime_error("Hollywood did not create an encoder texture");
+        [this](const EncodedVideoPacketView& packet) {
+            if (!videoWriter_ || !packet.data || packet.size == 0) return;
+            if (!videoWriter_->TrySubmit(packet.data, packet.size)) captureWriteFailed_.store(true);
+            std::lock_guard lock(livestreamMutex_);
+            if (livestreamSink_) livestreamSink_->SubmitVideo(packet);
+        });
+    if (!IsUnityObjectAlive(directVideoCapture_->texture)) {
+        throw std::runtime_error("Direct FFmpeg did not create an encoder texture");
     }
-    camera_.SetExternalOutputTexture(videoCapture_->texture);
+    camera_.SetExternalOutputTexture(directVideoCapture_->texture);
 }
 
 void RecordingController::StopVideoSegment() noexcept {
@@ -322,6 +356,21 @@ void RecordingController::StopVideoSegment() noexcept {
         Logging::Logger.error("Video segment cleanup failed");
     }
     videoCapture_ = nullptr;
+    try {
+        if (IsUnityObjectAlive(directVideoCapture_)) {
+            directVideoCapture_->Stop();
+            if (directVideoCapture_->Failed()) captureWriteFailed_.store(true);
+            if (const auto dropped = directVideoCapture_->DroppedFrameCount(); dropped > 0) {
+                Logging::Logger.warn(
+                    "Direct FFmpeg dropped {} video frames to keep its hardware queue bounded",
+                    dropped);
+            }
+            UnityEngine::Object::DestroyImmediate(directVideoCapture_);
+        }
+    } catch (...) {
+        Logging::Logger.error("Direct FFmpeg video segment cleanup failed");
+    }
+    directVideoCapture_ = nullptr;
 }
 
 bool RecordingController::Stop(std::string_view reason) {
@@ -340,6 +389,7 @@ bool RecordingController::Stop(std::string_view reason) {
             std::string(reason) + " Finalizing capture streams...")) {
             return false;
         }
+        StopLivestream();
         CleanupCaptureObjects();
         camera_.RemoveRenderDemand(kRecordingDemandId);
         FinalizeAsync();
@@ -368,6 +418,13 @@ void RecordingController::Shutdown() noexcept {
             Logging::Logger.error("Recording shutdown stop failed");
         }
     }
+    StopLivestream();
+    {
+        std::lock_guard lock(livestreamMutex_);
+        livestreamSink_.reset();
+        std::fill(streamKey_.begin(), streamKey_.end(), '\0');
+        streamKey_.clear();
+    }
     if (finalizer_.joinable()) finalizer_.join();
     CleanupCaptureObjects();
     camera_.RemoveRenderDemand(kRecordingDemandId);
@@ -380,7 +437,11 @@ void RecordingController::Tick() noexcept {
     HandleControllerShortcut();
     const auto current = state_.load();
     if (current == RecordingState::Recording) {
-        RefreshAudioListenerOwnership();
+        UpdateAudioCapturePose();
+        if (++audioListenerRefreshFrame_ >= 90) {
+            audioListenerRefreshFrame_ = 0;
+            RefreshAudioListenerOwnership();
+        }
     }
     if (recording::HasRecordingTimeline(current) &&
         gameplayOnlySession_ && !IsGameplaySceneActive()) {
@@ -464,6 +525,101 @@ RecordingSnapshot RecordingController::Snapshot() const {
     if (recording::HasRecordingTimeline(snapshot.state)) {
         snapshot.elapsedSeconds = ElapsedSeconds(std::chrono::steady_clock::now());
     }
+    const auto live = LivestreamSnapshot();
+    if (broadcast::CanStop(live.state)) snapshot.outputType = RecordingOutputType::LocalAndLive;
+    return snapshot;
+}
+
+bool RecordingController::SetStreamKey(std::string streamKey, std::string* error) {
+    if (streamKey.size() < 4 || streamKey.size() > 512 ||
+        std::any_of(streamKey.begin(), streamKey.end(), [](unsigned char value) {
+            return value <= 0x20 || value == 0x7F;
+        })) {
+        if (error) *error = "The stream key is empty or contains spaces/control characters.";
+        return false;
+    }
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) {
+        if (error) *error = "Stop the live stream before changing its key.";
+        return false;
+    }
+    std::fill(streamKey_.begin(), streamKey_.end(), '\0');
+    streamKey_ = std::move(streamKey);
+    statusVersion_.fetch_add(1);
+    return true;
+}
+
+void RecordingController::ClearStreamKey() noexcept {
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) return;
+    std::fill(streamKey_.begin(), streamKey_.end(), '\0');
+    streamKey_.clear();
+    statusVersion_.fetch_add(1);
+}
+
+bool RecordingController::StartLivestream(std::string* error) {
+    const auto& recording = settings_.Get().recording;
+    if (recording.backend != settings::RecordingBackend::DirectFfmpegHardware) {
+        if (error) *error = "Live streaming requires Direct FFmpeg (Hardware) as the recording backend.";
+        return false;
+    }
+    if (state_.load() == RecordingState::Recording &&
+        activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware) {
+        if (error) *error = "This recording was started with Hollywood. Stop it before switching to Direct FFmpeg for live streaming.";
+        return false;
+    }
+    {
+        std::lock_guard lock(livestreamMutex_);
+        if (streamKey_.empty()) {
+            if (error) *error = "Enter a stream key before going live.";
+            return false;
+        }
+        if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) {
+            if (error) *error = "A live stream is already active.";
+            return false;
+        }
+        livestreamSink_.reset();
+        livestreamSink_ = std::make_unique<broadcast::DirectLivestreamSink>(
+            recording,
+            settings_.Get().broadcast,
+            streamKey_,
+            [this] { statusVersion_.fetch_add(1); });
+        if (!livestreamSink_->Start(error)) {
+            livestreamSink_.reset();
+            return false;
+        }
+    }
+
+    const auto current = state_.load();
+    if (recording::CanStart(current)) {
+        if (!StartCapture(error, true)) {
+            StopLivestream();
+            return false;
+        }
+    } else if (current != RecordingState::Recording) {
+        StopLivestream();
+        if (error) *error = "Wait for local recording to finish starting, pausing, or saving before going live.";
+        return false;
+    }
+    statusVersion_.fetch_add(1);
+    return true;
+}
+
+void RecordingController::StopLivestream() noexcept {
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_) livestreamSink_->Stop();
+    statusVersion_.fetch_add(1);
+}
+
+broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_) {
+        auto snapshot = livestreamSink_->Snapshot();
+        snapshot.streamKeyConfigured = !streamKey_.empty();
+        return snapshot;
+    }
+    broadcast::LivestreamSnapshot snapshot;
+    snapshot.streamKeyConfigured = !streamKey_.empty();
     return snapshot;
 }
 
@@ -493,12 +649,16 @@ void RecordingController::CreatePersistentAudioCapture() {
     UnityEngine::Object::DontDestroyOnLoad(audioObject_);
     captureAudioListener_ = audioObject_->AddComponent<UnityEngine::AudioListener*>();
     if (!IsUnityObjectAlive(captureAudioListener_)) throw std::runtime_error("cannot create persistent game-audio listener");
-    audioCapture_ = audioObject_->AddComponent<Hollywood::AudioCapture*>();
+    audioCapture_ = audioObject_->AddComponent<RealtimeAudioCapture*>();
     if (!IsUnityObjectAlive(audioCapture_)) throw std::runtime_error("cannot attach persistent game-audio capture");
 
     RefreshAudioListenerOwnership();
-    audioCapture_->SetMuted(false);
-    audioCapture_->OpenFile(rawAudioPath_.string());
+    audioCapture_->OpenFile(
+        rawAudioPath_,
+        [this](const float* samples, std::size_t count, std::int32_t channels, std::int32_t sampleRate) {
+            std::lock_guard lock(livestreamMutex_);
+            if (livestreamSink_) livestreamSink_->SubmitAudio(samples, count, channels, sampleRate);
+        });
     audioObject_->SetActive(true);
     RefreshAudioListenerOwnership();
     Logging::Logger.info("Persistent game-audio capture started across scene transitions");
@@ -507,14 +667,7 @@ void RecordingController::CreatePersistentAudioCapture() {
 void RecordingController::RefreshAudioListenerOwnership() noexcept {
     if (!IsUnityObjectAlive(audioObject_) || !IsUnityObjectAlive(captureAudioListener_)) return;
     try {
-        auto mainCamera = UnityEngine::Camera::get_main();
-        if (mainCamera) {
-            auto* source = mainCamera->get_transform().ptr();
-            auto* destination = audioObject_->get_transform().ptr();
-            if (IsUnityObjectAlive(source) && IsUnityObjectAlive(destination)) {
-                destination->SetPositionAndRotation(source->get_position(), source->get_rotation());
-            }
-        }
+        UpdateAudioCapturePose();
 
         for (auto* listener : UnityEngine::Resources::FindObjectsOfTypeAll<UnityEngine::AudioListener*>()) {
             if (!IsUnityObjectAlive(listener) || listener == captureAudioListener_ || !listener->get_enabled()) continue;
@@ -529,6 +682,21 @@ void RecordingController::RefreshAudioListenerOwnership() noexcept {
         }
     } catch (...) {
         Logging::Logger.error("Could not refresh persistent game-audio listener ownership");
+    }
+}
+
+void RecordingController::UpdateAudioCapturePose() noexcept {
+    if (!IsUnityObjectAlive(audioObject_)) return;
+    try {
+        auto mainCamera = UnityEngine::Camera::get_main();
+        if (!mainCamera) return;
+        auto* source = mainCamera->get_transform().ptr();
+        auto* destination = audioObject_->get_transform().ptr();
+        if (IsUnityObjectAlive(source) && IsUnityObjectAlive(destination)) {
+            destination->SetPositionAndRotation(source->get_position(), source->get_rotation());
+        }
+    } catch (...) {
+        Logging::Logger.error("Could not update persistent game-audio listener pose");
     }
 }
 
@@ -595,10 +763,17 @@ double RecordingController::ElapsedSeconds(
 }
 
 void RecordingController::FinalizeAsync() {
-    if (videoWriteFailed_.load()) {
+    if (videoWriter_) {
+        videoWriter_->Close();
+        if (videoWriter_->Failed() || videoWriter_->DroppedPacketCount() > 0) {
+            captureWriteFailed_.store(true);
+        }
+        videoWriter_.reset();
+    }
+    if (captureWriteFailed_.load()) {
         SetState(
             RecordingState::Failed,
-            "Video write failed. Partial H.264 and WAV files were retained in Recordings.");
+            "Video or audio capture could not keep up. Partial H.264 and WAV files were retained in Recordings.");
         return;
     }
     if (!std::filesystem::exists(rawVideoPath_) || std::filesystem::file_size(rawVideoPath_) == 0 ||
@@ -612,6 +787,8 @@ void RecordingController::FinalizeAsync() {
     SetState(RecordingState::Finalizing, "Finalizing MP4; the next recording will unlock when this finishes...");
     if (finalizer_.joinable()) finalizer_.join();
     const auto fps = activeFramesPerSecond_;
+    const auto audioBitrate = settings_.Get().recording.audioBitrateBitsPerSecond;
+    const auto backend = activeBackend_;
     finalizer_ = std::thread(
         &RecordingController::FinalizeWorker,
         this,
@@ -619,7 +796,9 @@ void RecordingController::FinalizeAsync() {
         rawAudioPath_,
         partialOutputPath_,
         finalOutputPath_,
-        fps);
+        fps,
+        audioBitrate,
+        backend);
 }
 
 void RecordingController::FinalizeWorker(
@@ -627,14 +806,23 @@ void RecordingController::FinalizeWorker(
     std::filesystem::path rawAudio,
     std::filesystem::path partialOutput,
     std::filesystem::path finalOutput,
-    std::int32_t framesPerSecond) noexcept {
+    std::int32_t framesPerSecond,
+    std::int32_t audioBitrateBitsPerSecond,
+    settings::RecordingBackend backend) noexcept {
     try {
-        const auto video = rawVideo.string();
-        const auto audio = rawAudio.string();
-        const auto partial = partialOutput.string();
-        Hollywood::MuxFilesSync(video, audio, partial, framesPerSecond);
+        if (backend == settings::RecordingBackend::DirectFfmpegHardware) {
+            std::string muxError;
+            if (!MuxDirectFfmpegRecording(
+                    rawVideo, rawAudio, partialOutput, framesPerSecond,
+                    audioBitrateBitsPerSecond, &muxError)) {
+                throw std::runtime_error("Direct FFmpeg: " + muxError);
+            }
+        } else {
+            Hollywood::MuxFilesSync(
+                rawVideo.string(), rawAudio.string(), partialOutput.string(), framesPerSecond);
+        }
         if (!std::filesystem::exists(partialOutput) || std::filesystem::file_size(partialOutput) == 0) {
-            throw std::runtime_error("Hollywood/FFmpeg did not produce an MP4");
+            throw std::runtime_error("selected recording backend did not produce an MP4");
         }
         std::filesystem::rename(partialOutput, finalOutput);
         std::error_code cleanupError;
@@ -671,6 +859,12 @@ void RecordingController::CleanupCaptureObjects() noexcept {
     try {
         if (IsUnityObjectAlive(audioCapture_)) {
             audioCapture_->Save();
+            if (audioCapture_->Failed() || audioCapture_->DroppedSampleCount() > 0) {
+                captureWriteFailed_.store(true);
+                Logging::Logger.error(
+                    "Audio capture was incomplete: failed={}, droppedSamples={}",
+                    audioCapture_->Failed(), audioCapture_->DroppedSampleCount());
+            }
         }
     } catch (...) {
         Logging::Logger.error("Game-audio capture save failed");
@@ -690,9 +884,12 @@ void RecordingController::CleanupCaptureObjects() noexcept {
 
     StopVideoSegment();
     activeRuntimeCamera_ = nullptr;
-    if (videoOutput_.is_open()) {
-        videoOutput_.flush();
-        videoOutput_.close();
+    if (videoWriter_) {
+        videoWriter_->Close();
+        if (videoWriter_->Failed() || videoWriter_->DroppedPacketCount() > 0) {
+            captureWriteFailed_.store(true);
+        }
+        videoWriter_.reset();
     }
 }
 
