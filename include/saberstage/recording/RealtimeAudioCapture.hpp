@@ -34,10 +34,12 @@ public:
     void Save() noexcept;
     [[nodiscard]] std::uint64_t DroppedSampleCount() const noexcept;
     [[nodiscard]] bool Failed() const noexcept;
+    [[nodiscard]] std::int64_t FirstSampleMonotonicNanos() const noexcept;
 
 private:
     saberstage::recording::RealtimeAudioCaptureImpl* impl_ = nullptr;
     std::uint64_t lastDroppedSampleCount_ = 0;
+    std::int64_t lastFirstSampleMonotonicNanos_ = 0;
     bool lastFailed_ = false;
 };
 

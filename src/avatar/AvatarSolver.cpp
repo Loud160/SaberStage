@@ -170,6 +170,8 @@ void SeedBodyState(
     state.doubleSupportSeconds = 0.0F;
     state.airborneEvidenceSeconds = 0.0F;
     state.landingEvidenceSeconds = 0.0F;
+    state.gameplayStanceHeadHeight = tracking.head.pose.position.y;
+    state.gameplayStanceHeightValid = tracking.handIsSaberGrip[0] || tracking.handIsSaberGrip[1];
     state.leanAmount = 0.0F;
     state.crouchAmount = 0.0F;
     state.lastSteppedFoot = -1;
@@ -382,7 +384,26 @@ Pose EstimatePelvis(
         legReach * 0.045F,
         std::min(hardMaximumForwardLean, forwardBoundary));
     auto relativeLean = horizontalHeadTranslation - state.bodyTranslation;
-    const auto heightLoss = std::max(0.0F, player.neutralHead.position.y - tracking.head.pose.position.y);
+    const auto gameplayTracking = tracking.handIsSaberGrip[0] || tracking.handIsSaberGrip[1];
+    if (gameplayTracking && !state.gameplayStanceHeightValid) {
+        state.gameplayStanceHeadHeight = tracking.head.pose.position.y;
+        state.gameplayStanceHeightValid = true;
+    } else if (gameplayTracking &&
+               tracking.head.pose.position.y > state.gameplayStanceHeadHeight &&
+               std::abs(tracking.head.linearVelocity.y) < eyeHeight * 0.35F) {
+        // Learn a taller stable stance slowly, but never ratchet the baseline
+        // downward during ducks. This separates habitual gameplay posture from
+        // intentional crouch motion.
+        state.gameplayStanceHeadHeight = Smooth(
+            state.gameplayStanceHeadHeight,
+            tracking.head.pose.position.y,
+            deltaSeconds,
+            1.5F);
+    }
+    const auto stanceHeadHeight = gameplayTracking && state.gameplayStanceHeightValid
+        ? state.gameplayStanceHeadHeight
+        : player.neutralHead.position.y;
+    const auto heightLoss = std::max(0.0F, stanceHeadHeight - tracking.head.pose.position.y);
     const auto suppressTranslation =
         heightLoss > eyeHeight * tuning.verticalMotionTranslationSuppressionEyeFraction;
     const auto controllerMidpoint = (tracking.leftHand.pose.position + tracking.rightHand.pose.position) * 0.5F;
@@ -487,7 +508,7 @@ Pose EstimatePelvis(
     state.leanAmount = Smooth(state.leanAmount, targetLeanAmount, deltaSeconds, 0.08F);
     state.lateralLeanMeters = lateralLean;
 
-    const auto heightRise = std::max(0.0F, tracking.head.pose.position.y - player.neutralHead.position.y);
+    const auto heightRise = std::max(0.0F, tracking.head.pose.position.y - stanceHeadHeight);
     const auto forwardDisplacement = std::max(0.0F, Dot(relativeLean, bodyForward));
     const auto crouchHeightFraction = profile.valid && profile.crouch.squatConfidence > 0.0F
         ? Clamp(profile.crouch.squatDropNormalized * 1.15F, 0.20F, 0.40F)
@@ -521,6 +542,9 @@ Pose EstimatePelvis(
     const auto supportCenter = state.footAnchorsValid
         ? (state.footAnchor[0] + state.footAnchor[1]) * 0.5F
         : Vec3{neutralPelvis.position.x, player.floorHeight, neutralPelvis.position.z};
+    // Standing taller than the calibration snapshot should straighten the
+    // planted legs, not lift both feet or put the avatar on its toes.
+    desired.y = std::min(desired.y, player.floorHeight + legReach * 0.985F);
     const auto plantedSeparation = state.footAnchorsValid
         ? Length(Horizontal(state.footAnchor[1] - state.footAnchor[0]))
         : avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier;
@@ -602,6 +626,17 @@ Vec3 StableElbowPole(
     auto controllerCue = ProjectOnPlane(Rotate(hand.rotation, {0.0F, 0.0F, 1.0F}), axis);
     if (LengthSquared(controllerCue) > kEpsilon && Dot(controllerCue, pole) < 0.0F) controllerCue = -controllerCue;
     pole = Normalize(Lerp(pole, Normalize(controllerCue, pole), bend * 0.1F), pole);
+
+    // History removes jitter, but it must not preserve an elbow that has
+    // crossed through the torso. Keep the bend goal inside an outward/downward
+    // torso-local cone. This is the clean-room equivalent of a bend-goal
+    // constraint: controller roll may influence the elbow, never flip it to
+    // the opposite side of the chest.
+    const auto outwardPlane = Normalize(ProjectOnPlane(outward, axis), rest);
+    const auto outwardDot = Dot(pole, outwardPlane);
+    if (outwardDot < 0.25F) {
+        pole = Normalize(Lerp(pole, outwardPlane, Saturate((0.25F - outwardDot) / 0.75F)), outwardPlane);
+    }
     state.previousElbowPole[side] = pole;
     state.previousElbowPoleValid[side] = true;
     return pole;
@@ -631,10 +666,12 @@ void SolveArm(
     auto shoulder = Has(avatar, shoulderBone) ? Solved(output, shoulderBone).position : Solved(output, upperBone).position;
     const auto measuredArmLength =
         (avatar.upperArmLength[side] + avatar.lowerArmLength[side]) * scale;
-    const auto calibratedReach = profile.valid
+    const auto useCalibratedReach =
+        profile.valid && profile.reachConfidence[side] >= tuning.minimumReachFitConfidence;
+    const auto calibratedReach = useCalibratedReach
         ? profile.effectiveReachNormalized[side] * playerHeight
         : measuredArmLength;
-    const auto calibratedCompensation = profile.valid
+    const auto calibratedCompensation = useCalibratedReach
         ? Clamp(calibratedReach / std::max(measuredArmLength, kEpsilon), 1.0F, tuning.maximumArmStretchFraction)
         : 1.0F;
     const auto upperArmLength = avatar.upperArmLength[side] * scale * calibratedCompensation;
@@ -657,10 +694,13 @@ void SolveArm(
     const auto upperRoot = Solved(output, upperBone).position + (shoulder - originalShoulder);
     const auto shoulderToTargetDistance = Length(handTarget.position - upperRoot);
     const auto reachRatio = shoulderToTargetDistance / std::max(armLength, kEpsilon);
+    const auto stretchLimit = handFromSaberGrip
+        ? tuning.maximumTrackedGripStretchFraction
+        : tuning.maximumArmStretchFraction;
     const auto stretch = Clamp(
         shoulderToTargetDistance / std::max(armLength, kEpsilon),
         1.0F,
-        tuning.maximumArmStretchFraction);
+        stretchLimit);
     const auto restPole = Rotate(
         PoseDelta(Rest(avatar, chestBone).world.rotation, chest.rotation),
         avatar.restElbowPole[side]);
@@ -694,9 +734,17 @@ void SolveArm(
     const auto neutralHand = Solved(neutralPose, handBone);
     upper.position = result.root;
     lower.position = result.middle;
-    hand.position = result.end;
+    const auto solvedTargetError = Length(result.end - handTarget.position);
+    // A live saber handle is a directly tracked end effector, not an inferred
+    // hand target.  Never let an arm-length estimate visibly detach the hand
+    // from the saber: shoulder assist and conservative stretch solve as much
+    // of the reach as possible, then the last forearm segment terminates at
+    // the authoritative tracked handle.  Controller-only/menu tracking keeps
+    // the ordinary anatomical clamp.
+    const auto finalEnd = handFromSaberGrip ? handTarget.position : result.end;
+    hand.position = finalEnd;
     upper.rotation = AlignBone(neutralUpper, neutralLower, result.root, result.middle);
-    lower.rotation = AlignBone(neutralLower, neutralHand, result.middle, result.end);
+    lower.rotation = AlignBone(neutralLower, neutralHand, result.middle, finalEnd);
     const auto anatomicalHandRotation = Multiply(
         PoseDelta(neutralLower.rotation, lower.rotation),
         neutralHand.rotation);
@@ -704,7 +752,9 @@ void SolveArm(
         state.gripToHandRotationValid[side] &&
         state.previousHandWasSaberGrip[side] != handFromSaberGrip;
     if (!state.gripToHandRotationValid[side] || handSourceChanged) {
-        if (profile.valid) {
+        const auto useGripFit =
+            profile.valid && profile.gripConfidence[side] >= tuning.minimumGripFitConfidence;
+        if (useGripFit) {
             const auto canonicalRest = FromToRotation(
                 {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F},
                 Normalize(neutralHand.position - neutralLower.position,
@@ -735,7 +785,11 @@ void SolveArm(
         handTarget.rotation,
         state.gripToHandRotation[side]);
     const auto wristDeviation = QuaternionAngleDegrees(anatomicalHandRotation, desiredHandRotation);
-    hand.rotation = wristDeviation > tuning.maximumWristDeviationDegrees
+    // The saber supplies the wrist orientation during gameplay.  Clamping it
+    // would rotate the avatar hand away from the grip even though Quest still
+    // knows the exact handle pose.  Retain the protective wrist cone only for
+    // inferred controller/menu targets.
+    hand.rotation = !handFromSaberGrip && wristDeviation > tuning.maximumWristDeviationDegrees
         ? Slerp(
             anatomicalHandRotation,
             desiredHandRotation,
@@ -771,6 +825,8 @@ void SolveArm(
         diagnostics->elbowFlexionDegrees[side] = std::acos(
             Clamp(Dot(upperDirection, lowerDirection), -1.0F, 1.0F)) * kRadiansToDegrees;
         diagnostics->handTargetError[side] = Length(hand.position - handTarget.position);
+        diagnostics->preAnchorHandTargetError[side] = solvedTargetError;
+        diagnostics->trackedGripHardAnchored[side] = handFromSaberGrip;
         diagnostics->wristRotationErrorDegrees[side] = QuaternionAngleDegrees(hand.rotation, desiredHandRotation);
         diagnostics->gripToHandRotation[side] = state.gripToHandRotation[side];
         diagnostics->handTargetFromSaberGrip[side] = handFromSaberGrip;
@@ -1322,6 +1378,7 @@ bool PersistentStateFinite(const SolverPersistentState& state) noexcept {
         !IsFinite(state.forwardHingeAmount) || !IsFinite(state.lateralLeanMeters) ||
         !IsFinite(state.pelvisSupportOffset) || !IsFinite(state.predictedSupportMargin) ||
         !IsFinite(state.maximumSupportOffset) ||
+        !IsFinite(state.gameplayStanceHeadHeight) ||
         !IsFinite(state.translationDwellSeconds) || !IsFinite(state.motionDisplacementSeconds) ||
         !IsFinite(state.leanConfidence) || !IsFinite(state.translationConfidence) ||
         !IsFinite(state.leanEnvelopeUtilization) || !IsFinite(state.previousControllerMidpoint) ||
@@ -1420,21 +1477,26 @@ bool StaticTrackerlessAvatarSolver::Solve(
         const auto& authoritative = side == 0 ? tracking.leftHand : tracking.rightHand;
         const auto& controller = tracking.controllerHand[side].valid
             ? tracking.controllerHand[side] : authoritative;
+        const auto gripFitTrusted = profile.valid &&
+            profile.gripConfidence[side] >= kDefaultBodySolverTuning.minimumGripFitConfidence;
         if (tracking.handIsSaberGrip[side]) {
             handTarget[side] = authoritative.pose;
-            sourceToCanonicalHand[side] = profile.gripFitUsesSaber[side]
+            sourceToCanonicalHand[side] = gripFitTrusted && profile.gripFitUsesSaber[side]
                 ? profile.gripToCanonicalHand[side]
-                : Multiply(
+                : gripFitTrusted ? Multiply(
                     Inverse(authoritative.pose.rotation),
-                    Multiply(controller.pose.rotation, profile.gripToCanonicalHand[side]));
+                    Multiply(controller.pose.rotation, profile.gripToCanonicalHand[side]))
+                : Quaternion{};
         } else {
-            const auto controllerToTarget = profile.valid && profile.controllerToGripObserved[side]
+            const auto controllerToTarget = gripFitTrusted && profile.controllerToGripObserved[side]
                 ? profile.controllerToGrip[side]
                 : player.controllerToWrist[side];
             handTarget[side] = Compose(authoritative.pose, controllerToTarget);
-            sourceToCanonicalHand[side] = profile.gripFitUsesSaber[side]
+            sourceToCanonicalHand[side] = gripFitTrusted && profile.gripFitUsesSaber[side]
                 ? profile.gripToCanonicalHand[side]
-                : Multiply(Inverse(controllerToTarget.rotation), profile.gripToCanonicalHand[side]);
+                : gripFitTrusted
+                    ? Multiply(Inverse(controllerToTarget.rotation), profile.gripToCanonicalHand[side])
+                    : Quaternion{};
         }
     }
     const auto yawError = UpdateBodyYaw(tracking, player, profile, deltaSeconds, state);
@@ -1468,13 +1530,32 @@ bool StaticTrackerlessAvatarSolver::Solve(
         spine.segmentLengths[index] = Length(
             spine.initialPositions[index + 1] - spine.initialPositions[index]);
     }
-    spine.rootTarget = pelvis.position;
-    spine.endTarget = headTarget.position;
     const auto bodyForward = Vec3{
         std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
     const auto bodyRight = Vec3{
         std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
     const auto totalSpineLength = SpineLength(avatar, scale);
+    // Constrain the root/end relationship before FABRIK. The spine may bow
+    // forward for a lunge, but a pelvis far in front of the head produces the
+    // impossible rearward C-shape seen in recordings. Lateral displacement is
+    // deliberately tighter so a large reach becomes body translation/stepping
+    // instead of rubber-body side bending.
+    auto rootToHead = Horizontal(headTarget.position - pelvis.position);
+    const auto rootToHeadForward = Dot(rootToHead, bodyForward);
+    const auto rootToHeadLateral = Dot(rootToHead, bodyRight);
+    const auto constrainedForward = Clamp(
+        rootToHeadForward,
+        -totalSpineLength * kDefaultBodySolverTuning.maximumBackwardSpineBowFraction,
+        totalSpineLength * kDefaultBodySolverTuning.maximumForwardSpineBowFraction);
+    const auto constrainedLateral = Clamp(
+        rootToHeadLateral,
+        -totalSpineLength * kDefaultBodySolverTuning.maximumLateralSpineBowFraction,
+        totalSpineLength * kDefaultBodySolverTuning.maximumLateralSpineBowFraction);
+    pelvis.position += bodyForward * (rootToHeadForward - constrainedForward) +
+        bodyRight * (rootToHeadLateral - constrainedLateral);
+    state.pelvisPosition = pelvis.position;
+    spine.rootTarget = pelvis.position;
+    spine.endTarget = headTarget.position;
     spine.restPrebend = bodyForward * (
         totalSpineLength *
         (kDefaultBodySolverTuning.spineForwardCurveFraction +

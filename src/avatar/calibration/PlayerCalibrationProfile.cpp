@@ -310,6 +310,8 @@ RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile
         runtime.gripFitUsesSaber[side] = profile.grip.fitUsesSaberGrip[side];
         runtime.effectiveReachNormalized[side] = profile.reach.effectiveReachNormalized[side];
         runtime.gripResidualDegrees[side] = profile.grip.meanRotationResidualDegrees[side];
+        runtime.gripConfidence[side] = profile.grip.confidence[side];
+        runtime.reachConfidence[side] = profile.reach.confidence[side];
     }
     runtime.leanBoundaryNormalized[0] = profile.lean.leftNormalized;
     runtime.leanBoundaryNormalized[1] = profile.lean.rightNormalized;

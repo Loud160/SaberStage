@@ -14,6 +14,7 @@ extern "C" {
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -51,41 +52,75 @@ public:
         const std::filesystem::path& rawAudio,
         const std::filesystem::path& output,
         std::int32_t framesPerSecond,
-        std::int32_t audioBitrate) {
+        std::int32_t audioBitrate,
+        double audioStartOffsetSeconds,
+        const std::vector<std::int64_t>& videoPresentationFrames) {
         if (framesPerSecond != 30 && framesPerSecond != 60) {
             throw std::runtime_error("recording frame rate must be 30 or 60 FPS");
         }
         av_log_set_level(AV_LOG_ERROR);
         OpenInputs(rawVideo, rawAudio, framesPerSecond);
         OpenOutput(output, framesPerSecond, audioBitrate);
+        if (!std::isfinite(audioStartOffsetSeconds) || std::abs(audioStartOffsetSeconds) > 5.0) {
+            throw std::runtime_error("measured audio/video start offset is invalid");
+        }
+        const auto offsetSamples = static_cast<std::int64_t>(std::llround(
+            audioStartOffsetSeconds * static_cast<double>(audioEncoder_->sample_rate)));
+        if (offsetSamples >= 0) {
+            // Preserve a genuinely later audio callback by beginning its MP4
+            // timestamps later than video rather than silently shifting it to
+            // t=0.
+            audioSamplePts_ = offsetSamples;
+        } else {
+            // Audio that arrived before the first submitted video frame has no
+            // corresponding picture. Trim that prefix at interleaved-sample
+            // granularity so both streams share the same t=0 epoch.
+            audioTrimInterleavedSamples_ = static_cast<std::uint64_t>(-offsetSamples) *
+                static_cast<std::uint64_t>(audioEncoder_->ch_layout.nb_channels);
+        }
 
         videoPacket_ = av_packet_alloc();
         audioPacket_ = av_packet_alloc();
         if (!videoPacket_ || !audioPacket_) throw std::runtime_error("cannot allocate FFmpeg mux packets");
 
         std::int64_t videoFrame = 0;
+        std::int64_t lastPresentationFrame = -1;
         while (av_read_frame(videoInput_, videoPacket_) >= 0) {
             if (videoPacket_->stream_index != videoInputStreamIndex_) {
                 av_packet_unref(videoPacket_);
                 continue;
             }
+            const auto presentationFrame = static_cast<std::size_t>(videoFrame) < videoPresentationFrames.size()
+                ? videoPresentationFrames[static_cast<std::size_t>(videoFrame)]
+                : lastPresentationFrame + 1;
             const auto audioTarget = av_rescale_q(
-                videoFrame, AVRational{1, framesPerSecond}, AVRational{1, audioEncoder_->sample_rate});
+                presentationFrame, AVRational{1, framesPerSecond}, AVRational{1, audioEncoder_->sample_rate});
             EncodeAudioThrough(audioTarget, false);
 
             videoPacket_->stream_index = videoOutputStream_->index;
-            videoPacket_->pts = videoFrame;
-            videoPacket_->dts = videoFrame;
+            videoPacket_->pts = presentationFrame;
+            videoPacket_->dts = presentationFrame;
             videoPacket_->duration = 1;
             videoPacket_->pos = -1;
             av_packet_rescale_ts(
                 videoPacket_, AVRational{1, framesPerSecond}, videoOutputStream_->time_base);
             Require(av_interleaved_write_frame(output_, videoPacket_), "cannot write MP4 video packet");
             av_packet_unref(videoPacket_);
+            lastPresentationFrame = presentationFrame;
             ++videoFrame;
         }
 
-        EncodeAudioThrough(0, true);
+        // End audio at the recorded picture timeline rather than blindly
+        // appending callback tail captured while the video encoder stopped.
+        // One AAC frame of allowance lets the encoder cover the final picture
+        // without creating perceptible duration drift.
+        const auto finalAudioTarget = lastPresentationFrame >= 0
+            ? av_rescale_q(
+                lastPresentationFrame + 1,
+                AVRational{1, framesPerSecond},
+                AVRational{1, audioEncoder_->sample_rate}) + audioFrame_->nb_samples
+            : 0;
+        EncodeAudioThrough(finalAudioTarget, false);
         Require(avcodec_send_frame(audioEncoder_, nullptr), "cannot flush AAC encoder");
         DrainAudioEncoder();
         Require(av_write_trailer(output_), "cannot finish MP4 trailer");
@@ -210,6 +245,17 @@ private:
         const auto needed = static_cast<std::size_t>(frameSamples * channels);
         for (;;) {
             while (pcm_.size() - pcmRead_ < needed && !audioInputEnded_) ReadMoreAudio();
+            if (audioTrimInterleavedSamples_ > 0) {
+                const auto availableToTrim = pcm_.size() - pcmRead_;
+                const auto trim = std::min<std::uint64_t>(
+                    audioTrimInterleavedSamples_, availableToTrim);
+                pcmRead_ += static_cast<std::size_t>(trim);
+                audioTrimInterleavedSamples_ -= trim;
+                if (audioTrimInterleavedSamples_ > 0) {
+                    if (audioInputEnded_) break;
+                    continue;
+                }
+            }
             const auto available = pcm_.size() - pcmRead_;
             if (!drainAll && audioSamplePts_ + frameSamples > targetSample) break;
             if (available == 0) break;
@@ -273,22 +319,28 @@ private:
     std::vector<std::int16_t> pcm_;
     std::size_t pcmRead_ = 0;
     std::int64_t audioSamplePts_ = 0;
+    std::uint64_t audioTrimInterleavedSamples_ = 0;
     bool audioInputEnded_ = false;
     bool trailerWritten_ = false;
 };
 
 } // namespace
 
-bool MuxDirectFfmpegRecording(
+bool MuxSaberStageRecording(
     const std::filesystem::path& rawVideo,
     const std::filesystem::path& rawAudio,
     const std::filesystem::path& output,
     std::int32_t framesPerSecond,
     std::int32_t audioBitrateBitsPerSecond,
+    double audioStartOffsetSeconds,
+    const std::vector<std::int64_t>& videoPresentationFrames,
     std::string* error) noexcept {
     try {
         MuxSession session;
-        session.Run(rawVideo, rawAudio, output, framesPerSecond, audioBitrateBitsPerSecond);
+        session.Run(
+            rawVideo, rawAudio, output, framesPerSecond,
+            audioBitrateBitsPerSecond, audioStartOffsetSeconds,
+            videoPresentationFrames);
         return true;
     } catch (const std::exception& exception) {
         if (error) *error = exception.what();

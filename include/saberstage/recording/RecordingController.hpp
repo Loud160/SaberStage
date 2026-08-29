@@ -120,6 +120,8 @@ private:
         std::filesystem::path finalOutput,
         std::int32_t framesPerSecond,
         std::int32_t audioBitrateBitsPerSecond,
+        double audioStartOffsetSeconds,
+        std::vector<std::int64_t> videoPresentationFrames,
         settings::RecordingBackend backend) noexcept;
     void CleanupCaptureObjects() noexcept;
     std::filesystem::path CreateUniqueBasePath() const;
@@ -150,6 +152,12 @@ private:
     std::chrono::steady_clock::time_point recordingStarted_{};
     std::chrono::steady_clock::time_point pauseStarted_{};
     std::chrono::steady_clock::duration accumulatedPaused_{};
+    std::int64_t firstVideoFrameMonotonicNanos_ = 0;
+    std::int64_t firstAudioSampleMonotonicNanos_ = 0;
+    std::mutex videoTimingMutex_;
+    std::vector<std::int64_t> videoPresentationFrames_;
+    std::int64_t videoSegmentFrameBase_ = 0;
+    std::int64_t videoSegmentLastPresentationFrame_ = -1;
     mutable std::mutex statusMutex_;
     std::string status_ = "Ready to record Primary camera.";
     StatusChangedHandler statusChangedHandler_;

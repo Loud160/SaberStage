@@ -25,17 +25,20 @@ struct BodySolverTuning {
     float chestHandVelocityFadeEnd = 4.0F;
 
     float maximumArmStretchFraction = 1.05F;
-    float shoulderAssistStartReachRatio = 0.90F;
-    float maximumShoulderAssistWidthFraction = 0.12F;
+    float maximumTrackedGripStretchFraction = 1.10F;
+    float shoulderAssistStartReachRatio = 0.88F;
+    float maximumShoulderAssistWidthFraction = 0.16F;
     float maximumWristDeviationDegrees = 70.0F;
+    float minimumGripFitConfidence = 0.45F;
+    float minimumReachFitConfidence = 0.45F;
 
-    float leanRadiusLegFraction = 0.12F;
-    float maximumLateralLeanSpineFraction = 0.18F;
-    float maximumLateralLeanShoulderFraction = 0.48F;
-    float maximumLateralLeanEyeFraction = 0.10F;
-    float translationStartLegFraction = 0.07F;
-    float translationDwellSeconds = 0.055F;
-    float bodyTranslationResponseSeconds = 0.17F;
+    float leanRadiusLegFraction = 0.095F;
+    float maximumLateralLeanSpineFraction = 0.13F;
+    float maximumLateralLeanShoulderFraction = 0.36F;
+    float maximumLateralLeanEyeFraction = 0.075F;
+    float translationStartLegFraction = 0.05F;
+    float translationDwellSeconds = 0.040F;
+    float bodyTranslationResponseSeconds = 0.14F;
     float pelvisResponseSeconds = 0.10F;
     float pelvisLeanShare = 0.16F;
     float verticalMotionTranslationSuppressionEyeFraction = 0.08F;
@@ -53,6 +56,9 @@ struct BodySolverTuning {
     float spineCrouchCurveAdditionFraction = 0.025F;
     float spineGuideWeight = 0.62F;
     float spineReversalWarningDegrees = 18.0F;
+    float maximumBackwardSpineBowFraction = 0.035F;
+    float maximumForwardSpineBowFraction = 0.75F;
+    float maximumLateralSpineBowFraction = 0.10F;
 
     float stanceWidthHipMultiplier = 1.15F;
     float movementLeadSeconds = 0.08F;

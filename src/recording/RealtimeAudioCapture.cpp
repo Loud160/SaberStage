@@ -75,6 +75,12 @@ public:
 
     void Push(ArrayW<float> data, std::int32_t channels) noexcept {
         if (!accepting_.load(std::memory_order_acquire) || channels <= 0 || data.size() == 0) return;
+        std::int64_t unset = 0;
+        firstSampleMonotonicNanos_.compare_exchange_strong(
+            unset,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_acq_rel);
         std::int32_t expected = 0;
         channels_.compare_exchange_strong(expected, channels, std::memory_order_acq_rel);
         if (channels_.load(std::memory_order_relaxed) != channels) {
@@ -105,6 +111,10 @@ public:
 
     [[nodiscard]] bool Failed() const noexcept {
         return writeFailed_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] std::int64_t FirstSampleMonotonicNanos() const noexcept {
+        return firstSampleMonotonicNanos_.load(std::memory_order_acquire);
     }
 
 private:
@@ -173,12 +183,14 @@ private:
     std::atomic<std::uint64_t> readIndex_{0};
     std::atomic<std::uint64_t> writeIndex_{0};
     std::atomic<std::uint64_t> droppedSamples_{0};
+    std::atomic<std::int64_t> firstSampleMonotonicNanos_{0};
     std::uint32_t dataBytes_ = 0;
 };
 
 void RealtimeAudioCapture::OpenFile(const std::filesystem::path& path, PcmConsumer consumer) {
     Save();
     lastDroppedSampleCount_ = 0;
+    lastFirstSampleMonotonicNanos_ = 0;
     lastFailed_ = false;
     impl_ = new RealtimeAudioCaptureImpl(path, std::move(consumer));
 }
@@ -187,6 +199,7 @@ void RealtimeAudioCapture::Save() noexcept {
     if (!impl_) return;
     impl_->Close();
     lastDroppedSampleCount_ = impl_->DroppedSampleCount();
+    lastFirstSampleMonotonicNanos_ = impl_->FirstSampleMonotonicNanos();
     lastFailed_ = impl_->Failed();
     delete impl_;
     impl_ = nullptr;
@@ -198,6 +211,10 @@ std::uint64_t RealtimeAudioCapture::DroppedSampleCount() const noexcept {
 
 bool RealtimeAudioCapture::Failed() const noexcept {
     return impl_ ? impl_->Failed() : lastFailed_;
+}
+
+std::int64_t RealtimeAudioCapture::FirstSampleMonotonicNanos() const noexcept {
+    return impl_ ? impl_->FirstSampleMonotonicNanos() : lastFirstSampleMonotonicNanos_;
 }
 
 void RealtimeAudioCapture::OnAudioFilterRead(ArrayW<float> data, int channels) {

@@ -128,6 +128,14 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     partialOutputPath_ = std::filesystem::path(base.string() + ".partial.mp4");
     finalOutputPath_ = std::filesystem::path(base.string() + ".mp4");
     captureWriteFailed_.store(false);
+    firstVideoFrameMonotonicNanos_ = 0;
+    firstAudioSampleMonotonicNanos_ = 0;
+    {
+        std::lock_guard lock(videoTimingMutex_);
+        videoPresentationFrames_.clear();
+        videoSegmentFrameBase_ = 0;
+        videoSegmentLastPresentationFrame_ = -1;
+    }
     settings::ResolutionDimensions(recording.resolution, activeWidth_, activeHeight_);
     activeFramesPerSecond_ = recording.framesPerSecond;
     activeBitrateBitsPerSecond_ = recording.bitrateBitsPerSecond;
@@ -302,6 +310,10 @@ void RecordingController::StartVideoSegment() {
     if (IsUnityObjectAlive(videoCapture_) || IsUnityObjectAlive(directVideoCapture_)) {
         throw std::runtime_error("video encoder segment is already active");
     }
+    {
+        std::lock_guard lock(videoTimingMutex_);
+        videoSegmentLastPresentationFrame_ = -1;
+    }
 
     if (activeBackend_ == settings::RecordingBackend::Hollywood) {
         videoCapture_ = activeRuntimeCamera_->get_gameObject()->AddComponent<Hollywood::CameraCapture*>();
@@ -322,6 +334,15 @@ void RecordingController::StartVideoSegment() {
         if (!IsUnityObjectAlive(videoCapture_->texture)) {
             throw std::runtime_error("Hollywood did not create an encoder texture");
         }
+        // Hollywood does not expose MediaCodec packet timestamps. Its own
+        // scheduler epoch is established by Init(), so use the matching
+        // monotonic point as this segment's picture start. SaberStage's muxer
+        // can then align the first audio callback instead of forcing both raw
+        // streams to zero and baking startup skew into the MP4.
+        if (firstVideoFrameMonotonicNanos_ == 0) {
+            firstVideoFrameMonotonicNanos_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
         camera_.SetExternalOutputTexture(videoCapture_->texture);
         return;
     }
@@ -336,6 +357,15 @@ void RecordingController::StartVideoSegment() {
         [this](const EncodedVideoPacketView& packet) {
             if (!videoWriter_ || !packet.data || packet.size == 0) return;
             if (!videoWriter_->TrySubmit(packet.data, packet.size)) captureWriteFailed_.store(true);
+            {
+                std::lock_guard timingLock(videoTimingMutex_);
+                const auto segmentFrame = packet.presentationTimestamp >= 0
+                    ? packet.presentationTimestamp
+                    : videoSegmentLastPresentationFrame_ + 1;
+                videoSegmentLastPresentationFrame_ = std::max(
+                    videoSegmentLastPresentationFrame_, segmentFrame);
+                videoPresentationFrames_.push_back(videoSegmentFrameBase_ + segmentFrame);
+            }
             std::lock_guard lock(livestreamMutex_);
             if (livestreamSink_) livestreamSink_->SubmitVideo(packet);
         });
@@ -358,7 +388,17 @@ void RecordingController::StopVideoSegment() noexcept {
     videoCapture_ = nullptr;
     try {
         if (IsUnityObjectAlive(directVideoCapture_)) {
+            const auto firstFrame = directVideoCapture_->FirstFrameMonotonicNanos();
+            if (firstVideoFrameMonotonicNanos_ == 0 && firstFrame > 0) {
+                firstVideoFrameMonotonicNanos_ = firstFrame;
+            }
             directVideoCapture_->Stop();
+            {
+                std::lock_guard lock(videoTimingMutex_);
+                if (videoSegmentLastPresentationFrame_ >= 0) {
+                    videoSegmentFrameBase_ += videoSegmentLastPresentationFrame_ + 1;
+                }
+            }
             if (directVideoCapture_->Failed()) captureWriteFailed_.store(true);
             if (const auto dropped = directVideoCapture_->DroppedFrameCount(); dropped > 0) {
                 Logging::Logger.warn(
@@ -789,6 +829,21 @@ void RecordingController::FinalizeAsync() {
     const auto fps = activeFramesPerSecond_;
     const auto audioBitrate = settings_.Get().recording.audioBitrateBitsPerSecond;
     const auto backend = activeBackend_;
+    std::vector<std::int64_t> videoPresentationFrames;
+    {
+        std::lock_guard lock(videoTimingMutex_);
+        videoPresentationFrames = videoPresentationFrames_;
+    }
+    const auto audioStartOffsetSeconds =
+        firstVideoFrameMonotonicNanos_ > 0 && firstAudioSampleMonotonicNanos_ > 0
+            ? static_cast<double>(firstAudioSampleMonotonicNanos_ - firstVideoFrameMonotonicNanos_) /
+                1'000'000'000.0
+            : 0.0;
+    Logging::Logger.info(
+        "Recording A/V epoch: backend={} firstVideo={}ns firstAudio={}ns audioOffset={:.3f}ms "
+        "timestampedVideoFrames={}",
+        settings::ToString(backend), firstVideoFrameMonotonicNanos_, firstAudioSampleMonotonicNanos_,
+        audioStartOffsetSeconds * 1000.0, videoPresentationFrames.size());
     finalizer_ = std::thread(
         &RecordingController::FinalizeWorker,
         this,
@@ -798,6 +853,8 @@ void RecordingController::FinalizeAsync() {
         finalOutputPath_,
         fps,
         audioBitrate,
+        audioStartOffsetSeconds,
+        std::move(videoPresentationFrames),
         backend);
 }
 
@@ -808,18 +865,17 @@ void RecordingController::FinalizeWorker(
     std::filesystem::path finalOutput,
     std::int32_t framesPerSecond,
     std::int32_t audioBitrateBitsPerSecond,
+    double audioStartOffsetSeconds,
+    std::vector<std::int64_t> videoPresentationFrames,
     settings::RecordingBackend backend) noexcept {
     try {
-        if (backend == settings::RecordingBackend::DirectFfmpegHardware) {
-            std::string muxError;
-            if (!MuxDirectFfmpegRecording(
-                    rawVideo, rawAudio, partialOutput, framesPerSecond,
-                    audioBitrateBitsPerSecond, &muxError)) {
-                throw std::runtime_error("Direct FFmpeg: " + muxError);
-            }
-        } else {
-            Hollywood::MuxFilesSync(
-                rawVideo.string(), rawAudio.string(), partialOutput.string(), framesPerSecond);
+        std::string muxError;
+        if (!MuxSaberStageRecording(
+                rawVideo, rawAudio, partialOutput, framesPerSecond,
+                audioBitrateBitsPerSecond, audioStartOffsetSeconds,
+                videoPresentationFrames, &muxError)) {
+            throw std::runtime_error(
+                std::string(settings::ToString(backend)) + " capture finalization: " + muxError);
         }
         if (!std::filesystem::exists(partialOutput) || std::filesystem::file_size(partialOutput) == 0) {
             throw std::runtime_error("selected recording backend did not produce an MP4");
@@ -859,6 +915,10 @@ void RecordingController::CleanupCaptureObjects() noexcept {
     try {
         if (IsUnityObjectAlive(audioCapture_)) {
             audioCapture_->Save();
+            const auto firstSample = audioCapture_->FirstSampleMonotonicNanos();
+            if (firstAudioSampleMonotonicNanos_ == 0 && firstSample > 0) {
+                firstAudioSampleMonotonicNanos_ = firstSample;
+            }
             if (audioCapture_->Failed() || audioCapture_->DroppedSampleCount() > 0) {
                 captureWriteFailed_.store(true);
                 Logging::Logger.error(

@@ -8,6 +8,12 @@ The right-side menu has `Record`, `Live Stream`, and `Files` tabs. Recording bac
 
 `Go Live` requires a session stream key. If local recording is idle, it begins one continuous local safety recording and sends that same encoded video to the network sink. `Stop Stream` ends only network output. `Stop & Save` ends both and finalizes the local MP4. Local pause is disabled while live because a public broadcast cannot pause its timeline.
 
+## Local recording timeline and A/V synchronization
+
+Both capture choices now use SaberStage's private FFmpeg finalizer rather than Hollywood's zero-origin muxer. The Direct FFmpeg backend preserves each frame's scheduled monotonic presentation time instead of renumbering whatever frames MediaCodec happens to return as a gap-free sequence. If the spectator encoder drops or delays a frame, the MP4 therefore preserves the elapsed video time rather than silently shortening the picture track. Pause/resume segments are normalized onto one continuous presentation timeline. Hollywood does not expose packet timestamps, so its H.264 frames retain sequential FPS timing, but it still receives the shared audio/video start-offset and bounded-tail correction.
+
+The first submitted video frame and first nonempty Unity audio callback are measured against the same monotonic clock. A later audio start receives a matching positive PTS offset; an earlier audio start has only the leading samples before video trimmed. Finalization stops audio at the video timeline plus at most one AAC frame, preventing capture-shutdown audio from extending the file. The stop log records first-video time, first-audio time, and the applied offset in milliseconds so a device report can distinguish capture-start skew from long-session drift. This is compile- and host-validated, but recorded Quest clips still need explicit lip/saber-impact sync checks before the behavior is considered device-proven.
+
 ## Performance isolation
 
 - The Unity audio callback performs only a bounded copy into a preallocated SPSC ring.

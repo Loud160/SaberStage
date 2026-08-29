@@ -37,6 +37,7 @@ public:
     void Stop() noexcept;
     [[nodiscard]] bool Failed() const noexcept;
     [[nodiscard]] std::uint64_t DroppedFrameCount() const noexcept;
+    [[nodiscard]] std::int64_t FirstFrameMonotonicNanos() const noexcept;
 
 private:
     UnityEngine::Camera* camera_ = nullptr;
@@ -44,6 +45,7 @@ private:
     double frameIntervalSeconds_ = 1.0 / 30.0;
     float startedAtSeconds_ = 0.0F;
     std::uint64_t scheduledFrames_ = 0;
+    std::int64_t firstFrameMonotonicNanos_ = 0;
 };
 
 namespace saberstage::recording {

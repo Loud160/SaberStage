@@ -41,9 +41,9 @@ Finishing the last accepted capture fits a pending profile and enters Review. It
 
 The fitter constructs one per-side source-to-canonical-hand rotation across all accepted arm poses and reports mean/maximum rotational residual. When four or more visible saber-grip observations exist, that source is preferred and one controller-to-visible-grip pose is fitted with mean/maximum positional residual. Otherwise the fit explicitly records that it is controller-derived and does not invent a visible-grip transform.
 
-At runtime a controller-derived anatomical correction is converted through the simultaneously sampled controller-to-saber rotation before it is applied to an active saber handle. In menus, a measured controller-to-grip pose is used only when it has enough observations; otherwise the existing explicit controller-to-wrist fallback remains authoritative. This prevents a menu-only calibration from applying controller axes directly to a differently oriented gameplay saber.
+At runtime a controller-derived anatomical correction is converted through the simultaneously sampled controller-to-saber rotation before it is applied to an active saber handle. Per-side grip and reach fits also have explicit minimum confidence gates. In menus, a measured controller-to-grip pose is used only when it has enough observations and confidence; otherwise the existing explicit controller-to-wrist fallback remains authoritative. Low-confidence reach data similarly leaves measured avatar arm length unchanged. This prevents a weak or menu-only fit from applying controller axes directly to a differently oriented gameplay saber.
 
-Effective reach is stored independently for each side and includes the 85th-percentile effective reach, maximum comfortable sample, and labeled down/forward/overhead/cross-body regions. It changes bounded reach-space/shoulder behavior, but avatar bone lengths remain authoritative and the existing named five-percent maximum limb stretch remains the hard cap.
+Effective reach is stored independently for each side and includes the 85th-percentile effective reach, maximum comfortable sample, and labeled down/forward/overhead/cross-body regions. It changes bounded reach-space/shoulder behavior without changing whole-avatar scale. Controller-only targets retain the five-percent visual stretch cap. An active tracked saber handle is instead a hard hand target: the arm may use up to ten-percent emergency stretch for proportion mismatch, but any remaining anatomical reach error is recorded rather than allowing the visible hand to leave the saber. Finger curls are derived from the loaded avatar's own rest-pose geometry and applied around that live handle; they are not part of the saved player profile.
 
 ## Runtime motion model
 
@@ -55,7 +55,7 @@ Squat/forward-duck samples tune the existing geometric vertical-drop/forward-hin
 
 Calibration capture and fitting may allocate, sort, and serialize because they run deliberately outside normal play. `RuntimePlayerProfile`, the classifier state, and solver diagnostics contain no dynamic containers. The profile-aware gameplay solve performs no heap allocation, trajectory search, fitting, JSON work, reflection, or ML inference.
 
-`Write Diagnostic Log` reports profile validity/confidence, last capture confidence, current classification, lean/translation confidence, ellipse utilization, four step similarities, turn confidence, per-hand effective reach ratio and grip residual, plus the existing hand-target, body, spine, foot, timing, and reach diagnostics. It remains an explicit user action rather than a per-frame log.
+`Write Diagnostic Log` reports profile validity/confidence, last capture confidence, current classification, lean/translation confidence, ellipse utilization, four step similarities, turn confidence, per-hand effective reach ratio and grip residual, plus pre-anchor versus final hand error and whether the saber grip was hard-anchored. Existing body, spine, foot, timing, and reach diagnostics remain. It is still an explicit user action rather than a per-frame log.
 
 ## Validation status and stop point
 

@@ -33,7 +33,9 @@ extern "C" {
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <deque>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -104,20 +106,17 @@ public:
 
     ANativeWindow* Window() const noexcept { return inputWindow_; }
 
-    void NotifySurfaceFrame() noexcept {
+    void NotifySurfaceFrame(std::int64_t presentationTimeNanos) noexcept {
         if (!acceptingFrames_.load(std::memory_order_acquire)) return;
-        auto pending = pendingFrames_.load(std::memory_order_relaxed);
-        for (;;) {
-            if (pending >= 8) {
+        {
+            std::lock_guard lock(wakeMutex_);
+            if (pendingPresentationTimes_.size() >= 8) {
                 droppedFrames_.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
-            if (pendingFrames_.compare_exchange_weak(
-                    pending, pending + 1, std::memory_order_release, std::memory_order_relaxed)) {
-                wake_.notify_one();
-                return;
-            }
+            pendingPresentationTimes_.push_back(presentationTimeNanos);
         }
+        wake_.notify_one();
     }
 
     void Stop() noexcept {
@@ -230,22 +229,30 @@ private:
                 {
                     std::unique_lock lock(wakeMutex_);
                     wake_.wait_for(lock, std::chrono::milliseconds(5), [this] {
-                        return pendingFrames_.load(std::memory_order_acquire) > 0 ||
+                        return !pendingPresentationTimes_.empty() ||
                                !acceptingFrames_.load(std::memory_order_acquire);
                     });
                 }
-                auto pending = pendingFrames_.exchange(0, std::memory_order_acq_rel);
-                while (pending-- > 0) {
-                    frame->pts = nextPresentationTimestamp_++;
+                for (;;) {
+                    std::int64_t presentationTimeNanos = 0;
+                    {
+                        std::lock_guard lock(wakeMutex_);
+                        if (pendingPresentationTimes_.empty()) break;
+                        presentationTimeNanos = pendingPresentationTimes_.front();
+                        pendingPresentationTimes_.pop_front();
+                    }
+                    frame->pts = static_cast<std::int64_t>(std::llround(
+                        static_cast<double>(presentationTimeNanos) *
+                        static_cast<double>(settings_.framesPerSecond) / 1'000'000'000.0));
                     const auto result = avcodec_send_frame(codecContext_, frame);
                     if (result < 0 && result != AVERROR(EAGAIN)) {
                         throw std::runtime_error("FFmpeg rejected a hardware surface frame: " + FfmpegError(result));
                     }
                     DrainPackets();
                 }
-                if (!acceptingFrames_.load(std::memory_order_acquire) &&
-                    pendingFrames_.load(std::memory_order_acquire) == 0) {
-                    break;
+                if (!acceptingFrames_.load(std::memory_order_acquire)) {
+                    std::lock_guard lock(wakeMutex_);
+                    if (pendingPresentationTimes_.empty()) break;
                 }
             }
             avcodec_send_frame(codecContext_, nullptr);
@@ -270,9 +277,8 @@ private:
     std::condition_variable wake_;
     std::atomic<bool> acceptingFrames_{false};
     std::atomic<bool> failed_{false};
-    std::atomic<std::uint32_t> pendingFrames_{0};
+    std::deque<std::int64_t> pendingPresentationTimes_;
     std::atomic<std::uint64_t> droppedFrames_{0};
-    std::int64_t nextPresentationTimestamp_ = 0;
     std::int32_t width_ = 0;
     std::int32_t height_ = 0;
 
@@ -450,7 +456,10 @@ void RenderToEncoder(int slot) {
                 static_cast<EGLnsecsANDROID>(
                     bridge->presentationTimeNanos.load(std::memory_order_acquire)));
         }
-        if (eglSwapBuffers(bridge->display, bridge->surface)) bridge->encoder->NotifySurfaceFrame();
+        if (eglSwapBuffers(bridge->display, bridge->surface)) {
+            bridge->encoder->NotifySurfaceFrame(
+                bridge->presentationTimeNanos.load(std::memory_order_acquire));
+        }
     }
 
     eglMakeCurrent(oldDisplay, oldDraw, oldRead, oldContext);
@@ -597,6 +606,7 @@ void DirectFfmpegCapture::Init(
     frameIntervalSeconds_ = 1.0 / static_cast<double>(settings.framesPerSecond);
     startedAtSeconds_ = UnityEngine::Time::get_unscaledTime() - static_cast<float>(frameIntervalSeconds_ * 0.5);
     scheduledFrames_ = 0;
+    firstFrameMonotonicNanos_ = 0;
 }
 
 void DirectFfmpegCapture::Update() {
@@ -605,6 +615,10 @@ void DirectFfmpegCapture::Update() {
     if (elapsed < frameIntervalSeconds_ * static_cast<double>(scheduledFrames_)) {
         camera_->set_enabled(false);
         return;
+    }
+    if (scheduledFrames_ == 0) {
+        firstFrameMonotonicNanos_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     ++scheduledFrames_;
     camera_->set_enabled(true);
@@ -623,6 +637,10 @@ bool DirectFfmpegCapture::Failed() const noexcept { return !impl_ || impl_->Fail
 
 std::uint64_t DirectFfmpegCapture::DroppedFrameCount() const noexcept {
     return impl_ ? impl_->DroppedFrames() : 0;
+}
+
+std::int64_t DirectFfmpegCapture::FirstFrameMonotonicNanos() const noexcept {
+    return firstFrameMonotonicNanos_;
 }
 
 void DirectFfmpegCapture::OnDestroy() {

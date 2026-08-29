@@ -294,6 +294,10 @@ calibration::RuntimePlayerProfile BuildRuntimePlayerProfile() {
     profile.gripFitUsesSaber[1] = true;
     profile.effectiveReachNormalized[0] = 0.43F;
     profile.effectiveReachNormalized[1] = 0.45F;
+    profile.gripConfidence[0] = 0.88F;
+    profile.gripConfidence[1] = 0.86F;
+    profile.reachConfidence[0] = 0.84F;
+    profile.reachConfidence[1] = 0.82F;
     profile.leanBoundaryNormalized[0] = 0.075F;
     profile.leanBoundaryNormalized[1] = 0.085F;
     profile.leanBoundaryNormalized[2] = 0.10F;
@@ -352,6 +356,25 @@ void TestRuntimePlayerProfileIntegration() {
           "per-hand calibrated grip residual reaches diagnostics");
     Check(diagnostics.motionClassification == MotionClassification::Unknown,
           "a stationary calibrated pose is not mislabeled as a lean");
+
+    auto lowConfidenceProfile = profile;
+    lowConfidenceProfile.gripConfidence[0] = 0.20F;
+    lowConfidenceProfile.reachConfidence[0] = 0.20F;
+    lowConfidenceProfile.controllerToGrip[0].position = {0.45F, 0.35F, -0.20F};
+    SolverPersistentState lowConfidenceState{};
+    SolvedHumanoidPose lowConfidencePose{};
+    SolverDiagnostics lowConfidenceDiagnostics{};
+    Check(solver.Solve(tracking, avatar, player, lowConfidenceProfile,
+              lowConfidenceState, lowConfidencePose, &lowConfidenceDiagnostics),
+          "low-confidence player-profile solve succeeds");
+    Check(Length(lowConfidenceDiagnostics.handTarget[0].position -
+              Compose(tracking.leftHand.pose, player.controllerToWrist[0]).position) < 0.001F,
+          "low-confidence grip fit falls back to the neutral controller-to-wrist target");
+    Check(Near(lowConfidenceDiagnostics.totalArmLength[0],
+              (avatar.upperArmLength[0] + avatar.lowerArmLength[0]) *
+                  (player.standingHmdHeight / avatar.eyeHeight),
+              0.001F),
+          "low-confidence reach fit does not stretch the avatar arm");
 
     auto controllerFitProfile = profile;
     controllerFitProfile.gripFitUsesSaber[0] = false;
@@ -596,9 +619,15 @@ void TestArmReachBendAndGripAuthority() {
           "controller-source reach sample solves before gameplay");
     tracking = NextFrame(tracking, tracking.head.pose.position);
     tracking.handIsSaberGrip[0] = true;
+    tracking.leftHand.pose.position = {-1.25F, 1.40F, 0.10F};
     Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics), "saber-handle target pose solves");
     Check(Length(diagnostics.handTarget[0].position - tracking.leftHand.pose.position) < 0.0001F,
           "authoritative saber handle bypasses controller-only position offsets");
+    Check(diagnostics.trackedGripHardAnchored[0] &&
+              diagnostics.preAnchorHandTargetError[0] > 0.05F &&
+              diagnostics.handTargetError[0] < 0.0001F &&
+              Length(diagnostics.finalHand[0].position - tracking.leftHand.pose.position) < 0.0001F,
+          "an unreachable tracked saber remains hard-anchored while pre-anchor reach error stays diagnostic");
     Check(Near(diagnostics.armReachRatioMinimum[0], diagnostics.armReachRatio[0], 0.0001F) &&
               Near(diagnostics.armReachRatioAverage[0], diagnostics.armReachRatio[0], 0.0001F) &&
               Near(diagnostics.armReachRatioMaximum[0], diagnostics.armReachRatio[0], 0.0001F),
@@ -610,8 +639,9 @@ void TestArmReachBendAndGripAuthority() {
     Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics), "rotated saber grip solves");
     Check(!SameRotation(calibratedHandRotation, diagnostics.finalHand[0].rotation, 0.005F),
           "persistent grip-to-hand offset carries subsequent grip rotation into the wrist");
-    Check(diagnostics.wristRotationErrorDegrees[0] <= 70.1F,
-          "wrist rotation is anatomical-limit clamped after grip-to-hand calibration");
+    Check(SameRotation(diagnostics.finalHand[0].rotation,
+              Multiply(diagnostics.handTarget[0].rotation, diagnostics.gripToHandRotation[0]), 0.001F),
+          "tracked saber wrist orientation remains authoritative instead of being clamped away from the grip");
 }
 
 void TestEyeAnchorAndHeadContinuity() {

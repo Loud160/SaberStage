@@ -120,6 +120,59 @@ const std::array<UnityBoneMap, kHumanoidBoneCount> kBoneMap = {{
     {HumanoidBone::RightToes, UnityEngine::HumanBodyBones::RightToes, HumanoidBone::RightFoot},
 }};
 
+struct UnityFingerMap {
+    UnityEngine::HumanBodyBones unity;
+    std::uint8_t side;
+    std::uint8_t joint;
+    std::int8_t child;
+};
+
+// Humanoid finger bones are intentionally kept outside the native body solver:
+// they do not affect reach or balance. Their grip pose is derived from each
+// avatar's own rest geometry after the hard tracked hand pose is written.
+const std::array<UnityFingerMap, 30> kFingerMap = {{
+    {UnityEngine::HumanBodyBones::LeftThumbProximal, 0, 0, 1},
+    {UnityEngine::HumanBodyBones::LeftThumbIntermediate, 0, 1, 2},
+    {UnityEngine::HumanBodyBones::LeftThumbDistal, 0, 2, -1},
+    {UnityEngine::HumanBodyBones::LeftIndexProximal, 0, 0, 4},
+    {UnityEngine::HumanBodyBones::LeftIndexIntermediate, 0, 1, 5},
+    {UnityEngine::HumanBodyBones::LeftIndexDistal, 0, 2, -1},
+    {UnityEngine::HumanBodyBones::LeftMiddleProximal, 0, 0, 7},
+    {UnityEngine::HumanBodyBones::LeftMiddleIntermediate, 0, 1, 8},
+    {UnityEngine::HumanBodyBones::LeftMiddleDistal, 0, 2, -1},
+    {UnityEngine::HumanBodyBones::LeftRingProximal, 0, 0, 10},
+    {UnityEngine::HumanBodyBones::LeftRingIntermediate, 0, 1, 11},
+    {UnityEngine::HumanBodyBones::LeftRingDistal, 0, 2, -1},
+    {UnityEngine::HumanBodyBones::LeftLittleProximal, 0, 0, 13},
+    {UnityEngine::HumanBodyBones::LeftLittleIntermediate, 0, 1, 14},
+    {UnityEngine::HumanBodyBones::LeftLittleDistal, 0, 2, -1},
+    {UnityEngine::HumanBodyBones::RightThumbProximal, 1, 0, 16},
+    {UnityEngine::HumanBodyBones::RightThumbIntermediate, 1, 1, 17},
+    {UnityEngine::HumanBodyBones::RightThumbDistal, 1, 2, -1},
+    {UnityEngine::HumanBodyBones::RightIndexProximal, 1, 0, 19},
+    {UnityEngine::HumanBodyBones::RightIndexIntermediate, 1, 1, 20},
+    {UnityEngine::HumanBodyBones::RightIndexDistal, 1, 2, -1},
+    {UnityEngine::HumanBodyBones::RightMiddleProximal, 1, 0, 22},
+    {UnityEngine::HumanBodyBones::RightMiddleIntermediate, 1, 1, 23},
+    {UnityEngine::HumanBodyBones::RightMiddleDistal, 1, 2, -1},
+    {UnityEngine::HumanBodyBones::RightRingProximal, 1, 0, 25},
+    {UnityEngine::HumanBodyBones::RightRingIntermediate, 1, 1, 26},
+    {UnityEngine::HumanBodyBones::RightRingDistal, 1, 2, -1},
+    {UnityEngine::HumanBodyBones::RightLittleProximal, 1, 0, 28},
+    {UnityEngine::HumanBodyBones::RightLittleIntermediate, 1, 1, 29},
+    {UnityEngine::HumanBodyBones::RightLittleDistal, 1, 2, -1},
+}};
+
+struct FingerRestPose {
+    UnityEngine::Transform* transform = nullptr;
+    Vec3 localPosition{};
+    Quaternion localRotation{};
+    Quaternion worldRotation{};
+    Vec3 worldPosition{};
+    Vec3 curlAxisLocal{};
+    bool valid = false;
+};
+
 TrackedPose SamplePose(UnityEngine::Transform* transform, const TrackedPose& previous, double timestamp) {
     UnityEngine::Vector3 position{};
     UnityEngine::Quaternion rotation{};
@@ -260,6 +313,43 @@ public:
                 bone.world = {FromUnity(worldPosition), FromUnity(worldRotation)};
                 bone.local = {FromUnity(localPosition), FromUnity(localRotation)};
             }
+            for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
+                const auto& mapping = kFingerMap[index];
+                auto reference = animator_->GetBoneTransform(mapping.unity);
+                auto* transform = reference ? reference.ptr() : nullptr;
+                if (!IsAlive(transform)) continue;
+                UnityEngine::Vector3 worldPosition{};
+                UnityEngine::Quaternion worldRotation{};
+                UnityEngine::Vector3 localPosition{};
+                UnityEngine::Quaternion localRotation{};
+                transform->GetPositionAndRotation(byref(worldPosition), byref(worldRotation));
+                transform->GetLocalPositionAndRotation(byref(localPosition), byref(localRotation));
+                auto& finger = fingers_[index];
+                finger.transform = transform;
+                finger.worldPosition = FromUnity(worldPosition);
+                finger.worldRotation = FromUnity(worldRotation);
+                finger.localPosition = FromUnity(localPosition);
+                finger.localRotation = FromUnity(localRotation);
+                finger.valid = true;
+            }
+            for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
+                auto& finger = fingers_[index];
+                if (!finger.valid) continue;
+                const auto childIndex = kFingerMap[index].child;
+                if (childIndex >= 0 && fingers_[static_cast<std::size_t>(childIndex)].valid) {
+                    const auto segment = Normalize(
+                        fingers_[static_cast<std::size_t>(childIndex)].worldPosition - finger.worldPosition);
+                    const auto handBone = kFingerMap[index].side == 0
+                        ? HumanoidBone::LeftHand : HumanoidBone::RightHand;
+                    const auto towardPalm = Normalize(ProjectOnPlane(
+                        rest.bones[BoneIndex(handBone)].world.position - finger.worldPosition,
+                        segment));
+                    const auto axisWorld = Normalize(Cross(segment, towardPalm));
+                    finger.curlAxisLocal = Rotate(Inverse(finger.worldRotation), axisWorld);
+                } else if (index > 0 && kFingerMap[index - 1].side == kFingerMap[index].side) {
+                    finger.curlAxisLocal = fingers_[index - 1].curlAxisLocal;
+                }
+            }
             const auto measured = MeasureAvatarRestPose(rest, eyeAnchor);
             if (!measured.calibration.valid) {
                 Logging::Logger.error("Avatar rest-pose calibration failed: {}", measured.error ? measured.error : "unknown geometry failure");
@@ -302,12 +392,18 @@ public:
                     const auto& local = calibration_.rest.bones[index].local;
                     transform->SetLocalPositionAndRotation(ToUnity(local.position), ToUnity(local.rotation));
                 }
+                for (const auto& finger : fingers_) {
+                    if (!finger.valid || !IsAlive(finger.transform)) continue;
+                    finger.transform->SetLocalPositionAndRotation(
+                        ToUnity(finger.localPosition), ToUnity(finger.localRotation));
+                }
                 if (IsAlive(animator_)) animator_->set_enabled(animatorWasEnabled_);
             } catch (...) {
                 Logging::Logger.error("Avatar rest-pose restoration failed during unbind");
             }
         }
         transforms_.fill(nullptr);
+        fingers_ = {};
         animator_ = nullptr;
         tracking_ = nullptr;
         headTransform_ = nullptr;
@@ -832,7 +928,8 @@ public:
                     "Avatar {} arm: source={} shoulder=({:.3f},{:.3f},{:.3f}) target=({:.3f},{:.3f},{:.3f}) "
                     "length={:.3f}+{:.3f}={:.3f} distance={:.3f} reachRatio={:.3f} range={:.3f}/{:.3f}/{:.3f} "
                     "calibratedReach={:.3f} gripResidual={:.1f}deg elbowFlex={:.1f}deg "
-                    "handError={:.4f}m wristError={:.1f}deg pole=({:.3f},{:.3f},{:.3f})",
+                    "preAnchorError={:.4f}m finalHandError={:.4f}m hardGripAnchor={} "
+                    "wristError={:.1f}deg pole=({:.3f},{:.3f},{:.3f})",
                     side == 0 ? "left" : "right",
                     diagnostics_.handTargetFromSaberGrip[side] ? "saber-handle" : "controller",
                     diagnostics_.shoulderTarget[side].x,
@@ -852,7 +949,9 @@ public:
                     diagnostics_.calibratedEffectiveReachRatio[side],
                     diagnostics_.calibratedGripResidualDegrees[side],
                     diagnostics_.elbowFlexionDegrees[side],
+                    diagnostics_.preAnchorHandTargetError[side],
                     diagnostics_.handTargetError[side],
+                    diagnostics_.trackedGripHardAnchored[side],
                     diagnostics_.wristRotationErrorDegrees[side],
                     diagnostics_.elbowPole[side].x,
                     diagnostics_.elbowPole[side].y,
@@ -1238,6 +1337,27 @@ private:
             transform->SetPositionAndRotation(ToUnity(pose.position), ToUnity(pose.rotation));
             ++writes;
         }
+        // Close the fingers around a live saber only after the solved hand has
+        // been written. Axes come from this VRM's rest geometry, avoiding the
+        // fragile assumption that every exporter uses the same local axes.
+        constexpr float kCurlDegrees[3] = {46.0F, 58.0F, 38.0F};
+        constexpr float kThumbCurlDegrees[3] = {24.0F, 32.0F, 24.0F};
+        for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
+            const auto& mapping = kFingerMap[index];
+            auto& finger = fingers_[index];
+            if (!finger.valid || !IsAlive(finger.transform)) continue;
+            auto rotation = finger.localRotation;
+            if (sample_.handIsSaberGrip[mapping.side] && LengthSquared(finger.curlAxisLocal) > 1.0e-5F) {
+                const auto isThumb = index % 15 < 3;
+                const auto degrees = isThumb
+                    ? kThumbCurlDegrees[mapping.joint]
+                    : kCurlDegrees[mapping.joint];
+                rotation = Multiply(rotation, AxisAngle(
+                    Normalize(finger.curlAxisLocal), degrees * 3.14159265358979323846F / 180.0F));
+            }
+            finger.transform->SetLocalPositionAndRotation(ToUnity(finger.localPosition), ToUnity(rotation));
+            ++writes;
+        }
         return writes;
     }
 
@@ -1278,6 +1398,7 @@ private:
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::Animator* animator_ = nullptr;
     std::array<UnityEngine::Transform*, kHumanoidBoneCount> transforms_{};
+    std::array<FingerRestPose, kFingerMap.size()> fingers_{};
     GlobalNamespace::PlayerTransforms* tracking_ = nullptr;
     UnityEngine::Transform* headTransform_ = nullptr;
     UnityEngine::Transform* handTransforms_[2]{};

@@ -215,6 +215,11 @@ struct RuntimePlayerProfile {
     CrouchModel crouch{};
     TurnModel turn{};
     float gripResidualDegrees[2]{};
+    // Keep the component confidences in the allocation-free runtime view.
+    // Overall confidence alone is not sufficient: an otherwise valid body
+    // calibration can contain a poor grip or reach fit on one side.
+    float gripConfidence[2]{};
+    float reachConfidence[2]{};
     float overallConfidence = 0.0F;
     bool valid = false;
 };

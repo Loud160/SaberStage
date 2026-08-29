@@ -199,6 +199,11 @@ struct SolverPersistentState {
     float pelvisSupportOffset = 0.0F;
     float predictedSupportMargin = 0.0F;
     float maximumSupportOffset = 0.0F;
+    // A gameplay stance is often several centimetres lower than the neutral
+    // calibration pose. Track that separately so ordinary Beat Saber posture
+    // is not mistaken for a permanent squat.
+    float gameplayStanceHeadHeight = 0.0F;
+    bool gameplayStanceHeightValid = false;
     float translationDwellSeconds = 0.0F;
     float motionDisplacementSeconds = 0.0F;
     float leanConfidence = 0.0F;
@@ -257,6 +262,8 @@ struct SolverDiagnostics {
     float elbowFlexionDegrees[2]{};
     float handTargetError[2]{};
     float wristRotationErrorDegrees[2]{};
+    float preAnchorHandTargetError[2]{};
+    bool trackedGripHardAnchored[2]{};
     Quaternion gripToHandRotation[2]{};
     bool handTargetFromSaberGrip[2]{};
     float eyeTargetError = 0.0F;
