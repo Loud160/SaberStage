@@ -90,12 +90,19 @@ private:
     void BrowseAvatarDirectory(const std::filesystem::path& directory);
     void SelectAvatarFile(const std::filesystem::path& path);
     [[nodiscard]] std::filesystem::path ConfiguredAvatarPath() const;
+    void ShowAvatarTab(int index);
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     static MenuController* active_;
     app::ApplicationRoot& root_;
     TMPro::TextMeshProUGUI* scriptStatusText_ = nullptr;
     UnityEngine::UI::RawImage* dockedPreviewImage_ = nullptr;
+    HMUI::TextSegmentedControl* avatarTabs_ = nullptr;
+    std::array<UnityEngine::GameObject*, 3> avatarTabViewRoots_{};
+    // The scroll-view root controls visibility, while the content root owns
+    // the actual settings layout. Keep both so a page that was hidden during
+    // its first canvas pass can be rebuilt when selected.
+    std::array<UnityEngine::GameObject*, 3> avatarTabContentRoots_{};
     HMUI::TextSegmentedControl* settingsTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 4> tabViewRoots_{};
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
@@ -158,6 +165,7 @@ private:
     bool calibrationPanelCreationFailureLogged_ = false;
     bool calibrationPanelTickFailureLogged_ = false;
     bool livestreamKeyVisible_ = false;
+    int selectedAvatarTab_ = 0;
     int selectedTab_ = 0;
     int selectedRecordingTab_ = 0;
     bool registered_ = false;

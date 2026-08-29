@@ -8,6 +8,7 @@ namespace saberstage::avatar {
 class StaticTrackerlessAvatarSolver final {
 public:
     void Reset(SolverPersistentState& state) const noexcept;
+    void SetSideStepLeanLimit(float fraction) noexcept;
 
     bool Solve(
         const TrackingSample& tracking,
@@ -25,6 +26,9 @@ public:
         SolverPersistentState& state,
         SolvedHumanoidPose& output,
         SolverDiagnostics* diagnostics = nullptr) const noexcept;
+
+private:
+    float sideStepLeanLimit_ = 1.0F;
 };
 
 } // namespace saberstage::avatar

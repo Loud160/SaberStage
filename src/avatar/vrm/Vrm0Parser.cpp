@@ -292,7 +292,8 @@ private:
         const auto* vrm = extensions ? Member(*extensions, "VRM") : nullptr;
         if (!vrm || !vrm->IsObject()) throw ParseFailure("VRM 0.x extension is missing");
 
-        static const std::unordered_set<std::string> supportedExtensions{"VRM", "KHR_materials_unlit"};
+        static const std::unordered_set<std::string> supportedExtensions{
+            "VRM", "KHR_materials_unlit", "KHR_texture_transform"};
         if (const auto* used = Member(document_, "extensionsUsed")) {
             if (!used->IsArray()) throw ParseFailure("glTF.extensionsUsed must be an array");
             for (const auto& extension : used->GetArray()) {
@@ -526,6 +527,51 @@ private:
     }
 
     void ParseMaterials(const rapidjson::Value& vrm) {
+        const auto parseTextureInfo = [&](const rapidjson::Value* textureInfo,
+                                          MToonMaterial& material,
+                                          const char* property,
+                                          const char* context) {
+            if (!textureInfo) return;
+            if (!textureInfo->IsObject()) throw ParseFailure(std::string(context) + " must be an object");
+            const auto index = OptionalIndex(*textureInfo, "index", context);
+            if (!index) return;
+            material.textureProperties[property] = *index;
+            TextureTransform transform{};
+            if (const auto* texCoord = Member(*textureInfo, "texCoord")) {
+                if (!texCoord->IsInt() || texCoord->GetInt() < 0 || texCoord->GetInt() > 1) {
+                    throw ParseFailure(std::string(context) + ".texCoord must be 0 or 1");
+                }
+                transform.texCoord = texCoord->GetInt();
+            }
+            if (const auto* extensions = Member(*textureInfo, "extensions")) {
+                if (!extensions->IsObject()) throw ParseFailure(std::string(context) + ".extensions must be an object");
+                if (const auto* khr = Member(*extensions, "KHR_texture_transform")) {
+                    if (!khr->IsObject()) throw ParseFailure("KHR_texture_transform must be an object");
+                    transform.present = true;
+                    if (const auto* offset = Member(*khr, "offset")) {
+                        const auto value = JsonFloat4(offset, {0, 0, 0, 0});
+                        transform.offset = {value.x, value.y};
+                    }
+                    if (const auto* scale = Member(*khr, "scale")) {
+                        const auto value = JsonFloat4(scale, {1, 1, 0, 0});
+                        transform.scale = {value.x, value.y};
+                    }
+                    if (const auto* rotation = Member(*khr, "rotation")) {
+                        if (!rotation->IsNumber()) throw ParseFailure("KHR_texture_transform.rotation must be numeric");
+                        transform.rotation = rotation->GetFloat();
+                    }
+                    if (const auto* texCoord = Member(*khr, "texCoord")) {
+                        if (!texCoord->IsInt() || texCoord->GetInt() < 0 || texCoord->GetInt() > 1) {
+                            throw ParseFailure("KHR_texture_transform.texCoord must be 0 or 1");
+                        }
+                        transform.texCoord = texCoord->GetInt();
+                    }
+                }
+            }
+            if (transform.present || transform.texCoord != 0) {
+                material.textureTransforms[property] = transform;
+            }
+        };
         const auto* gltfMaterials = Member(document_, "materials");
         const auto* vrmMaterials = Member(vrm, "materialProperties");
         const auto count = std::max(
@@ -539,9 +585,27 @@ private:
                 material.name = StringValue(Member(source, "name"), "Material " + std::to_string(i));
                 if (const auto* pbr = Member(source, "pbrMetallicRoughness")) {
                     material.vectorProperties["_Color"] = JsonFloat4(Member(*pbr, "baseColorFactor"), {1, 1, 1, 1});
-                    if (const auto* texture = Member(*pbr, "baseColorTexture")) {
-                        if (const auto index = OptionalIndex(*texture, "index", "baseColorTexture")) material.textureProperties["_MainTex"] = *index;
-                    }
+                    parseTextureInfo(Member(*pbr, "baseColorTexture"), material, "_MainTex", "baseColorTexture");
+                }
+                parseTextureInfo(Member(source, "normalTexture"), material, "_BumpMap", "normalTexture");
+                parseTextureInfo(Member(source, "emissiveTexture"), material, "_EmissionMap", "emissiveTexture");
+                if (const auto* emissive = Member(source, "emissiveFactor")) {
+                    const auto value = JsonFloat4(emissive, {0, 0, 0, 1});
+                    material.vectorProperties["_EmissionColor"] = value;
+                }
+                const auto alphaMode = StringValue(Member(source, "alphaMode"), "OPAQUE");
+                material.floatProperties["_BlendMode"] = alphaMode == "MASK" ? 1.0F : alphaMode == "BLEND" ? 2.0F : 0.0F;
+                if (const auto* cutoff = Member(source, "alphaCutoff")) {
+                    if (!cutoff->IsNumber()) throw ParseFailure("material.alphaCutoff must be numeric");
+                    material.floatProperties["_Cutoff"] = cutoff->GetFloat();
+                }
+                material.floatProperties["_CullMode"] =
+                    Member(source, "doubleSided") && Member(source, "doubleSided")->IsBool() &&
+                    Member(source, "doubleSided")->GetBool() ? 0.0F : 2.0F;
+                if (const auto* extensions = Member(source, "extensions");
+                    extensions && extensions->IsObject() && Member(*extensions, "KHR_materials_unlit")) {
+                    material.shader = alphaMode == "MASK" ? "VRM/UnlitCutout" :
+                        alphaMode == "BLEND" ? "VRM/UnlitTransparent" : "VRM/UnlitTexture";
                 }
             }
             if (!vrmMaterials || !vrmMaterials->IsArray() || i >= vrmMaterials->Size()) continue;
@@ -549,6 +613,10 @@ private:
             if (!source.IsObject()) throw ParseFailure("VRM materialProperty must be an object");
             material.name = StringValue(Member(source, "name"), material.name);
             material.shader = StringValue(Member(source, "shader"));
+            if (const auto* queue = Member(source, "renderQueue")) {
+                if (!queue->IsInt()) throw ParseFailure("VRM material renderQueue must be an integer");
+                material.renderQueue = queue->GetInt();
+            }
             if (!material.shader.empty() && material.shader != "VRM/MToon" && material.shader != "VRM/UnlitTexture" &&
                 material.shader != "VRM/UnlitTransparent" && material.shader != "VRM/UnlitCutout") {
                 const auto warning = "VRM material shader will use the first-pass fallback: " + material.shader;
@@ -639,6 +707,7 @@ private:
                 if (const auto accessor = attributeIndex("NORMAL", false)) primitive.normals = Float3s(*accessor);
                 if (const auto accessor = attributeIndex("TANGENT", false)) primitive.tangents = Float4s(*accessor);
                 if (const auto accessor = attributeIndex("TEXCOORD_0", false)) primitive.texcoords0 = Float2s(*accessor);
+                if (const auto accessor = attributeIndex("TEXCOORD_1", false)) primitive.texcoords1 = Float2s(*accessor);
                 if (const auto accessor = attributeIndex("JOINTS_0", false)) primitive.joints0 = UInt4s(*accessor);
                 if (const auto accessor = attributeIndex("WEIGHTS_0", false)) primitive.weights0 = Float4s(*accessor);
                 if (const auto* indices = Member(source, "indices")) primitive.indices = Indices(CheckedIndex(*indices, "primitive.indices"));
@@ -649,7 +718,8 @@ private:
                 const auto vertices = primitive.positions.size();
                 const auto sameSize = [vertices](std::size_t size) { return size == 0 || size == vertices; };
                 if (!sameSize(primitive.normals.size()) || !sameSize(primitive.tangents.size()) ||
-                    !sameSize(primitive.texcoords0.size()) || !sameSize(primitive.joints0.size()) || !sameSize(primitive.weights0.size())) {
+                    !sameSize(primitive.texcoords0.size()) || !sameSize(primitive.texcoords1.size()) ||
+                    !sameSize(primitive.joints0.size()) || !sameSize(primitive.weights0.size())) {
                     throw ParseFailure("primitive attributes have inconsistent vertex counts");
                 }
                 if (primitive.joints0.empty() != primitive.weights0.empty()) throw ParseFailure("skinned primitive must provide both JOINTS_0 and WEIGHTS_0");

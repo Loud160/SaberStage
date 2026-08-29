@@ -41,6 +41,7 @@
 #include "UnityEngine/UI/HorizontalLayoutGroup.hpp"
 #include "UnityEngine/UI/Image.hpp"
 #include "UnityEngine/UI/LayoutElement.hpp"
+#include "UnityEngine/UI/LayoutRebuilder.hpp"
 #include "UnityEngine/UI/VerticalLayoutGroup.hpp"
 #include "bsml/shared/BSML-Lite.hpp"
 #include "bsml/shared/BSML.hpp"
@@ -339,6 +340,144 @@ T* ConstrainRightPanelRow(T* control) {
     return control;
 }
 
+constexpr float kCenterPanelRowWidth = 52.0F;
+constexpr float kCenterPanelLabelFraction = 0.44F;
+
+void ConstrainCenterPanelRowObject(UnityEngine::GameObject* object) {
+    if (!object) return;
+    auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>();
+    if (!layout) layout = object->AddComponent<UnityEngine::UI::LayoutElement*>();
+    if (!layout) return;
+
+    // BSML's setting prefabs are authored for a 90-unit settings screen.
+    // SaberStage's center tab deliberately owns a 52-unit content column.
+    // The parent layout and every stock row must agree on that same width or
+    // Unity preserves the prefab's 90-unit geometry outside the scroll mask.
+    layout->set_minWidth(kCenterPanelRowWidth);
+    layout->set_preferredWidth(kCenterPanelRowWidth);
+    layout->set_flexibleWidth(0.0F);
+}
+
+void FitRectToParentRegion(
+    UnityEngine::RectTransform* rect,
+    float left,
+    float right,
+    float leftInset = 0.0F,
+    float rightInset = 0.0F) {
+    if (!rect) return;
+    rect->set_anchorMin({left, 0.0F});
+    rect->set_anchorMax({right, 1.0F});
+    rect->set_pivot({0.5F, 0.5F});
+    rect->set_offsetMin({leftInset, 0.0F});
+    rect->set_offsetMax({-rightInset, 0.0F});
+}
+
+BSML::DropdownListSetting* ConstrainCenterPanelRow(BSML::DropdownListSetting* control) {
+    if (!control) return nullptr;
+    auto object = control->get_gameObject();
+    ConstrainCenterPanelRowObject(object);
+    if (!object) return control;
+
+    // A stock dropdown keeps its selector at the far edge of a 90-unit row.
+    // Re-anchor both halves inside this row instead of merely shrinking the
+    // row's LayoutElement and leaving the visible children off-screen.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    if (auto labelTransform = root->Find("Label")) {
+        FitRectToParentRegion(
+            labelTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+            0.0F,
+            kCenterPanelLabelFraction,
+            0.5F,
+            0.75F);
+        if (auto* label = labelTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+            label->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            label->set_enableWordWrapping(false);
+            label->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        }
+    }
+    if (control->dropdown) {
+        FitRectToParentRegion(
+            control->dropdown->get_transform().cast<UnityEngine::RectTransform>(),
+            kCenterPanelLabelFraction,
+            1.0F,
+            0.75F,
+            0.5F);
+    }
+    return control;
+}
+
+BSML::SliderSetting* ConstrainCenterPanelRow(BSML::SliderSetting* control) {
+    if (!control) return nullptr;
+    auto object = control->get_gameObject();
+    ConstrainCenterPanelRowObject(object);
+    if (!object) return control;
+
+    // SliderSettingTag reserves a fixed 52 units for the slider by default.
+    // On this 52-unit page that leaves the title with no width at all. Split
+    // the row explicitly so the title and the complete native slider remain
+    // visible and interactive inside the same masked column.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    if (auto titleTransform = root->Find("Title")) {
+        FitRectToParentRegion(
+            titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+            0.0F,
+            kCenterPanelLabelFraction,
+            0.5F,
+            0.75F);
+        if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+            title->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            title->set_enableWordWrapping(false);
+            title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        }
+    }
+    if (control->slider) {
+        FitRectToParentRegion(
+            control->slider->get_transform().cast<UnityEngine::RectTransform>(),
+            kCenterPanelLabelFraction,
+            1.0F,
+            0.75F,
+            0.5F);
+    }
+    return control;
+}
+
+BSML::ToggleSetting* ConstrainCenterPanelRow(BSML::ToggleSetting* control) {
+    if (!control) return nullptr;
+    auto object = control->get_gameObject();
+    ConstrainCenterPanelRowObject(object);
+    if (!object) return control;
+
+    // ToggleSettingTag copies the game's full-width Fullscreen row. Preserve
+    // the native switch dimensions, but pin it to this row's right edge and
+    // give all remaining width to the label.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    auto switchTransform = root->Find("SwitchView");
+    auto* switchRect = switchTransform
+        ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
+        : nullptr;
+    const auto switchWidth = switchRect ? switchRect->get_sizeDelta().x : 12.0F;
+    if (auto nameTransform = root->Find("NameText")) {
+        auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
+        nameRect->set_anchorMin({0.0F, 0.0F});
+        nameRect->set_anchorMax({1.0F, 1.0F});
+        nameRect->set_pivot({0.5F, 0.5F});
+        nameRect->set_offsetMin({0.5F, 0.0F});
+        nameRect->set_offsetMax({-(switchWidth + 1.5F), 0.0F});
+        if (control->text) {
+            control->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            control->text->set_enableWordWrapping(false);
+            control->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        }
+    }
+    if (switchRect) {
+        switchRect->set_anchorMin({1.0F, 0.5F});
+        switchRect->set_anchorMax({1.0F, 0.5F});
+        switchRect->set_pivot({1.0F, 0.5F});
+        switchRect->set_anchoredPosition({-0.5F, 0.0F});
+    }
+    return control;
+}
+
 void ConfigureRightPanelButton(UnityEngine::UI::Button* button) {
     if (!IsAlive(button)) return;
     NeutralizeContentSizeFitter(button);
@@ -472,13 +611,64 @@ void MenuController::Register() {
 
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
-    auto* container = BSML::Lite::CreateScrollableSettingsContainer(view);
-    if (!container) return;
-    if (auto* rows = container->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
-        rows->set_childControlHeight(true);
-        rows->set_childForceExpandHeight(false);
-        rows->set_spacing(1.0F);
+    static std::array<std::string_view, 3> tabNames{"Avatar", "Quality", "Calibration"};
+    active_->avatarTabViewRoots_.fill(nullptr);
+    active_->avatarTabContentRoots_.fill(nullptr);
+    active_->selectedAvatarTab_ = 0;
+    active_->avatarTabs_ = BSML::Lite::CreateTextSegmentedControl(
+        view,
+        {0.0F, 0.0F},
+        {54.0F, 7.0F},
+        tabNames,
+        [](int index) {
+            if (active_) active_->ShowAvatarTab(index);
+        });
+    if (active_->avatarTabs_) {
+        WithHint(active_->avatarTabs_, "Switches the center panel between avatar loading, visual quality, and player calibration.");
+        auto tabsRect = active_->avatarTabs_->get_transform().cast<UnityEngine::RectTransform>();
+        tabsRect->set_anchorMin({0.0F, 1.0F});
+        tabsRect->set_anchorMax({1.0F, 1.0F});
+        tabsRect->set_pivot({0.5F, 1.0F});
+        tabsRect->set_anchoredPosition({0.0F, -1.5F});
+        tabsRect->set_sizeDelta({-4.0F, 7.0F});
     }
+
+    const auto createTabPage = [&](int index) -> UnityEngine::GameObject* {
+        auto* page = BSML::Lite::CreateScrollableSettingsContainer(view);
+        if (!page) return nullptr;
+        active_->avatarTabContentRoots_[index] = page;
+        if (auto* external = page->GetComponent<BSML::ExternalComponents*>()) {
+            if (auto* scroll = external->Get<UnityEngine::RectTransform*>()) {
+                scroll->set_anchoredPosition({2.0F, -3.5F});
+                scroll->set_sizeDelta({0.0F, -13.0F});
+                active_->avatarTabViewRoots_[index] = scroll->get_gameObject();
+            }
+        }
+        if (!active_->avatarTabViewRoots_[index]) active_->avatarTabViewRoots_[index] = page;
+        if (auto* rows = page->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
+            // The scroll content owns a narrow center-column layout. Width
+            // control is required here; without it the row-level 52-unit
+            // LayoutElements are ignored and BSML retains its 90-unit prefab
+            // geometry beyond both sides of the visible mask.
+            rows->set_childControlWidth(true);
+            rows->set_childForceExpandWidth(false);
+            rows->set_childControlHeight(true);
+            rows->set_childForceExpandHeight(false);
+            rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
+            rows->set_spacing(1.0F);
+        }
+        return page;
+    };
+    std::array<UnityEngine::GameObject*, 3> pages{
+        createTabPage(0),
+        createTabPage(1),
+        createTabPage(2)};
+    if (std::any_of(pages.begin(), pages.end(), [](auto* page) { return page == nullptr; })) {
+        Logging::Logger.error("Could not create all native SaberStage avatar settings pages");
+        return;
+    }
+
+    auto* container = pages[0];
     auto* heading = BSML::Lite::CreateText(
         container->get_transform(), "Avatar", 6.0F, {0.0F, 0.0F}, {55.0F, 8.0F});
     heading->set_alignment(TMPro::TextAlignmentOptions::Center);
@@ -499,18 +689,203 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         if (active_) active_->OpenAvatarFilePicker();
     }), "Browse the headset and choose the VRM avatar SaberStage should display.");
     ConfigureLayout(chooseAvatar, 48.0F, 8.0F, 1.0F);
-    static std::array<std::string_view, 3> textureCaps{"512", "1024", "2048"};
-    WithHint(BSML::Lite::CreateDropdown(
+
+    container = pages[1];
+    auto* qualityHeading = BSML::Lite::CreateText(
+        container->get_transform(), "Avatar Quality and Motion", 5.0F, {0.0F, 0.0F}, {55.0F, 7.0F});
+    qualityHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
+    auto* qualityNote = BSML::Lite::CreateText(
+        container->get_transform(),
+        "Presets set the controls below. Change any individual option to create a Custom profile. Texture Limit applies on the next avatar load; 4096 can use about 85 MB per RGBA texture with mipmaps. The other controls update live.",
+        3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
+    qualityNote->set_enableWordWrapping(true);
+    qualityNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+    static std::array<std::string_view, 4> qualityPresets{"Performance", "Balanced", "Quality", "Custom"};
+    const auto presetLabel = [&] {
+        switch (avatar.qualityPreset) {
+            case settings::AvatarQualityPreset::Performance: return std::string("Performance");
+            case settings::AvatarQualityPreset::Balanced: return std::string("Balanced");
+            case settings::AvatarQualityPreset::Quality: return std::string("Quality");
+            case settings::AvatarQualityPreset::Custom: return std::string("Custom");
+        }
+        return std::string("Balanced");
+    }();
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Quality Preset", presetLabel, qualityPresets, [](StringW value) {
+        if (!active_) return;
+        const auto label = static_cast<std::string>(value);
+        auto preset = settings::AvatarQualityPreset::Custom;
+        if (label == "Performance") preset = settings::AvatarQualityPreset::Performance;
+        else if (label == "Balanced") preset = settings::AvatarQualityPreset::Balanced;
+        else if (label == "Quality") preset = settings::AvatarQualityPreset::Quality;
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        settings::ApplyAvatarQualityPreset(avatarSettings, preset);
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Applies visible Quest-conscious defaults. Changing any individual quality control selects Custom."));
+
+    static std::array<std::string_view, 10> materialStages{
+        "Configured", "1 Texture Only", "2 Texture + Color", "3 Toon Lighting",
+        "4 Toon + Shade", "5 + Normal Maps", "6 + Rim Lighting",
+        "7 + MatCap", "8 + Emission", "9 + Outlines"};
+    const auto materialStageLabel = [&] {
+        switch (avatar.materialStage) {
+            case settings::AvatarMaterialStage::Configured: return std::string("Configured");
+            case settings::AvatarMaterialStage::MainTextureOnly: return std::string("1 Texture Only");
+            case settings::AvatarMaterialStage::MainTextureColor: return std::string("2 Texture + Color");
+            case settings::AvatarMaterialStage::ToonLighting: return std::string("3 Toon Lighting");
+            case settings::AvatarMaterialStage::ToonShadeTexture: return std::string("4 Toon + Shade");
+            case settings::AvatarMaterialStage::NormalMaps: return std::string("5 + Normal Maps");
+            case settings::AvatarMaterialStage::RimLighting: return std::string("6 + Rim Lighting");
+            case settings::AvatarMaterialStage::MatCap: return std::string("7 + MatCap");
+            case settings::AvatarMaterialStage::Emission: return std::string("8 + Emission");
+            case settings::AvatarMaterialStage::Outlines: return std::string("9 + Outlines");
+        }
+        return std::string("Configured");
+    }();
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Material Stage", materialStageLabel, materialStages, [](StringW value) {
+        if (!active_) return;
+        const auto label = static_cast<std::string>(value);
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        avatarSettings.materialStage = label.starts_with("1 ") ? settings::AvatarMaterialStage::MainTextureOnly :
+            label.starts_with("2 ") ? settings::AvatarMaterialStage::MainTextureColor :
+            label.starts_with("3 ") ? settings::AvatarMaterialStage::ToonLighting :
+            label.starts_with("4 ") ? settings::AvatarMaterialStage::ToonShadeTexture :
+            label.starts_with("5 ") ? settings::AvatarMaterialStage::NormalMaps :
+            label.starts_with("6 ") ? settings::AvatarMaterialStage::RimLighting :
+            label.starts_with("7 ") ? settings::AvatarMaterialStage::MatCap :
+            label.starts_with("8 ") ? settings::AvatarMaterialStage::Emission :
+            label.starts_with("9 ") ? settings::AvatarMaterialStage::Outlines :
+            settings::AvatarMaterialStage::Configured;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Diagnostic ladder. Configured uses the individual quality controls; numbered stages cumulatively add one material feature at a time."));
+
+    static std::array<std::string_view, 3> lightingModes{"Environment", "Balanced", "Studio"};
+    const auto lightingLabel = avatar.lightingMode == settings::AvatarLightingMode::Environment ? "Environment" :
+        avatar.lightingMode == settings::AvatarLightingMode::Studio ? "Studio" : "Balanced";
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Avatar Lighting", lightingLabel, lightingModes, [](StringW value) {
+        if (!active_) return;
+        const auto label = static_cast<std::string>(value);
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        avatarSettings.lightingMode = label == "Environment" ? settings::AvatarLightingMode::Environment :
+            label == "Studio" ? settings::AvatarLightingMode::Studio : settings::AvatarLightingMode::Balanced;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Environment follows map darkness. Balanced preserves map influence with a readability floor. Studio uses stable avatar-only key and fill shading for recording."));
+
+    static std::array<std::string_view, 4> textureCaps{"512", "1024", "2048", "4096"};
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
         container,
         "Texture Limit",
         std::to_string(avatar.maximumTextureDimension),
         textureCaps,
         [](StringW value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().avatar.maximumTextureDimension = std::stoi(static_cast<std::string>(value));
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.maximumTextureDimension = std::stoi(static_cast<std::string>(value));
+            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
             std::string error;
             if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar texture limit: {}", error);
-        }), "Limits avatar texture size. Lower values use less memory and GPU time; higher values look sharper.");
+        }), "Limits avatar texture size. It takes effect the next time the avatar is loaded; other quality controls update live."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Side-Step Lean Limit",
+        5.0F,
+        avatar.sideStepLeanLimitPercent,
+        40.0F,
+        100.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [](float value) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.sideStepLeanLimitPercent = value;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }),
+        "Maximum sideways lean before SaberStage shifts the body and steps. 100% keeps the previous behavior; lower values force an earlier side step."));
+    const auto addQualityToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
+        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [member](bool enabled) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.*member = enabled;
+            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }), hint));
+    };
+    addQualityToggle("Toon Lighting", avatar.toonLighting, &settings::AvatarSettings::toonLighting,
+        "Uses the authored MToon light and shade model. Off is an emergency unlit fallback.");
+    addQualityToggle("Normal Maps", avatar.normalMaps, &settings::AvatarSettings::normalMaps,
+        "Adds authored surface detail. Turning it off removes the normal-map shader sample.");
+    addQualityToggle("Rim Lighting", avatar.rimLighting, &settings::AvatarSettings::rimLighting,
+        "Adds authored edge lighting. Turning it off removes rim texture and Fresnel work.");
+    addQualityToggle("MatCap", avatar.matcap, &settings::AvatarSettings::matcap,
+        "Adds authored sphere/matcap highlights. This can be expensive on complex avatars.");
+    addQualityToggle("Emission", avatar.emission, &settings::AvatarSettings::emission,
+        "Shows authored glowing materials while retaining a bounded Quest-safe intensity.");
+    static std::array<std::string_view, 3> outlineModes{"Off", "Reduced", "Full"};
+    const auto outlineLabel = avatar.outlines == settings::AvatarOutlineMode::Full ? "Full" :
+        avatar.outlines == settings::AvatarOutlineMode::Reduced ? "Reduced" : "Off";
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Outlines", outlineLabel, outlineModes, [](StringW value) {
+        if (!active_) return;
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        const auto label = static_cast<std::string>(value);
+        avatarSettings.outlines = label == "Full" ? settings::AvatarOutlineMode::Full :
+            label == "Reduced" ? settings::AvatarOutlineMode::Reduced : settings::AvatarOutlineMode::Off;
+        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Off skips the outline pass. Reduced omits low-value transparent or tiny outlines; Full honors authored outlines."));
+    addQualityToggle("SpringBones", avatar.springBones, &settings::AvatarSettings::springBones,
+        "Animates VRM hair, clothing, and accessories. Off performs no secondary-motion work.");
+    static std::array<std::string_view, 7> springQualities{"Off", "Very Low", "Low", "Medium", "High", "Ultra", "Custom"};
+    const auto springLabel = [&] {
+        switch (avatar.springBoneQuality) {
+            case settings::SpringBoneQuality::Off: return std::string("Off");
+            case settings::SpringBoneQuality::VeryLow: return std::string("Very Low");
+            case settings::SpringBoneQuality::Low: return std::string("Low");
+            case settings::SpringBoneQuality::Medium: return std::string("Medium");
+            case settings::SpringBoneQuality::High: return std::string("High");
+            case settings::SpringBoneQuality::Ultra: return std::string("Ultra");
+            case settings::SpringBoneQuality::Custom: return std::string("Custom");
+        }
+        return std::string("Medium");
+    }();
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Spring Quality", springLabel, springQualities, [](StringW value) {
+        if (!active_) return;
+        const auto label = static_cast<std::string>(value);
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        if (label == "Off") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Off;
+        else if (label == "Very Low") avatarSettings.springBoneQuality = settings::SpringBoneQuality::VeryLow;
+        else if (label == "Low") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Low;
+        else if (label == "High") avatarSettings.springBoneQuality = settings::SpringBoneQuality::High;
+        else if (label == "Ultra") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Ultra;
+        else if (label == "Custom") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Custom;
+        else avatarSettings.springBoneQuality = settings::SpringBoneQuality::Medium;
+        avatarSettings.springBones = avatarSettings.springBoneQuality != settings::SpringBoneQuality::Off;
+        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Controls update rate, substeps, and deterministic chain/joint budgets rather than one unexplained iteration value."));
+
+    static std::array<std::string_view, 3> collisionQualities{"Off", "Reduced", "Full"};
+    const auto collisionLabel = avatar.springCollisions == settings::SpringCollisionQuality::Full ? "Full" :
+        avatar.springCollisions == settings::SpringCollisionQuality::Reduced ? "Reduced" : "Off";
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
+        container, "Spring Collisions", collisionLabel, collisionQualities, [](StringW value) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            const auto label = static_cast<std::string>(value);
+            avatarSettings.springCollisions = label == "Full" ? settings::SpringCollisionQuality::Full :
+                label == "Reduced" ? settings::SpringCollisionQuality::Reduced : settings::SpringCollisionQuality::Off;
+            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }), "Off skips SpringBone collider checks. Reduced uses the deterministic collider budget; Full honors all supported VRM colliders."));
+
+    container = pages[0];
     WithHint(BSML::Lite::CreateToggle(container, "Visible", avatar.visible, [](bool visible) {
         if (!active_) return;
         active_->root_.Settings().Edit().avatar.visible = visible;
@@ -543,6 +918,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
                 AvatarOffsetPose(settings.leftControllerToWrist),
                 AvatarOffsetPose(settings.rightControllerToWrist));
             active_->root_.Avatar().SetAvatarVisible(settings.visible);
+            active_->root_.Avatar().ApplyAvatarSettings(settings);
             active_->root_.Settings().Save(nullptr);
         } else {
             Logging::Logger.error("Avatar load button failed: {}", error);
@@ -578,6 +954,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         if (active_) active_->root_.Avatar().LogDiagnostics();
     }), "Writes detailed avatar tracking and solver measurements to the SaberStage log for troubleshooting; it does not change the avatar.");
 
+    container = pages[2];
     auto* calibrationHeading = BSML::Lite::CreateText(
         container->get_transform(), "Player Calibration", 4.5F, {0.0F, 0.0F}, {55.0F, 7.0F});
     calibrationHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
@@ -628,6 +1005,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->calibrationStatusText_->set_enableWordWrapping(true);
     active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
 
+    container = pages[0];
     auto* expressionActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
     expressionActions->set_spacing(1.0F);
     expressionActions->set_childControlWidth(true);
@@ -652,6 +1030,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->BuildAvatarFilePicker(view);
     active_->RefreshAvatarStatus();
     active_->RefreshCalibrationStatus();
+    active_->ShowAvatarTab(0);
+    if (active_->avatarTabs_) active_->avatarTabs_->SelectCellWithNumber(0);
 
     // This is intentionally outside the scrolling settings content. It stays
     // visible at the bottom of the center screen and uniquely identifies the
@@ -1659,6 +2039,24 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
 
     active_->ShowSettingsTab(0);
     if (active_->settingsTabs_) active_->settingsTabs_->SelectCellWithNumber(0);
+}
+
+void MenuController::ShowAvatarTab(int index) {
+    index = std::clamp(index, 0, 2);
+    selectedAvatarTab_ = index;
+    for (int page = 0; page < static_cast<int>(avatarTabViewRoots_.size()); ++page) {
+        if (avatarTabViewRoots_[page]) avatarTabViewRoots_[page]->SetActive(page == selectedAvatarTab_);
+    }
+    // ForceUpdateCanvases alone does not rebuild the content hierarchy of a
+    // scroll page that was disabled before Unity's first layout pass. Rebuild
+    // the selected page explicitly after its viewport is active; otherwise a
+    // valid collection of BSML controls can appear as a completely empty tab.
+    UnityEngine::Canvas::ForceUpdateCanvases();
+    if (auto* content = avatarTabContentRoots_[selectedAvatarTab_]) {
+        auto rect = content->get_transform().cast<UnityEngine::RectTransform>();
+        UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(rect);
+    }
+    UnityEngine::Canvas::ForceUpdateCanvases();
 }
 
 void MenuController::ShowSettingsTab(int index) {

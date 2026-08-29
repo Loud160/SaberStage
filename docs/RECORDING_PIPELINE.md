@@ -25,7 +25,7 @@ private FFmpeg H.264 demux + AAC encode + MP4 mux -> .partial.mp4 -> final .mp4
 
 Direct mode exposes 720p/1080p/1440p, 30/60 FPS, target and peak bitrate, CBR/VBR, hardware complexity preference, H.264 profile/level, keyframe interval, and AAC bitrate. The build enables no software video encoder; unsupported hardware settings fail the start instead of stealing gameplay CPU. The two FFmpeg installations use different SONAMEs and private symbol namespaces so Hollywood remains independently selectable.
 
-EGL setup is failure-contained: shader or surface initialization restores Unity's prior draw/read surfaces before reporting failure. Stop order first drains the encoder while its input surface is valid, then destroys the EGL surface on the render thread, preventing codec/surface use-after-free during Stop & Save.
+EGL setup is failure-contained: shader or surface initialization restores Unity's prior draw/read surfaces before reporting failure. The bridge validates the current EGL context/config, including `EGL_RECORDABLE_ANDROID`, before using Unity's native texture as a GL texture, and records stage-specific EGL/GL and encoder counters. The present implementation is OpenGL ES/EGL-specific; a Vulkan-native bridge remains future work. If the bridge fails before presenting or submitting any input, a local-only session falls back to Hollywood while the raw stream is still guaranteed empty; an active live session fails explicitly because changing encoder parameter sets midstream would be unsafe. Stop order first drains the encoder while its input surface is valid, then destroys the EGL surface on the render thread, preventing codec/surface use-after-free during Stop & Save.
 
 Both paths still require fresh Quest validation for video content, color/orientation, audio, duration, sync, sustained gameplay performance, 1440p codec acceptance, and abnormal shutdown behavior.
 
@@ -41,7 +41,11 @@ Unity audio tap -> AAC packets ----+-> CaptureTimeline -> packet fan-out
 
 The direct packet path is GPU-native and hardware-only. One encode currently feeds local recording and direct livestreaming; the companion remains a later sink. Conservative Quest 2 defaults and higher modes remain gated by measured capability/performance tiers. Software H.264 fallback remains out of scope.
 
-The frame scheduler uses monotonic time and a fixed cadence independent of HMD refresh. It presents at most one due spectator frame per game frame. Encoder drain tracks a bounded number of submitted surface frames and owns codec-output release.
+The frame scheduler uses monotonic time and a fixed cadence independent of HMD refresh. It presents at most one due spectator frame per game frame. If Unity misses a capture deadline, the next submitted image retains its real presentation slot and the MP4 holds the prior picture over the gap; missed time is never compressed into consecutive frame numbers because doing so makes video progressively drift from continuously sampled game audio. Diagnostics report these skipped timeline deadlines separately from MediaCodec queue drops. Encoder drain tracks a bounded number of submitted surface frames and owns codec-output release.
+
+The first packet actually emitted by the hardware encoder is normalized to the start of the saved video. Frames accepted but never emitted during encoder startup do not become a permanent picture delay; later deadline gaps keep their original duration, so startup normalization cannot reintroduce cumulative audio drift.
+
+The GLES bridge samples Unity's RenderTexture in its native OpenGL orientation. It does not apply a second Y inversion; that redundant flip was the cause of upside-down Direct FFmpeg recordings.
 
 The Unity mix tap copies interleaved PCM into a preallocated SPSC ring on the audio callback. It performs no allocation, logging, file I/O, or Unity object work there. The audio worker converts and writes PCM to the temporary WAV and fans it to the live sink, where AAC-LC encoding runs on the network worker. The hardware surface receives explicit monotonic presentation timestamps. Recording pause closes a video segment and disables the audio tap so paused duration is omitted from both temporary tracks; game pause alone does not.
 

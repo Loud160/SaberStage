@@ -93,6 +93,7 @@ bool ApplicationRoot::Start() {
                     AvatarOffsetPose(avatarProfile.leftControllerToWrist),
                     AvatarOffsetPose(avatarProfile.rightControllerToWrist));
                 avatar_->SetAvatarVisible(avatarProfile.visible);
+                avatar_->ApplyAvatarSettings(avatarProfile);
             }
         }
     }

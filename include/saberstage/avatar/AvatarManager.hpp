@@ -18,6 +18,10 @@ namespace saberstage::camera {
 class CameraManager;
 }
 
+namespace saberstage::settings {
+struct AvatarSettings;
+}
+
 namespace saberstage::avatar {
 
 // Owns the Unity/IL2CPP boundary for one humanoid avatar. A VRM loader supplies
@@ -62,11 +66,13 @@ public:
     bool BindLoadedVrmAvatar(std::string* error = nullptr) noexcept;
     void UnloadVrmAvatar() noexcept;
     void SetAvatarVisible(bool visible) noexcept;
+    void ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept;
     void SetControllerToWristOffsets(Pose left, Pose right) noexcept;
     bool SetExpression(std::string_view presetName, float weight, std::string* error = nullptr) noexcept;
 
     void SampleTracking() noexcept;
     void SolveAndWrite() noexcept;
+    void UpdateSecondaryMotion(float deltaTime) noexcept;
     void EnsureSolvedForSpectatorRender() noexcept;
     void LogDiagnostics() const noexcept;
 

@@ -339,6 +339,40 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.avatar.selectedFile = String(*avatar, "selectedFile", settings.avatar.selectedFile, repaired);
             settings.avatar.maximumTextureDimension = Int(
                 *avatar, "maximumTextureDimension", settings.avatar.maximumTextureDimension, repaired);
+            settings.avatar.qualityPreset = EnumValue(
+                *avatar, "qualityPreset", settings.avatar.qualityPreset,
+                [](std::string_view value, AvatarQualityPreset& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.toonLighting = Bool(*avatar, "toonLighting", settings.avatar.toonLighting, repaired);
+            settings.avatar.normalMaps = Bool(*avatar, "normalMaps", settings.avatar.normalMaps, repaired);
+            settings.avatar.rimLighting = Bool(*avatar, "rimLighting", settings.avatar.rimLighting, repaired);
+            settings.avatar.matcap = Bool(*avatar, "matcap", settings.avatar.matcap, repaired);
+            settings.avatar.emission = Bool(*avatar, "emission", settings.avatar.emission, repaired);
+            settings.avatar.outlines = EnumValue(
+                *avatar, "outlines", settings.avatar.outlines,
+                [](std::string_view value, AvatarOutlineMode& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.materialStage = EnumValue(
+                *avatar, "materialStage", settings.avatar.materialStage,
+                [](std::string_view value, AvatarMaterialStage& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.lightingMode = EnumValue(
+                *avatar, "lightingMode", settings.avatar.lightingMode,
+                [](std::string_view value, AvatarLightingMode& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.springBones = Bool(*avatar, "springBones", settings.avatar.springBones, repaired);
+            settings.avatar.springBoneQuality = EnumValue(
+                *avatar, "springBoneQuality", settings.avatar.springBoneQuality,
+                [](std::string_view value, SpringBoneQuality& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.springCollisions = EnumValue(
+                *avatar, "springCollisions", settings.avatar.springCollisions,
+                [](std::string_view value, SpringCollisionQuality& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.springUpdateRateHz = Int(
+                *avatar, "springUpdateRateHz", settings.avatar.springUpdateRateHz, repaired);
+            settings.avatar.springSubsteps = Int(
+                *avatar, "springSubsteps", settings.avatar.springSubsteps, repaired);
+            settings.avatar.maximumSpringChains = Int(
+                *avatar, "maximumSpringChains", settings.avatar.maximumSpringChains, repaired);
+            settings.avatar.maximumSpringJoints = Int(
+                *avatar, "maximumSpringJoints", settings.avatar.maximumSpringJoints, repaired);
+            settings.avatar.sideStepLeanLimitPercent = Float(
+                *avatar, "sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, repaired);
             settings.avatar.leftControllerToWrist = AvatarControllerOffset(
                 *avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, repaired);
             settings.avatar.rightControllerToWrist = AvatarControllerOffset(
@@ -429,6 +463,23 @@ std::string Encode(const SettingsDocument& settings) {
     avatar.AddMember("selectedPath", Value(settings.avatar.selectedPath.c_str(), allocator), allocator);
     avatar.AddMember("selectedFile", Value(settings.avatar.selectedFile.c_str(), allocator), allocator);
     avatar.AddMember("maximumTextureDimension", settings.avatar.maximumTextureDimension, allocator);
+    avatar.AddMember("qualityPreset", Value(ToString(settings.avatar.qualityPreset).data(), allocator), allocator);
+    avatar.AddMember("toonLighting", settings.avatar.toonLighting, allocator);
+    avatar.AddMember("normalMaps", settings.avatar.normalMaps, allocator);
+    avatar.AddMember("rimLighting", settings.avatar.rimLighting, allocator);
+    avatar.AddMember("matcap", settings.avatar.matcap, allocator);
+    avatar.AddMember("emission", settings.avatar.emission, allocator);
+    avatar.AddMember("outlines", Value(ToString(settings.avatar.outlines).data(), allocator), allocator);
+    avatar.AddMember("materialStage", Value(ToString(settings.avatar.materialStage).data(), allocator), allocator);
+    avatar.AddMember("lightingMode", Value(ToString(settings.avatar.lightingMode).data(), allocator), allocator);
+    avatar.AddMember("springBones", settings.avatar.springBones, allocator);
+    avatar.AddMember("springBoneQuality", Value(ToString(settings.avatar.springBoneQuality).data(), allocator), allocator);
+    avatar.AddMember("springCollisions", Value(ToString(settings.avatar.springCollisions).data(), allocator), allocator);
+    avatar.AddMember("springUpdateRateHz", settings.avatar.springUpdateRateHz, allocator);
+    avatar.AddMember("springSubsteps", settings.avatar.springSubsteps, allocator);
+    avatar.AddMember("maximumSpringChains", settings.avatar.maximumSpringChains, allocator);
+    avatar.AddMember("maximumSpringJoints", settings.avatar.maximumSpringJoints, allocator);
+    avatar.AddMember("sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, allocator);
     AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, allocator);
     AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
     document.AddMember("avatar", avatar, allocator);

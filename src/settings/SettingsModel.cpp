@@ -211,8 +211,30 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
             }
         }
     }
-    RepairRange(settings.avatar.maximumTextureDimension, 256, 2048,
+    RepairRange(settings.avatar.maximumTextureDimension, 256, 4096,
                 defaults.avatar.maximumTextureDimension, result);
+    RepairEnum(settings.avatar.qualityPreset, AvatarQualityPreset::Performance,
+               AvatarQualityPreset::Custom, defaults.avatar.qualityPreset, result);
+    RepairEnum(settings.avatar.outlines, AvatarOutlineMode::Off,
+               AvatarOutlineMode::Full, defaults.avatar.outlines, result);
+    RepairEnum(settings.avatar.materialStage, AvatarMaterialStage::Configured,
+               AvatarMaterialStage::Outlines, defaults.avatar.materialStage, result);
+    RepairEnum(settings.avatar.lightingMode, AvatarLightingMode::Environment,
+               AvatarLightingMode::Studio, defaults.avatar.lightingMode, result);
+    RepairEnum(settings.avatar.springBoneQuality, SpringBoneQuality::Off,
+               SpringBoneQuality::Custom, defaults.avatar.springBoneQuality, result);
+    RepairEnum(settings.avatar.springCollisions, SpringCollisionQuality::Off,
+               SpringCollisionQuality::Full, defaults.avatar.springCollisions, result);
+    RepairRange(settings.avatar.springUpdateRateHz, 12, 90,
+                defaults.avatar.springUpdateRateHz, result);
+    RepairRange(settings.avatar.springSubsteps, 1, 4,
+                defaults.avatar.springSubsteps, result);
+    RepairRange(settings.avatar.maximumSpringChains, 1, 256,
+                defaults.avatar.maximumSpringChains, result);
+    RepairRange(settings.avatar.maximumSpringJoints, 1, 1024,
+                defaults.avatar.maximumSpringJoints, result);
+    RepairFloat(settings.avatar.sideStepLeanLimitPercent, 40.0F, 100.0F,
+                defaults.avatar.sideStepLeanLimitPercent, result);
     RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
     RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
     RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
@@ -348,6 +370,72 @@ std::string_view ToString(LivestreamProvider value) noexcept {
     return "twitch";
 }
 
+std::string_view ToString(AvatarQualityPreset value) noexcept {
+    switch (value) {
+        case AvatarQualityPreset::Performance: return "performance";
+        case AvatarQualityPreset::Balanced: return "balanced";
+        case AvatarQualityPreset::Quality: return "quality";
+        case AvatarQualityPreset::Custom: return "custom";
+    }
+    return "balanced";
+}
+
+std::string_view ToString(AvatarOutlineMode value) noexcept {
+    switch (value) {
+        case AvatarOutlineMode::Off: return "off";
+        case AvatarOutlineMode::Reduced: return "reduced";
+        case AvatarOutlineMode::Full: return "full";
+    }
+    return "off";
+}
+
+std::string_view ToString(AvatarMaterialStage value) noexcept {
+    switch (value) {
+        case AvatarMaterialStage::Configured: return "configured";
+        case AvatarMaterialStage::MainTextureOnly: return "main_texture_only";
+        case AvatarMaterialStage::MainTextureColor: return "main_texture_color";
+        case AvatarMaterialStage::ToonLighting: return "toon_lighting";
+        case AvatarMaterialStage::ToonShadeTexture: return "toon_shade_texture";
+        case AvatarMaterialStage::NormalMaps: return "normal_maps";
+        case AvatarMaterialStage::RimLighting: return "rim_lighting";
+        case AvatarMaterialStage::MatCap: return "matcap";
+        case AvatarMaterialStage::Emission: return "emission";
+        case AvatarMaterialStage::Outlines: return "outlines";
+    }
+    return "configured";
+}
+
+std::string_view ToString(AvatarLightingMode value) noexcept {
+    switch (value) {
+        case AvatarLightingMode::Environment: return "environment";
+        case AvatarLightingMode::Balanced: return "balanced";
+        case AvatarLightingMode::Studio: return "studio";
+    }
+    return "balanced";
+}
+
+std::string_view ToString(SpringBoneQuality value) noexcept {
+    switch (value) {
+        case SpringBoneQuality::Off: return "off";
+        case SpringBoneQuality::VeryLow: return "very_low";
+        case SpringBoneQuality::Low: return "low";
+        case SpringBoneQuality::Medium: return "medium";
+        case SpringBoneQuality::High: return "high";
+        case SpringBoneQuality::Ultra: return "ultra";
+        case SpringBoneQuality::Custom: return "custom";
+    }
+    return "medium";
+}
+
+std::string_view ToString(SpringCollisionQuality value) noexcept {
+    switch (value) {
+        case SpringCollisionQuality::Off: return "off";
+        case SpringCollisionQuality::Reduced: return "reduced";
+        case SpringCollisionQuality::Full: return "full";
+    }
+    return "reduced";
+}
+
 #define SABERSTAGE_PARSE_ENUM_CASE(text, member) \
     if (value == text) { result = member; return true; }
 
@@ -395,6 +483,100 @@ bool TryParse(std::string_view value, LivestreamProvider& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("kick", LivestreamProvider::Kick)
     SABERSTAGE_PARSE_ENUM_CASE("custom", LivestreamProvider::Custom)
     return false;
+}
+bool TryParse(std::string_view value, AvatarQualityPreset& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("performance", AvatarQualityPreset::Performance)
+    SABERSTAGE_PARSE_ENUM_CASE("balanced", AvatarQualityPreset::Balanced)
+    SABERSTAGE_PARSE_ENUM_CASE("quality", AvatarQualityPreset::Quality)
+    SABERSTAGE_PARSE_ENUM_CASE("custom", AvatarQualityPreset::Custom)
+    return false;
+}
+bool TryParse(std::string_view value, AvatarOutlineMode& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("off", AvatarOutlineMode::Off)
+    SABERSTAGE_PARSE_ENUM_CASE("reduced", AvatarOutlineMode::Reduced)
+    SABERSTAGE_PARSE_ENUM_CASE("full", AvatarOutlineMode::Full)
+    return false;
+}
+bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("configured", AvatarMaterialStage::Configured)
+    SABERSTAGE_PARSE_ENUM_CASE("main_texture_only", AvatarMaterialStage::MainTextureOnly)
+    SABERSTAGE_PARSE_ENUM_CASE("main_texture_color", AvatarMaterialStage::MainTextureColor)
+    SABERSTAGE_PARSE_ENUM_CASE("toon_lighting", AvatarMaterialStage::ToonLighting)
+    SABERSTAGE_PARSE_ENUM_CASE("toon_shade_texture", AvatarMaterialStage::ToonShadeTexture)
+    SABERSTAGE_PARSE_ENUM_CASE("normal_maps", AvatarMaterialStage::NormalMaps)
+    SABERSTAGE_PARSE_ENUM_CASE("rim_lighting", AvatarMaterialStage::RimLighting)
+    SABERSTAGE_PARSE_ENUM_CASE("matcap", AvatarMaterialStage::MatCap)
+    SABERSTAGE_PARSE_ENUM_CASE("emission", AvatarMaterialStage::Emission)
+    SABERSTAGE_PARSE_ENUM_CASE("outlines", AvatarMaterialStage::Outlines)
+    return false;
+}
+bool TryParse(std::string_view value, AvatarLightingMode& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("environment", AvatarLightingMode::Environment)
+    SABERSTAGE_PARSE_ENUM_CASE("balanced", AvatarLightingMode::Balanced)
+    SABERSTAGE_PARSE_ENUM_CASE("studio", AvatarLightingMode::Studio)
+    return false;
+}
+bool TryParse(std::string_view value, SpringBoneQuality& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("off", SpringBoneQuality::Off)
+    SABERSTAGE_PARSE_ENUM_CASE("very_low", SpringBoneQuality::VeryLow)
+    SABERSTAGE_PARSE_ENUM_CASE("low", SpringBoneQuality::Low)
+    SABERSTAGE_PARSE_ENUM_CASE("medium", SpringBoneQuality::Medium)
+    SABERSTAGE_PARSE_ENUM_CASE("high", SpringBoneQuality::High)
+    SABERSTAGE_PARSE_ENUM_CASE("ultra", SpringBoneQuality::Ultra)
+    SABERSTAGE_PARSE_ENUM_CASE("custom", SpringBoneQuality::Custom)
+    return false;
+}
+bool TryParse(std::string_view value, SpringCollisionQuality& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("off", SpringCollisionQuality::Off)
+    SABERSTAGE_PARSE_ENUM_CASE("reduced", SpringCollisionQuality::Reduced)
+    SABERSTAGE_PARSE_ENUM_CASE("full", SpringCollisionQuality::Full)
+    return false;
+}
+
+void ApplyAvatarQualityPreset(AvatarSettings& settings, AvatarQualityPreset preset) noexcept {
+    settings.qualityPreset = preset;
+    settings.materialStage = AvatarMaterialStage::Configured;
+    settings.toonLighting = true;
+    switch (preset) {
+        case AvatarQualityPreset::Performance:
+            settings.lightingMode = AvatarLightingMode::Balanced;
+            settings.maximumTextureDimension = 512;
+            settings.normalMaps = false;
+            settings.rimLighting = false;
+            settings.matcap = false;
+            settings.emission = true;
+            settings.outlines = AvatarOutlineMode::Off;
+            settings.springBones = true;
+            settings.springBoneQuality = SpringBoneQuality::Low;
+            settings.springCollisions = SpringCollisionQuality::Off;
+            return;
+        case AvatarQualityPreset::Balanced:
+            settings.lightingMode = AvatarLightingMode::Balanced;
+            settings.maximumTextureDimension = 1024;
+            settings.normalMaps = true;
+            settings.rimLighting = true;
+            settings.matcap = false;
+            settings.emission = true;
+            settings.outlines = AvatarOutlineMode::Off;
+            settings.springBones = true;
+            settings.springBoneQuality = SpringBoneQuality::Medium;
+            settings.springCollisions = SpringCollisionQuality::Reduced;
+            return;
+        case AvatarQualityPreset::Quality:
+            settings.lightingMode = AvatarLightingMode::Balanced;
+            settings.maximumTextureDimension = 2048;
+            settings.normalMaps = true;
+            settings.rimLighting = true;
+            settings.matcap = true;
+            settings.emission = true;
+            settings.outlines = AvatarOutlineMode::Full;
+            settings.springBones = true;
+            settings.springBoneQuality = SpringBoneQuality::High;
+            settings.springCollisions = SpringCollisionQuality::Full;
+            return;
+        case AvatarQualityPreset::Custom:
+            return;
+    }
 }
 
 #undef SABERSTAGE_PARSE_ENUM_CASE

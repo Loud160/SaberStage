@@ -8,6 +8,8 @@ The right-side menu has `Record`, `Live Stream`, and `Files` tabs. Recording bac
 
 `Go Live` requires a session stream key. If local recording is idle, it begins one continuous local safety recording and sends that same encoded video to the network sink. `Stop Stream` ends only network output. `Stop & Save` ends both and finalizes the local MP4. Local pause is disabled while live because a public broadcast cannot pause its timeline.
 
+The current Direct input-surface bridge is an OpenGL ES/EGL implementation. It now verifies that Unity has a current EGL display/context and that the context config advertises `EGL_RECORDABLE_ANDROID` before it uses the native texture as a GL texture. If Unity is running Vulkan or any bridge stage cannot present frames, local recording switches to Hollywood before accepting an empty Direct stream. A live stream cannot change encoders mid-session, so the same condition stops with a specific diagnostic instead of silently creating a zero-byte H.264 file. This fallback is session-only and does not rewrite the user's selected backend.
+
 ## Local recording timeline and A/V synchronization
 
 Both capture choices now use SaberStage's private FFmpeg finalizer rather than Hollywood's zero-origin muxer. The Direct FFmpeg backend preserves each frame's scheduled monotonic presentation time instead of renumbering whatever frames MediaCodec happens to return as a gap-free sequence. If the spectator encoder drops or delays a frame, the MP4 therefore preserves the elapsed video time rather than silently shortening the picture track. Pause/resume segments are normalized onto one continuous presentation timeline. Hollywood does not expose packet timestamps, so its H.264 frames retain sequential FPS timing, but it still receives the shared audio/video start-offset and bounded-tail correction.
@@ -21,6 +23,8 @@ The first submitted video frame and first nonempty Unity audio callback are meas
 - Encoded H.264 file writes run on a bounded writer worker, not an encoder callback.
 - Network writes and AAC encoding run on the livestream worker.
 - The Direct FFmpeg EGL bridge restores Unity's render context on every setup failure and tears its MediaCodec surface down only after the encoder worker has drained.
+- Direct diagnostics separately count scheduled camera frames, render events, EGL setup attempts, successful surface presents, encoder submissions, output packets/bytes, `EAGAIN` retries, bounded-queue drops, and EGL/GL failure codes. The controller logs the snapshot both at failure and at segment shutdown.
+- FFmpeg `EAGAIN` back-pressure drains output and retries the same surface frame instead of discarding that frame's timestamp.
 - Video and audio network queues are bounded; overload drops broadcast packets before blocking gameplay or local capture.
 - The preview capture-exclusion renderer lists are rebuilt only when panels are attached, created, or removed—not for every spectator frame.
 - A 90-frame refresh cadence replaces per-frame global AudioListener enumeration; the capture listener still follows the HMD pose each frame.
@@ -37,9 +41,9 @@ The build also emits exact configuration, upstream licenses, source hashes, and 
 
 TLS certificate verification is enabled for RTMPS against Android's system trust directory. Stream keys are rejected when they contain whitespace/control characters, masked after entry, excluded from settings JSON and diagnostics, and cleared from owned memory on shutdown. They are session-only. Secure persistent storage needs a reviewed Android Keystore integration and is not silently approximated with plaintext or reversible local storage.
 
-## Unverified device boundary
+## Device-validation boundary
 
-No headset was accessed for this work. Before release, device testing must establish:
+The zero-byte Direct capture incident is now diagnosable and locally recoverable, but a true Vulkan-to-MediaCodec input-surface bridge remains future work. Before Direct mode or livestreaming is considered release-proven, device testing must establish:
 
 - MediaCodec surface input, RGB orientation, color, and exact frame pacing;
 - 720p30 and 1080p30 local Direct FFmpeg recording with desktop `ffprobe`/decode inspection;

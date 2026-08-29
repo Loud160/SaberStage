@@ -137,6 +137,33 @@ target_link_libraries(${COMPILE_ID} PRIVATE
     -lGLESv3
     -lmediandk)
 
+# The game cannot compile ShaderLab at runtime. Embed the deterministic Android
+# AssetBundle produced by scripts/build-avatar-shaders.ps1 so MToon is always
+# deployed atomically with the mod and cannot become a stale sidecar file.
+set(SABERSTAGE_AVATAR_SHADER_ASSET
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/saberstage_avatar_shaders")
+if(NOT EXISTS "${SABERSTAGE_AVATAR_SHADER_ASSET}")
+    message(FATAL_ERROR
+        "Missing embedded avatar shader bundle. Run scripts/build-avatar-shaders.ps1 first.")
+endif()
+set(SABERSTAGE_AVATAR_SHADER_OBJECT
+    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_avatar_shaders.o")
+add_custom_command(
+    OUTPUT "${SABERSTAGE_AVATAR_SHADER_OBJECT}"
+    COMMAND ${CMAKE_OBJCOPY}
+        saberstage_avatar_shaders
+        "${SABERSTAGE_AVATAR_SHADER_OBJECT}"
+        --input-target binary
+        --output-target elf64-aarch64
+        --set-section-flags binary=alloc,load,readonly,data,contents
+    DEPENDS "${SABERSTAGE_AVATAR_SHADER_ASSET}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+    COMMENT "Embedding SaberStage Quest MToon shader bundle")
+set_source_files_properties("${SABERSTAGE_AVATAR_SHADER_OBJECT}" PROPERTIES
+    GENERATED TRUE
+    EXTERNAL_OBJECT TRUE)
+target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AVATAR_SHADER_OBJECT}")
+
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set_property(TARGET ${COMPILE_ID} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
     target_compile_options(${COMPILE_ID} PRIVATE -O3 -flto)

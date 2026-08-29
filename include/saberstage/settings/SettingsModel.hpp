@@ -9,7 +9,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 9;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 12;
 
 enum class RecordingBackend {
     Hollywood,
@@ -54,6 +54,58 @@ enum class LivestreamProvider {
     YouTube,
     Kick,
     Custom,
+};
+
+enum class AvatarQualityPreset {
+    Performance,
+    Balanced,
+    Quality,
+    Custom,
+};
+
+enum class AvatarOutlineMode {
+    Off,
+    Reduced,
+    Full,
+};
+
+// Configured uses the ordinary per-feature quality toggles. The remaining
+// stages are an intentionally cumulative diagnostic ladder so a bad avatar can
+// be reduced to its authored texture and rebuilt one material feature at a
+// time without creating a special build.
+enum class AvatarMaterialStage {
+    Configured,
+    MainTextureOnly,
+    MainTextureColor,
+    ToonLighting,
+    ToonShadeTexture,
+    NormalMaps,
+    RimLighting,
+    MatCap,
+    Emission,
+    Outlines,
+};
+
+enum class AvatarLightingMode {
+    Environment,
+    Balanced,
+    Studio,
+};
+
+enum class SpringBoneQuality {
+    Off,
+    VeryLow,
+    Low,
+    Medium,
+    High,
+    Ultra,
+    Custom,
+};
+
+enum class SpringCollisionQuality {
+    Off,
+    Reduced,
+    Full,
 };
 
 enum class Subsystem {
@@ -136,6 +188,28 @@ struct AvatarSettings {
     std::string selectedPath;
     std::string selectedFile = "avatar.vrm";
     std::int32_t maximumTextureDimension = 1024;
+    AvatarQualityPreset qualityPreset = AvatarQualityPreset::Balanced;
+    bool toonLighting = true;
+    bool normalMaps = true;
+    bool rimLighting = true;
+    bool matcap = false;
+    bool emission = true;
+    AvatarOutlineMode outlines = AvatarOutlineMode::Off;
+    AvatarMaterialStage materialStage = AvatarMaterialStage::Configured;
+    AvatarLightingMode lightingMode = AvatarLightingMode::Balanced;
+    bool springBones = true;
+    SpringBoneQuality springBoneQuality = SpringBoneQuality::Medium;
+    SpringCollisionQuality springCollisions = SpringCollisionQuality::Reduced;
+    // These values are authoritative only when springBoneQuality is Custom.
+    std::int32_t springUpdateRateHz = 30;
+    std::int32_t springSubsteps = 1;
+    std::int32_t maximumSpringChains = 32;
+    std::int32_t maximumSpringJoints = 96;
+    // Percentage of the calibrated/default lateral lean envelope that may be
+    // used before the existing pelvis-translation and support-step path takes
+    // over. 100 preserves the original solver behavior; lower values make a
+    // side step happen sooner without changing the player's calibration.
+    float sideStepLeanLimitPercent = 100.0F;
     AvatarControllerOffsetSettings leftControllerToWrist;
     AvatarControllerOffsetSettings rightControllerToWrist;
 };
@@ -171,6 +245,12 @@ std::string_view ToString(EncoderPriority value) noexcept;
 std::string_view ToString(H264Profile value) noexcept;
 std::string_view ToString(H264Level value) noexcept;
 std::string_view ToString(LivestreamProvider value) noexcept;
+std::string_view ToString(AvatarQualityPreset value) noexcept;
+std::string_view ToString(AvatarOutlineMode value) noexcept;
+std::string_view ToString(AvatarMaterialStage value) noexcept;
+std::string_view ToString(AvatarLightingMode value) noexcept;
+std::string_view ToString(SpringBoneQuality value) noexcept;
+std::string_view ToString(SpringCollisionQuality value) noexcept;
 bool TryParse(std::string_view value, RecordingBackend& result) noexcept;
 bool TryParse(std::string_view value, RecordingResolution& result) noexcept;
 bool TryParse(std::string_view value, RateControlMode& result) noexcept;
@@ -178,6 +258,13 @@ bool TryParse(std::string_view value, EncoderPriority& result) noexcept;
 bool TryParse(std::string_view value, H264Profile& result) noexcept;
 bool TryParse(std::string_view value, H264Level& result) noexcept;
 bool TryParse(std::string_view value, LivestreamProvider& result) noexcept;
+bool TryParse(std::string_view value, AvatarQualityPreset& result) noexcept;
+bool TryParse(std::string_view value, AvatarOutlineMode& result) noexcept;
+bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept;
+bool TryParse(std::string_view value, AvatarLightingMode& result) noexcept;
+bool TryParse(std::string_view value, SpringBoneQuality& result) noexcept;
+bool TryParse(std::string_view value, SpringCollisionQuality& result) noexcept;
+void ApplyAvatarQualityPreset(AvatarSettings& settings, AvatarQualityPreset preset) noexcept;
 void ResolutionDimensions(RecordingResolution resolution, std::int32_t& width, std::int32_t& height) noexcept;
 
 } // namespace saberstage::settings

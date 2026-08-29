@@ -3,6 +3,7 @@
 #include "saberstage/avatar/AvatarManager.hpp"
 
 #include "custom-types/shared/register.hpp"
+#include "UnityEngine/Time.hpp"
 
 DEFINE_TYPE(saberstage::avatar, AvatarRuntimeDriver);
 
@@ -28,7 +29,14 @@ void AvatarRuntimeDriver::Update() {
 }
 
 void AvatarRuntimeDriver::LateUpdate() {
-    if (activeManager != nullptr) activeManager->SolveAndWrite();
+    if (activeManager != nullptr) {
+        activeManager->SolveAndWrite();
+        // Secondary motion is intentionally applied after the trackerless body
+        // solve, exactly once per Unity LateUpdate. Spectator pre-render can
+        // request another body solve, but it must never advance hair/clothing
+        // physics a second time in the same rendered frame.
+        activeManager->UpdateSecondaryMotion(UnityEngine::Time::get_deltaTime());
+    }
 }
 
 } // namespace saberstage::avatar

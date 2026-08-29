@@ -1,4 +1,5 @@
 #include "saberstage/recording/DirectFfmpegMuxer.hpp"
+#include "saberstage/recording/CaptureTimeline.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -83,6 +84,9 @@ public:
         audioPacket_ = av_packet_alloc();
         if (!videoPacket_ || !audioPacket_) throw std::runtime_error("cannot allocate FFmpeg mux packets");
 
+        const auto firstEmittedPresentationFrame = videoPresentationFrames.empty()
+            ? std::int64_t{0}
+            : std::max(std::int64_t{0}, videoPresentationFrames.front());
         std::int64_t videoFrame = 0;
         std::int64_t lastPresentationFrame = -1;
         while (av_read_frame(videoInput_, videoPacket_) >= 0) {
@@ -91,7 +95,9 @@ public:
                 continue;
             }
             const auto presentationFrame = static_cast<std::size_t>(videoFrame) < videoPresentationFrames.size()
-                ? videoPresentationFrames[static_cast<std::size_t>(videoFrame)]
+                ? NormalizeCapturePresentationFrame(
+                    videoPresentationFrames[static_cast<std::size_t>(videoFrame)],
+                    firstEmittedPresentationFrame)
                 : lastPresentationFrame + 1;
             const auto audioTarget = av_rescale_q(
                 presentationFrame, AVRational{1, framesPerSecond}, AVRational{1, audioEncoder_->sample_rate});
@@ -193,8 +199,16 @@ private:
         }
         audioEncoder_->sample_fmt = AV_SAMPLE_FMT_FLTP;
         audioEncoder_->sample_rate = inputAudio->sample_rate;
-        Require(av_channel_layout_copy(&audioEncoder_->ch_layout, &inputAudio->ch_layout),
-            "cannot copy audio channel layout");
+        // The WAV demuxer commonly reports only a channel count for ordinary
+        // PCM and leaves the layout order unspecified. The native AAC encoder
+        // rejects that incomplete layout with EINVAL. SaberStage captures game
+        // audio as mono/stereo, so materialize FFmpeg's canonical layout from
+        // the validated channel count before opening the encoder.
+        av_channel_layout_default(
+            &audioEncoder_->ch_layout, inputAudio->ch_layout.nb_channels);
+        if (!av_channel_layout_check(&audioEncoder_->ch_layout)) {
+            throw std::runtime_error("temporary WAV has no valid audio channel layout");
+        }
         audioEncoder_->bit_rate = audioBitrate;
         audioEncoder_->time_base = {1, audioEncoder_->sample_rate};
         if (output_->oformat->flags & AVFMT_GLOBALHEADER) audioEncoder_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;

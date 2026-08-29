@@ -348,6 +348,7 @@ Pose EstimatePelvis(
     const calibration::RuntimePlayerProfile& profile,
     Pose headTarget,
     Pose neutralPelvis,
+    float sideStepLeanLimit,
     float deltaSeconds,
     SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
@@ -377,9 +378,16 @@ Pose EstimatePelvis(
     const auto forwardBoundary = profile.valid
         ? eyeHeight * profile.leanBoundaryNormalized[preliminaryForward >= 0.0F ? 2 : 3]
         : hardMaximumForwardLean;
-    const auto maximumLateralLean = std::max(
+    const auto calibratedMaximumLateralLean = std::max(
         legReach * 0.035F,
         std::min(hardMaximumLateralLean, lateralBoundary));
+    // This is the one authoritative user override for lateral balance. It
+    // scales the already calibrated/anatomically bounded envelope rather than
+    // adding a second stepping heuristic. Once the smaller envelope is
+    // exceeded, the existing body-translation, support-margin, and foot-step
+    // machinery takes over naturally.
+    const auto maximumLateralLean = calibratedMaximumLateralLean *
+        Clamp(sideStepLeanLimit, 0.40F, 1.0F);
     const auto maximumForwardLean = std::max(
         legReach * 0.045F,
         std::min(hardMaximumForwardLean, forwardBoundary));
@@ -411,6 +419,14 @@ Pose EstimatePelvis(
     const auto controllerTranslation = Horizontal(controllerMidpoint - neutralControllerMidpoint - state.bodyTranslation);
     const auto lateral = Dot(relativeLean, bodyRight);
     const auto forward = Dot(relativeLean, bodyForward);
+    // A Beat Saber attack stance commonly moves the HMD forward while the
+    // player lowers their head only slightly. Treating that sustained motion
+    // as walking translated the pelvis under the HMD and forced the spine into
+    // the backward C-shape visible only during gameplay. Preserve the planted
+    // pelvis in the forward axis when position says "hinge"; controller/head
+    // rotation remains free and lateral stepping still works normally.
+    const auto forwardAttackStance =
+        forward > eyeHeight * 0.045F && heightLoss > eyeHeight * 0.012F;
     const auto normalizedLateral = lateral / std::max(
         eyeHeight * profile.leanBoundaryNormalized[lateral < 0.0F ? 0 : 1], kEpsilon);
     const auto normalizedForward = forward / std::max(
@@ -482,6 +498,11 @@ Pose EstimatePelvis(
         (state.translationDwellSeconds >= (profile.valid ? 0.035F : tuning.translationDwellSeconds) ||
          hardLimitExceeded || (profile.valid && state.translationConfidence > 0.62F))) {
         desiredBodyTranslation = horizontalHeadTranslation - constrainedLean;
+        if (forwardAttackStance) {
+            const auto previousForwardTranslation = Dot(state.bodyTranslation, bodyForward);
+            desiredBodyTranslation += bodyForward * (
+                previousForwardTranslation - Dot(desiredBodyTranslation, bodyForward));
+        }
     }
     const auto previousTranslation = state.bodyTranslation;
     state.bodyTranslation = Smooth(
@@ -1430,6 +1451,10 @@ void StaticTrackerlessAvatarSolver::Reset(SolverPersistentState& state) const no
     state = {};
 }
 
+void StaticTrackerlessAvatarSolver::SetSideStepLeanLimit(float fraction) noexcept {
+    sideStepLeanLimit_ = Clamp(fraction, 0.40F, 1.0F);
+}
+
 bool StaticTrackerlessAvatarSolver::Solve(
     const TrackingSample& tracking,
     const AvatarCalibration& avatar,
@@ -1507,6 +1532,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
         profile,
         headTarget,
         Solved(neutralPose, HumanoidBone::Hips),
+        sideStepLeanLimit_,
         deltaSeconds,
         state);
 
@@ -1573,8 +1599,11 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto neutralBodyYaw = YawFromDirection(player.neutralForward);
     const auto bodyYawDelta = AngleDelta(neutralBodyYaw, state.torsoYawRadians);
     const auto bodyDeltaRotation = AxisAngle({0.0F, 1.0F, 0.0F}, bodyYawDelta);
-    const auto bodyHeadRotation = Multiply(bodyDeltaRotation, neutralHeadBone.rotation);
-    const auto residualHeadRotation = PoseDelta(bodyHeadRotation, headTarget.rotation);
+    // Do not distribute HMD pitch/roll through the torso. A player can keep
+    // looking down the note highway while hinging forward at the waist; gaze
+    // rotation belongs to the neck/head, while the spine curve is determined
+    // by the tracked head position. Only residual yaw is shared with the torso.
+    const auto residualHeadYawRotation = AxisAngle({0.0F, 1.0F, 0.0F}, yawError);
     const auto handChestYaw = HandChestYawContribution(
         tracking, headTarget, avatar, scale, state.torsoYawRadians);
     for (std::uint8_t index = 0; index < spine.jointCount; ++index) {
@@ -1592,7 +1621,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
                 ? accumulatedSpineLength / totalSpineLength
                 : 0.0F;
             bone.rotation = Multiply(
-                Slerp({}, residualHeadRotation, fraction * kDefaultBodySolverTuning.chestHeadRotationShare),
+                Slerp({}, residualHeadYawRotation, fraction * kDefaultBodySolverTuning.chestHeadRotationShare),
                 bone.rotation);
             const auto chestWeight = 4.0F * fraction * (1.0F - fraction);
             bone.rotation = Multiply(

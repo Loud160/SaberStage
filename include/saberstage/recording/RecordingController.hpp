@@ -98,7 +98,8 @@ public:
 private:
     bool StartCapture(std::string* error, bool forceContinuous = false);
     void StartVideoSegment();
-    void StopVideoSegment() noexcept;
+    void StopVideoSegment(bool recordCaptureFailure = true) noexcept;
+    bool HandleDirectCaptureHealth() noexcept;
     void CreatePersistentAudioCapture();
     void UpdateAudioCapturePose() noexcept;
     void RefreshAudioListenerOwnership() noexcept;
@@ -149,6 +150,7 @@ private:
     std::thread finalizer_;
     std::atomic<RecordingState> state_{RecordingState::Idle};
     std::atomic<bool> captureWriteFailed_{false};
+    std::string captureFailureDetail_;
     std::chrono::steady_clock::time_point recordingStarted_{};
     std::chrono::steady_clock::time_point pauseStarted_{};
     std::chrono::steady_clock::duration accumulatedPaused_{};
@@ -171,6 +173,7 @@ private:
     settings::RecordingBackend activeBackend_ = settings::RecordingBackend::Hollywood;
     float activeFovDegrees_ = 0.0F;
     bool gameplayOnlySession_ = false;
+    bool directFallbackAttempted_ = false;
     ControllerShortcut controllerShortcut_;
     std::uint32_t audioListenerRefreshFrame_ = 0;
     mutable std::mutex livestreamMutex_;

@@ -846,6 +846,25 @@ void TestAnatomicalSpineCrouchAndSupport() {
 
     solver.Reset(state);
     tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+          "forward attack-stance neutral pose solves");
+    for (int frame = 0; frame < 75; ++frame) {
+        tracking = NextFrame(tracking, {0.0F, 1.62F, 0.30F});
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+              "forward attack stance solves");
+    }
+    Check(state.bodyTranslation.z < 0.06F,
+          "forward attack stance remains a planted hip hinge instead of walking the pelvis under the HMD");
+    Check(pose.bones[BoneIndex(HumanoidBone::Head)].position.z >
+              pose.bones[BoneIndex(HumanoidBone::Chest)].position.z &&
+              pose.bones[BoneIndex(HumanoidBone::Chest)].position.z >
+              pose.bones[BoneIndex(HumanoidBone::Hips)].position.z,
+          "forward attack stance forms one forward anatomical chain from hips through head");
+    Check(!diagnostics.spineReversalWarning,
+          "forward attack stance cannot arch backward through adjacent spine segments");
+
+    solver.Reset(state);
+    tracking = BuildTracking();
     Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "backward-lean neutral pose solves");
     const auto backwardNeutralHips = pose.bones[BoneIndex(HumanoidBone::Hips)];
     const auto backwardNeutralChest = pose.bones[BoneIndex(HumanoidBone::Chest)];
@@ -911,6 +930,48 @@ void TestAnatomicalSpineCrouchAndSupport() {
           "predicted support margin requests a lateral step before extreme body lean");
     Check(std::abs(diagnostics.lateralLeanMeters) < 0.13F,
           "step begins while lateral lean remains anatomically bounded");
+}
+
+void TestSideStepLeanLimitOverride() {
+    struct Result {
+        int firstStepFrame = -1;
+        float greatestLeanBeforeStep = 0.0F;
+    };
+    const auto run = [](float limit) {
+        const auto avatar = BuildAvatar();
+        auto tracking = BuildTracking();
+        const auto player = BuildPlayer(tracking);
+        StaticTrackerlessAvatarSolver solver{};
+        solver.SetSideStepLeanLimit(limit);
+        SolverPersistentState state{};
+        SolvedHumanoidPose pose{};
+        SolverDiagnostics diagnostics{};
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+              "side-step limit neutral pose solves");
+        Result result{};
+        for (int frame = 0; frame < 90; ++frame) {
+            tracking = NextFrame(tracking, {0.19F, 1.70F, 0.06F}, 0.0F, {0.25F, 0.0F, 0.0F});
+            Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+                  "side-step limit lateral pose solves");
+            result.greatestLeanBeforeStep = std::max(
+                result.greatestLeanBeforeStep, std::abs(diagnostics.lateralLeanMeters));
+            if (state.feet[0].state == FootState::Stepping ||
+                state.feet[1].state == FootState::Stepping) {
+                result.firstStepFrame = frame;
+                break;
+            }
+        }
+        return result;
+    };
+
+    const auto original = run(1.0F);
+    const auto earlier = run(0.50F);
+    Check(original.firstStepFrame >= 0 && earlier.firstStepFrame >= 0,
+          "both original and reduced lateral limits still produce a support step");
+    Check(earlier.firstStepFrame <= original.firstStepFrame,
+          "lower lateral limit does not delay the side step");
+    Check(earlier.greatestLeanBeforeStep < original.greatestLeanBeforeStep * 0.75F,
+          "lower lateral limit materially reduces lean retained before stepping");
 }
 
 void TestProceduralStepAndPivot() {
@@ -1052,6 +1113,7 @@ int main() {
     TestBodyYawStateMachine();
     TestPelvisLeanCrouchAndBend();
     TestAnatomicalSpineCrouchAndSupport();
+    TestSideStepLeanLimitOverride();
     TestProceduralStepAndPivot();
     TestAirborneAndResetRecovery();
     std::cout << "Avatar solver tests passed\n";

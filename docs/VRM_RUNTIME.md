@@ -18,12 +18,24 @@ The parser does not include Unity headers. The solver does not know about glTF, 
 - node hierarchy with TRS or decomposed matrix transforms
 - triangle-list mesh primitives, 16- or 32-bit Unity index buffers, positions, normals, tangents, UV0, indices, skin joints, normalized weights, and inverse bind matrices
 - multiple meshes, primitives, skins, and materials (one Unity renderer per primitive for correctness before later optimization)
-- embedded PNG and JPEG images decoded through Unity, sampler filtering/wrapping, and a configurable 256-2048 maximum texture dimension
+- embedded PNG and JPEG images decoded through Unity, sampler filtering/wrapping, and a configurable 512-4096 maximum texture dimension
 - VRM metadata, humanoid mapping, first-person bone/offset and mesh annotations, blend-shape groups, material-value metadata, collider groups, and SpringBone group metadata
 - Unity humanoid Avatar construction and validation before `BindHumanoidAnimator(...)`
 - preset expression morph bindings, including ordinary VRM `blink` and `joy` groups when present
 
-The current material pass consumes VRM 0.x MToon properties but intentionally uses built-in unlit opaque/cutout/transparent shaders. Base color, main texture, emission color/texture, VRM's offset-then-scale texture transform, blend class, and render queue are retained. MToon lighting ramps, rim lighting, matcaps, exact culling behavior, and outlines are not claimed yet. SpringBone metadata is parsed but simulation is not implemented in this milestone.
+The material runtime consumes VRM 0.x MToon properties through SaberStage's Quest shader bundle. It retains authored base and shade colors, main/shade/normal/rim/matcap/emission textures, UV transforms, alpha mode and cutoff, render queue, culling, toon ramp controls, and outline settings. Unsupported custom shaders use a bounded built-in fallback rather than preventing the avatar from loading. SpringBone simulation is implemented independently of this material-diagnostic pass and was deliberately left unchanged here.
+
+The Appearance section exposes a cumulative `Material Stage` diagnostic ladder. `Configured` uses the normal user-facing material switches; numbered stages then add texture color, toon lighting, shade texture, normal maps, rim lighting, matcap, emission, and outlines one feature at a time. This is intended to identify the first failing material stage without changing importer code between headset tests. It is not a claim that every VRM renders identically to its desktop reference.
+
+`Avatar Lighting` selects an avatar-only lighting policy:
+
+- `Environment` follows the active Beat Saber environment most closely.
+- `Balanced` retains environment response while applying a conservative minimum light contribution so avatars remain readable in dark environments.
+- `Studio` uses stable camera-relative key and fill lighting for appearance comparison.
+
+These modes alter only the avatar material. They do not add or modify Beat Saber environment lights.
+
+`Side-Step Lean Limit` is a motion override expressed as 40-100 percent. The default 100 percent preserves the calibrated/original lateral lean envelope. Lower values scale that same envelope so the existing pelvis-translation and support-step solver takes over sooner, reducing extreme sideways torso lean without rewriting or discarding the player's calibration profile.
 
 Sparse accessors, external buffers/images, data URIs, non-triangle primitives, VRM 1.x, Draco compression, mesh merging, advanced SpringBones, terrain-aware feet, continuous locomotion, and FBT are outside this stop point. Unsupported or malformed input fails with a bounded error and does not replace the current avatar.
 
@@ -41,7 +53,9 @@ The [VRM 0.x specification](https://github.com/vrm-c/vrm-specification/blob/mast
 
 ## Texture and memory policy
 
-The default maximum dimension is 1024. The profile permits 512 or 2048 for development. Aspect ratio is preserved. Only images referenced by runtime materials are decoded; the VRM metadata thumbnail and other unused images are excluded. Textures are decoded and capped one at a time to bound transient peak memory, made non-readable after mip generation, and their encoded bytes are released.
+The default maximum dimension is 1024. The profile permits 512, 2048, or 4096 for diagnosis and quality testing. Aspect ratio is preserved. Only images referenced by runtime materials are decoded; the VRM metadata thumbnail and other unused images are excluded. Textures are decoded and capped one at a time to bound transient peak memory, made non-readable after mip generation, and their encoded bytes are released. Color textures are created as sRGB while normal, shading-grade, and outline-width data textures are created as linear. If one source image is assigned to both color and data roles, the loader logs the ambiguity and preserves its visible color interpretation rather than silently creating inconsistent duplicate material inputs.
+
+Load diagnostics record each source and runtime texture size, its material roles and color space, each material's shader and mapped features, alpha/cull/render-queue state, and a summary of MToon versus fallback materials. Applying a material stage or lighting mode logs only when the effective controls change; it does not emit per-frame logging.
 
 Host inspection of the supplied Black Heart fixture found 24 material texture references. At the 1024 cap, their estimated RGBA32 mip-chain storage is about 68.3 MiB, down from about 111.3 MiB of source-resolution decoded pixels. This is an estimate, not a Quest memory measurement. The 512 option is the intended fallback if the first device profile is too expensive.
 

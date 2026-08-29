@@ -1,6 +1,7 @@
 #include "saberstage/recording/DirectFfmpegCapture.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/recording/CaptureTimeline.hpp"
 
 #include "UnityEngine/Camera.hpp"
 #include "UnityEngine/FilterMode.hpp"
@@ -18,6 +19,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec.h>
 #include <libavutil/dict.h>
+#include <libavutil/buffer.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_mediacodec.h>
@@ -35,11 +37,14 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -49,6 +54,87 @@ namespace saberstage::recording {
 namespace {
 
 constexpr std::size_t kRenderSlotCount = 4;
+constexpr std::uint64_t kMaximumTransientBridgeFailures = 3;
+
+#ifndef EGL_RECORDABLE_ANDROID
+#define EGL_RECORDABLE_ANDROID 0x3142
+#endif
+
+enum class BridgeFailureStage : std::int32_t {
+    None = 0,
+    NoCurrentDisplay,
+    NoCurrentContext,
+    QueryContextConfig,
+    EnumerateConfigs,
+    SelectContextConfig,
+    ContextConfigNotRecordable,
+    CreateWindowSurface,
+    MakeEncoderSurfaceCurrent,
+    CompileVertexShader,
+    CompileFragmentShader,
+    LinkShaderProgram,
+    CreateVertexArray,
+    RestoreUnityContext,
+    DrawSourceTexture,
+    PresentEncoderSurface,
+    NoSurfaceFrames,
+    NoEncoderOutput,
+    EncoderWorker,
+};
+
+std::string_view BridgeFailureStageName(BridgeFailureStage stage) {
+    switch (stage) {
+        case BridgeFailureStage::None: return "none";
+        case BridgeFailureStage::NoCurrentDisplay: return "no current EGL display (Unity is likely using Vulkan)";
+        case BridgeFailureStage::NoCurrentContext: return "no current EGL context (Unity is likely using Vulkan)";
+        case BridgeFailureStage::QueryContextConfig: return "query Unity EGL context config";
+        case BridgeFailureStage::EnumerateConfigs: return "enumerate EGL configs";
+        case BridgeFailureStage::SelectContextConfig: return "choose MediaCodec-recordable EGL config";
+        case BridgeFailureStage::ContextConfigNotRecordable: return "Unity EGL config is not MediaCodec-recordable";
+        case BridgeFailureStage::CreateWindowSurface: return "create MediaCodec EGL window surface";
+        case BridgeFailureStage::MakeEncoderSurfaceCurrent: return "make MediaCodec EGL surface current";
+        case BridgeFailureStage::CompileVertexShader: return "compile bridge vertex shader";
+        case BridgeFailureStage::CompileFragmentShader: return "compile bridge fragment shader";
+        case BridgeFailureStage::LinkShaderProgram: return "link bridge shader program";
+        case BridgeFailureStage::CreateVertexArray: return "create bridge vertex array";
+        case BridgeFailureStage::RestoreUnityContext: return "restore Unity EGL context";
+        case BridgeFailureStage::DrawSourceTexture: return "draw Unity source texture";
+        case BridgeFailureStage::PresentEncoderSurface: return "present MediaCodec EGL surface";
+        case BridgeFailureStage::NoSurfaceFrames: return "no frames reached the MediaCodec input surface";
+        case BridgeFailureStage::NoEncoderOutput: return "MediaCodec produced no H.264 packets";
+        case BridgeFailureStage::EncoderWorker: return "FFmpeg MediaCodec worker";
+    }
+    return "unknown direct-capture stage";
+}
+
+struct RenderBridgeDiagnostics final {
+    std::atomic<std::uint64_t> renderEvents{0};
+    std::atomic<std::uint64_t> initAttempts{0};
+    std::atomic<std::uint64_t> surfaceFramesPresented{0};
+    std::atomic<std::uint64_t> makeCurrentFailures{0};
+    std::atomic<std::uint64_t> swapFailures{0};
+    std::atomic<std::uint64_t> consecutiveFailures{0};
+    std::atomic<std::int32_t> lastEglError{EGL_SUCCESS};
+    std::atomic<std::int32_t> lastGlError{GL_NO_ERROR};
+    std::atomic<std::int32_t> failureStage{static_cast<std::int32_t>(BridgeFailureStage::None)};
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> terminalFailure{false};
+};
+
+void RecordBridgeFailure(
+    RenderBridgeDiagnostics& diagnostics,
+    BridgeFailureStage stage,
+    bool terminal,
+    EGLint eglError = EGL_SUCCESS,
+    GLenum glError = GL_NO_ERROR) noexcept {
+    diagnostics.failureStage.store(static_cast<std::int32_t>(stage), std::memory_order_release);
+    diagnostics.lastEglError.store(eglError, std::memory_order_release);
+    diagnostics.lastGlError.store(static_cast<std::int32_t>(glError), std::memory_order_release);
+    const auto failures = diagnostics.consecutiveFailures.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (terminal || failures >= kMaximumTransientBridgeFailures) {
+        diagnostics.terminalFailure.store(true, std::memory_order_release);
+    }
+}
 
 std::string FfmpegError(int result) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
@@ -115,6 +201,7 @@ public:
                 return;
             }
             pendingPresentationTimes_.push_back(presentationTimeNanos);
+            queuedSurfaceFrames_.fetch_add(1, std::memory_order_relaxed);
         }
         wake_.notify_one();
     }
@@ -128,6 +215,21 @@ public:
     [[nodiscard]] bool Failed() const noexcept { return failed_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t DroppedFrames() const noexcept {
         return droppedFrames_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t QueuedSurfaceFrames() const noexcept {
+        return queuedSurfaceFrames_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t SubmittedFrames() const noexcept {
+        return submittedFrames_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t EncodedPackets() const noexcept {
+        return encodedPackets_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t EncodedBytes() const noexcept {
+        return encodedBytes_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::uint64_t AgainResponses() const noexcept {
+        return againResponses_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -192,12 +294,22 @@ private:
             settings::ToString(settings_.h264Profile), settings::ToString(settings_.h264Level));
     }
 
-    void DrainPackets() {
+    bool DrainPackets(bool waitForEndOfStream = false) {
         AVPacket* packet = av_packet_alloc();
         if (!packet) throw std::runtime_error("cannot allocate FFmpeg output packet");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        bool endOfStream = false;
         for (;;) {
             const auto result = avcodec_receive_packet(codecContext_, packet);
-            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) break;
+            if (result == AVERROR_EOF) {
+                endOfStream = true;
+                break;
+            }
+            if (result == AVERROR(EAGAIN)) {
+                if (!waitForEndOfStream || std::chrono::steady_clock::now() >= deadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             if (result < 0) {
                 av_packet_free(&packet);
                 throw std::runtime_error("FFmpeg hardware packet drain failed: " + FfmpegError(result));
@@ -210,9 +322,12 @@ private:
                     packet->dts,
                     (packet->flags & AV_PKT_FLAG_KEY) != 0});
             }
+            encodedPackets_.fetch_add(1, std::memory_order_relaxed);
+            encodedBytes_.fetch_add(static_cast<std::uint64_t>(packet->size), std::memory_order_relaxed);
             av_packet_unref(packet);
         }
         av_packet_free(&packet);
+        return endOfStream;
     }
 
     void Run() noexcept {
@@ -221,9 +336,6 @@ private:
             failed_.store(true, std::memory_order_release);
             return;
         }
-        frame->format = AV_PIX_FMT_MEDIACODEC;
-        frame->width = width_;
-        frame->height = height_;
         try {
             for (;;) {
                 {
@@ -241,12 +353,38 @@ private:
                         presentationTimeNanos = pendingPresentationTimes_.front();
                         pendingPresentationTimes_.pop_front();
                     }
+                    // Surface-mode MediaCodec consumes pixels from the EGL
+                    // input window, but FFmpeg's public send-frame contract
+                    // still requires a refcounted frame object. A one-byte
+                    // token keeps that contract valid without copying video;
+                    // eglPresentationTimeANDROID remains the authoritative PTS.
+                    av_frame_unref(frame);
+                    frame->format = AV_PIX_FMT_MEDIACODEC;
+                    frame->width = width_;
+                    frame->height = height_;
                     frame->pts = static_cast<std::int64_t>(std::llround(
                         static_cast<double>(presentationTimeNanos) *
                         static_cast<double>(settings_.framesPerSecond) / 1'000'000'000.0));
-                    const auto result = avcodec_send_frame(codecContext_, frame);
-                    if (result < 0 && result != AVERROR(EAGAIN)) {
-                        throw std::runtime_error("FFmpeg rejected a hardware surface frame: " + FfmpegError(result));
+                    frame->buf[0] = av_buffer_alloc(1);
+                    if (!frame->buf[0]) throw std::runtime_error("cannot allocate FFmpeg surface-frame token");
+                    frame->data[0] = frame->buf[0]->data;
+                    // send/receive requires the same frame to be retried after
+                    // EAGAIN. The old code drained output but silently threw
+                    // this surface timestamp away, which could create gaps
+                    // under ordinary encoder back-pressure.
+                    for (;;) {
+                        const auto result = avcodec_send_frame(codecContext_, frame);
+                        if (result == AVERROR(EAGAIN)) {
+                            againResponses_.fetch_add(1, std::memory_order_relaxed);
+                            DrainPackets();
+                            continue;
+                        }
+                        if (result < 0) {
+                            throw std::runtime_error(
+                                "FFmpeg rejected a hardware surface frame: " + FfmpegError(result));
+                        }
+                        submittedFrames_.fetch_add(1, std::memory_order_relaxed);
+                        break;
                     }
                     DrainPackets();
                 }
@@ -255,8 +393,21 @@ private:
                     if (pendingPresentationTimes_.empty()) break;
                 }
             }
-            avcodec_send_frame(codecContext_, nullptr);
-            DrainPackets();
+            for (;;) {
+                const auto flush = avcodec_send_frame(codecContext_, nullptr);
+                if (flush == AVERROR(EAGAIN)) {
+                    againResponses_.fetch_add(1, std::memory_order_relaxed);
+                    DrainPackets();
+                    continue;
+                }
+                if (flush < 0 && flush != AVERROR_EOF) {
+                    throw std::runtime_error("FFmpeg hardware encoder flush failed: " + FfmpegError(flush));
+                }
+                break;
+            }
+            if (!DrainPackets(true)) {
+                throw std::runtime_error("FFmpeg hardware encoder did not finish draining before timeout");
+            }
         } catch (const std::exception& exception) {
             failed_.store(true, std::memory_order_release);
             Logging::Logger.error("Direct FFmpeg encoder worker failed: {}", exception.what());
@@ -279,6 +430,11 @@ private:
     std::atomic<bool> failed_{false};
     std::deque<std::int64_t> pendingPresentationTimes_;
     std::atomic<std::uint64_t> droppedFrames_{0};
+    std::atomic<std::uint64_t> queuedSurfaceFrames_{0};
+    std::atomic<std::uint64_t> submittedFrames_{0};
+    std::atomic<std::uint64_t> encodedPackets_{0};
+    std::atomic<std::uint64_t> encodedBytes_{0};
+    std::atomic<std::uint64_t> againResponses_{0};
     std::int32_t width_ = 0;
     std::int32_t height_ = 0;
 
@@ -292,6 +448,7 @@ public:
 
 struct RenderBridge {
     std::shared_ptr<DirectEncoder> encoder;
+    std::shared_ptr<RenderBridgeDiagnostics> diagnostics;
     GLuint sourceTexture = 0;
     std::int32_t width = 0;
     std::int32_t height = 0;
@@ -319,51 +476,92 @@ GLuint CompileShader(GLenum kind, const char* source) {
 }
 
 bool InitializeRenderBridge(RenderBridge& bridge) {
+    auto& diagnostics = *bridge.diagnostics;
+    diagnostics.initAttempts.fetch_add(1, std::memory_order_relaxed);
     bridge.display = eglGetCurrentDisplay();
     bridge.context = eglGetCurrentContext();
-    if (bridge.display == EGL_NO_DISPLAY || bridge.context == EGL_NO_CONTEXT) return false;
-
-    EGLint configId = 0;
-    if (!eglQueryContext(bridge.display, bridge.context, EGL_CONFIG_ID, &configId)) return false;
-    EGLint count = 0;
-    eglGetConfigs(bridge.display, nullptr, 0, &count);
-    if (count <= 0) return false;
-    std::vector<EGLConfig> configs(static_cast<std::size_t>(count));
-    eglGetConfigs(bridge.display, configs.data(), count, &count);
-    EGLConfig selected = nullptr;
-    for (auto config : configs) {
-        EGLint candidate = 0;
-        eglGetConfigAttrib(bridge.display, config, EGL_CONFIG_ID, &candidate);
-        if (candidate == configId) {
-            selected = config;
-            break;
-        }
+    if (bridge.display == EGL_NO_DISPLAY) {
+        RecordBridgeFailure(
+            diagnostics, BridgeFailureStage::NoCurrentDisplay, true, eglGetError());
+        return false;
     }
-    if (!selected) return false;
+    if (bridge.context == EGL_NO_CONTEXT) {
+        RecordBridgeFailure(
+            diagnostics, BridgeFailureStage::NoCurrentContext, true, eglGetError());
+        return false;
+    }
+
+    // Unity's Quest context can be an EGL_KHR_no_config_context. In that case
+    // EGL_CONFIG_ID is zero and enumerating configs can never find a matching
+    // entry even though the context can render to a compatible surface. Pick a
+    // recordable RGBA8 ES3 window config explicitly, as required by the
+    // MediaCodec input surface, and continue sharing Unity's current context.
+    static constexpr EGLint attributes[] = {
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RECORDABLE_ANDROID, EGL_TRUE,
+        EGL_NONE,
+    };
+    EGLConfig selected = nullptr;
+    EGLint count = 0;
+    if (!eglChooseConfig(bridge.display, attributes, &selected, 1, &count) ||
+        count <= 0 || !selected) {
+        RecordBridgeFailure(
+            diagnostics, BridgeFailureStage::SelectContextConfig, false, eglGetError());
+        return false;
+    }
+    EGLint recordable = EGL_FALSE;
+    if (!eglGetConfigAttrib(
+            bridge.display, selected, EGL_RECORDABLE_ANDROID, &recordable) ||
+        recordable != EGL_TRUE) {
+        RecordBridgeFailure(
+            diagnostics,
+            BridgeFailureStage::ContextConfigNotRecordable,
+            true,
+            eglGetError());
+        return false;
+    }
     bridge.surface = eglCreateWindowSurface(
         bridge.display, selected, bridge.encoder->Window(), nullptr);
-    if (bridge.surface == EGL_NO_SURFACE) return false;
+    if (bridge.surface == EGL_NO_SURFACE) {
+        RecordBridgeFailure(
+            diagnostics, BridgeFailureStage::CreateWindowSurface, false, eglGetError());
+        return false;
+    }
 
-    const auto failSurfaceInitialization = [&bridge] {
+    const auto failSurfaceInitialization = [&bridge, &diagnostics](
+        BridgeFailureStage stage,
+        bool terminal,
+        EGLint eglError = EGL_SUCCESS,
+        GLenum glError = GL_NO_ERROR) {
         if (bridge.surface != EGL_NO_SURFACE) {
             eglDestroySurface(bridge.display, bridge.surface);
             bridge.surface = EGL_NO_SURFACE;
         }
         bridge.program = 0;
         bridge.vertexArray = 0;
+        RecordBridgeFailure(diagnostics, stage, terminal, eglError, glError);
         return false;
     };
     const auto oldDraw = eglGetCurrentSurface(EGL_DRAW);
     const auto oldRead = eglGetCurrentSurface(EGL_READ);
     if (!eglMakeCurrent(bridge.display, bridge.surface, bridge.surface, bridge.context)) {
-        return failSurfaceInitialization();
+        return failSurfaceInitialization(
+            BridgeFailureStage::MakeEncoderSurfaceCurrent, false, eglGetError());
     }
 
     static constexpr char vertexSource[] = R"(#version 300 es
 out vec2 uv;
 void main() {
     vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
-    uv = vec2(p.x, 1.0 - p.y);
+    // Unity's OpenGL RenderTexture is already in the texture orientation
+    // expected by this GLES bridge. Flipping Y here produced an upside-down
+    // encoded recording even though the live spectator camera was correct.
+    uv = p;
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 })";
     static constexpr char fragmentSource[] = R"(#version 300 es
@@ -381,7 +579,20 @@ void main() {
     color = vec4(linearToSrgb(sampled.rgb), sampled.a);
     })";
     const auto vertex = CompileShader(GL_VERTEX_SHADER, vertexSource);
+    if (!vertex) {
+        const auto glError = glGetError();
+        eglMakeCurrent(bridge.display, oldDraw, oldRead, bridge.context);
+        return failSurfaceInitialization(
+            BridgeFailureStage::CompileVertexShader, true, EGL_SUCCESS, glError);
+    }
     const auto fragment = CompileShader(GL_FRAGMENT_SHADER, fragmentSource);
+    if (!fragment) {
+        const auto glError = glGetError();
+        glDeleteShader(vertex);
+        eglMakeCurrent(bridge.display, oldDraw, oldRead, bridge.context);
+        return failSurfaceInitialization(
+            BridgeFailureStage::CompileFragmentShader, true, EGL_SUCCESS, glError);
+    }
     GLint linked = GL_FALSE;
     if (vertex && fragment) {
         bridge.program = glCreateProgram();
@@ -402,8 +613,23 @@ void main() {
         bridge.vertexArray = 0;
         bridge.program = 0;
     }
-    eglMakeCurrent(bridge.display, oldDraw, oldRead, bridge.context);
-    if (!initialized) return failSurfaceInitialization();
+    if (!eglMakeCurrent(bridge.display, oldDraw, oldRead, bridge.context)) {
+        return failSurfaceInitialization(
+            BridgeFailureStage::RestoreUnityContext, true, eglGetError());
+    }
+    if (!initialized) {
+        return failSurfaceInitialization(
+            linked == GL_TRUE
+                ? BridgeFailureStage::CreateVertexArray
+                : BridgeFailureStage::LinkShaderProgram,
+            true,
+            EGL_SUCCESS,
+            glGetError());
+    }
+    diagnostics.initialized.store(true, std::memory_order_release);
+    diagnostics.consecutiveFailures.store(0, std::memory_order_release);
+    diagnostics.failureStage.store(
+        static_cast<std::int32_t>(BridgeFailureStage::None), std::memory_order_release);
     return true;
 }
 
@@ -411,6 +637,9 @@ void RenderToEncoder(int slot) {
     if (slot < 0 || static_cast<std::size_t>(slot) >= renderSlots.size()) return;
     auto* bridge = renderSlots[static_cast<std::size_t>(slot)].load(std::memory_order_acquire);
     if (!bridge || !bridge->encoder || bridge->encoder->Failed()) return;
+    auto& diagnostics = *bridge->diagnostics;
+    diagnostics.renderEvents.fetch_add(1, std::memory_order_relaxed);
+    if (diagnostics.terminalFailure.load(std::memory_order_acquire)) return;
     if (bridge->surface == EGL_NO_SURFACE && !InitializeRenderBridge(*bridge)) return;
 
     const auto oldDisplay = eglGetCurrentDisplay();
@@ -433,7 +662,9 @@ void RenderToEncoder(int slot) {
     const auto cull = glIsEnabled(GL_CULL_FACE);
     const auto scissor = glIsEnabled(GL_SCISSOR_TEST);
 
-    if (eglMakeCurrent(bridge->display, bridge->surface, bridge->surface, bridge->context)) {
+    bool encoderSurfaceCurrent = eglMakeCurrent(
+        bridge->display, bridge->surface, bridge->surface, bridge->context);
+    if (encoderSurfaceCurrent) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glViewport(0, 0, bridge->width, bridge->height);
         glDisable(GL_BLEND);
@@ -446,6 +677,15 @@ void RenderToEncoder(int slot) {
         glBindTexture(GL_TEXTURE_2D, bridge->sourceTexture);
         glUniform1i(glGetUniformLocation(bridge->program, "sourceTexture"), 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
+        const auto drawError = glGetError();
+        if (drawError != GL_NO_ERROR) {
+            RecordBridgeFailure(
+                diagnostics,
+                BridgeFailureStage::DrawSourceTexture,
+                true,
+                EGL_SUCCESS,
+                drawError);
+        }
         static const auto setPresentationTime =
             reinterpret_cast<PFNEGLPRESENTATIONTIMEANDROIDPROC>(
                 eglGetProcAddress("eglPresentationTimeANDROID"));
@@ -456,13 +696,37 @@ void RenderToEncoder(int slot) {
                 static_cast<EGLnsecsANDROID>(
                     bridge->presentationTimeNanos.load(std::memory_order_acquire)));
         }
-        if (eglSwapBuffers(bridge->display, bridge->surface)) {
+        if (drawError == GL_NO_ERROR && eglSwapBuffers(bridge->display, bridge->surface)) {
+            diagnostics.surfaceFramesPresented.fetch_add(1, std::memory_order_relaxed);
+            diagnostics.consecutiveFailures.store(0, std::memory_order_release);
+            diagnostics.failureStage.store(
+                static_cast<std::int32_t>(BridgeFailureStage::None),
+                std::memory_order_release);
             bridge->encoder->NotifySurfaceFrame(
                 bridge->presentationTimeNanos.load(std::memory_order_acquire));
+        } else if (drawError == GL_NO_ERROR) {
+            diagnostics.swapFailures.fetch_add(1, std::memory_order_relaxed);
+            RecordBridgeFailure(
+                diagnostics,
+                BridgeFailureStage::PresentEncoderSurface,
+                false,
+                eglGetError());
         }
+    } else {
+        diagnostics.makeCurrentFailures.fetch_add(1, std::memory_order_relaxed);
+        RecordBridgeFailure(
+            diagnostics,
+            BridgeFailureStage::MakeEncoderSurfaceCurrent,
+            false,
+            eglGetError());
     }
 
-    eglMakeCurrent(oldDisplay, oldDraw, oldRead, oldContext);
+    const auto restored = eglMakeCurrent(oldDisplay, oldDraw, oldRead, oldContext);
+    if (!restored) {
+        RecordBridgeFailure(
+            diagnostics, BridgeFailureStage::RestoreUnityContext, true, eglGetError());
+        return;
+    }
     glUseProgram(static_cast<GLuint>(oldProgram));
     glBindVertexArray(static_cast<GLuint>(oldVao));
     glActiveTexture(GL_TEXTURE0);
@@ -521,9 +785,12 @@ public:
         const settings::RecordingSettings& settings,
         GLuint sourceTexture,
         EncodedVideoCallback callback)
-        : encoder_(std::make_shared<DirectEncoder>(settings, std::move(callback))) {
+        : encoder_(std::make_shared<DirectEncoder>(settings, std::move(callback))),
+          bridgeDiagnostics_(std::make_shared<RenderBridgeDiagnostics>()) {
         settings::ResolutionDimensions(settings.resolution, width_, height_);
-        auto* bridge = new RenderBridge{encoder_, sourceTexture, width_, height_};
+        framesPerSecond_ = settings.framesPerSecond;
+        auto* bridge = new RenderBridge{
+            encoder_, bridgeDiagnostics_, sourceTexture, width_, height_};
         for (std::size_t slot = 0; slot < renderSlots.size(); ++slot) {
             RenderBridge* expected = nullptr;
             if (renderSlots[slot].compare_exchange_strong(expected, bridge)) {
@@ -552,8 +819,7 @@ public:
             // final shared ownership of the encoder in render-thread order.
             if (encoder_) {
                 encoder_->Stop();
-                lastFailed_ = encoder_->Failed();
-                lastDroppedFrames_ = encoder_->DroppedFrames();
+                lastDiagnostics_ = Diagnostics();
             }
             IssueRenderEvent(&DestroyRenderBridge, slot_);
             slot_ = -1;
@@ -562,19 +828,89 @@ public:
     }
 
     [[nodiscard]] bool Failed() const noexcept {
-        return encoder_ ? encoder_->Failed() : lastFailed_;
+        return encoder_
+            ? encoder_->Failed() || bridgeDiagnostics_->terminalFailure.load(std::memory_order_acquire)
+            : lastDiagnostics_.failed;
     }
     [[nodiscard]] std::uint64_t DroppedFrames() const noexcept {
-        return encoder_ ? encoder_->DroppedFrames() : lastDroppedFrames_;
+        return encoder_ ? encoder_->DroppedFrames() : lastDiagnostics_.droppedFrames;
+    }
+
+    void EvaluateHealth(double elapsedSeconds, std::uint64_t scheduledFrames) noexcept {
+        if (!encoder_) return;
+        if (encoder_->Failed() &&
+            !bridgeDiagnostics_->terminalFailure.load(std::memory_order_acquire)) {
+            RecordBridgeFailure(
+                *bridgeDiagnostics_, BridgeFailureStage::EncoderWorker, true);
+            return;
+        }
+        if (bridgeDiagnostics_->terminalFailure.load(std::memory_order_acquire) ||
+            elapsedSeconds < 3.0 || scheduledFrames < 30) {
+            return;
+        }
+
+        const auto presented = bridgeDiagnostics_->surfaceFramesPresented.load(std::memory_order_acquire);
+        if (presented == 0) {
+            RecordBridgeFailure(
+                *bridgeDiagnostics_, BridgeFailureStage::NoSurfaceFrames, true);
+            return;
+        }
+        if (presented >= static_cast<std::uint64_t>(std::max(15, framesPerSecond_)) &&
+            encoder_->EncodedPackets() == 0) {
+            RecordBridgeFailure(
+                *bridgeDiagnostics_, BridgeFailureStage::NoEncoderOutput, true);
+        }
+    }
+
+    [[nodiscard]] DirectCaptureDiagnostics Diagnostics() const noexcept {
+        if (!encoder_) return lastDiagnostics_;
+        DirectCaptureDiagnostics result;
+        result.renderEvents = bridgeDiagnostics_->renderEvents.load(std::memory_order_relaxed);
+        result.bridgeInitAttempts = bridgeDiagnostics_->initAttempts.load(std::memory_order_relaxed);
+        result.surfaceFramesPresented =
+            bridgeDiagnostics_->surfaceFramesPresented.load(std::memory_order_relaxed);
+        result.surfaceFramesQueued = encoder_->QueuedSurfaceFrames();
+        result.encoderFramesSubmitted = encoder_->SubmittedFrames();
+        result.encodedPackets = encoder_->EncodedPackets();
+        result.encodedBytes = encoder_->EncodedBytes();
+        result.encoderAgainResponses = encoder_->AgainResponses();
+        result.droppedFrames = encoder_->DroppedFrames();
+        result.makeCurrentFailures =
+            bridgeDiagnostics_->makeCurrentFailures.load(std::memory_order_relaxed);
+        result.swapFailures = bridgeDiagnostics_->swapFailures.load(std::memory_order_relaxed);
+        result.lastEglError = bridgeDiagnostics_->lastEglError.load(std::memory_order_relaxed);
+        result.lastGlError = bridgeDiagnostics_->lastGlError.load(std::memory_order_relaxed);
+        result.failureStage = bridgeDiagnostics_->failureStage.load(std::memory_order_relaxed);
+        result.bridgeInitialized = bridgeDiagnostics_->initialized.load(std::memory_order_relaxed);
+        result.failed = encoder_->Failed() ||
+            bridgeDiagnostics_->terminalFailure.load(std::memory_order_relaxed);
+        return result;
+    }
+
+    [[nodiscard]] std::string FailureSummary() const {
+        const auto diagnostics = Diagnostics();
+        const auto stage = static_cast<BridgeFailureStage>(diagnostics.failureStage);
+        return std::string(BridgeFailureStageName(stage)) +
+            " (EGL=0x" + [&] {
+                char buffer[16]{};
+                std::snprintf(buffer, sizeof(buffer), "%x", diagnostics.lastEglError);
+                return std::string(buffer);
+            }() +
+            ", GL=0x" + [&] {
+                char buffer[16]{};
+                std::snprintf(buffer, sizeof(buffer), "%x", diagnostics.lastGlError);
+                return std::string(buffer);
+            }() + ")";
     }
 
 private:
     std::shared_ptr<DirectEncoder> encoder_;
+    std::shared_ptr<RenderBridgeDiagnostics> bridgeDiagnostics_;
     std::int32_t width_ = 0;
     std::int32_t height_ = 0;
+    std::int32_t framesPerSecond_ = 30;
     int slot_ = -1;
-    bool lastFailed_ = false;
-    std::uint64_t lastDroppedFrames_ = 0;
+    DirectCaptureDiagnostics lastDiagnostics_{};
 };
 
 void DirectFfmpegCapture::Awake() {
@@ -601,18 +937,49 @@ void DirectFfmpegCapture::Init(
     camera_->set_rect({0.0F, 0.0F, 1.0F, 1.0F});
     camera_->set_enabled(false);
     const auto native = texture->GetNativeTexturePtr().m_value.convert();
+    const auto nativeTexture = static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(native));
     impl_ = new DirectFfmpegCaptureImpl(
-        settings, static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(native)), std::move(callback));
-    frameIntervalSeconds_ = 1.0 / static_cast<double>(settings.framesPerSecond);
-    startedAtSeconds_ = UnityEngine::Time::get_unscaledTime() - static_cast<float>(frameIntervalSeconds_ * 0.5);
+        settings, nativeTexture, std::move(callback));
+    framesPerSecond_ = settings.framesPerSecond;
+    startedAtSeconds_ = UnityEngine::Time::get_unscaledTime();
+    lastPresentationFrame_ = -1;
     scheduledFrames_ = 0;
+    skippedTimelineFrames_ = 0;
     firstFrameMonotonicNanos_ = 0;
+    failureLogged_ = false;
+    lastDiagnostics_ = {};
+    Logging::Logger.info(
+        "Direct FFmpeg render bridge created: sourceTexture={}, {}x{}@{}",
+        nativeTexture, width, height, settings.framesPerSecond);
 }
 
 void DirectFfmpegCapture::Update() {
-    if (!camera_ || !impl_ || impl_->Failed()) return;
+    if (!camera_ || !impl_) return;
     const auto elapsed = static_cast<double>(UnityEngine::Time::get_unscaledTime() - startedAtSeconds_);
-    if (elapsed < frameIntervalSeconds_ * static_cast<double>(scheduledFrames_)) {
+    impl_->EvaluateHealth(elapsed, scheduledFrames_);
+    if (impl_->Failed()) {
+        camera_->set_enabled(false);
+        if (!failureLogged_) {
+            failureLogged_ = true;
+            const auto diagnostics = Diagnostics();
+            Logging::Logger.error(
+                "Direct FFmpeg capture failed at {}: scheduled={}, timelineSkipped={}, renderEvents={}, initAttempts={}, "
+                "bridgeReady={}, presented={}, queued={}, submitted={}, packets={}, bytes={}, "
+                "again={}, dropped={}, makeCurrentFailures={}, swapFailures={}, EGL=0x{:x}, GL=0x{:x}",
+                FailureSummary(), diagnostics.scheduledFrames, diagnostics.skippedTimelineFrames,
+                diagnostics.renderEvents,
+                diagnostics.bridgeInitAttempts, diagnostics.bridgeInitialized,
+                diagnostics.surfaceFramesPresented, diagnostics.surfaceFramesQueued,
+                diagnostics.encoderFramesSubmitted, diagnostics.encodedPackets,
+                diagnostics.encodedBytes, diagnostics.encoderAgainResponses,
+                diagnostics.droppedFrames, diagnostics.makeCurrentFailures,
+                diagnostics.swapFailures, diagnostics.lastEglError, diagnostics.lastGlError);
+        }
+        return;
+    }
+    const auto timeline = DecideCaptureTimelineFrame(
+        elapsed, framesPerSecond_, lastPresentationFrame_);
+    if (!timeline.frameDue) {
         camera_->set_enabled(false);
         return;
     }
@@ -620,27 +987,55 @@ void DirectFfmpegCapture::Update() {
         firstFrameMonotonicNanos_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
+    lastPresentationFrame_ = timeline.presentationFrame;
+    skippedTimelineFrames_ += timeline.skippedDeadlines;
     ++scheduledFrames_;
     camera_->set_enabled(true);
-    impl_->RenderFrame(static_cast<std::int64_t>(
-        static_cast<double>(scheduledFrames_ - 1) * frameIntervalSeconds_ * 1'000'000'000.0));
+    impl_->RenderFrame(CapturePresentationTimeNanos(
+        timeline.presentationFrame, framesPerSecond_));
 }
 
 void DirectFfmpegCapture::Stop() noexcept {
     if (camera_) camera_->set_enabled(false);
-    if (impl_) impl_->Stop();
+    if (impl_) {
+        impl_->Stop();
+        // Preserve the final render-thread/codec snapshot after the worker has
+        // drained. RecordingController queries this after Stop(), so returning
+        // a zeroed structure here previously hid the actual failure evidence.
+        lastDiagnostics_ = impl_->Diagnostics();
+    }
     delete impl_;
     impl_ = nullptr;
 }
 
-bool DirectFfmpegCapture::Failed() const noexcept { return !impl_ || impl_->Failed(); }
+bool DirectFfmpegCapture::Failed() const noexcept {
+    return impl_ ? impl_->Failed() : lastDiagnostics_.failed;
+}
 
 std::uint64_t DirectFfmpegCapture::DroppedFrameCount() const noexcept {
-    return impl_ ? impl_->DroppedFrames() : 0;
+    return impl_ ? impl_->DroppedFrames() : lastDiagnostics_.droppedFrames;
 }
 
 std::int64_t DirectFfmpegCapture::FirstFrameMonotonicNanos() const noexcept {
     return firstFrameMonotonicNanos_;
+}
+
+DirectCaptureDiagnostics DirectFfmpegCapture::Diagnostics() const noexcept {
+    auto diagnostics = impl_ ? impl_->Diagnostics() : lastDiagnostics_;
+    diagnostics.scheduledFrames = scheduledFrames_;
+    diagnostics.skippedTimelineFrames = skippedTimelineFrames_;
+    return diagnostics;
+}
+
+std::string DirectFfmpegCapture::FailureSummary() const {
+    const auto diagnostics = Diagnostics();
+    const auto stage = static_cast<BridgeFailureStage>(diagnostics.failureStage);
+    char egl[16]{};
+    char gl[16]{};
+    std::snprintf(egl, sizeof(egl), "%x", diagnostics.lastEglError);
+    std::snprintf(gl, sizeof(gl), "%x", diagnostics.lastGlError);
+    return std::string(BridgeFailureStageName(stage)) +
+        " (EGL=0x" + egl + ", GL=0x" + gl + ")";
 }
 
 void DirectFfmpegCapture::OnDestroy() {

@@ -267,6 +267,26 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("StopVideoSegment()", controller)
         self.assertIn("accumulatedPaused_", (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8"))
 
+    def test_direct_capture_reports_each_pipeline_stage_and_falls_back_before_saving_empty_video(self):
+        direct = (ROOT / "src/recording/DirectFfmpegCapture.cpp").read_text(encoding="utf-8")
+        controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "include/saberstage/recording/DirectFfmpegCapture.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("DirectCaptureDiagnostics", header)
+        self.assertIn("EGL_RECORDABLE_ANDROID", direct)
+        self.assertIn("NoCurrentContext", direct)
+        self.assertIn("NoEncoderOutput", direct)
+        self.assertIn("surfaceFramesPresented", direct)
+        self.assertIn("encodedPackets", direct)
+        self.assertIn("Direct FFmpeg capture failed at", direct)
+        self.assertIn("result == AVERROR(EAGAIN)", direct)
+        self.assertIn("continue;", direct)
+        self.assertIn("HandleDirectCaptureHealth", controller)
+        self.assertIn("StopVideoSegment(false)", controller)
+        self.assertIn("activeBackend_ = settings::RecordingBackend::Hollywood", controller)
+        self.assertIn("Direct encoder was unavailable; recording is continuing with Hollywood.", controller)
+        self.assertIn("Capture stream finalization check", controller)
+
     def test_avatar_picker_uses_absolute_headset_paths_without_filename_entry(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         settings = (ROOT / "src/settings/SettingsModel.cpp").read_text(encoding="utf-8")

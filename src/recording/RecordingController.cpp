@@ -47,6 +47,12 @@ std::string FileNameForStatus(const std::filesystem::path& path) {
     return path.empty() ? std::string{} : path.filename().string();
 }
 
+std::uintmax_t FileSizeOrZero(const std::filesystem::path& path) noexcept {
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    return error ? 0 : size;
+}
+
 bool IsGameplaySceneActive() {
     const auto name = static_cast<std::string>(
         UnityEngine::SceneManagement::SceneManager::GetActiveScene().get_name());
@@ -128,6 +134,8 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     partialOutputPath_ = std::filesystem::path(base.string() + ".partial.mp4");
     finalOutputPath_ = std::filesystem::path(base.string() + ".mp4");
     captureWriteFailed_.store(false);
+    captureFailureDetail_.clear();
+    directFallbackAttempted_ = false;
     firstVideoFrameMonotonicNanos_ = 0;
     firstAudioSampleMonotonicNanos_ = 0;
     {
@@ -375,7 +383,7 @@ void RecordingController::StartVideoSegment() {
     camera_.SetExternalOutputTexture(directVideoCapture_->texture);
 }
 
-void RecordingController::StopVideoSegment() noexcept {
+void RecordingController::StopVideoSegment(bool recordCaptureFailure) noexcept {
     camera_.SetExternalOutputTexture(nullptr);
     try {
         if (IsUnityObjectAlive(videoCapture_)) {
@@ -384,22 +392,49 @@ void RecordingController::StopVideoSegment() noexcept {
         }
     } catch (...) {
         Logging::Logger.error("Video segment cleanup failed");
+        if (recordCaptureFailure) {
+            captureFailureDetail_ = "Hollywood video-segment cleanup failed.";
+            captureWriteFailed_.store(true);
+        }
     }
     videoCapture_ = nullptr;
     try {
         if (IsUnityObjectAlive(directVideoCapture_)) {
+            auto diagnostics = directVideoCapture_->Diagnostics();
             const auto firstFrame = directVideoCapture_->FirstFrameMonotonicNanos();
-            if (firstVideoFrameMonotonicNanos_ == 0 && firstFrame > 0) {
+            // A scheduled render is not a captured frame. Do not use its epoch
+            // when the EGL bridge never yielded an H.264 packet, especially
+            // when this segment is about to fall back to Hollywood.
+            if (diagnostics.encodedPackets > 0 &&
+                firstVideoFrameMonotonicNanos_ == 0 && firstFrame > 0) {
                 firstVideoFrameMonotonicNanos_ = firstFrame;
             }
             directVideoCapture_->Stop();
+            diagnostics = directVideoCapture_->Diagnostics();
             {
                 std::lock_guard lock(videoTimingMutex_);
                 if (videoSegmentLastPresentationFrame_ >= 0) {
                     videoSegmentFrameBase_ += videoSegmentLastPresentationFrame_ + 1;
                 }
             }
-            if (directVideoCapture_->Failed()) captureWriteFailed_.store(true);
+            Logging::Logger.info(
+                "Direct FFmpeg segment diagnostics: scheduled={}, timelineSkipped={}, renderEvents={}, initAttempts={}, "
+                "bridgeReady={}, presented={}, queued={}, submitted={}, packets={}, bytes={}, "
+                "again={}, dropped={}, makeCurrentFailures={}, swapFailures={}, failureStage={}, "
+                "EGL=0x{:x}, GL=0x{:x}",
+                diagnostics.scheduledFrames, diagnostics.skippedTimelineFrames, diagnostics.renderEvents,
+                diagnostics.bridgeInitAttempts, diagnostics.bridgeInitialized,
+                diagnostics.surfaceFramesPresented, diagnostics.surfaceFramesQueued,
+                diagnostics.encoderFramesSubmitted, diagnostics.encodedPackets,
+                diagnostics.encodedBytes, diagnostics.encoderAgainResponses,
+                diagnostics.droppedFrames, diagnostics.makeCurrentFailures,
+                diagnostics.swapFailures, diagnostics.failureStage,
+                diagnostics.lastEglError, diagnostics.lastGlError);
+            if (recordCaptureFailure && directVideoCapture_->Failed()) {
+                captureFailureDetail_ =
+                    "Direct FFmpeg failed at " + directVideoCapture_->FailureSummary() + ".";
+                captureWriteFailed_.store(true);
+            }
             if (const auto dropped = directVideoCapture_->DroppedFrameCount(); dropped > 0) {
                 Logging::Logger.warn(
                     "Direct FFmpeg dropped {} video frames to keep its hardware queue bounded",
@@ -409,6 +444,10 @@ void RecordingController::StopVideoSegment() noexcept {
         }
     } catch (...) {
         Logging::Logger.error("Direct FFmpeg video segment cleanup failed");
+        if (recordCaptureFailure) {
+            captureFailureDetail_ = "Direct FFmpeg video-segment cleanup failed.";
+            captureWriteFailed_.store(true);
+        }
     }
     directVideoCapture_ = nullptr;
 }
@@ -473,10 +512,75 @@ void RecordingController::Shutdown() noexcept {
     driverObject_ = nullptr;
 }
 
+bool RecordingController::HandleDirectCaptureHealth() noexcept {
+    if (state_.load() != RecordingState::Recording ||
+        activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware ||
+        !IsUnityObjectAlive(directVideoCapture_) ||
+        !directVideoCapture_->Failed()) {
+        return false;
+    }
+
+    const auto diagnostics = directVideoCapture_->Diagnostics();
+    const auto failure = directVideoCapture_->FailureSummary();
+    const auto livestreamActive = broadcast::CanStop(LivestreamSnapshot().state);
+
+    // If Direct mode failed before even presenting/submitting a surface frame,
+    // its temporary H.264 file is guaranteed to remain empty and it is safe to
+    // replace that segment with Hollywood's proven Quest path. We deliberately
+    // do not change the persisted backend. Once MediaCodec has accepted input,
+    // Stop() could flush a delayed packet; mixing encoders in one raw stream
+    // could then change SPS/PPS or timestamp semantics, so that case fails.
+    if (!livestreamActive &&
+        diagnostics.encodedPackets == 0 &&
+        diagnostics.surfaceFramesPresented == 0 &&
+        diagnostics.encoderFramesSubmitted == 0 &&
+        !directFallbackAttempted_) {
+        directFallbackAttempted_ = true;
+        Logging::Logger.warn(
+            "Direct FFmpeg produced no video and failed at {}; switching this local recording "
+            "to Hollywood. scheduled={}, timelineSkipped={}, presented={}, submitted={}, packets={}",
+            failure, diagnostics.scheduledFrames, diagnostics.skippedTimelineFrames,
+            diagnostics.surfaceFramesPresented, diagnostics.encoderFramesSubmitted,
+            diagnostics.encodedPackets);
+        try {
+            StopVideoSegment(false);
+            activeBackend_ = settings::RecordingBackend::Hollywood;
+            firstVideoFrameMonotonicNanos_ = 0;
+            StartVideoSegment();
+            SetState(
+                RecordingState::Recording,
+                "Direct encoder was unavailable; recording is continuing with Hollywood.");
+            return true;
+        } catch (const std::exception& exception) {
+            captureFailureDetail_ =
+                "Direct FFmpeg failed at " + failure +
+                "; Hollywood fallback also failed: " + exception.what() + ".";
+        } catch (...) {
+            captureFailureDetail_ =
+                "Direct FFmpeg failed at " + failure +
+                "; Hollywood fallback also failed unexpectedly.";
+        }
+    } else if (livestreamActive) {
+        captureFailureDetail_ =
+            "Direct FFmpeg failed at " + failure +
+            ". Live streaming cannot switch encoders during a session.";
+    } else {
+        captureFailureDetail_ =
+            "Direct FFmpeg failed at " + failure +
+            " after encoded output had already started; the segment was stopped to avoid a corrupt mixed stream.";
+    }
+
+    Logging::Logger.error("{}", captureFailureDetail_);
+    captureWriteFailed_.store(true);
+    Stop("Direct video encoder failed.");
+    return true;
+}
+
 void RecordingController::Tick() noexcept {
     HandleControllerShortcut();
     const auto current = state_.load();
     if (current == RecordingState::Recording) {
+        if (HandleDirectCaptureHealth()) return;
         UpdateAudioCapturePose();
         if (++audioListenerRefreshFrame_ >= 90) {
             audioListenerRefreshFrame_ = 0;
@@ -805,22 +909,45 @@ double RecordingController::ElapsedSeconds(
 void RecordingController::FinalizeAsync() {
     if (videoWriter_) {
         videoWriter_->Close();
-        if (videoWriter_->Failed() || videoWriter_->DroppedPacketCount() > 0) {
+        const auto writerFailed = videoWriter_->Failed();
+        const auto droppedPackets = videoWriter_->DroppedPacketCount();
+        if (writerFailed || droppedPackets > 0) {
             captureWriteFailed_.store(true);
+            if (captureFailureDetail_.empty()) {
+                captureFailureDetail_ = writerFailed
+                    ? "The background H.264 file writer failed."
+                    : "The background H.264 file writer overflowed and dropped " +
+                        std::to_string(droppedPackets) + " encoded packet(s).";
+            }
         }
         videoWriter_.reset();
     }
+    const auto videoBytes = FileSizeOrZero(rawVideoPath_);
+    const auto audioBytes = FileSizeOrZero(rawAudioPath_);
+    Logging::Logger.info(
+        "Capture stream finalization check: backend={}, videoBytes={}, audioBytes={}, "
+        "writeFailed={}, detail={}",
+        settings::ToString(activeBackend_), videoBytes, audioBytes,
+        captureWriteFailed_.load(),
+        captureFailureDetail_.empty() ? "none" : captureFailureDetail_);
     if (captureWriteFailed_.load()) {
         SetState(
             RecordingState::Failed,
-            "Video or audio capture could not keep up. Partial H.264 and WAV files were retained in Recordings.");
+            (captureFailureDetail_.empty()
+                ? std::string("Video or audio capture failed.")
+                : captureFailureDetail_) +
+                " Partial H.264 and WAV files were retained in Recordings.");
         return;
     }
-    if (!std::filesystem::exists(rawVideoPath_) || std::filesystem::file_size(rawVideoPath_) == 0 ||
-        !std::filesystem::exists(rawAudioPath_) || std::filesystem::file_size(rawAudioPath_) <= 44) {
+    if (videoBytes == 0 || audioBytes <= 44) {
+        Logging::Logger.error(
+            "Capture produced unusable streams: backend={}, videoBytes={}, audioBytes={}",
+            settings::ToString(activeBackend_), videoBytes, audioBytes);
         SetState(
             RecordingState::Failed,
-            "Capture produced no usable video or audio. Partial files were retained in Recordings.");
+            videoBytes == 0
+                ? "The video encoder produced no H.264 data. Partial files were retained in Recordings."
+                : "Game-audio capture produced no samples. Partial files were retained in Recordings.");
         return;
     }
 
@@ -921,6 +1048,12 @@ void RecordingController::CleanupCaptureObjects() noexcept {
             }
             if (audioCapture_->Failed() || audioCapture_->DroppedSampleCount() > 0) {
                 captureWriteFailed_.store(true);
+                if (captureFailureDetail_.empty()) {
+                    captureFailureDetail_ = audioCapture_->Failed()
+                        ? "The game-audio capture worker failed."
+                        : "Game-audio capture overflowed and dropped " +
+                            std::to_string(audioCapture_->DroppedSampleCount()) + " sample(s).";
+                }
                 Logging::Logger.error(
                     "Audio capture was incomplete: failed={}, droppedSamples={}",
                     audioCapture_->Failed(), audioCapture_->DroppedSampleCount());
@@ -946,8 +1079,19 @@ void RecordingController::CleanupCaptureObjects() noexcept {
     activeRuntimeCamera_ = nullptr;
     if (videoWriter_) {
         videoWriter_->Close();
-        if (videoWriter_->Failed() || videoWriter_->DroppedPacketCount() > 0) {
+        const auto writerFailed = videoWriter_->Failed();
+        const auto droppedPackets = videoWriter_->DroppedPacketCount();
+        if (writerFailed || droppedPackets > 0) {
             captureWriteFailed_.store(true);
+            if (captureFailureDetail_.empty()) {
+                captureFailureDetail_ = writerFailed
+                    ? "The background H.264 file writer failed."
+                    : "The background H.264 file writer overflowed and dropped " +
+                        std::to_string(droppedPackets) + " encoded packet(s).";
+            }
+            Logging::Logger.error(
+                "Background H.264 writer incomplete: failed={}, droppedPackets={}",
+                writerFailed, droppedPackets);
         }
         videoWriter_.reset();
     }

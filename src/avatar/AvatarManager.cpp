@@ -4,6 +4,7 @@
 #include "saberstage/avatar/AvatarRuntimeDriver.hpp"
 #include "saberstage/avatar/Calibration.hpp"
 #include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
+#include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 
@@ -36,6 +37,28 @@
 
 namespace saberstage::avatar {
 namespace {
+
+vrm::RuntimeOptions RuntimeOptionsFromSettings(const settings::AvatarSettings& settings) noexcept {
+    vrm::RuntimeOptions options;
+    options.maximumTextureDimension = static_cast<std::uint32_t>(std::clamp(settings.maximumTextureDimension, 256, 4096));
+    options.visible = settings.visible;
+    options.toonLighting = settings.toonLighting;
+    options.normalMaps = settings.normalMaps;
+    options.rimLighting = settings.rimLighting;
+    options.matcap = settings.matcap;
+    options.emission = settings.emission;
+    options.outlineMode = static_cast<std::int32_t>(settings.outlines);
+    options.materialStage = static_cast<std::int32_t>(settings.materialStage);
+    options.lightingMode = static_cast<std::int32_t>(settings.lightingMode);
+    options.springBones = settings.springBones;
+    options.springQuality = static_cast<std::int32_t>(settings.springBoneQuality);
+    options.springCollisionQuality = static_cast<std::int32_t>(settings.springCollisions);
+    options.springUpdateRateHz = settings.springUpdateRateHz;
+    options.springSubsteps = settings.springSubsteps;
+    options.maximumSpringChains = settings.maximumSpringChains;
+    options.maximumSpringJoints = settings.maximumSpringJoints;
+    return options;
+}
 
 UnityEngine::Vector3 ToUnity(Vec3 value) noexcept { return {value.x, value.y, value.z}; }
 UnityEngine::Quaternion ToUnity(Quaternion value) noexcept { return {value.x, value.y, value.z, value.w}; }
@@ -193,6 +216,48 @@ TrackedPose SamplePose(UnityEngine::Transform* transform, const TrackedPose& pre
     if (sine > 1.0e-5F) {
         const Vec3 axis{rotationDelta.x / sine, rotationDelta.y / sine, rotationDelta.z / sine};
         result.angularVelocity = axis * (2.0F * halfAngle / delta);
+    }
+    return result;
+}
+
+TrackedPose SampleSaberGripPose(
+    GlobalNamespace::Saber* saber,
+    UnityEngine::Transform* handleTransform,
+    const TrackedPose& previous,
+    double timestamp) {
+    auto result = SamplePose(handleTransform, previous, timestamp);
+    if (!result.valid || !IsAlive(saber)) return result;
+
+    // Saber.handleTransform is the controller-side handle reference used by
+    // Beat Saber, but its origin is not guaranteed to be the visual center of
+    // the grip. Some stock/custom saber models place it at the blade-side hilt,
+    // which puts an avatar's palm against the guard. Derive a bounded grip
+    // center from the live blade axis instead. When the handle-to-blade span is
+    // usable, retain its authored length; otherwise use a conservative Quest
+    // saber handle depth. This changes only the avatar wrist target—the saber
+    // itself remains the authoritative tracked object.
+    const auto handle = FromUnity(saber->get_handlePos());
+    const auto bladeBottom = FromUnity(saber->get_saberBladeBottomPos());
+    const auto bladeTop = FromUnity(saber->get_saberBladeTopPos());
+    const auto bladeVector = bladeTop - bladeBottom;
+    if (!IsFinite(handle) || !IsFinite(bladeBottom) || !IsFinite(bladeTop) ||
+        LengthSquared(bladeVector) < 1.0e-5F) {
+        return result;
+    }
+    const auto bladeAxis = Normalize(bladeVector, Rotate(result.pose.rotation, {0.0F, 0.0F, 1.0F}));
+    const auto authoredHandleDepth = Dot(bladeBottom - handle, bladeAxis);
+    const auto gripDepth = authoredHandleDepth >= 0.04F && authoredHandleDepth <= 0.30F
+        ? Clamp(authoredHandleDepth * 0.55F, 0.055F, 0.11F)
+        : 0.085F;
+    const auto centeredGrip = bladeBottom - bladeAxis * gripDepth;
+    if (Length(centeredGrip - result.pose.position) > 0.25F) return result;
+
+    result.pose.position = centeredGrip;
+    const auto delta = static_cast<float>(timestamp - previous.timestampSeconds);
+    if (previous.valid && delta > 0.0F && delta <= 0.25F) {
+        result.linearVelocity = (result.pose.position - previous.pose.position) / delta;
+    } else {
+        result.linearVelocity = {};
     }
     return result;
 }
@@ -566,10 +631,10 @@ public:
                 ? SampleControllerPose(handControllers_[1], previous.controllerHand[1], timestamp)
                 : SamplePose(handTransforms_[1], previous.controllerHand[1], timestamp);
             sample_.saberGrip[0] = leftGripReady
-                ? SamplePose(saberGripTransforms_[0], previous.saberGrip[0], timestamp)
+                ? SampleSaberGripPose(sabers_[0], saberGripTransforms_[0], previous.saberGrip[0], timestamp)
                 : TrackedPose{};
             sample_.saberGrip[1] = rightGripReady
-                ? SamplePose(saberGripTransforms_[1], previous.saberGrip[1], timestamp)
+                ? SampleSaberGripPose(sabers_[1], saberGripTransforms_[1], previous.saberGrip[1], timestamp)
                 : TrackedPose{};
             sample_.handIsSaberGrip[0] = leftGripReady;
             sample_.handIsSaberGrip[1] = rightGripReady;
@@ -678,7 +743,7 @@ public:
         bool bindSolver) noexcept {
         try {
             vrm::RuntimeOptions options{};
-            options.maximumTextureDimension = std::clamp(maximumTextureDimension, 256U, 2048U);
+            options.maximumTextureDimension = std::clamp(maximumTextureDimension, 256U, 4096U);
             options.avatarLayer = camera::kAvatarLayer;
             options.visible = true;
             std::string loadError;
@@ -815,6 +880,15 @@ public:
 
     void SetAvatarVisible(bool visible) noexcept {
         if (vrmRuntime_) vrmRuntime_->SetVisible(visible);
+    }
+
+    void ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept {
+        solver_.SetSideStepLeanLimit(settings.sideStepLeanLimitPercent / 100.0F);
+        if (vrmRuntime_) vrmRuntime_->ApplyOptions(RuntimeOptionsFromSettings(settings));
+    }
+
+    void UpdateSecondaryMotion(float deltaTime) noexcept {
+        if (vrmRuntime_) vrmRuntime_->UpdateSecondaryMotion(deltaTime);
     }
 
     void SetControllerToWristOffsets(Pose left, Pose right) noexcept {
@@ -1500,6 +1574,7 @@ bool AvatarManager::LoadVrmAvatar(
 bool AvatarManager::BindLoadedVrmAvatar(std::string* error) noexcept { return impl_->BindLoadedVrmAvatar(error); }
 void AvatarManager::UnloadVrmAvatar() noexcept { impl_->UnloadVrmAvatar(); }
 void AvatarManager::SetAvatarVisible(bool visible) noexcept { impl_->SetAvatarVisible(visible); }
+void AvatarManager::ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept { impl_->ApplyAvatarSettings(settings); }
 void AvatarManager::SetControllerToWristOffsets(Pose left, Pose right) noexcept {
     impl_->SetControllerToWristOffsets(left, right);
 }
@@ -1508,6 +1583,7 @@ bool AvatarManager::SetExpression(std::string_view preset, float weight, std::st
 }
 void AvatarManager::SampleTracking() noexcept { impl_->SampleTracking(); }
 void AvatarManager::SolveAndWrite() noexcept { impl_->SolveAndWrite(); }
+void AvatarManager::UpdateSecondaryMotion(float deltaTime) noexcept { impl_->UpdateSecondaryMotion(deltaTime); }
 void AvatarManager::EnsureSolvedForSpectatorRender() noexcept { impl_->EnsureSolvedForSpectatorRender(); }
 void AvatarManager::LogDiagnostics() const noexcept { impl_->LogDiagnostics(); }
 bool AvatarManager::IsBound() const noexcept { return impl_->IsBound(); }

@@ -1,4 +1,5 @@
 #include "saberstage/recording/ControllerShortcut.hpp"
+#include "saberstage/recording/CaptureTimeline.hpp"
 #include "saberstage/recording/RecordingState.hpp"
 
 #include <cstdlib>
@@ -12,9 +13,12 @@ using saberstage::recording::CanResume;
 using saberstage::recording::CanStart;
 using saberstage::recording::CanStop;
 using saberstage::recording::CanTransition;
+using saberstage::recording::CapturePresentationTimeNanos;
 using saberstage::recording::ControllerShortcut;
 using saberstage::recording::ControllerShortcutAction;
+using saberstage::recording::DecideCaptureTimelineFrame;
 using saberstage::recording::HasRecordingTimeline;
+using saberstage::recording::NormalizeCapturePresentationFrame;
 using saberstage::recording::RecordingOutputType;
 using saberstage::recording::RecordingOutputTypeName;
 using saberstage::recording::RecordingState;
@@ -63,6 +67,23 @@ int main() {
     Require(HasRecordingTimeline(RecordingState::Recording), "recording has elapsed timeline");
     Require(HasRecordingTimeline(RecordingState::Paused), "paused retains elapsed timeline");
     Require(!HasRecordingTimeline(RecordingState::Armed), "armed has not started a timeline");
+
+    const auto firstFrame = DecideCaptureTimelineFrame(0.0, 30, -1);
+    Require(firstFrame.frameDue && firstFrame.presentationFrame == 0 &&
+                firstFrame.skippedDeadlines == 0,
+            "direct capture begins at the first real timeline deadline");
+    const auto tooSoon = DecideCaptureTimelineFrame(0.02, 30, firstFrame.presentationFrame);
+    Require(!tooSoon.frameDue, "direct capture does not duplicate a frame before the next deadline");
+    const auto afterHitch = DecideCaptureTimelineFrame(0.141, 30, firstFrame.presentationFrame);
+    Require(afterHitch.frameDue && afterHitch.presentationFrame == 4 &&
+                afterHitch.skippedDeadlines == 3,
+            "a render hitch preserves elapsed A/V time instead of compressing missed frames");
+    Require(CapturePresentationTimeNanos(afterHitch.presentationFrame, 30) == 133'333'333,
+            "presentation nanoseconds use the configured video time base");
+    Require(NormalizeCapturePresentationFrame(17, 17) == 0,
+            "the first packet emitted after encoder pre-roll starts the saved video at zero");
+    Require(NormalizeCapturePresentationFrame(21, 17) == 4,
+            "normalization preserves real deadline gaps after encoder pre-roll");
 
     ControllerShortcut shortcut;
     Require(

@@ -83,14 +83,24 @@ struct Texture {
     std::optional<std::size_t> sampler;
 };
 
+struct TextureTransform {
+    Float2 offset{};
+    Float2 scale{1.0F, 1.0F};
+    float rotation = 0.0F;
+    std::int32_t texCoord = 0;
+    bool present = false;
+};
+
 struct MToonMaterial {
     std::string name;
     std::string shader;
     std::unordered_map<std::string, float> floatProperties;
     std::unordered_map<std::string, Float4> vectorProperties;
     std::unordered_map<std::string, std::size_t> textureProperties;
+    std::unordered_map<std::string, TextureTransform> textureTransforms;
     std::unordered_map<std::string, std::string> keywordMap;
     std::unordered_map<std::string, std::string> tagMap;
+    std::int32_t renderQueue = -1;
 };
 
 struct MorphTarget {
@@ -104,6 +114,7 @@ struct Primitive {
     std::vector<Float3> normals;
     std::vector<Float4> tangents;
     std::vector<Float2> texcoords0;
+    std::vector<Float2> texcoords1;
     std::vector<UInt4> joints0;
     std::vector<Float4> weights0;
     std::vector<std::uint32_t> indices;

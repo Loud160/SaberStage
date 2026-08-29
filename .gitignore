@@ -35,3 +35,12 @@ Thumbs.db
 SaberStage Support Logs/
 SaberStage Recordings/
 artifacts/
+
+# Unity is used only to produce the embedded Android MToon shader bundle.
+# Track the small source project, never its machine-local import/build caches.
+tools/avatar-shader/Library/
+tools/avatar-shader/Logs/
+tools/avatar-shader/Temp/
+tools/avatar-shader/obj/
+tools/avatar-shader/Build/
+tools/avatar-shader/UserSettings/

@@ -4,6 +4,7 @@
 #include "saberstage/avatar/vrm/Vrm0Parser.hpp"
 
 #include "UnityEngine/Animator.hpp"
+#include "UnityEngine/AssetBundle.hpp"
 #include "UnityEngine/Avatar.hpp"
 #include "UnityEngine/BoneWeight.hpp"
 #include "UnityEngine/Color.hpp"
@@ -13,6 +14,7 @@
 #include "UnityEngine/HumanBone.hpp"
 #include "UnityEngine/HumanDescription.hpp"
 #include "UnityEngine/HumanLimit.hpp"
+#include "UnityEngine/HideFlags.hpp"
 #include "UnityEngine/ImageConversion.hpp"
 #include "UnityEngine/Material.hpp"
 #include "UnityEngine/Matrix4x4.hpp"
@@ -29,19 +31,27 @@
 #include "UnityEngine/Texture2D.hpp"
 #include "UnityEngine/TextureFormat.hpp"
 #include "UnityEngine/TextureWrapMode.hpp"
+#include "UnityEngine/Time.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Vector2.hpp"
 #include "UnityEngine/Vector3.hpp"
 #include "UnityEngine/Vector4.hpp"
 #include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
+#include "beatsaber-hook/shared/utils/il2cpp-functions.hpp"
+#include "beatsaber-hook/shared/utils/typedefs-wrappers.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <span>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+
+extern "C" std::uint8_t _binary_saberstage_avatar_shaders_start[];
+extern "C" std::uint8_t _binary_saberstage_avatar_shaders_end[];
 
 namespace saberstage::avatar::vrm {
 namespace {
@@ -131,6 +141,83 @@ std::pair<std::uint32_t, std::uint32_t> CappedDimensions(
         std::max(1U, static_cast<std::uint32_t>(std::floor(height * scale)))};
 }
 
+bool Finite(UnityEngine::Vector3 value) noexcept {
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+UnityEngine::Vector3 Add(UnityEngine::Vector3 a, UnityEngine::Vector3 b) noexcept {
+    return UnityEngine::Vector3::op_Addition(a, b);
+}
+
+UnityEngine::Vector3 Subtract(UnityEngine::Vector3 a, UnityEngine::Vector3 b) noexcept {
+    return UnityEngine::Vector3::op_Subtraction(a, b);
+}
+
+UnityEngine::Vector3 Scale(UnityEngine::Vector3 value, float scale) noexcept {
+    return UnityEngine::Vector3::op_Multiply(value, scale);
+}
+
+UnityEngine::Vector3 SafeDirection(UnityEngine::Vector3 value, UnityEngine::Vector3 fallback) noexcept {
+    if (!Finite(value) || value.get_sqrMagnitude() < 1.0e-8F) return fallback;
+    return UnityEngine::Vector3::Normalize(value);
+}
+
+struct AvatarShaderResources {
+    SafePtrUnity<UnityEngine::AssetBundle> bundle;
+    SafePtrUnity<UnityEngine::Shader> mtoon;
+    SafePtrUnity<UnityEngine::Shader> outline;
+    bool attempted = false;
+};
+
+AvatarShaderResources& AvatarShaders() {
+    static AvatarShaderResources resources;
+    return resources;
+}
+
+bool RetainShader(UnityEngine::Shader* shader) {
+    if (!IsAlive(shader)) return false;
+    const auto flags = static_cast<std::int32_t>(shader->get_hideFlags()) |
+        static_cast<std::int32_t>(UnityEngine::HideFlags::DontUnloadUnusedAsset);
+    shader->set_hideFlags(static_cast<UnityEngine::HideFlags>(flags));
+    return true;
+}
+
+bool LoadAvatarShaders() {
+    auto& resources = AvatarShaders();
+    if (resources.mtoon && resources.outline) return true;
+    if (resources.attempted) return false;
+    resources.attempted = true;
+    try {
+        const auto* begin = _binary_saberstage_avatar_shaders_start;
+        const auto* end = _binary_saberstage_avatar_shaders_end;
+        if (end <= begin) throw std::runtime_error("embedded avatar shader bundle is empty");
+        ArrayW<std::uint8_t> bytes(std::span<const std::uint8_t>(begin, static_cast<std::size_t>(end - begin)));
+        using LoadFromMemory = function_ptr_t<UnityEngine::AssetBundle*, ArrayW<std::uint8_t>, std::uint32_t>;
+        static auto loadFromMemory = reinterpret_cast<LoadFromMemory>(
+            il2cpp_functions::resolve_icall("UnityEngine.AssetBundle::LoadFromMemory_Internal"));
+        if (!loadFromMemory) throw std::runtime_error("Unity AssetBundle memory loader is unavailable");
+        auto* bundle = loadFromMemory(bytes, 0);
+        if (!IsAlive(bundle)) throw std::runtime_error("Unity rejected the embedded Android avatar shader bundle");
+        auto* mtoon = static_cast<UnityEngine::Shader*>(bundle->LoadAsset<UnityEngine::Shader*>("saberstage-mtoon"));
+        auto* outline = static_cast<UnityEngine::Shader*>(bundle->LoadAsset<UnityEngine::Shader*>("saberstage-mtoon-outline"));
+        if (!RetainShader(mtoon) || !RetainShader(outline)) {
+            bundle->Unload(true);
+            throw std::runtime_error("embedded bundle does not contain both SaberStage MToon shaders");
+        }
+        resources.bundle = bundle;
+        resources.mtoon = mtoon;
+        resources.outline = outline;
+        Logging::Logger.info("Loaded Quest MToon and outline shaders from the embedded SaberStage bundle");
+        return true;
+    } catch (const std::exception& failure) {
+        Logging::Logger.error("Could not load SaberStage's MToon shader bundle: {}", failure.what());
+        return false;
+    } catch (...) {
+        Logging::Logger.error("Could not load SaberStage's MToon shader bundle");
+        return false;
+    }
+}
+
 } // namespace
 
 class VrmUnityRuntime::Impl final {
@@ -152,6 +239,8 @@ public:
             BuildMaterials();
             BuildMeshes();
             BuildHumanoidAvatar();
+            BuildSpringBones();
+            ApplyOptions(options);
             SetVisible(options.visible);
             return true;
         } catch (const std::exception& failure) {
@@ -172,8 +261,13 @@ public:
             animator_ = nullptr;
             renderers_.clear();
             rendererMeshIndices_.clear();
+            allRenderers_.clear();
+            rendererMaterialIndices_.clear();
+            rendererOutlineEnabled_.clear();
             nodeObjects_.clear();
             nodeTransforms_.clear();
+            springChains_.clear();
+            springColliders_.clear();
             for (auto* mesh : meshes_) if (IsAlive(mesh)) UnityEngine::Object::Destroy(mesh);
             for (auto* material : materials_) if (IsAlive(material)) UnityEngine::Object::Destroy(material);
             for (auto* texture : ownedTextures_) if (IsAlive(texture)) UnityEngine::Object::Destroy(texture);
@@ -182,12 +276,17 @@ public:
         }
         meshes_.clear();
         materials_.clear();
+        outlineMaterials_.clear();
+        baseMaterialsUseMtoon_.clear();
         fallbackMaterial_ = nullptr;
         textureObjects_.clear();
         ownedTextures_.clear();
         humanoidAvatar_ = nullptr;
         asset_ = {};
         stats_ = {};
+        springAccumulator_ = 0.0F;
+        springWindowSeconds_ = 0.0;
+        springWindowUpdates_ = 0;
     }
 
     void BuildNodes() {
@@ -220,8 +319,42 @@ public:
         return false;
     }
 
-    UnityEngine::Texture2D* DecodeTexture(const Image& image) {
-        auto* source = UnityEngine::Texture2D::New_ctor(2, 2, UnityEngine::TextureFormat::RGBA32, true, false);
+    struct TextureUsage final {
+        bool color = false;
+        bool data = false;
+        std::string roles;
+    };
+
+    TextureUsage ClassifyTexture(std::size_t textureIndex) const {
+        TextureUsage usage;
+        std::unordered_set<std::string> uniqueRoles;
+        for (const auto& material : asset_.materials) {
+            for (const auto& [property, usedTexture] : material.textureProperties) {
+                if (usedTexture != textureIndex) continue;
+                uniqueRoles.insert(property);
+                if (property == "_BumpMap" || property == "_ShadingGradeTexture" ||
+                    property == "_OutlineWidthTexture") {
+                    usage.data = true;
+                } else {
+                    usage.color = true;
+                }
+            }
+        }
+        for (const auto& role : uniqueRoles) {
+            if (!usage.roles.empty()) usage.roles += ',';
+            usage.roles += role;
+        }
+        if (usage.roles.empty()) usage.roles = "unused";
+        return usage;
+    }
+
+    UnityEngine::Texture2D* DecodeTexture(const Image& image, bool linear) {
+        // Unity's final constructor argument is the linear-data flag. Albedo,
+        // shade, rim, matcap and emission images are authored color and remain
+        // sRGB. Normal/grade/width maps are GPU data and must bypass sRGB
+        // sampling or their vectors and thresholds become numerically wrong.
+        auto* source = UnityEngine::Texture2D::New_ctor(
+            2, 2, UnityEngine::TextureFormat::RGBA32, true, linear);
         if (!IsAlive(source)) throw std::runtime_error("Unity could not allocate a texture decoder target");
         auto encoded = ConvertArray<std::uint8_t>(image.encoded.size(), [&](std::size_t i) { return image.encoded[i]; });
         if (!UnityEngine::ImageConversion::LoadImage(source, encoded, false)) {
@@ -243,12 +376,33 @@ public:
                 [&](std::size_t i) {
                     const auto x = static_cast<std::uint32_t>(i % width);
                     const auto y = static_cast<std::uint32_t>(i / width);
-                    const auto sourceX = std::min(sourceWidth - 1, static_cast<std::uint32_t>((static_cast<std::uint64_t>(x) * sourceWidth) / width));
-                    const auto sourceY = std::min(sourceHeight - 1, static_cast<std::uint32_t>((static_cast<std::uint64_t>(y) * sourceHeight) / height));
-                    return pixels[static_cast<il2cpp_array_size_t>(static_cast<std::size_t>(sourceY) * sourceWidth + sourceX)];
+                    const auto sampleX = (static_cast<float>(x) + 0.5F) * sourceWidth / width - 0.5F;
+                    const auto sampleY = (static_cast<float>(y) + 0.5F) * sourceHeight / height - 0.5F;
+                    const auto x0 = std::min(sourceWidth - 1, static_cast<std::uint32_t>(std::max(0.0F, std::floor(sampleX))));
+                    const auto y0 = std::min(sourceHeight - 1, static_cast<std::uint32_t>(std::max(0.0F, std::floor(sampleY))));
+                    const auto x1 = std::min(sourceWidth - 1, x0 + 1);
+                    const auto y1 = std::min(sourceHeight - 1, y0 + 1);
+                    const auto tx = std::clamp(sampleX - std::floor(sampleX), 0.0F, 1.0F);
+                    const auto ty = std::clamp(sampleY - std::floor(sampleY), 0.0F, 1.0F);
+                    const auto at = [&](std::uint32_t sx, std::uint32_t sy) {
+                        return pixels[static_cast<il2cpp_array_size_t>(static_cast<std::size_t>(sy) * sourceWidth + sx)];
+                    };
+                    const auto a = at(x0, y0);
+                    const auto b = at(x1, y0);
+                    const auto c = at(x0, y1);
+                    const auto d = at(x1, y1);
+                    const auto blendChannel = [&](std::uint8_t av, std::uint8_t bv, std::uint8_t cv, std::uint8_t dv) {
+                        const auto top = static_cast<float>(av) + (static_cast<float>(bv) - av) * tx;
+                        const auto bottom = static_cast<float>(cv) + (static_cast<float>(dv) - cv) * tx;
+                        return static_cast<std::uint8_t>(std::clamp(std::lround(top + (bottom - top) * ty), 0L, 255L));
+                    };
+                    return UnityEngine::Color32{0,
+                        blendChannel(a.r, b.r, c.r, d.r), blendChannel(a.g, b.g, c.g, d.g),
+                        blendChannel(a.b, b.b, c.b, d.b), blendChannel(a.a, b.a, c.a, d.a)};
                 });
             result = UnityEngine::Texture2D::New_ctor(
-                static_cast<int>(width), static_cast<int>(height), UnityEngine::TextureFormat::RGBA32, true, false);
+                static_cast<int>(width), static_cast<int>(height),
+                UnityEngine::TextureFormat::RGBA32, true, linear);
             if (!IsAlive(result)) {
                 UnityEngine::Object::Destroy(source);
                 throw std::runtime_error("Unity could not allocate a capped VRM texture");
@@ -274,14 +428,25 @@ public:
                 continue;
             }
             const auto& textureDefinition = asset_.textures[i];
+            const auto usage = ClassifyTexture(i);
+            // A malformed/odd avatar can reuse one texture for both color and
+            // numeric data. Preserve visible color in that ambiguous case and
+            // report it rather than silently applying the wrong gamma path.
+            const auto linear = usage.data && !usage.color;
+            if (usage.data && usage.color) {
+                Logging::Logger.warn(
+                    "VRM texture {} is shared by color and data roles ({}); treating it as sRGB color",
+                    i, usage.roles);
+            }
             const auto samplerKey = textureDefinition.sampler ? static_cast<std::uint64_t>(*textureDefinition.sampler + 1) : 0U;
-            const auto key = (static_cast<std::uint64_t>(textureDefinition.source) << 32U) | samplerKey;
+            const auto key = (static_cast<std::uint64_t>(textureDefinition.source) << 32U) |
+                (samplerKey << 1U) | static_cast<std::uint64_t>(linear);
             if (const auto existing = decoded.find(key); existing != decoded.end()) {
                 textureObjects_[i] = existing->second;
                 continue;
             }
             auto& image = asset_.images[textureDefinition.source];
-            auto* texture = DecodeTexture(image);
+            auto* texture = DecodeTexture(image, linear);
             texture->set_name(textureDefinition.name.empty()
                 ? (image.name.empty() ? "SaberStage VRM Texture" : image.name)
                 : textureDefinition.name);
@@ -294,6 +459,16 @@ public:
             ownedTextures_.push_back(texture);
             decoded.emplace(key, texture);
             ++stats_.decodedTextureCount;
+            Logging::Logger.info(
+                "VRM texture {} '{}': source={}x{} runtime={}x{} roles={} treatment={} format=RGBA32 mipmaps=on",
+                i,
+                texture->get_name(),
+                image.encodedWidth,
+                image.encodedHeight,
+                texture->get_width(),
+                texture->get_height(),
+                usage.roles,
+                linear ? "linear-data" : "sRGB-color");
         }
         for (auto& image : asset_.images) {
             image.encoded.clear();
@@ -302,29 +477,128 @@ public:
     }
 
     void BuildMaterials() {
+        const auto customShadersAvailable = LoadAvatarShaders();
+        const auto textureDescription = [&](const MToonMaterial& material, const char* property) {
+            const auto found = material.textureProperties.find(property);
+            if (found == material.textureProperties.end()) return std::string("none");
+            if (found->second >= asset_.textures.size()) return std::string("invalid:") + std::to_string(found->second);
+            const auto& texture = asset_.textures[found->second];
+            const auto& image = asset_.images[texture.source];
+            const auto name = !texture.name.empty() ? texture.name : !image.name.empty() ? image.name : "unnamed";
+            return std::to_string(found->second) + ":" + name;
+        };
+        const auto vectorOr = [](const MToonMaterial& material, const char* property, Float4 fallback) {
+            const auto found = material.vectorProperties.find(property);
+            return found == material.vectorProperties.end() ? fallback : found->second;
+        };
         materials_.reserve(asset_.materials.size());
+        baseMaterialsUseMtoon_.reserve(asset_.materials.size());
         for (std::size_t i = 0; i < asset_.materials.size(); ++i) {
             const auto& source = asset_.materials[i];
             const auto blend = source.floatProperties.contains("_BlendMode") ? source.floatProperties.at("_BlendMode") : 0.0F;
             const char* shaderName = blend >= 2.0F ? "Unlit/Transparent" : blend >= 1.0F ? "Unlit/Transparent Cutout" : "Unlit/Texture";
-            auto shader = UnityEngine::Shader::Find(shaderName);
+            const auto useMtoon = customShadersAvailable && source.shader == "VRM/MToon";
+            UnityEngine::Shader* shader = useMtoon ? AvatarShaders().mtoon.ptr() : nullptr;
+            if (!IsAlive(shader)) shader = UnityEngine::Shader::Find(shaderName);
             if (!shader) shader = UnityEngine::Shader::Find("Unlit/Texture");
             if (!shader) throw std::runtime_error("Unity has no compatible first-pass avatar shader");
             auto* material = UnityEngine::Material::New_ctor(shader);
             if (!IsAlive(material)) throw std::runtime_error("Unity could not create a VRM material");
             material->set_name(source.name.empty() ? "SaberStage VRM Material " + std::to_string(i) : source.name);
-            material->set_renderQueue(blend >= 2.0F ? 3000 : blend >= 1.0F ? 2450 : 2000);
+            const auto defaultQueue = blend >= 2.0F ? (blend >= 3.0F ? 2501 : 3000) : blend >= 1.0F ? 2450 : 2000;
+            material->set_renderQueue(source.renderQueue >= 0 ? source.renderQueue : defaultQueue);
+            if (useMtoon) ++stats_.mtoonMaterialCount;
+            else {
+                ++stats_.fallbackMaterialCount;
+                Logging::Logger.warn(
+                    "VRM material {} '{}' uses diagnostic unlit fallback (metadata shader='{}', customMToonAvailable={})",
+                    i, source.name, source.shader, customShadersAvailable);
+            }
+            if (blend < 1.0F) ++stats_.opaqueMaterialCount;
+            else if (blend < 2.0F) ++stats_.cutoutMaterialCount;
+            else if (blend < 3.0F) ++stats_.transparentMaterialCount;
+            else ++stats_.transparentZWriteMaterialCount;
+            if (source.floatProperties.contains("_CullMode") && source.floatProperties.at("_CullMode") == 0.0F) {
+                ++stats_.doubleSidedMaterialCount;
+            }
+            if (useMtoon) {
+                static constexpr std::array<const char*, 19> requiredProperties{
+                    "_MainTex", "_Color", "_ShadeTexture", "_ShadeColor", "_ShadeShift", "_ShadeToony",
+                    "_BumpMap", "_BumpScale", "_RimTexture", "_RimColor", "_SphereAdd",
+                    "_EmissionMap", "_EmissionColor", "_Cutoff", "_Cull", "_SrcBlend", "_DstBlend",
+                    "_MaterialDebugStage", "_AvatarLightingMode"};
+                for (const auto* property : requiredProperties) {
+                    if (!material->HasProperty(property)) {
+                        Logging::Logger.error(
+                            "SaberStage/MToon is missing required property '{}' for VRM material {} '{}'",
+                            property, i, source.name);
+                    }
+                }
+                const auto valueOr = [&](const char* name, float fallback) {
+                    const auto found = source.floatProperties.find(name);
+                    return found == source.floatProperties.end() ? fallback : found->second;
+                };
+                const auto transparent = blend >= 2.0F;
+                material->SetFloat("_SrcBlend", valueOr("_SrcBlend", transparent ? 5.0F : 1.0F));
+                material->SetFloat("_DstBlend", valueOr("_DstBlend", transparent ? 10.0F : 0.0F));
+                material->SetFloat("_ZWrite", valueOr("_ZWrite", blend == 2.0F ? 0.0F : 1.0F));
+                material->SetFloat("_Cull", source.floatProperties.contains("_CullMode")
+                    ? source.floatProperties.at("_CullMode") : 2.0F);
+                material->SetFloat("_AlphaToMask", valueOr("_AlphaToMask", blend == 1.0F ? 1.0F : 0.0F));
+                material->SetFloat("_MaterialDebugStage", static_cast<float>(options_.materialStage));
+                material->SetFloat("_AvatarLightingMode", static_cast<float>(options_.lightingMode));
+            }
             if (const auto color = source.vectorProperties.find("_Color"); color != source.vectorProperties.end()) {
                 material->SetColor("_Color", {color->second.x, color->second.y, color->second.z, color->second.w});
             }
             if (const auto emission = source.vectorProperties.find("_EmissionColor"); emission != source.vectorProperties.end()) {
                 material->SetColor("_EmissionColor", {emission->second.x, emission->second.y, emission->second.z, emission->second.w});
             }
+            if (const auto shade = source.vectorProperties.find("_ShadeColor"); shade != source.vectorProperties.end()) {
+                material->SetColor("_ShadeColor", {shade->second.x, shade->second.y, shade->second.z, shade->second.w});
+            }
+            if (const auto rim = source.vectorProperties.find("_RimColor"); rim != source.vectorProperties.end()) {
+                material->SetColor("_RimColor", {rim->second.x, rim->second.y, rim->second.z, rim->second.w});
+            }
+            static constexpr std::array<const char*, 11> scalarProperties{
+                "_ShadeShift", "_ShadeToony", "_BumpScale", "_RimLightingMix",
+                "_RimFresnelPower", "_RimLift", "_Cutoff", "_OutlineWidth",
+                "_LightColorAttenuation", "_IndirectLightIntensity", "_ShadingGradeRate"};
+            for (const auto* property : scalarProperties) {
+                if (const auto found = source.floatProperties.find(property); found != source.floatProperties.end()) {
+                    material->SetFloat(property, found->second);
+                }
+            }
             for (const auto& [name, textureIndex] : source.textureProperties) {
                 if (textureIndex >= asset_.textures.size()) continue;
                 auto* texture = textureObjects_[textureIndex];
                 if (IsAlive(texture)) material->SetTexture(name, texture);
             }
+            const auto setTransform = [&](const std::string& property, TextureTransform transform) {
+                material->SetVector(
+                    property + "_ST",
+                    {transform.scale.x, transform.scale.y, transform.offset.x, transform.offset.y});
+                if (useMtoon) {
+                    material->SetFloat(property + "Coord", static_cast<float>(transform.texCoord));
+                    material->SetFloat(property + "Rotation", transform.rotation);
+                }
+            };
+            for (const auto& [property, transform] : source.textureTransforms) {
+                setTransform(property, transform);
+            }
+            if (!source.textureProperties.contains("_ShadeTexture")) {
+                if (const auto main = source.textureProperties.find("_MainTex");
+                    main != source.textureProperties.end() && main->second < textureObjects_.size() &&
+                    IsAlive(textureObjects_[main->second])) {
+                    material->SetTexture("_ShadeTexture", textureObjects_[main->second]);
+                }
+            }
+            if (source.textureProperties.contains("_MainTex")) ++stats_.mainTextureMaterialCount;
+            if (source.textureProperties.contains("_ShadeTexture")) ++stats_.shadeTextureMaterialCount;
+            if (source.textureProperties.contains("_BumpMap")) ++stats_.normalMapMaterialCount;
+            if (source.vectorProperties.contains("_RimColor") || source.textureProperties.contains("_RimTexture")) ++stats_.rimMaterialCount;
+            if (source.textureProperties.contains("_SphereAdd")) ++stats_.matcapMaterialCount;
+            if (source.vectorProperties.contains("_EmissionColor") || source.textureProperties.contains("_EmissionMap")) ++stats_.emissionMaterialCount;
             if (const auto transform = source.vectorProperties.find("_MainTex"); transform != source.vectorProperties.end()) {
                 // VRM 0.x serializes texture ST as offset.xy followed by
                 // scale.xy. Treating the first pair as scale collapses the
@@ -334,8 +608,82 @@ public:
             }
             UnityEngine::Object::DontDestroyOnLoad(material);
             materials_.push_back(material);
+            baseMaterialsUseMtoon_.push_back(useMtoon);
+            const auto color = vectorOr(source, "_Color", {1, 1, 1, 1});
+            const auto shade = vectorOr(source, "_ShadeColor", {1, 1, 1, 1});
+            const auto cull = source.floatProperties.contains("_CullMode") ? source.floatProperties.at("_CullMode") : 2.0F;
+            Logging::Logger.info(
+                "VRM material {} '{}': shader={} runtime={} main={} shade={} normal={} rim={} matcap={} emission={} "
+                "color=({:.3f},{:.3f},{:.3f},{:.3f}) shadeColor=({:.3f},{:.3f},{:.3f},{:.3f}) "
+                "blend={:.0f} queue={} cull={:.0f}",
+                i, source.name, source.shader, useMtoon ? "SaberStage/MToon" : shaderName,
+                textureDescription(source, "_MainTex"), textureDescription(source, "_ShadeTexture"),
+                textureDescription(source, "_BumpMap"), textureDescription(source, "_RimTexture"),
+                textureDescription(source, "_SphereAdd"), textureDescription(source, "_EmissionMap"),
+                color.x, color.y, color.z, color.w,
+                shade.x, shade.y, shade.z, shade.w,
+                blend, material->get_renderQueue(), cull);
+            for (const auto& [property, transform] : source.textureTransforms) {
+                if (transform.present || transform.texCoord != 0) {
+                    Logging::Logger.info(
+                        "VRM material {} texture transform {}: uv={} offset=({:.4f},{:.4f}) scale=({:.4f},{:.4f}) rotation={:.4f}",
+                        i, property, transform.texCoord, transform.offset.x, transform.offset.y,
+                        transform.scale.x, transform.scale.y, transform.rotation);
+                }
+            }
+        }
+        outlineMaterials_.resize(asset_.materials.size());
+        if (customShadersAvailable) {
+            for (std::size_t i = 0; i < asset_.materials.size(); ++i) {
+                const auto& source = asset_.materials[i];
+                if (i >= baseMaterialsUseMtoon_.size() || !baseMaterialsUseMtoon_[i]) continue;
+                const auto widthMode = source.floatProperties.contains("_OutlineWidthMode")
+                    ? source.floatProperties.at("_OutlineWidthMode") : 0.0F;
+                const auto width = source.floatProperties.contains("_OutlineWidth")
+                    ? source.floatProperties.at("_OutlineWidth") : 0.0F;
+                if (widthMode <= 0.0F || width <= 0.0F) continue;
+                auto* outline = UnityEngine::Material::New_ctor(AvatarShaders().outline.ptr());
+                if (!IsAlive(outline)) continue;
+                outline->set_name((source.name.empty() ? "SaberStage VRM Material " + std::to_string(i) : source.name) + " Outline");
+                outline->SetFloat("_OutlineWidth", std::clamp(width, 0.0F, 0.02F));
+                outline->SetFloat("_Cutoff", source.floatProperties.contains("_Cutoff") ? source.floatProperties.at("_Cutoff") : 0.5F);
+                outline->SetFloat("_AlphaToMask", source.floatProperties.contains("_AlphaToMask")
+                    ? source.floatProperties.at("_AlphaToMask")
+                    : (source.floatProperties.contains("_BlendMode") && source.floatProperties.at("_BlendMode") == 1.0F ? 1.0F : 0.0F));
+                if (const auto color = source.vectorProperties.find("_OutlineColor"); color != source.vectorProperties.end()) {
+                    outline->SetColor("_OutlineColor", {color->second.x, color->second.y, color->second.z, color->second.w});
+                }
+                if (const auto main = source.textureProperties.find("_MainTex"); main != source.textureProperties.end() &&
+                    main->second < textureObjects_.size() && IsAlive(textureObjects_[main->second])) {
+                    outline->SetTexture("_MainTex", textureObjects_[main->second]);
+                }
+                if (const auto transform = source.textureTransforms.find("_MainTex");
+                    transform != source.textureTransforms.end()) {
+                    outline->SetVector("_MainTex_ST", {
+                        transform->second.scale.x, transform->second.scale.y,
+                        transform->second.offset.x, transform->second.offset.y});
+                    outline->SetFloat("_MainTexCoord", static_cast<float>(transform->second.texCoord));
+                    outline->SetFloat("_MainTexRotation", transform->second.rotation);
+                }
+                if (source.floatProperties.contains("_BlendMode") && source.floatProperties.at("_BlendMode") == 1.0F) {
+                    outline->EnableKeyword("SABERSTAGE_ALPHA_TEST");
+                }
+                UnityEngine::Object::DontDestroyOnLoad(outline);
+                outlineMaterials_[i] = outline;
+                materials_.push_back(outline);
+            }
         }
         stats_.runtimeMaterialCount = materials_.size();
+        Logging::Logger.info(
+            "VRM material summary: materials={} MToon={} fallback={} mainTextures={}/{} shadeTextures={} "
+            "normalMaps={} rim={} matcaps={} emission={} opaque={} cutout={} transparent={} "
+            "transparentZWrite={} doubleSided={} lightingMode={} materialStage={}",
+            asset_.materials.size(), stats_.mtoonMaterialCount, stats_.fallbackMaterialCount,
+            stats_.mainTextureMaterialCount, asset_.materials.size(), stats_.shadeTextureMaterialCount,
+            stats_.normalMapMaterialCount, stats_.rimMaterialCount, stats_.matcapMaterialCount,
+            stats_.emissionMaterialCount, stats_.opaqueMaterialCount, stats_.cutoutMaterialCount,
+            stats_.transparentMaterialCount, stats_.transparentZWriteMaterialCount,
+            stats_.doubleSidedMaterialCount, options_.lightingMode, options_.materialStage);
     }
 
     UnityEngine::Material* FallbackMaterial() {
@@ -369,6 +717,9 @@ public:
         }));
         if (!primitive.texcoords0.empty()) mesh->set_uv(ConvertArray<UnityEngine::Vector2>(primitive.texcoords0.size(), [&](std::size_t i) {
             return UnityEngine::Vector2{primitive.texcoords0[i].x, primitive.texcoords0[i].y};
+        }));
+        if (!primitive.texcoords1.empty()) mesh->set_uv2(ConvertArray<UnityEngine::Vector2>(primitive.texcoords1.size(), [&](std::size_t i) {
+            return UnityEngine::Vector2{primitive.texcoords1[i].x, primitive.texcoords1[i].y};
         }));
         auto triangles = ConvertArray<std::int32_t>(primitive.indices.size(), [&](std::size_t i) {
             const auto triangleBase = i - (i % 3);
@@ -451,8 +802,13 @@ public:
                     filter->set_sharedMesh(mesh);
                     renderer = object->AddComponent<UnityEngine::MeshRenderer*>();
                 }
-                if (primitive.material && *primitive.material < asset_.materials.size()) renderer->set_sharedMaterial(materials_[*primitive.material]);
-                else renderer->set_sharedMaterial(FallbackMaterial());
+                const auto materialIndex = primitive.material && *primitive.material < asset_.materials.size()
+                    ? *primitive.material : asset_.materials.size();
+                renderer->set_sharedMaterial(materialIndex < asset_.materials.size()
+                    ? materials_[materialIndex] : FallbackMaterial());
+                allRenderers_.push_back(renderer);
+                rendererMaterialIndices_.push_back(materialIndex);
+                rendererOutlineEnabled_.push_back(false);
                 ++stats_.rendererCount;
             }
         }
@@ -466,6 +822,7 @@ public:
                 primitive.normals.clear(); primitive.normals.shrink_to_fit();
                 primitive.tangents.clear(); primitive.tangents.shrink_to_fit();
                 primitive.texcoords0.clear(); primitive.texcoords0.shrink_to_fit();
+                primitive.texcoords1.clear(); primitive.texcoords1.shrink_to_fit();
                 primitive.joints0.clear(); primitive.joints0.shrink_to_fit();
                 primitive.weights0.clear(); primitive.weights0.shrink_to_fit();
                 primitive.indices.clear(); primitive.indices.shrink_to_fit();
@@ -533,12 +890,328 @@ public:
 
     void SetVisible(bool visible) noexcept {
         try {
+            options_.visible = visible;
             for (auto* renderer : renderers_) if (IsAlive(renderer)) renderer->set_enabled(visible);
             // Rigid renderers are children of the avatar root and follow this
             // visibility state through the root while skinned renderers are
             // explicitly toggled for expression/runtime ownership.
             if (IsAlive(root_)) root_->SetActive(visible);
         } catch (...) {
+        }
+    }
+
+    struct SpringColliderRuntime {
+        UnityEngine::Transform* transform = nullptr;
+        UnityEngine::Vector3 localOffset{};
+        float radius = 0.0F;
+    };
+
+    struct SpringJointRuntime {
+        UnityEngine::Transform* transform = nullptr;
+        UnityEngine::Transform* child = nullptr;
+        UnityEngine::Quaternion restLocalRotation{};
+        UnityEngine::Vector3 localAxis{};
+        UnityEngine::Vector3 currentTail{};
+        UnityEngine::Vector3 previousTail{};
+        float length = 0.0F;
+    };
+
+    struct SpringChainRuntime {
+        std::size_t groupIndex = 0;
+        std::vector<SpringJointRuntime> joints;
+        float score = 0.0F;
+    };
+
+    void AppendSpringPaths(
+        std::size_t groupIndex,
+        std::size_t nodeIndex,
+        std::vector<std::size_t>& path) {
+        if (nodeIndex >= asset_.nodes.size()) return;
+        path.push_back(nodeIndex);
+        const auto& children = asset_.nodes[nodeIndex].children;
+        if (children.empty()) {
+            if (path.size() >= 2) BuildSpringChain(groupIndex, path);
+        } else {
+            for (const auto child : children) AppendSpringPaths(groupIndex, child, path);
+        }
+        path.pop_back();
+    }
+
+    void BuildSpringChain(std::size_t groupIndex, const std::vector<std::size_t>& path) {
+        SpringChainRuntime chain;
+        chain.groupIndex = groupIndex;
+        chain.joints.reserve(path.size() - 1);
+        float restLength = 0.0F;
+        for (std::size_t index = 0; index + 1 < path.size(); ++index) {
+            auto* transform = nodeTransforms_[path[index]];
+            auto* child = nodeTransforms_[path[index + 1]];
+            if (!IsAlive(transform) || !IsAlive(child)) return;
+            const auto parentPosition = transform->get_position();
+            const auto childPosition = child->get_position();
+            auto worldAxis = Subtract(childPosition, parentPosition);
+            const auto length = worldAxis.get_magnitude();
+            if (!std::isfinite(length) || length < 1.0e-5F) continue;
+            chain.joints.push_back(SpringJointRuntime{
+                transform,
+                child,
+                transform->get_localRotation(),
+                transform->InverseTransformDirection(worldAxis),
+                childPosition,
+                childPosition,
+                length});
+            restLength += length;
+        }
+        if (chain.joints.empty()) return;
+        // Long chains and chains with more articulated joints generally
+        // contribute most to visible hair/clothing motion. Sorting once here
+        // gives deterministic budget selection without relying on avatar-
+        // specific bone names or doing any per-frame discovery.
+        chain.score = restLength * 10.0F + static_cast<float>(chain.joints.size());
+        springChains_.push_back(std::move(chain));
+    }
+
+    void BuildSpringBones() {
+        stats_.springGroupCount = asset_.springBoneGroups.size();
+        for (const auto& group : asset_.springColliderGroups) {
+            if (group.node >= nodeTransforms_.size()) continue;
+            for (const auto& collider : group.colliders) {
+                if (!std::isfinite(collider.radius) || collider.radius <= 0.0F) continue;
+                springColliders_.push_back({
+                    nodeTransforms_[group.node],
+                    ToUnityPosition(collider.offset),
+                    collider.radius});
+            }
+        }
+        stats_.springColliderCount = springColliders_.size();
+        for (std::size_t groupIndex = 0; groupIndex < asset_.springBoneGroups.size(); ++groupIndex) {
+            for (const auto root : asset_.springBoneGroups[groupIndex].roots) {
+                std::vector<std::size_t> path;
+                path.reserve(32);
+                AppendSpringPaths(groupIndex, root, path);
+            }
+        }
+        std::stable_sort(springChains_.begin(), springChains_.end(), [](const auto& left, const auto& right) {
+            return left.score > right.score;
+        });
+        stats_.springChainCount = springChains_.size();
+        for (const auto& chain : springChains_) stats_.springJointCount += chain.joints.size();
+        ResetSecondaryMotion();
+    }
+
+    void ApplyOptions(const RuntimeOptions& options) noexcept {
+        options_ = options;
+        const auto quality = std::clamp(options.springQuality, 0, 6);
+        if (quality != 6) {
+            static constexpr std::array<int, 6> rates{12, 18, 24, 30, 45, 60};
+            static constexpr std::array<int, 6> substeps{1, 1, 1, 1, 2, 3};
+            static constexpr std::array<int, 6> chains{1, 8, 16, 32, 64, 128};
+            static constexpr std::array<int, 6> joints{1, 24, 48, 96, 192, 512};
+            options_.springUpdateRateHz = rates[static_cast<std::size_t>(quality)];
+            options_.springSubsteps = substeps[static_cast<std::size_t>(quality)];
+            options_.maximumSpringChains = chains[static_cast<std::size_t>(quality)];
+            options_.maximumSpringJoints = joints[static_cast<std::size_t>(quality)];
+        }
+        if (!options_.springBones || quality == 0) ResetSecondaryMotion();
+        ApplyMaterialOptions();
+        UpdateActiveSpringStatistics();
+        Logging::Logger.info(
+            "Avatar material controls applied: stage={} lighting={} toon={} normal={} rim={} matcap={} emission={} outlines={}",
+            options_.materialStage, options_.lightingMode, options_.toonLighting, options_.normalMaps,
+            options_.rimLighting, options_.matcap, options_.emission, options_.outlineMode);
+    }
+
+    void SetKeyword(UnityEngine::Material* material, const char* keyword, bool enabled) noexcept {
+        if (!IsAlive(material)) return;
+        if (enabled) material->EnableKeyword(keyword);
+        else material->DisableKeyword(keyword);
+    }
+
+    void ApplyMaterialOptions() noexcept {
+        try {
+            const auto baseCount = asset_.materials.size();
+            if (materials_.size() < baseCount) return;
+            stats_.outlinedMaterialCount = 0;
+            for (std::size_t index = 0; index < baseCount; ++index) {
+                auto* material = materials_[index];
+                const auto& source = asset_.materials[index];
+                const auto stage = std::clamp(options_.materialStage, 0, 9);
+                const auto configured = stage == 0;
+                if (stage == 1) {
+                    material->SetColor("_Color", UnityEngine::Color::get_white());
+                } else if (const auto color = source.vectorProperties.find("_Color");
+                    color != source.vectorProperties.end()) {
+                    material->SetColor("_Color", {
+                        color->second.x, color->second.y, color->second.z, color->second.w});
+                }
+                if (index >= baseMaterialsUseMtoon_.size() || !baseMaterialsUseMtoon_[index]) continue;
+                material->SetFloat("_MaterialDebugStage", static_cast<float>(stage));
+                material->SetFloat("_AvatarLightingMode", static_cast<float>(std::clamp(options_.lightingMode, 0, 2)));
+                SetKeyword(material, "SABERSTAGE_UNLIT", configured ? !options_.toonLighting : stage <= 2);
+                SetKeyword(material, "SABERSTAGE_NORMAL_MAP",
+                    (configured ? options_.normalMaps : stage >= 5) && source.textureProperties.contains("_BumpMap"));
+                SetKeyword(material, "SABERSTAGE_RIM_LIGHT", (configured ? options_.rimLighting : stage >= 6) &&
+                    (source.textureProperties.contains("_RimTexture") || source.vectorProperties.contains("_RimColor")));
+                SetKeyword(material, "SABERSTAGE_MATCAP", (configured ? options_.matcap : stage >= 7) &&
+                    source.textureProperties.contains("_SphereAdd"));
+                SetKeyword(material, "SABERSTAGE_EMISSION", (configured ? options_.emission : stage >= 8) &&
+                    (source.textureProperties.contains("_EmissionMap") || source.vectorProperties.contains("_EmissionColor")));
+                SetKeyword(material, "SABERSTAGE_ALPHA_TEST", source.floatProperties.contains("_BlendMode") &&
+                    source.floatProperties.at("_BlendMode") == 1.0F);
+            }
+            for (std::size_t rendererIndex = 0; rendererIndex < allRenderers_.size(); ++rendererIndex) {
+                auto* renderer = allRenderers_[rendererIndex];
+                if (!IsAlive(renderer)) continue;
+                const auto materialIndex = rendererMaterialIndices_[rendererIndex];
+                if (materialIndex >= baseCount) continue;
+                auto* base = materials_[materialIndex];
+                auto* outline = materialIndex < outlineMaterials_.size() ? outlineMaterials_[materialIndex] : nullptr;
+                const auto stage = std::clamp(options_.materialStage, 0, 9);
+                const auto effectiveOutlineMode = stage == 0 ? options_.outlineMode : stage >= 9 ? 2 : 0;
+                bool includeOutline = effectiveOutlineMode > 0 && IsAlive(outline);
+                if (includeOutline && effectiveOutlineMode == 1) {
+                    const auto& source = asset_.materials[materialIndex];
+                    const auto blend = source.floatProperties.contains("_BlendMode") ? source.floatProperties.at("_BlendMode") : 0.0F;
+                    const auto width = source.floatProperties.contains("_OutlineWidth") ? source.floatProperties.at("_OutlineWidth") : 0.0F;
+                    includeOutline = blend < 2.0F && width >= 0.001F;
+                }
+                if (includeOutline) {
+                    if (rendererIndex >= rendererOutlineEnabled_.size() || !rendererOutlineEnabled_[rendererIndex]) {
+                        renderer->set_sharedMaterials(ConvertArray<UnityEngine::Material*>(2, [&](std::size_t slot) {
+                            return slot == 0 ? base : outline;
+                        }));
+                    }
+                    ++stats_.outlinedMaterialCount;
+                } else {
+                    // set_sharedMaterial only replaces slot zero; it does not
+                    // remove the second outline slot. Always restore a one-item
+                    // array so disabling outlines cannot leave stale geometry.
+                    if (rendererIndex >= rendererOutlineEnabled_.size() || rendererOutlineEnabled_[rendererIndex]) {
+                        renderer->set_sharedMaterials(ConvertArray<UnityEngine::Material*>(1, [&](std::size_t) {
+                            return base;
+                        }));
+                    }
+                }
+                if (rendererIndex < rendererOutlineEnabled_.size()) {
+                    rendererOutlineEnabled_[rendererIndex] = includeOutline;
+                }
+            }
+        } catch (...) {
+            Logging::Logger.warn("Could not apply one or more live avatar material quality options");
+        }
+    }
+
+    void UpdateActiveSpringStatistics() noexcept {
+        stats_.activeSpringChainCount = 0;
+        stats_.activeSpringJointCount = 0;
+        std::size_t joints = 0;
+        for (const auto& chain : springChains_) {
+            if (stats_.activeSpringChainCount >= static_cast<std::size_t>(std::max(0, options_.maximumSpringChains))) break;
+            if (joints + chain.joints.size() > static_cast<std::size_t>(std::max(0, options_.maximumSpringJoints))) continue;
+            joints += chain.joints.size();
+            ++stats_.activeSpringChainCount;
+        }
+        stats_.activeSpringJointCount = joints;
+        if (options_.springCollisionQuality <= 0) stats_.activeSpringColliderCount = 0;
+        else if (options_.springCollisionQuality == 1) stats_.activeSpringColliderCount = (springColliders_.size() + 1) / 2;
+        else stats_.activeSpringColliderCount = springColliders_.size();
+    }
+
+    void ResetSecondaryMotion() noexcept {
+        try {
+            for (auto& chain : springChains_) {
+                for (auto& joint : chain.joints) {
+                    if (!IsAlive(joint.transform) || !IsAlive(joint.child)) continue;
+                    joint.transform->set_localRotation(joint.restLocalRotation);
+                    joint.currentTail = joint.child->get_position();
+                    joint.previousTail = joint.currentTail;
+                }
+            }
+        } catch (...) {
+        }
+        springAccumulator_ = 0.0F;
+    }
+
+    void SimulateSpringStep(float deltaTime) {
+        const auto maximumChains = static_cast<std::size_t>(std::max(0, options_.maximumSpringChains));
+        const auto maximumJoints = static_cast<std::size_t>(std::max(0, options_.maximumSpringJoints));
+        const auto colliderCount = stats_.activeSpringColliderCount;
+        std::size_t usedChains = 0;
+        std::size_t usedJoints = 0;
+        for (auto& chain : springChains_) {
+            if (usedChains >= maximumChains) break;
+            if (usedJoints + chain.joints.size() > maximumJoints) continue;
+            if (chain.groupIndex >= asset_.springBoneGroups.size()) continue;
+            ++usedChains;
+            usedJoints += chain.joints.size();
+            const auto& group = asset_.springBoneGroups[chain.groupIndex];
+            const auto drag = std::clamp(group.dragForce, 0.0F, 1.0F);
+            const auto gravity = Scale(SafeDirection(ToUnityDirection(group.gravityDirection), {0.0F, -1.0F, 0.0F}), group.gravityPower * deltaTime * deltaTime);
+            for (auto& joint : chain.joints) {
+                if (!IsAlive(joint.transform) || !IsAlive(joint.child)) continue;
+                joint.transform->set_localRotation(joint.restLocalRotation);
+                const auto origin = joint.transform->get_position();
+                const auto restDirection = SafeDirection(joint.transform->TransformDirection(joint.localAxis), {0.0F, -1.0F, 0.0F});
+                const auto velocity = Scale(Subtract(joint.currentTail, joint.previousTail), 1.0F - drag);
+                const auto stiffness = Scale(restDirection, group.stiffness * deltaTime);
+                auto next = Add(Add(joint.currentTail, velocity), Add(stiffness, gravity));
+                next = Add(origin, Scale(SafeDirection(Subtract(next, origin), restDirection), joint.length));
+                for (std::size_t colliderIndex = 0; colliderIndex < colliderCount; ++colliderIndex) {
+                    const auto& collider = springColliders_[colliderIndex];
+                    if (!IsAlive(collider.transform)) continue;
+                    const auto center = collider.transform->TransformPoint(collider.localOffset);
+                    const auto radius = std::max(0.0F, collider.radius + group.hitRadius);
+                    auto fromCenter = Subtract(next, center);
+                    if (fromCenter.get_sqrMagnitude() < radius * radius) {
+                        next = Add(center, Scale(SafeDirection(fromCenter, restDirection), radius));
+                        next = Add(origin, Scale(SafeDirection(Subtract(next, origin), restDirection), joint.length));
+                    }
+                }
+                if (!Finite(next)) {
+                    joint.currentTail = joint.child->get_position();
+                    joint.previousTail = joint.currentTail;
+                    continue;
+                }
+                joint.previousTail = joint.currentTail;
+                joint.currentTail = next;
+                const auto rotation = UnityEngine::Quaternion::FromToRotation(
+                    restDirection,
+                    SafeDirection(Subtract(next, origin), restDirection));
+                joint.transform->set_rotation(UnityEngine::Quaternion::op_Multiply(rotation, joint.transform->get_rotation()));
+            }
+        }
+    }
+
+    void UpdateSecondaryMotion(float deltaTime) noexcept {
+        if (!options_.visible || !options_.springBones || options_.springQuality == 0 || springChains_.empty()) return;
+        if (!std::isfinite(deltaTime) || deltaTime <= 0.0F) return;
+        if (deltaTime > 0.25F) {
+            ResetSecondaryMotion();
+            return;
+        }
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            const auto interval = 1.0F / static_cast<float>(std::clamp(options_.springUpdateRateHz, 12, 90));
+            springAccumulator_ = std::min(springAccumulator_ + deltaTime, interval * 2.0F);
+            std::size_t updates = 0;
+            while (springAccumulator_ >= interval && updates < 2) {
+                const auto substeps = std::clamp(options_.springSubsteps, 1, 4);
+                for (int substep = 0; substep < substeps; ++substep) {
+                    SimulateSpringStep(interval / static_cast<float>(substeps));
+                }
+                springAccumulator_ -= interval;
+                ++updates;
+            }
+            const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            stats_.springSolverMilliseconds = elapsed;
+            springWindowSeconds_ += deltaTime;
+            springWindowUpdates_ += updates;
+            if (springWindowSeconds_ >= 1.0) {
+                stats_.springUpdatesPerSecond = static_cast<double>(springWindowUpdates_) / springWindowSeconds_;
+                springWindowSeconds_ = 0.0;
+                springWindowUpdates_ = 0;
+            }
+        } catch (...) {
+            ResetSecondaryMotion();
         }
     }
 
@@ -602,10 +1275,20 @@ public:
     std::vector<UnityEngine::Texture2D*> textureObjects_;
     std::vector<UnityEngine::Texture2D*> ownedTextures_;
     std::vector<UnityEngine::Material*> materials_;
+    std::vector<UnityEngine::Material*> outlineMaterials_;
+    std::vector<bool> baseMaterialsUseMtoon_;
     UnityEngine::Material* fallbackMaterial_ = nullptr;
     std::vector<UnityEngine::Mesh*> meshes_;
     std::vector<UnityEngine::SkinnedMeshRenderer*> renderers_;
     std::vector<std::size_t> rendererMeshIndices_;
+    std::vector<UnityEngine::Renderer*> allRenderers_;
+    std::vector<std::size_t> rendererMaterialIndices_;
+    std::vector<bool> rendererOutlineEnabled_;
+    std::vector<SpringChainRuntime> springChains_;
+    std::vector<SpringColliderRuntime> springColliders_;
+    float springAccumulator_ = 0.0F;
+    double springWindowSeconds_ = 0.0;
+    std::size_t springWindowUpdates_ = 0;
 };
 
 VrmUnityRuntime::~VrmUnityRuntime() = default;
@@ -636,6 +1319,9 @@ std::unique_ptr<VrmUnityRuntime> VrmUnityRuntime::Load(
 
 void VrmUnityRuntime::Destroy() noexcept { if (impl_) impl_->Destroy(); }
 void VrmUnityRuntime::SetVisible(bool visible) noexcept { if (impl_) impl_->SetVisible(visible); }
+void VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { if (impl_) impl_->ApplyOptions(options); }
+void VrmUnityRuntime::UpdateSecondaryMotion(float deltaTime) noexcept { if (impl_) impl_->UpdateSecondaryMotion(deltaTime); }
+void VrmUnityRuntime::ResetSecondaryMotion() noexcept { if (impl_) impl_->ResetSecondaryMotion(); }
 bool VrmUnityRuntime::SetExpression(std::string_view preset, float weight, std::string* error) noexcept {
     return impl_ && impl_->SetExpression(preset, weight, error);
 }

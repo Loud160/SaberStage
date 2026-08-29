@@ -52,11 +52,22 @@ std::vector<std::uint8_t> MinimalVrm(
     const std::string imageViews = includeImage ? ",{\"buffer\":0,\"byteOffset\":168,\"byteLength\":24}" : "";
     const std::string imageObjects = includeImage
         ? ",\"images\":[{\"name\":\"bomb\",\"mimeType\":\"image/png\",\"bufferView\":5}],"
-          "\"textures\":[{\"source\":0}],\"materials\":[{\"name\":\"material\"}]"
+          "\"textures\":[{\"name\":\"surface\",\"source\":0}],"
+          "\"materials\":[{\"name\":\"material\",\"pbrMetallicRoughness\":{"
+          "\"baseColorFactor\":[0.8,0.7,0.6,0.5],\"baseColorTexture\":{"
+          "\"index\":0,\"texCoord\":1,\"extensions\":{\"KHR_texture_transform\":{"
+          "\"offset\":[0.25,0.5],\"scale\":[0.75,0.5],\"rotation\":0.125}}}},"
+          "\"normalTexture\":{\"index\":0},\"alphaMode\":\"MASK\","
+          "\"alphaCutoff\":0.42,\"doubleSided\":true}]"
         : "";
     const std::string primitiveMaterial = includeImage ? ",\"material\":0" : "";
     const std::string vrmMaterials = includeImage
-        ? "[{\"name\":\"material\",\"shader\":\"VRM/MToon\",\"textureProperties\":{\"_MainTex\":0}}]"
+        ? "[{\"name\":\"material\",\"shader\":\"VRM/MToon\",\"renderQueue\":2450,"
+          "\"floatProperties\":{\"_BlendMode\":1,\"_CullMode\":0,\"_Cutoff\":0.42,"
+          "\"_ShadeShift\":-0.1,\"_ShadeToony\":0.85},"
+          "\"vectorProperties\":{\"_Color\":[0.8,0.7,0.6,0.5],"
+          "\"_ShadeColor\":[0.4,0.3,0.2,1]},"
+          "\"textureProperties\":{\"_MainTex\":0,\"_ShadeTexture\":0,\"_BumpMap\":0}}]"
         : "[]";
     std::string json =
         "{\"asset\":{\"version\":\"2.0\",\"generator\":\"SaberStage test\"},"
@@ -171,6 +182,26 @@ int main(int argc, char** argv) {
               textureMetadata.asset->images[0].encodedHeight == 32 &&
               textureMetadata.asset->materials[0].textureProperties.at("_MainTex") == 0,
           "embedded texture metadata and MToon texture reference parse without Unity");
+    if (textureMetadata) {
+        const auto& material = textureMetadata.asset->materials[0];
+        Check(material.textureProperties.at("_ShadeTexture") == 0 &&
+                  material.textureProperties.at("_BumpMap") == 0,
+              "MToon color, shade, and normal texture roles retain their declared texture indices");
+        Check(material.vectorProperties.at("_Color").x == 0.8F &&
+                  material.vectorProperties.at("_Color").w == 0.5F &&
+                  material.vectorProperties.at("_ShadeColor").x == 0.4F,
+              "MToon base and shade colors retain normalized RGBA values");
+        Check(material.floatProperties.at("_BlendMode") == 1.0F &&
+                  material.floatProperties.at("_CullMode") == 0.0F &&
+                  material.floatProperties.at("_Cutoff") == 0.42F &&
+                  material.renderQueue == 2450,
+              "cutout, double-sided culling, alpha cutoff, and render queue map independently");
+        const auto transform = material.textureTransforms.at("_MainTex");
+        Check(transform.texCoord == 1 && transform.offset.x == 0.25F &&
+                  transform.offset.y == 0.5F && transform.scale.x == 0.75F &&
+                  transform.scale.y == 0.5F && transform.rotation == 0.125F,
+              "KHR_texture_transform preserves UV set, offset, scale, and rotation");
+    }
 
     const char* environmentPath = std::getenv("SABERSTAGE_VRM_TEST_PATH");
     const char* path = argc > 1 ? argv[1] : environmentPath;
@@ -195,6 +226,35 @@ int main(int argc, char** argv) {
                       << " colliders=" << colliders
                       << " sourceDecodedImageBytes=" << integration.asset->statistics.decodedImageBytesAtSourceSize
                       << '\n';
+            const auto textureName = [&](const auto& material, const char* property) {
+                const auto found = material.textureProperties.find(property);
+                if (found == material.textureProperties.end()) return std::string("none");
+                const auto& texture = integration.asset->textures.at(found->second);
+                const auto& image = integration.asset->images.at(texture.source);
+                return std::to_string(found->second) + ":" +
+                    (!texture.name.empty() ? texture.name : !image.name.empty() ? image.name : "unnamed");
+            };
+            for (std::size_t index = 0; index < integration.asset->materials.size(); ++index) {
+                const auto& material = integration.asset->materials[index];
+                const auto color = material.vectorProperties.contains("_Color")
+                    ? material.vectorProperties.at("_Color")
+                    : saberstage::avatar::vrm::Float4{1, 1, 1, 1};
+                std::cout << "  material[" << index << "] '" << material.name
+                          << "' shader=" << material.shader
+                          << " main=" << textureName(material, "_MainTex")
+                          << " shade=" << textureName(material, "_ShadeTexture")
+                          << " normal=" << textureName(material, "_BumpMap")
+                          << " rim=" << textureName(material, "_RimTexture")
+                          << " matcap=" << textureName(material, "_SphereAdd")
+                          << " emission=" << textureName(material, "_EmissionMap")
+                          << " color=(" << color.x << ',' << color.y << ',' << color.z << ',' << color.w << ')'
+                          << " blend=" << (material.floatProperties.contains("_BlendMode")
+                              ? material.floatProperties.at("_BlendMode") : 0.0F)
+                          << " queue=" << material.renderQueue
+                          << " cull=" << (material.floatProperties.contains("_CullMode")
+                              ? material.floatProperties.at("_CullMode") : 2.0F)
+                          << '\n';
+            }
         }
     }
 

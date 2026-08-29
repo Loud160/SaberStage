@@ -57,6 +57,18 @@ int main() {
               defaults.broadcast.serverUrl.rfind("rtmp://", 0) == 0,
           "livestream defaults use Twitch's ordinary RTMP ingest endpoint");
     Check(defaults.avatar.maximumTextureDimension == 1024, "VRM textures default to the Quest-conscious 1024 cap");
+    Check(defaults.avatar.qualityPreset == AvatarQualityPreset::Balanced &&
+              defaults.avatar.toonLighting && defaults.avatar.normalMaps &&
+              defaults.avatar.rimLighting && !defaults.avatar.matcap &&
+              defaults.avatar.emission && defaults.avatar.outlines == AvatarOutlineMode::Off &&
+              defaults.avatar.materialStage == AvatarMaterialStage::Configured &&
+              defaults.avatar.lightingMode == AvatarLightingMode::Balanced,
+          "Balanced avatar defaults expose each MToon cost independently");
+    Check(defaults.avatar.springBones && defaults.avatar.springBoneQuality == SpringBoneQuality::Medium &&
+              defaults.avatar.springCollisions == SpringCollisionQuality::Reduced,
+          "SpringBones default to a conservative explicit Quest budget");
+    Check(defaults.avatar.sideStepLeanLimitPercent == 100.0F,
+          "side-step lean override defaults to the original solver boundary");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
@@ -78,6 +90,13 @@ int main() {
     invalid.avatar.selectedFile = "../outside.vrm";
     invalid.avatar.selectedPath = "relative/outside.vrm";
     invalid.avatar.maximumTextureDimension = 8192;
+    invalid.avatar.materialStage = static_cast<AvatarMaterialStage>(99);
+    invalid.avatar.lightingMode = static_cast<AvatarLightingMode>(99);
+    invalid.avatar.springUpdateRateHz = 1000;
+    invalid.avatar.springSubsteps = 20;
+    invalid.avatar.maximumSpringChains = 0;
+    invalid.avatar.maximumSpringJoints = 5000;
+    invalid.avatar.sideStepLeanLimitPercent = 10.0F;
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -87,6 +106,11 @@ int main() {
           "recording peak bitrate repairs to at least the target bitrate");
     Check(invalid.broadcast.reconnectAttempts == defaults.broadcast.reconnectAttempts,
           "livestream reconnect count repairs to its bounded default");
+    Check(invalid.avatar.materialStage == AvatarMaterialStage::Configured &&
+              invalid.avatar.lightingMode == AvatarLightingMode::Balanced,
+          "invalid avatar material diagnostics repair to configured balanced rendering");
+    Check(invalid.avatar.sideStepLeanLimitPercent == defaults.avatar.sideStepLeanLimitPercent,
+          "invalid side-step lean limit repairs to the original solver boundary");
 
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
@@ -168,6 +192,18 @@ int main() {
     first.Edit().avatar.selectedFile = "Black Heart.vrm";
     first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
     first.Edit().avatar.maximumTextureDimension = 512;
+    first.Edit().avatar.qualityPreset = AvatarQualityPreset::Custom;
+    first.Edit().avatar.matcap = true;
+    first.Edit().avatar.outlines = AvatarOutlineMode::Reduced;
+    first.Edit().avatar.materialStage = AvatarMaterialStage::RimLighting;
+    first.Edit().avatar.lightingMode = AvatarLightingMode::Studio;
+    first.Edit().avatar.springBoneQuality = SpringBoneQuality::Custom;
+    first.Edit().avatar.springCollisions = SpringCollisionQuality::Full;
+    first.Edit().avatar.springUpdateRateHz = 40;
+    first.Edit().avatar.springSubsteps = 2;
+    first.Edit().avatar.maximumSpringChains = 48;
+    first.Edit().avatar.maximumSpringJoints = 160;
+    first.Edit().avatar.sideStepLeanLimitPercent = 65.0F;
     first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
@@ -215,8 +251,30 @@ int main() {
     Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&
               second.Get().avatar.selectedPath == "/sdcard/Download/Black Heart.vrm" &&
               second.Get().avatar.maximumTextureDimension == 512 &&
-              second.Get().avatar.leftControllerToWrist.position.z == 0.03F,
-          "avatar selection, texture cap, and wrist calibration survive restart");
+              second.Get().avatar.leftControllerToWrist.position.z == 0.03F &&
+              second.Get().avatar.qualityPreset == AvatarQualityPreset::Custom &&
+              second.Get().avatar.matcap && second.Get().avatar.outlines == AvatarOutlineMode::Reduced &&
+              second.Get().avatar.materialStage == AvatarMaterialStage::RimLighting &&
+              second.Get().avatar.lightingMode == AvatarLightingMode::Studio &&
+              second.Get().avatar.springBoneQuality == SpringBoneQuality::Custom &&
+              second.Get().avatar.springCollisions == SpringCollisionQuality::Full &&
+              second.Get().avatar.springUpdateRateHz == 40 && second.Get().avatar.springSubsteps == 2 &&
+              second.Get().avatar.maximumSpringChains == 48 && second.Get().avatar.maximumSpringJoints == 160 &&
+              second.Get().avatar.sideStepLeanLimitPercent == 65.0F,
+          "avatar selection, visual quality, SpringBone budget, and wrist calibration survive restart");
+
+    auto preset = defaults.avatar;
+    ApplyAvatarQualityPreset(preset, AvatarQualityPreset::Performance);
+    Check(preset.maximumTextureDimension == 512 && !preset.normalMaps && !preset.rimLighting &&
+              preset.outlines == AvatarOutlineMode::Off &&
+              preset.materialStage == AvatarMaterialStage::Configured &&
+              preset.lightingMode == AvatarLightingMode::Balanced &&
+              preset.springBoneQuality == SpringBoneQuality::Low,
+          "Performance preset assigns only visible individual avatar controls");
+    ApplyAvatarQualityPreset(preset, AvatarQualityPreset::Quality);
+    Check(preset.maximumTextureDimension == 2048 && preset.normalMaps && preset.rimLighting && preset.matcap &&
+              preset.outlines == AvatarOutlineMode::Full && preset.springBoneQuality == SpringBoneQuality::High,
+          "Quality preset assigns the documented high-fidelity controls");
 
     auto normalizedPreview = Defaults();
     normalizedPreview.preview.rotationDegrees = {365.0F, -540.0F, 720.0F};

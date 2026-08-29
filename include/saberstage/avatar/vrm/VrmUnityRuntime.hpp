@@ -20,6 +20,21 @@ struct RuntimeOptions {
     std::uint32_t maximumTextureDimension = 1024;
     std::int32_t avatarLayer = 3;
     bool visible = true;
+    bool toonLighting = true;
+    bool normalMaps = true;
+    bool rimLighting = true;
+    bool matcap = false;
+    bool emission = true;
+    std::int32_t outlineMode = 0;
+    std::int32_t materialStage = 0;
+    std::int32_t lightingMode = 1;
+    bool springBones = true;
+    std::int32_t springQuality = 3;
+    std::int32_t springCollisionQuality = 1;
+    std::int32_t springUpdateRateHz = 30;
+    std::int32_t springSubsteps = 1;
+    std::int32_t maximumSpringChains = 32;
+    std::int32_t maximumSpringJoints = 96;
 };
 
 struct RuntimeStatistics {
@@ -31,8 +46,31 @@ struct RuntimeStatistics {
     std::size_t skippedThumbnailTextureCount = 0;
     std::size_t skippedUnusedTextureCount = 0;
     std::size_t runtimeMaterialCount = 0;
+    std::size_t mtoonMaterialCount = 0;
+    std::size_t fallbackMaterialCount = 0;
+    std::size_t mainTextureMaterialCount = 0;
+    std::size_t shadeTextureMaterialCount = 0;
     std::size_t estimatedRuntimeTextureBytes = 0;
     std::size_t textureDownscaleCount = 0;
+    std::size_t normalMapMaterialCount = 0;
+    std::size_t rimMaterialCount = 0;
+    std::size_t matcapMaterialCount = 0;
+    std::size_t emissionMaterialCount = 0;
+    std::size_t outlinedMaterialCount = 0;
+    std::size_t opaqueMaterialCount = 0;
+    std::size_t cutoutMaterialCount = 0;
+    std::size_t transparentMaterialCount = 0;
+    std::size_t transparentZWriteMaterialCount = 0;
+    std::size_t doubleSidedMaterialCount = 0;
+    std::size_t springGroupCount = 0;
+    std::size_t springChainCount = 0;
+    std::size_t springJointCount = 0;
+    std::size_t activeSpringChainCount = 0;
+    std::size_t activeSpringJointCount = 0;
+    std::size_t springColliderCount = 0;
+    std::size_t activeSpringColliderCount = 0;
+    double springSolverMilliseconds = 0.0;
+    double springUpdatesPerSecond = 0.0;
 };
 
 struct RuntimeAnchor {
@@ -57,6 +95,9 @@ public:
 
     void Destroy() noexcept;
     void SetVisible(bool visible) noexcept;
+    void ApplyOptions(const RuntimeOptions& options) noexcept;
+    void UpdateSecondaryMotion(float deltaTime) noexcept;
+    void ResetSecondaryMotion() noexcept;
     bool SetExpression(std::string_view presetName, float weight, std::string* error = nullptr) noexcept;
 
     [[nodiscard]] UnityEngine::Animator* Animator() const noexcept;
