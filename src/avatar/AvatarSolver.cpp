@@ -154,8 +154,10 @@ Quaternion AlignBone(Pose neutralRoot, Pose neutralChild, Vec3 solvedRoot, Vec3 
 
 void SeedBodyState(
     const TrackingSample& tracking,
+    const AvatarCalibration& avatar,
     const PlayerCalibration& player,
     const SolvedHumanoidPose& neutralPose,
+    float stanceWidthScale,
     SolverPersistentState& state) noexcept {
     state.bodyYawState = BodyYawState::Locked;
     state.bodyMode = BodyMode::Grounded;
@@ -175,12 +177,25 @@ void SeedBodyState(
     state.leanAmount = 0.0F;
     state.crouchAmount = 0.0F;
     state.lastSteppedFoot = -1;
+    const auto scale = AvatarScale(avatar, player);
+    const auto neutralFootCenter =
+        (Solved(neutralPose, HumanoidBone::LeftFoot).position +
+         Solved(neutralPose, HumanoidBone::RightFoot).position) * 0.5F;
+    const auto right = Normalize(
+        Cross({0.0F, 1.0F, 0.0F}, Horizontal(player.neutralForward)),
+        {1.0F, 0.0F, 0.0F});
+    const auto halfStance = avatar.hipWidth * scale *
+        kDefaultBodySolverTuning.stanceWidthHipMultiplier *
+        Clamp(stanceWidthScale, 0.75F, 2.0F) * 0.5F;
     for (int side = 0; side < 2; ++side) {
         const auto footBone = side == 0 ? HumanoidBone::LeftFoot : HumanoidBone::RightFoot;
         auto& foot = state.feet[side];
         foot = {};
         foot.state = FootState::Planted;
         foot.planted = Solved(neutralPose, footBone);
+        const auto desiredLateral = right * (side == 0 ? -halfStance : halfStance);
+        foot.planted.position.x = neutralFootCenter.x + desiredLateral.x;
+        foot.planted.position.z = neutralFootCenter.z + desiredLateral.z;
         foot.current = foot.planted;
         state.footAnchor[side] = foot.current.position;
         state.footRotation[side] = foot.current.rotation;
@@ -349,6 +364,7 @@ Pose EstimatePelvis(
     Pose headTarget,
     Pose neutralPelvis,
     float sideStepLeanLimit,
+    float plantedLegLeanLimit,
     float deltaSeconds,
     SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
@@ -569,9 +585,15 @@ Pose EstimatePelvis(
     const auto plantedSeparation = state.footAnchorsValid
         ? Length(Horizontal(state.footAnchor[1] - state.footAnchor[0]))
         : avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier;
-    const auto maximumLateralSupport = std::max(
+    const auto baseMaximumLateralSupport = std::max(
         plantedSeparation * 0.5F + legReach * tuning.supportMarginLegFraction,
         legReach * tuning.maximumPelvisSupportOffsetLegFraction);
+    // Torso lean and planted-leg lean are deliberately independent. The
+    // side-step setting above limits head-to-pelvis displacement; this setting
+    // limits pelvis-to-support displacement so reducing torso lean cannot turn
+    // into an equally implausible whole-body pivot around both ankles.
+    const auto maximumLateralSupport = baseMaximumLateralSupport *
+        Clamp(plantedLegLeanLimit, 0.20F, 1.0F);
     const auto maximumForwardSupport = legReach * tuning.maximumPelvisSupportOffsetLegFraction;
     auto supportOffset = Horizontal(desired - supportCenter);
     auto supportLateral = Dot(supportOffset, bodyRight);
@@ -631,7 +653,7 @@ Vec3 StableElbowPole(
     Vec3 restPole,
     SolverPersistentState& state) noexcept {
     const auto axis = Normalize(hand.position - shoulder, {0.0F, 0.0F, 1.0F});
-    const auto outward = Rotate(chest.rotation, {side == 0 ? -1.0F : 1.0F, -0.25F, 0.0F});
+    const auto outward = Rotate(chest.rotation, {side == 0 ? -0.35F : 0.35F, -1.0F, -0.12F});
     auto rest = Normalize(ProjectOnPlane(restPole, axis), Normalize(ProjectOnPlane(outward, axis), outward));
     auto history = state.previousElbowPoleValid[side]
         ? Normalize(ProjectOnPlane(state.previousElbowPole[side], axis), rest)
@@ -649,14 +671,35 @@ Vec3 StableElbowPole(
     pole = Normalize(Lerp(pole, Normalize(controllerCue, pole), bend * 0.1F), pole);
 
     // History removes jitter, but it must not preserve an elbow that has
-    // crossed through the torso. Keep the bend goal inside an outward/downward
-    // torso-local cone. This is the clean-room equivalent of a bend-goal
-    // constraint: controller roll may influence the elbow, never flip it to
-    // the opposite side of the chest.
+    // crossed through the torso. Keep the bend goal inside a strict
+    // outward/downward torso-local cone. The prior implementation accepted a
+    // very broad cone and could therefore keep a mathematically valid pole on
+    // the visually backward side of the arm. Requiring a stronger signed
+    // hemisphere prevents either elbow from crossing its anatomical hinge
+    // plane while still permitting overhead and cross-body reaches.
     const auto outwardPlane = Normalize(ProjectOnPlane(outward, axis), rest);
     const auto outwardDot = Dot(pole, outwardPlane);
-    if (outwardDot < 0.25F) {
-        pole = Normalize(Lerp(pole, outwardPlane, Saturate((0.25F - outwardDot) / 0.75F)), outwardPlane);
+    constexpr float kMinimumAnatomicalPoleDot = 0.60F;
+    if (outwardDot < kMinimumAnatomicalPoleDot) {
+        pole = Normalize(
+            Lerp(pole, outwardPlane,
+                Saturate((kMinimumAnatomicalPoleDot - outwardDot) /
+                    (1.0F + kMinimumAnatomicalPoleDot))),
+            outwardPlane);
+    }
+    // Normalization after the blend can leave the result just outside the
+    // requested cone. A second projection makes the signed bound explicit
+    // instead of relying on an approximate interpolation weight.
+    const auto boundedDot = Dot(pole, outwardPlane);
+    if (boundedDot < kMinimumAnatomicalPoleDot) {
+        const auto tangent = Normalize(
+            pole - outwardPlane * boundedDot,
+            Normalize(ProjectOnPlane(rest, outwardPlane), {0.0F, 0.0F, 1.0F}));
+        const auto tangentWeight = std::sqrt(
+            std::max(0.0F, 1.0F - kMinimumAnatomicalPoleDot * kMinimumAnatomicalPoleDot));
+        pole = Normalize(
+            outwardPlane * kMinimumAnatomicalPoleDot + tangent * tangentWeight,
+            outwardPlane);
     }
     state.previousElbowPole[side] = pole;
     state.previousElbowPoleValid[side] = true;
@@ -806,15 +849,19 @@ void SolveArm(
         handTarget.rotation,
         state.gripToHandRotation[side]);
     const auto wristDeviation = QuaternionAngleDegrees(anatomicalHandRotation, desiredHandRotation);
-    // The saber supplies the wrist orientation during gameplay.  Clamping it
-    // would rotate the avatar hand away from the grip even though Quest still
-    // knows the exact handle pose.  Retain the protective wrist cone only for
-    // inferred controller/menu targets.
-    hand.rotation = !handFromSaberGrip && wristDeviation > tuning.maximumWristDeviationDegrees
+    // Saber tracking remains authoritative for hand position. Rotation still
+    // needs an anatomical hemisphere: an unconstrained 180-degree controller
+    // orientation can turn the hand inside-out even though its grip point is
+    // correct. Gameplay receives a wider cone than inferred menu tracking so
+    // ordinary forearm pronation and backhand cuts remain available.
+    const auto wristLimit = handFromSaberGrip
+        ? tuning.maximumTrackedGripWristDeviationDegrees
+        : tuning.maximumWristDeviationDegrees;
+    hand.rotation = wristDeviation > wristLimit
         ? Slerp(
             anatomicalHandRotation,
             desiredHandRotation,
-            tuning.maximumWristDeviationDegrees / std::max(wristDeviation, kEpsilon))
+            wristLimit / std::max(wristDeviation, kEpsilon))
         : desiredHandRotation;
 
     if (state.armReachSampleCount[side] == 0) {
@@ -948,6 +995,7 @@ IdealStance CalculateIdealStance(
     const PlayerCalibration& player,
     const SolvedHumanoidPose& neutralPose,
     Pose pelvis,
+    float stanceWidthScale,
     const SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
     const auto scale = AvatarScale(avatar, player);
@@ -963,7 +1011,8 @@ IdealStance CalculateIdealStance(
     const auto predictedYaw = WrapRadians(state.torsoYawRadians + yawLead);
     const auto forward = Vec3{std::sin(predictedYaw), 0.0F, std::cos(predictedYaw)};
     const auto right = Vec3{std::cos(predictedYaw), 0.0F, -std::sin(predictedYaw)};
-    const auto halfStance = avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier * 0.5F;
+    const auto halfStance = avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier *
+        Clamp(stanceWidthScale, 0.75F, 2.0F) * 0.5F;
     const auto neutralHips = Solved(neutralPose, HumanoidBone::Hips);
     const auto neutralFootCenter =
         (Solved(neutralPose, HumanoidBone::LeftFoot).position +
@@ -1184,13 +1233,15 @@ void UpdateFeet(
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
     Pose pelvis,
+    float stanceWidthScale,
     float deltaSeconds,
     SolverPersistentState& state,
     SolverDiagnostics* diagnostics) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
     const auto scale = AvatarScale(avatar, player);
     const auto legReach = MinimumLegReach(avatar, scale);
-    const auto ideal = CalculateIdealStance(tracking, avatar, player, neutralPose, pelvis, state);
+    const auto ideal = CalculateIdealStance(
+        tracking, avatar, player, neutralPose, pelvis, stanceWidthScale, state);
     const auto headRise = tracking.head.pose.position.y - player.neutralHead.position.y;
     const auto upwardVelocity = tracking.head.linearVelocity.y;
     const auto hipLeft = Solved(output, HumanoidBone::LeftUpperLeg);
@@ -1455,6 +1506,18 @@ void StaticTrackerlessAvatarSolver::SetSideStepLeanLimit(float fraction) noexcep
     sideStepLeanLimit_ = Clamp(fraction, 0.40F, 1.0F);
 }
 
+void StaticTrackerlessAvatarSolver::SetPlantedLegLeanLimit(float fraction) noexcept {
+    plantedLegLeanLimit_ = Clamp(fraction, 0.20F, 1.0F);
+}
+
+void StaticTrackerlessAvatarSolver::SetStanceWidthScale(float scale) noexcept {
+    stanceWidthScale_ = Clamp(scale, 0.75F, 2.0F);
+}
+
+void StaticTrackerlessAvatarSolver::SetBackwardSpineCurveLimit(float fraction) noexcept {
+    backwardSpineCurveLimit_ = Clamp(fraction, 0.0F, 1.0F);
+}
+
 bool StaticTrackerlessAvatarSolver::Solve(
     const TrackingSample& tracking,
     const AvatarCalibration& avatar,
@@ -1488,7 +1551,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto neutralPose = output;
     const auto scale = AvatarScale(avatar, player);
     if (!state.bodyStateValid || !state.footAnchorsValid || !PersistentStateFinite(state)) {
-        SeedBodyState(tracking, player, neutralPose, state);
+        SeedBodyState(tracking, avatar, player, neutralPose, stanceWidthScale_, state);
     }
     const auto deltaSeconds = StateDeltaSeconds(tracking, state, newRenderFrame);
 
@@ -1533,6 +1596,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
         headTarget,
         Solved(neutralPose, HumanoidBone::Hips),
         sideStepLeanLimit_,
+        plantedLegLeanLimit_,
         deltaSeconds,
         state);
 
@@ -1571,7 +1635,8 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto rootToHeadLateral = Dot(rootToHead, bodyRight);
     const auto constrainedForward = Clamp(
         rootToHeadForward,
-        -totalSpineLength * kDefaultBodySolverTuning.maximumBackwardSpineBowFraction,
+        -totalSpineLength * kDefaultBodySolverTuning.maximumBackwardSpineBowFraction *
+            backwardSpineCurveLimit_,
         totalSpineLength * kDefaultBodySolverTuning.maximumForwardSpineBowFraction);
     const auto constrainedLateral = Clamp(
         rootToHeadLateral,
@@ -1579,6 +1644,18 @@ bool StaticTrackerlessAvatarSolver::Solve(
         totalSpineLength * kDefaultBodySolverTuning.maximumLateralSpineBowFraction);
     pelvis.position += bodyForward * (rootToHeadForward - constrainedForward) +
         bodyRight * (rootToHeadLateral - constrainedLateral);
+    // The spine correction above may move the pelvis toward the tracked head.
+    // Re-apply the independently configured planted-leg boundary here so that
+    // limiting torso lean cannot be paid for with an unbounded whole-body
+    // ankle pivot. Exceeding this support envelope has already made the
+    // predicted margin urgent, so UpdateFeet will start the required step.
+    const auto plantedSupportCenter =
+        (state.feet[0].current.position + state.feet[1].current.position) * 0.5F;
+    const auto pelvisFromSupport = Horizontal(pelvis.position - plantedSupportCenter);
+    const auto pelvisSupportLateral = Dot(pelvisFromSupport, bodyRight);
+    const auto clampedPelvisSupportLateral = Clamp(
+        pelvisSupportLateral, -state.maximumSupportOffset, state.maximumSupportOffset);
+    pelvis.position += bodyRight * (clampedPelvisSupportLateral - pelvisSupportLateral);
     state.pelvisPosition = pelvis.position;
     spine.rootTarget = pelvis.position;
     spine.endTarget = headTarget.position;
@@ -1587,7 +1664,11 @@ bool StaticTrackerlessAvatarSolver::Solve(
         (kDefaultBodySolverTuning.spineForwardCurveFraction +
          state.crouchAmount * kDefaultBodySolverTuning.spineCrouchCurveAdditionFraction));
     spine.curveGuideWeight = kDefaultBodySolverTuning.spineGuideWeight;
-    spine.maximumRootShift = std::min(avatar.lowerLegLength[0], avatar.lowerLegLength[1]) * scale * 0.12F;
+    const auto remainingLateralSupport = std::max(
+        0.0F, state.maximumSupportOffset - std::abs(clampedPelvisSupportLateral));
+    spine.maximumRootShift = std::min(
+        std::min(avatar.lowerLegLength[0], avatar.lowerLegLength[1]) * scale * 0.12F,
+        remainingLateralSupport);
     spine.maximumIterations = 6;
     const auto spineResult = SolveFabrikSpine(spine);
     if (!spineResult.valid) return false;
@@ -1595,6 +1676,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
 
     pelvis.position = spineResult.rootUsed;
     state.pelvisPosition = pelvis.position;
+    state.pelvisSupportOffset = Length(Horizontal(pelvis.position - plantedSupportCenter));
     float accumulatedSpineLength = 0.0F;
     const auto neutralBodyYaw = YawFromDirection(player.neutralForward);
     const auto bodyYawDelta = AngleDelta(neutralBodyYaw, state.torsoYawRadians);
@@ -1677,6 +1759,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
         neutralPose,
         output,
         solvedHips,
+        stanceWidthScale_,
         deltaSeconds,
         state,
         diagnostics);

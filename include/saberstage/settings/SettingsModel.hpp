@@ -9,7 +9,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 12;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 13;
 
 enum class RecordingBackend {
     Hollywood,
@@ -194,6 +194,10 @@ struct AvatarSettings {
     bool rimLighting = true;
     bool matcap = false;
     bool emission = true;
+    // Enables the low-frequency facial animation controller: a subtle idle
+    // smile, randomized blinks, and gameplay expressions driven by combo,
+    // misses, and level failure. Off performs no automatic expression work.
+    bool animatedExpressions = true;
     AvatarOutlineMode outlines = AvatarOutlineMode::Off;
     AvatarMaterialStage materialStage = AvatarMaterialStage::Configured;
     AvatarLightingMode lightingMode = AvatarLightingMode::Balanced;
@@ -210,6 +214,16 @@ struct AvatarSettings {
     // over. 100 preserves the original solver behavior; lower values make a
     // side step happen sooner without changing the player's calibration.
     float sideStepLeanLimitPercent = 100.0F;
+    // Separately limits how far the pelvis may travel sideways over planted
+    // feet before the support solver must step. This controls the whole-body
+    // ankle/leg lean that remains possible even when torso lean is reduced.
+    float plantedLegLeanLimitPercent = 100.0F;
+    // Scales the solver's hip-width-derived neutral foot separation. 100 keeps
+    // the original stance; larger values give the avatar a wider base.
+    float stanceWidthPercent = 100.0F;
+    // Scales only the permitted rearward spine bow. Forward bending retains
+    // its full calibrated/anatomical range.
+    float backwardSpineCurveLimitPercent = 100.0F;
     AvatarControllerOffsetSettings leftControllerToWrist;
     AvatarControllerOffsetSettings rightControllerToWrist;
 };

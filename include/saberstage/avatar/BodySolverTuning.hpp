@@ -29,6 +29,9 @@ struct BodySolverTuning {
     float shoulderAssistStartReachRatio = 0.88F;
     float maximumShoulderAssistWidthFraction = 0.16F;
     float maximumWristDeviationDegrees = 70.0F;
+    // A tracked saber remains a hard positional target, but its rotation is
+    // not allowed to invert the wrist relative to the solved forearm.
+    float maximumTrackedGripWristDeviationDegrees = 105.0F;
     float minimumGripFitConfidence = 0.45F;
     float minimumReachFitConfidence = 0.45F;
 

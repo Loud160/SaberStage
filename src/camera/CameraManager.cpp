@@ -701,6 +701,12 @@ private:
             width, height, 24,
             UnityEngine::RenderTextureFormat::Default,
             UnityEngine::RenderTextureReadWrite::Default);
+        // 4x MSAA matters beyond edge smoothing: VRM cutout materials rely on
+        // AlphaToMask (alpha-to-coverage), which needs multisampling to
+        // produce gradients. On a 1-sample target it collapses to a hard
+        // 50% threshold and cutout clothing edges alias badly. Quest's tiled
+        // GPU resolves MSAA on-chip, so the cost is modest.
+        renderTarget_->set_antiAliasing(4);
         renderTarget_->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
         renderTarget_->set_filterMode(UnityEngine::FilterMode::Bilinear);
         if (!renderTarget_->Create()) {

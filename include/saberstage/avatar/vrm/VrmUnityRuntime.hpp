@@ -98,7 +98,11 @@ public:
     void ApplyOptions(const RuntimeOptions& options) noexcept;
     void UpdateSecondaryMotion(float deltaTime) noexcept;
     void ResetSecondaryMotion() noexcept;
+    [[nodiscard]] bool HasExpression(std::string_view presetName) const noexcept;
     bool SetExpression(std::string_view presetName, float weight, std::string* error = nullptr) noexcept;
+    // Runtime animation uses the same validated blend-shape path without
+    // producing a diagnostic line for every blink animation sample.
+    bool SetExpressionQuiet(std::string_view presetName, float weight) noexcept;
 
     [[nodiscard]] UnityEngine::Animator* Animator() const noexcept;
     [[nodiscard]] UnityEngine::GameObject* Root() const noexcept;

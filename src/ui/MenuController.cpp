@@ -805,6 +805,60 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             active_->root_.Settings().Save(nullptr);
         }),
         "Maximum sideways lean before SaberStage shifts the body and steps. 100% keeps the previous behavior; lower values force an earlier side step."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Planted Leg Lean Limit",
+        5.0F,
+        avatar.plantedLegLeanLimitPercent,
+        20.0F,
+        100.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [](float value) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.plantedLegLeanLimitPercent = value;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }),
+        "Maximum sideways pelvis movement over planted feet before SaberStage forces a step. Lower values reduce whole-body leaning from the ankles without changing the torso lean setting."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Stance Width",
+        5.0F,
+        avatar.stanceWidthPercent,
+        75.0F,
+        200.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [](float value) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.stanceWidthPercent = value;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }),
+        "Scales the avatar's normal foot separation. 100% keeps the original stance; higher values create a wider, more stable baseline."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Backward Spine Curve Limit",
+        5.0F,
+        avatar.backwardSpineCurveLimitPercent,
+        0.0F,
+        100.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [](float value) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.backwardSpineCurveLimitPercent = value;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }),
+        "Limits only backward spine bowing. 0% prevents rearward curve; forward attack and lunge bending remain available."));
     const auto addQualityToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
         ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [member](bool enabled) {
             if (!active_) return;
@@ -825,6 +879,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         "Adds authored sphere/matcap highlights. This can be expensive on complex avatars.");
     addQualityToggle("Emission", avatar.emission, &settings::AvatarSettings::emission,
         "Shows authored glowing materials while retaining a bounded Quest-safe intensity.");
+    addQualityToggle("Animated Expressions", avatar.animatedExpressions, &settings::AvatarSettings::animatedExpressions,
+        "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
     static std::array<std::string_view, 3> outlineModes{"Off", "Reduced", "Full"};
     const auto outlineLabel = avatar.outlines == settings::AvatarOutlineMode::Full ? "Full" :
         avatar.outlines == settings::AvatarOutlineMode::Reduced ? "Reduced" : "Off";

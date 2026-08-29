@@ -235,6 +235,12 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                 defaults.avatar.maximumSpringJoints, result);
     RepairFloat(settings.avatar.sideStepLeanLimitPercent, 40.0F, 100.0F,
                 defaults.avatar.sideStepLeanLimitPercent, result);
+    RepairFloat(settings.avatar.plantedLegLeanLimitPercent, 20.0F, 100.0F,
+                defaults.avatar.plantedLegLeanLimitPercent, result);
+    RepairFloat(settings.avatar.stanceWidthPercent, 75.0F, 200.0F,
+                defaults.avatar.stanceWidthPercent, result);
+    RepairFloat(settings.avatar.backwardSpineCurveLimitPercent, 0.0F, 100.0F,
+                defaults.avatar.backwardSpineCurveLimitPercent, result);
     RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
     RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
     RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);

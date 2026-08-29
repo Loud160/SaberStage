@@ -642,6 +642,48 @@ void TestArmReachBendAndGripAuthority() {
     Check(SameRotation(diagnostics.finalHand[0].rotation,
               Multiply(diagnostics.handTarget[0].rotation, diagnostics.gripToHandRotation[0]), 0.001F),
           "tracked saber wrist orientation remains authoritative instead of being clamped away from the grip");
+
+    tracking = NextFrame(tracking, tracking.head.pose.position);
+    tracking.handIsSaberGrip[0] = true;
+    tracking.leftHand.pose.rotation = AxisAngle({0.0F, 1.0F, 0.0F}, 3.05F);
+    Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics),
+          "inverted saber wrist target solves");
+    Check(diagnostics.handTargetError[0] < 0.0001F,
+          "wrist inversion protection never releases the tracked saber position");
+    Check(!SameRotation(
+              diagnostics.finalHand[0].rotation,
+              Multiply(diagnostics.handTarget[0].rotation, diagnostics.gripToHandRotation[0]),
+              0.01F) && diagnostics.wristRotationErrorDegrees[0] > 1.0F,
+          "an inverted tracked grip is rotation-limited instead of turning the hand inside-out");
+
+    solver.Reset(state);
+    tracking = BuildTracking();
+    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+          "elbow hemisphere sweep seeds");
+    for (int frame = 0; frame < 48; ++frame) {
+        const auto phase = static_cast<float>(frame) / 47.0F;
+        tracking = NextFrame(tracking, tracking.head.pose.position);
+        tracking.leftHand.pose.position = {
+            -0.55F + phase * 0.72F,
+            1.25F + std::sin(phase * 6.2831853F) * 0.35F,
+            0.12F + std::cos(phase * 6.2831853F) * 0.22F};
+        tracking.rightHand.pose.position = {
+            0.55F - phase * 0.72F,
+            1.25F - std::sin(phase * 6.2831853F) * 0.35F,
+            0.12F + std::cos(phase * 6.2831853F) * 0.22F};
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+              "rapid elbow hemisphere sweep solves");
+        const auto chest = pose.bones[BoneIndex(HumanoidBone::UpperChest)];
+        for (int side = 0; side < 2; ++side) {
+            const auto upperBone = side == 0 ? HumanoidBone::LeftUpperArm : HumanoidBone::RightUpperArm;
+            const auto shoulder = pose.bones[BoneIndex(upperBone)].position;
+            const auto axis = Normalize(diagnostics.handTarget[side].position - shoulder, {0.0F, 0.0F, 1.0F});
+            const auto preferred = Normalize(ProjectOnPlane(
+                Rotate(chest.rotation, {side == 0 ? -0.35F : 0.35F, -1.0F, -0.12F}), axis));
+            Check(Dot(diagnostics.elbowPole[side], preferred) >= 0.58F,
+                  "each elbow remains inside its signed anatomical bend hemisphere");
+        }
+    }
 }
 
 void TestEyeAnchorAndHeadContinuity() {
@@ -974,6 +1016,109 @@ void TestSideStepLeanLimitOverride() {
           "lower lateral limit materially reduces lean retained before stepping");
 }
 
+void TestPlantedLegLeanLimitOverride() {
+    struct Result {
+        int firstStepFrame = -1;
+        float greatestPelvisSupportOffset = 0.0F;
+        float reportedMaximumSupportOffset = 0.0F;
+    };
+    const auto run = [](float limit) {
+        const auto avatar = BuildAvatar();
+        auto tracking = BuildTracking();
+        const auto player = BuildPlayer(tracking);
+        StaticTrackerlessAvatarSolver solver{};
+        solver.SetPlantedLegLeanLimit(limit);
+        SolverPersistentState state{};
+        SolvedHumanoidPose pose{};
+        SolverDiagnostics diagnostics{};
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+              "planted-leg limit neutral pose solves");
+        Result result{};
+        for (int frame = 0; frame < 20; ++frame) {
+            const auto amount = std::min(1.0F, static_cast<float>(frame + 1) / 3.0F);
+            tracking = NextFrame(tracking, {0.30F * amount, 1.70F, 0.06F}, 0.0F, {1.8F, 0.0F, 0.0F});
+            tracking.leftHand.pose.position.x = -0.48F + 0.30F * amount;
+            tracking.rightHand.pose.position.x = 0.48F + 0.30F * amount;
+            Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+                  "planted-leg rapid lateral pose solves");
+            const auto supportCenter = (state.footAnchor[0] + state.footAnchor[1]) * 0.5F;
+            const auto actualOffset = std::abs(
+                pose.bones[BoneIndex(HumanoidBone::Hips)].position.x - supportCenter.x);
+            result.greatestPelvisSupportOffset = std::max(
+                result.greatestPelvisSupportOffset, actualOffset);
+            result.reportedMaximumSupportOffset = diagnostics.maximumSupportOffset;
+            if (result.firstStepFrame < 0 &&
+                (state.feet[0].state == FootState::Stepping || state.feet[1].state == FootState::Stepping)) {
+                result.firstStepFrame = frame;
+            }
+        }
+        return result;
+    };
+
+    const auto original = run(1.0F);
+    const auto reduced = run(0.50F);
+    Check(original.firstStepFrame >= 0 && reduced.firstStepFrame >= 0,
+          "both planted-leg limits still produce a rapid support step");
+    Check(reduced.firstStepFrame <= original.firstStepFrame,
+          "a lower planted-leg limit does not delay the support step");
+    Check(reduced.reportedMaximumSupportOffset < original.reportedMaximumSupportOffset * 0.60F,
+          "the planted-leg slider independently scales the pelvis support boundary");
+    Check(reduced.greatestPelvisSupportOffset < original.greatestPelvisSupportOffset * 0.80F,
+          "the planted-leg slider visibly reduces pelvis displacement over anchored feet");
+}
+
+void TestStanceWidthAndBackwardSpineOverrides() {
+    const auto horizontal = [](Vec3 value) {
+        value.y = 0.0F;
+        return value;
+    };
+    const auto avatar = BuildAvatar();
+    auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+
+    StaticTrackerlessAvatarSolver original{};
+    Check(original.Solve(tracking, avatar, player, state, pose, &diagnostics),
+          "original stance seeds");
+    const auto originalStance = Length(horizontal(state.footAnchor[1] - state.footAnchor[0]));
+
+    StaticTrackerlessAvatarSolver wider{};
+    wider.SetStanceWidthScale(1.50F);
+    wider.Reset(state);
+    tracking = BuildTracking();
+    Check(wider.Solve(tracking, avatar, player, state, pose, &diagnostics),
+          "wider stance seeds");
+    const auto widerStance = Length(horizontal(state.footAnchor[1] - state.footAnchor[0]));
+    Check(widerStance > originalStance * 1.40F,
+          "stance-width override expands the actual planted-foot baseline");
+
+    const auto solveBackward = [&](float limit) {
+        StaticTrackerlessAvatarSolver solver{};
+        solver.SetBackwardSpineCurveLimit(limit);
+        SolverPersistentState localState{};
+        SolvedHumanoidPose localPose{};
+        SolverDiagnostics localDiagnostics{};
+        auto localTracking = BuildTracking();
+        Check(solver.Solve(localTracking, avatar, player, localState, localPose, &localDiagnostics),
+              "backward spine limit seeds");
+        for (int frame = 0; frame < 20; ++frame) {
+            localTracking = NextFrame(localTracking, {0.0F, 1.70F, -0.12F});
+            Check(solver.Solve(localTracking, avatar, player, localState, localPose, &localDiagnostics),
+                  "backward spine pose solves");
+        }
+        const auto head = localPose.bones[BoneIndex(HumanoidBone::Head)].position;
+        const auto hips = localPose.bones[BoneIndex(HumanoidBone::Hips)].position;
+        return Dot(horizontal(head - hips), Normalize(horizontal(player.neutralForward)));
+    };
+
+    const auto originalBackward = solveBackward(1.0F);
+    const auto blockedBackward = solveBackward(0.0F);
+    Check(blockedBackward >= -0.002F && blockedBackward > originalBackward,
+          "zero backward-spine limit removes rearward bow without constraining forward motion");
+}
+
 void TestProceduralStepAndPivot() {
     const auto avatar = BuildAvatar();
     auto tracking = BuildTracking();
@@ -1114,6 +1259,8 @@ int main() {
     TestPelvisLeanCrouchAndBend();
     TestAnatomicalSpineCrouchAndSupport();
     TestSideStepLeanLimitOverride();
+    TestPlantedLegLeanLimitOverride();
+    TestStanceWidthAndBackwardSpineOverrides();
     TestProceduralStepAndPivot();
     TestAirborneAndResetRecovery();
     std::cout << "Avatar solver tests passed\n";

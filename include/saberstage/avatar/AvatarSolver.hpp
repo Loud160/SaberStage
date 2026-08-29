@@ -9,6 +9,9 @@ class StaticTrackerlessAvatarSolver final {
 public:
     void Reset(SolverPersistentState& state) const noexcept;
     void SetSideStepLeanLimit(float fraction) noexcept;
+    void SetPlantedLegLeanLimit(float fraction) noexcept;
+    void SetStanceWidthScale(float scale) noexcept;
+    void SetBackwardSpineCurveLimit(float fraction) noexcept;
 
     bool Solve(
         const TrackingSample& tracking,
@@ -29,6 +32,9 @@ public:
 
 private:
     float sideStepLeanLimit_ = 1.0F;
+    float plantedLegLeanLimit_ = 1.0F;
+    float stanceWidthScale_ = 1.0F;
+    float backwardSpineCurveLimit_ = 1.0F;
 };
 
 } // namespace saberstage::avatar

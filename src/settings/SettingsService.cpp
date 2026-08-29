@@ -347,6 +347,8 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.avatar.rimLighting = Bool(*avatar, "rimLighting", settings.avatar.rimLighting, repaired);
             settings.avatar.matcap = Bool(*avatar, "matcap", settings.avatar.matcap, repaired);
             settings.avatar.emission = Bool(*avatar, "emission", settings.avatar.emission, repaired);
+            settings.avatar.animatedExpressions = Bool(
+                *avatar, "animatedExpressions", settings.avatar.animatedExpressions, repaired);
             settings.avatar.outlines = EnumValue(
                 *avatar, "outlines", settings.avatar.outlines,
                 [](std::string_view value, AvatarOutlineMode& parsed) { return TryParse(value, parsed); }, repaired);
@@ -373,6 +375,12 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 *avatar, "maximumSpringJoints", settings.avatar.maximumSpringJoints, repaired);
             settings.avatar.sideStepLeanLimitPercent = Float(
                 *avatar, "sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, repaired);
+            settings.avatar.plantedLegLeanLimitPercent = Float(
+                *avatar, "plantedLegLeanLimitPercent", settings.avatar.plantedLegLeanLimitPercent, repaired);
+            settings.avatar.stanceWidthPercent = Float(
+                *avatar, "stanceWidthPercent", settings.avatar.stanceWidthPercent, repaired);
+            settings.avatar.backwardSpineCurveLimitPercent = Float(
+                *avatar, "backwardSpineCurveLimitPercent", settings.avatar.backwardSpineCurveLimitPercent, repaired);
             settings.avatar.leftControllerToWrist = AvatarControllerOffset(
                 *avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, repaired);
             settings.avatar.rightControllerToWrist = AvatarControllerOffset(
@@ -469,6 +477,7 @@ std::string Encode(const SettingsDocument& settings) {
     avatar.AddMember("rimLighting", settings.avatar.rimLighting, allocator);
     avatar.AddMember("matcap", settings.avatar.matcap, allocator);
     avatar.AddMember("emission", settings.avatar.emission, allocator);
+    avatar.AddMember("animatedExpressions", settings.avatar.animatedExpressions, allocator);
     avatar.AddMember("outlines", Value(ToString(settings.avatar.outlines).data(), allocator), allocator);
     avatar.AddMember("materialStage", Value(ToString(settings.avatar.materialStage).data(), allocator), allocator);
     avatar.AddMember("lightingMode", Value(ToString(settings.avatar.lightingMode).data(), allocator), allocator);
@@ -480,6 +489,9 @@ std::string Encode(const SettingsDocument& settings) {
     avatar.AddMember("maximumSpringChains", settings.avatar.maximumSpringChains, allocator);
     avatar.AddMember("maximumSpringJoints", settings.avatar.maximumSpringJoints, allocator);
     avatar.AddMember("sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, allocator);
+    avatar.AddMember("plantedLegLeanLimitPercent", settings.avatar.plantedLegLeanLimitPercent, allocator);
+    avatar.AddMember("stanceWidthPercent", settings.avatar.stanceWidthPercent, allocator);
+    avatar.AddMember("backwardSpineCurveLimitPercent", settings.avatar.backwardSpineCurveLimitPercent, allocator);
     AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, allocator);
     AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
     document.AddMember("avatar", avatar, allocator);

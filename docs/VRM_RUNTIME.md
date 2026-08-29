@@ -35,7 +35,15 @@ The Appearance section exposes a cumulative `Material Stage` diagnostic ladder. 
 
 These modes alter only the avatar material. They do not add or modify Beat Saber environment lights.
 
-`Side-Step Lean Limit` is a motion override expressed as 40-100 percent. The default 100 percent preserves the calibrated/original lateral lean envelope. Lower values scale that same envelope so the existing pelvis-translation and support-step solver takes over sooner, reducing extreme sideways torso lean without rewriting or discarding the player's calibration profile.
+`Side-Step Lean Limit` is a torso-motion override expressed as 40-100 percent. The default 100 percent preserves the calibrated/original lateral head-to-pelvis envelope. Lower values scale that envelope so pelvis translation and stepping take over sooner.
+
+`Planted Leg Lean Limit` is a separate 20-100 percent support control. It limits lateral pelvis displacement over the currently planted feet, reapplies that boundary after the spine root correction, and forces the support-step path when exceeded. Keeping this independent prevents a reduced torso limit from reappearing as a full-body pivot around the ankles. `Stance Width` scales the hip-width-derived neutral and ideal foot separation from 75-200 percent; changing it does not change avatar scale. Both controls default to 100 percent to preserve existing settings files and behavior until the user deliberately tunes them.
+
+`Backward Spine Curve Limit` scales only the permitted rearward root-to-head bow from 0-100 percent. Zero prevents backward C-bowing, while forward attack/lunge bending keeps its full existing range. The default 100 percent preserves the prior solver limit.
+
+`Animated Expressions` gates all automatic face work. When enabled, the menu applies a subtle `joy` weight and blinks at randomized 2.4-6.6 second intervals. Gameplay keeps x1/x2 focused, blends a slight smile at x4, a stronger `joy` expression at x8, briefly blends `angry` after a miss, strengthens that reaction for clustered misses, blends `sorrow` as energy becomes low, combines `sorrow` and `angry` after a real fail, and briefly blends `joy`/`fun` after a near-song-end completion. Attack and release transitions are eased over roughly 0.2-0.34 seconds, miss detection has a short retrigger cooldown, and blinking remains an independent blend channel. Missing presets fall back between `joy`/`fun` and `angry`/`sorrow`; an avatar that supplies neither compatible preset simply retains its authored face. Turning the option off clears the automatic weights and performs no ongoing expression work.
+
+VRM 0 avatar files do not ordinarily carry reusable gameplay jump or celebration animation clips, and SaberStage currently imports no animation clips. A completion jump therefore cannot be honestly described as avatar-dependent data already available in the file. It would require a separate tracked-body animation layer with grounding, solver blending, and an explicit SaberStage animation asset; no inert toggle is exposed for that unimplemented path.
 
 Sparse accessors, external buffers/images, data URIs, non-triangle primitives, VRM 1.x, Draco compression, mesh merging, advanced SpringBones, terrain-aware feet, continuous locomotion, and FBT are outside this stop point. Unsupported or malformed input fails with a bounded error and does not replace the current avatar.
 
@@ -48,12 +56,22 @@ Neutral data remains in glTF's right-handed coordinate system. The Unity adapter
 - inverse bind matrices: `M -> S M S`, where `S = diag(1, 1, -1, 1)`
 - triangle winding: swap the second and third index
 - tangent direction reflects Z and tangent handedness flips
+- texture coordinates: `(u, v) -> (u, 1 - v)` for both UV sets. glTF UVs use a
+  top-left origin; Unity samples from a bottom-left origin. Without this flip,
+  uniformly colored regions still look plausible but every alpha-cutout
+  silhouette cuts along mirrored contours (missing collar/neck accessories,
+  stair-stepped stocking tapers) and atlased models sample the wrong cells.
+  Consequently `KHR_texture_transform` values (authored in glTF space) are
+  re-based as `offsetY' = 1 - offsetY - scaleY` with the rotation negated,
+  while VRM 0.x `vectorProperties` texture ST values are applied verbatim
+  because the exporter captured them from Unity materials (already
+  bottom-left origin).
 
 The [VRM 0.x specification](https://github.com/vrm-c/vrm-specification/blob/master/specification/0.0/README.md#vrm-rules) requires a model to face glTF `-Z`. Reflecting Z maps that forward vector to Unity `+Z`; SaberStage therefore passes positive Unity Z as the avatar's model-forward calibration direction. No arbitrary 180-degree model rotation is hidden in the loader. This must still be visually confirmed on Quest with the supplied assets.
 
 ## Texture and memory policy
 
-The default maximum dimension is 1024. The profile permits 512, 2048, or 4096 for diagnosis and quality testing. Aspect ratio is preserved. Only images referenced by runtime materials are decoded; the VRM metadata thumbnail and other unused images are excluded. Textures are decoded and capped one at a time to bound transient peak memory, made non-readable after mip generation, and their encoded bytes are released. Color textures are created as sRGB while normal, shading-grade, and outline-width data textures are created as linear. If one source image is assigned to both color and data roles, the loader logs the ambiguity and preserves its visible color interpretation rather than silently creating inconsistent duplicate material inputs.
+The default maximum dimension is 1024. The profile permits 512, 2048, or 4096 for diagnosis and quality testing. Aspect ratio is preserved. Only images referenced by runtime materials are decoded; the VRM metadata thumbnail and other unused images are excluded. Textures are decoded and capped one at a time to bound transient peak memory, made non-readable after mip generation, and their encoded bytes are released. Color textures are created as sRGB while normal, shading-grade, and outline-width data textures are created as linear. Runtime textures use trilinear filtering with anisotropic level 4: bilinear-only sampling snaps between mip levels, and without aniso, glancing-angle surfaces drop to deep mips whose box-filtered alpha erodes cutout boundaries into chunky steps on camera. If one source image is assigned to both color and data roles, the loader logs the ambiguity and preserves its visible color interpretation rather than silently creating inconsistent duplicate material inputs.
 
 Load diagnostics record each source and runtime texture size, its material roles and color space, each material's shader and mapped features, alpha/cull/render-queue state, and a summary of MToon versus fallback materials. Applying a material stage or lighting mode logs only when the effective controls change; it does not emit per-frame logging.
 

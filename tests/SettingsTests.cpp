@@ -60,7 +60,8 @@ int main() {
     Check(defaults.avatar.qualityPreset == AvatarQualityPreset::Balanced &&
               defaults.avatar.toonLighting && defaults.avatar.normalMaps &&
               defaults.avatar.rimLighting && !defaults.avatar.matcap &&
-              defaults.avatar.emission && defaults.avatar.outlines == AvatarOutlineMode::Off &&
+              defaults.avatar.emission && defaults.avatar.animatedExpressions &&
+              defaults.avatar.outlines == AvatarOutlineMode::Off &&
               defaults.avatar.materialStage == AvatarMaterialStage::Configured &&
               defaults.avatar.lightingMode == AvatarLightingMode::Balanced,
           "Balanced avatar defaults expose each MToon cost independently");
@@ -69,6 +70,11 @@ int main() {
           "SpringBones default to a conservative explicit Quest budget");
     Check(defaults.avatar.sideStepLeanLimitPercent == 100.0F,
           "side-step lean override defaults to the original solver boundary");
+    Check(defaults.avatar.plantedLegLeanLimitPercent == 100.0F,
+          "planted-leg lean override defaults to the original support boundary");
+    Check(defaults.avatar.stanceWidthPercent == 100.0F &&
+              defaults.avatar.backwardSpineCurveLimitPercent == 100.0F,
+          "stance width and backward spine controls default to original solver behavior");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
@@ -97,6 +103,9 @@ int main() {
     invalid.avatar.maximumSpringChains = 0;
     invalid.avatar.maximumSpringJoints = 5000;
     invalid.avatar.sideStepLeanLimitPercent = 10.0F;
+    invalid.avatar.plantedLegLeanLimitPercent = 10.0F;
+    invalid.avatar.stanceWidthPercent = 20.0F;
+    invalid.avatar.backwardSpineCurveLimitPercent = 150.0F;
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -111,6 +120,12 @@ int main() {
           "invalid avatar material diagnostics repair to configured balanced rendering");
     Check(invalid.avatar.sideStepLeanLimitPercent == defaults.avatar.sideStepLeanLimitPercent,
           "invalid side-step lean limit repairs to the original solver boundary");
+    Check(invalid.avatar.plantedLegLeanLimitPercent == defaults.avatar.plantedLegLeanLimitPercent,
+          "invalid planted-leg lean limit repairs to the original support boundary");
+    Check(invalid.avatar.stanceWidthPercent == defaults.avatar.stanceWidthPercent &&
+              invalid.avatar.backwardSpineCurveLimitPercent ==
+                  defaults.avatar.backwardSpineCurveLimitPercent,
+          "invalid stance and backward spine limits repair to original behavior");
 
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
@@ -194,6 +209,7 @@ int main() {
     first.Edit().avatar.maximumTextureDimension = 512;
     first.Edit().avatar.qualityPreset = AvatarQualityPreset::Custom;
     first.Edit().avatar.matcap = true;
+    first.Edit().avatar.animatedExpressions = false;
     first.Edit().avatar.outlines = AvatarOutlineMode::Reduced;
     first.Edit().avatar.materialStage = AvatarMaterialStage::RimLighting;
     first.Edit().avatar.lightingMode = AvatarLightingMode::Studio;
@@ -204,6 +220,9 @@ int main() {
     first.Edit().avatar.maximumSpringChains = 48;
     first.Edit().avatar.maximumSpringJoints = 160;
     first.Edit().avatar.sideStepLeanLimitPercent = 65.0F;
+    first.Edit().avatar.plantedLegLeanLimitPercent = 55.0F;
+    first.Edit().avatar.stanceWidthPercent = 145.0F;
+    first.Edit().avatar.backwardSpineCurveLimitPercent = 35.0F;
     first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
@@ -253,14 +272,18 @@ int main() {
               second.Get().avatar.maximumTextureDimension == 512 &&
               second.Get().avatar.leftControllerToWrist.position.z == 0.03F &&
               second.Get().avatar.qualityPreset == AvatarQualityPreset::Custom &&
-              second.Get().avatar.matcap && second.Get().avatar.outlines == AvatarOutlineMode::Reduced &&
+              second.Get().avatar.matcap && !second.Get().avatar.animatedExpressions &&
+              second.Get().avatar.outlines == AvatarOutlineMode::Reduced &&
               second.Get().avatar.materialStage == AvatarMaterialStage::RimLighting &&
               second.Get().avatar.lightingMode == AvatarLightingMode::Studio &&
               second.Get().avatar.springBoneQuality == SpringBoneQuality::Custom &&
               second.Get().avatar.springCollisions == SpringCollisionQuality::Full &&
               second.Get().avatar.springUpdateRateHz == 40 && second.Get().avatar.springSubsteps == 2 &&
               second.Get().avatar.maximumSpringChains == 48 && second.Get().avatar.maximumSpringJoints == 160 &&
-              second.Get().avatar.sideStepLeanLimitPercent == 65.0F,
+              second.Get().avatar.sideStepLeanLimitPercent == 65.0F &&
+              second.Get().avatar.plantedLegLeanLimitPercent == 55.0F &&
+              second.Get().avatar.stanceWidthPercent == 145.0F &&
+              second.Get().avatar.backwardSpineCurveLimitPercent == 35.0F,
           "avatar selection, visual quality, SpringBone budget, and wrist calibration survive restart");
 
     auto preset = defaults.avatar;

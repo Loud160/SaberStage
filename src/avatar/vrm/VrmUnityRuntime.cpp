@@ -60,6 +60,17 @@ bool IsAlive(UnityEngine::Object* object) noexcept {
     return object && UnityEngine::Object::op_Inequality(object, nullptr);
 }
 
+bool EqualsAsciiCaseInsensitive(std::string_view left, std::string_view right) noexcept {
+    if (left.size() != right.size()) return false;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        auto lower = [](char value) noexcept {
+            return value >= 'A' && value <= 'Z' ? static_cast<char>(value + ('a' - 'A')) : value;
+        };
+        if (lower(left[index]) != lower(right[index])) return false;
+    }
+    return true;
+}
+
 UnityEngine::Vector3 ToUnityPosition(Float3 value) noexcept { return {value.x, value.y, -value.z}; }
 UnityEngine::Vector3 ToUnityDirection(Float3 value) noexcept { return {value.x, value.y, -value.z}; }
 UnityEngine::Quaternion ToUnityRotation(Float4 value) noexcept { return {-value.x, -value.y, value.z, value.w}; }
@@ -128,7 +139,10 @@ UnityEngine::TextureWrapMode WrapMode(std::int32_t value) {
 
 UnityEngine::FilterMode Filter(std::int32_t minFilter, std::int32_t magFilter) {
     if (minFilter == 9728 && magFilter == 9728) return UnityEngine::FilterMode::Point;
-    if (minFilter == 9987 || minFilter == 9985) return UnityEngine::FilterMode::Trilinear;
+    // Runtime avatar textures always carry a full mip chain, so plain LINEAR
+    // minification (9729, "no mips" in glTF terms) is served best by
+    // trilinear sampling; bilinear would snap between mip levels visibly.
+    if (minFilter == 9987 || minFilter == 9985 || minFilter == 9729) return UnityEngine::FilterMode::Trilinear;
     return UnityEngine::FilterMode::Bilinear;
 }
 
@@ -453,7 +467,10 @@ public:
             const auto sampler = textureDefinition.sampler ? asset_.samplers[*textureDefinition.sampler] : Sampler{};
             texture->set_filterMode(Filter(sampler.minFilter, sampler.magFilter));
             texture->set_wrapMode(WrapMode(sampler.wrapS));
-            texture->set_anisoLevel(1);
+            // Aniso keeps glancing-angle surfaces (thighs, shoulders, hair
+            // cards) from dropping to deep blurry mips, which reads as chunky
+            // alpha-cutout boundaries and smeared cloth detail on camera.
+            texture->set_anisoLevel(4);
             UnityEngine::Object::DontDestroyOnLoad(texture);
             textureObjects_[i] = texture;
             ownedTextures_.push_back(texture);
@@ -574,13 +591,18 @@ public:
                 auto* texture = textureObjects_[textureIndex];
                 if (IsAlive(texture)) material->SetTexture(name, texture);
             }
+            // KHR_texture_transform is authored in glTF's top-left UV space.
+            // Mesh UVs are imported flipped to Unity's bottom-left space, so
+            // the transform must be re-based: offsetY' = 1 - offsetY - scaleY
+            // and the rotation direction inverts.
             const auto setTransform = [&](const std::string& property, TextureTransform transform) {
                 material->SetVector(
                     property + "_ST",
-                    {transform.scale.x, transform.scale.y, transform.offset.x, transform.offset.y});
+                    {transform.scale.x, transform.scale.y,
+                     transform.offset.x, 1.0F - transform.offset.y - transform.scale.y});
                 if (useMtoon) {
                     material->SetFloat(property + "Coord", static_cast<float>(transform.texCoord));
-                    material->SetFloat(property + "Rotation", transform.rotation);
+                    material->SetFloat(property + "Rotation", -transform.rotation);
                 }
             };
             for (const auto& [property, transform] : source.textureTransforms) {
@@ -602,7 +624,10 @@ public:
             if (const auto transform = source.vectorProperties.find("_MainTex"); transform != source.vectorProperties.end()) {
                 // VRM 0.x serializes texture ST as offset.xy followed by
                 // scale.xy. Treating the first pair as scale collapses the
-                // common [0,0,1,1] value to one gray texel.
+                // common [0,0,1,1] value to one gray texel. Unlike
+                // KHR_texture_transform these values are captured from Unity
+                // materials by the exporter, so they are already bottom-left
+                // origin and must NOT be vertically re-based.
                 material->set_mainTextureOffset({transform->second.x, transform->second.y});
                 material->set_mainTextureScale({transform->second.z, transform->second.w});
             }
@@ -645,7 +670,14 @@ public:
                 auto* outline = UnityEngine::Material::New_ctor(AvatarShaders().outline.ptr());
                 if (!IsAlive(outline)) continue;
                 outline->set_name((source.name.empty() ? "SaberStage VRM Material " + std::to_string(i) : source.name) + " Outline");
-                outline->SetFloat("_OutlineWidth", std::clamp(width, 0.0F, 0.02F));
+                // MToon authors _OutlineWidth in hundredths of a world unit:
+                // the reference shader displaces by width * 0.01, so a typical
+                // VRoid value of ~0.1 means ~1mm. Passing the raw value into a
+                // shader that displaces in meters (then clamping to the 2cm
+                // cap) inflates every outline into a thick shell around the
+                // avatar. Convert to meters here; the clamp now only guards
+                // against pathological authored widths.
+                outline->SetFloat("_OutlineWidth", std::clamp(width * 0.01F, 0.0F, 0.02F));
                 outline->SetFloat("_Cutoff", source.floatProperties.contains("_Cutoff") ? source.floatProperties.at("_Cutoff") : 0.5F);
                 outline->SetFloat("_AlphaToMask", source.floatProperties.contains("_AlphaToMask")
                     ? source.floatProperties.at("_AlphaToMask")
@@ -657,13 +689,32 @@ public:
                     main->second < textureObjects_.size() && IsAlive(textureObjects_[main->second])) {
                     outline->SetTexture("_MainTex", textureObjects_[main->second]);
                 }
+                // MToon thins/suppresses the line per-region via the width
+                // mask (decoded linear by ClassifyTexture); without it the
+                // outline is uniform width across nostrils, inner ears, etc.
+                if (const auto mask = source.textureProperties.find("_OutlineWidthTexture");
+                    mask != source.textureProperties.end() &&
+                    mask->second < textureObjects_.size() && IsAlive(textureObjects_[mask->second])) {
+                    outline->SetTexture("_OutlineWidthTexture", textureObjects_[mask->second]);
+                }
+                // 0 = fixed authored color, 1 = mixed (tinted by the surface
+                // texture, used by VRoid hair). Prefer the serialized float
+                // and fall back to the keyword map for older exports.
+                const auto colorMode = source.floatProperties.contains("_OutlineColorMode")
+                    ? source.floatProperties.at("_OutlineColorMode")
+                    : (source.keywordMap.contains("MTOON_OUTLINE_COLOR_MIXED") ? 1.0F : 0.0F);
+                outline->SetFloat("_OutlineColorMode", colorMode);
+                outline->SetFloat("_OutlineLightingMix", source.floatProperties.contains("_OutlineLightingMix")
+                    ? std::clamp(source.floatProperties.at("_OutlineLightingMix"), 0.0F, 1.0F) : 1.0F);
                 if (const auto transform = source.textureTransforms.find("_MainTex");
                     transform != source.textureTransforms.end()) {
+                    // Same top-left -> bottom-left re-basing as the base pass.
                     outline->SetVector("_MainTex_ST", {
                         transform->second.scale.x, transform->second.scale.y,
-                        transform->second.offset.x, transform->second.offset.y});
+                        transform->second.offset.x,
+                        1.0F - transform->second.offset.y - transform->second.scale.y});
                     outline->SetFloat("_MainTexCoord", static_cast<float>(transform->second.texCoord));
-                    outline->SetFloat("_MainTexRotation", transform->second.rotation);
+                    outline->SetFloat("_MainTexRotation", -transform->second.rotation);
                 }
                 if (source.floatProperties.contains("_BlendMode") && source.floatProperties.at("_BlendMode") == 1.0F) {
                     outline->EnableKeyword("SABERSTAGE_ALPHA_TEST");
@@ -715,11 +766,16 @@ public:
             const auto& tangent = primitive.tangents[i];
             return UnityEngine::Vector4{tangent.x, tangent.y, -tangent.z, -tangent.w};
         }));
+        // glTF texture coordinates use a top-left origin (v grows downward)
+        // while Unity samples with a bottom-left origin. Every UV must be
+        // flipped vertically or textures sample mirrored: flat color regions
+        // still look plausible, but alpha-cutout silhouettes (stocking tapers,
+        // collar straps) cut along the wrong contours and thin details vanish.
         if (!primitive.texcoords0.empty()) mesh->set_uv(ConvertArray<UnityEngine::Vector2>(primitive.texcoords0.size(), [&](std::size_t i) {
-            return UnityEngine::Vector2{primitive.texcoords0[i].x, primitive.texcoords0[i].y};
+            return UnityEngine::Vector2{primitive.texcoords0[i].x, 1.0F - primitive.texcoords0[i].y};
         }));
         if (!primitive.texcoords1.empty()) mesh->set_uv2(ConvertArray<UnityEngine::Vector2>(primitive.texcoords1.size(), [&](std::size_t i) {
-            return UnityEngine::Vector2{primitive.texcoords1[i].x, primitive.texcoords1[i].y};
+            return UnityEngine::Vector2{primitive.texcoords1[i].x, 1.0F - primitive.texcoords1[i].y};
         }));
         auto triangles = ConvertArray<std::int32_t>(primitive.indices.size(), [&](std::size_t i) {
             const auto triangleBase = i - (i % 3);
@@ -1215,12 +1271,26 @@ public:
         }
     }
 
-    bool SetExpression(std::string_view presetName, float weight, std::string* error) noexcept {
+    const BlendShapeGroup* FindExpression(std::string_view presetName) const noexcept {
+        const auto preset = std::find_if(asset_.blendShapeGroups.begin(), asset_.blendShapeGroups.end(), [&](const auto& group) {
+            return EqualsAsciiCaseInsensitive(group.presetName, presetName) ||
+                EqualsAsciiCaseInsensitive(group.name, presetName);
+        });
+        return preset == asset_.blendShapeGroups.end() ? nullptr : &*preset;
+    }
+
+    bool HasExpression(std::string_view presetName) const noexcept {
+        return FindExpression(presetName) != nullptr;
+    }
+
+    bool ApplyExpression(
+        std::string_view presetName,
+        float weight,
+        std::string* error,
+        bool writeDiagnostic) noexcept {
         try {
-            const auto preset = std::find_if(asset_.blendShapeGroups.begin(), asset_.blendShapeGroups.end(), [&](const auto& group) {
-                return group.presetName == presetName || group.name == presetName;
-            });
-            if (preset == asset_.blendShapeGroups.end()) {
+            const auto* preset = FindExpression(presetName);
+            if (!preset) {
                 if (error) *error = "VRM expression was not found: " + std::string(presetName);
                 return false;
             }
@@ -1237,16 +1307,26 @@ public:
                 if (error) *error = "VRM expression has no matching runtime renderer: " + std::string(presetName);
                 return false;
             }
-            Logging::Logger.debug(
-                "Applied VRM expression '{}' weight={:.2f} across {} renderer bindings",
-                presetName,
-                clamped,
-                appliedRendererCount);
+            if (writeDiagnostic) {
+                Logging::Logger.debug(
+                    "Applied VRM expression '{}' weight={:.2f} across {} renderer bindings",
+                    presetName,
+                    clamped,
+                    appliedRendererCount);
+            }
             return true;
         } catch (...) {
             if (error) *error = "VRM expression application failed safely";
             return false;
         }
+    }
+
+    bool SetExpression(std::string_view presetName, float weight, std::string* error) noexcept {
+        return ApplyExpression(presetName, weight, error, true);
+    }
+
+    bool SetExpressionQuiet(std::string_view presetName, float weight) noexcept {
+        return ApplyExpression(presetName, weight, nullptr, false);
     }
 
     std::optional<RuntimeAnchor> FirstPersonAnchorWorld() const noexcept {
@@ -1322,8 +1402,14 @@ void VrmUnityRuntime::SetVisible(bool visible) noexcept { if (impl_) impl_->SetV
 void VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { if (impl_) impl_->ApplyOptions(options); }
 void VrmUnityRuntime::UpdateSecondaryMotion(float deltaTime) noexcept { if (impl_) impl_->UpdateSecondaryMotion(deltaTime); }
 void VrmUnityRuntime::ResetSecondaryMotion() noexcept { if (impl_) impl_->ResetSecondaryMotion(); }
+bool VrmUnityRuntime::HasExpression(std::string_view preset) const noexcept {
+    return impl_ && impl_->HasExpression(preset);
+}
 bool VrmUnityRuntime::SetExpression(std::string_view preset, float weight, std::string* error) noexcept {
     return impl_ && impl_->SetExpression(preset, weight, error);
+}
+bool VrmUnityRuntime::SetExpressionQuiet(std::string_view preset, float weight) noexcept {
+    return impl_ && impl_->SetExpressionQuiet(preset, weight);
 }
 UnityEngine::Animator* VrmUnityRuntime::Animator() const noexcept { return impl_ ? impl_->animator_ : nullptr; }
 UnityEngine::GameObject* VrmUnityRuntime::Root() const noexcept { return impl_ ? impl_->root_ : nullptr; }

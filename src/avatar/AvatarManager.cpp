@@ -9,6 +9,9 @@
 #include "saberstage/camera/CameraProfile.hpp"
 
 #include "GlobalNamespace/PlayerTransforms.hpp"
+#include "GlobalNamespace/AudioTimeSyncController.hpp"
+#include "GlobalNamespace/ComboController.hpp"
+#include "GlobalNamespace/GameEnergyCounter.hpp"
 #include "GlobalNamespace/Saber.hpp"
 #include "GlobalNamespace/VRController.hpp"
 #include "UnityEngine/Animator.hpp"
@@ -621,23 +624,33 @@ public:
             const auto timestamp = static_cast<double>(UnityEngine::Time::get_unscaledTime());
             const auto previous = sample_;
             sample_.head = SamplePose(headTransform_, previous.head, timestamp);
-            RefreshSaberGripTransforms(frame);
-            const auto leftGripReady = SaberGripReady(0);
-            const auto rightGripReady = SaberGripReady(1);
             sample_.controllerHand[0] = IsAlive(handControllers_[0])
                 ? SampleControllerPose(handControllers_[0], previous.controllerHand[0], timestamp)
                 : SamplePose(handTransforms_[0], previous.controllerHand[0], timestamp);
             sample_.controllerHand[1] = IsAlive(handControllers_[1])
                 ? SampleControllerPose(handControllers_[1], previous.controllerHand[1], timestamp)
                 : SamplePose(handTransforms_[1], previous.controllerHand[1], timestamp);
+            // Controller poses are sampled before saber discovery so the menu
+            // can select the visible handle nearest each controller instead of
+            // accidentally retaining a stale gameplay Saber from Resources.
+            RefreshSaberGripTransforms(frame);
+            const auto leftGripReady = SaberGripReady(0);
+            const auto rightGripReady = SaberGripReady(1);
             sample_.saberGrip[0] = leftGripReady
                 ? SampleSaberGripPose(sabers_[0], saberGripTransforms_[0], previous.saberGrip[0], timestamp)
                 : TrackedPose{};
             sample_.saberGrip[1] = rightGripReady
                 ? SampleSaberGripPose(sabers_[1], saberGripTransforms_[1], previous.saberGrip[1], timestamp)
                 : TrackedPose{};
-            sample_.handIsSaberGrip[0] = leftGripReady;
-            sample_.handIsSaberGrip[1] = rightGripReady;
+            // Menu saber components can be disabled even while their visible
+            // controller-attached handle remains on screen. If no usable Saber
+            // component was exposed, still close the VRM fingers around the
+            // live menu controller instead of displaying an open palm beside
+            // the visible grip.
+            sample_.handIsSaberGrip[0] = leftGripReady ||
+                (!IsAlive(tracking_) && sample_.controllerHand[0].valid);
+            sample_.handIsSaberGrip[1] = rightGripReady ||
+                (!IsAlive(tracking_) && sample_.controllerHand[1].valid);
             sample_.leftHand = leftGripReady
                 ? sample_.saberGrip[0]
                 : sample_.controllerHand[0];
@@ -776,6 +789,7 @@ public:
             }
             if (!bindSolver) UnbindAnimator();
             vrmRuntime_ = std::move(candidate);
+            ResetAutomaticExpressionState();
             if (previous) previous->SetVisible(false);
             previous.reset();
             const auto& stats = vrmRuntime_->Statistics();
@@ -873,8 +887,10 @@ public:
 
     void UnloadVrmAvatar() noexcept {
         if (!vrmRuntime_) return;
+        ClearAutomaticExpressions();
         UnbindAnimator();
         vrmRuntime_.reset();
+        ResetAutomaticExpressionState();
         Logging::Logger.info("Unloaded SaberStage VRM avatar and released its Unity assets");
     }
 
@@ -884,11 +900,21 @@ public:
 
     void ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept {
         solver_.SetSideStepLeanLimit(settings.sideStepLeanLimitPercent / 100.0F);
+        solver_.SetPlantedLegLeanLimit(settings.plantedLegLeanLimitPercent / 100.0F);
+        solver_.SetStanceWidthScale(settings.stanceWidthPercent / 100.0F);
+        solver_.SetBackwardSpineCurveLimit(settings.backwardSpineCurveLimitPercent / 100.0F);
+        if (automaticExpressionsEnabled_ != settings.animatedExpressions) {
+            automaticExpressionsEnabled_ = settings.animatedExpressions;
+            if (!automaticExpressionsEnabled_) ClearAutomaticExpressions();
+            ResetAutomaticExpressionState();
+        }
         if (vrmRuntime_) vrmRuntime_->ApplyOptions(RuntimeOptionsFromSettings(settings));
     }
 
     void UpdateSecondaryMotion(float deltaTime) noexcept {
-        if (vrmRuntime_) vrmRuntime_->UpdateSecondaryMotion(deltaTime);
+        if (!vrmRuntime_) return;
+        UpdateAutomaticExpressions(deltaTime);
+        vrmRuntime_->UpdateSecondaryMotion(deltaTime);
     }
 
     void SetControllerToWristOffsets(Pose left, Pose right) noexcept {
@@ -1269,9 +1295,299 @@ private:
         }
     }
 
+    void ResetAutomaticExpressionState() noexcept {
+        comboController_ = nullptr;
+        energyCounter_ = nullptr;
+        audioTimeSyncController_ = nullptr;
+        nextExpressionSourceDiscoveryFrame_ = 0;
+        previousCombo_ = -1;
+        previousEnergy_ = -1.0F;
+        angryReactionSeconds_ = 0.0F;
+        missBurstWindowSeconds_ = 0.0F;
+        missRegistrationCooldownSeconds_ = 0.0F;
+        missBurstCount_ = 0;
+        failureReactionSeconds_ = 0.0F;
+        completionReactionSeconds_ = 0.0F;
+        wasInGameplay_ = false;
+        lastGameplayNearEnd_ = false;
+        lastGameplayFailed_ = false;
+        expressionWeights_.fill(0.0F);
+        blinkCountdownSeconds_ = -1.0F;
+        blinkElapsedSeconds_ = -1.0F;
+        lastBlinkWeight_ = -1.0F;
+        expressionRandomState_ ^= static_cast<std::uint32_t>(
+            std::max(UnityEngine::Time::get_frameCount(), 1));
+    }
+
+    void ClearAutomaticExpressions() noexcept {
+        if (!vrmRuntime_) return;
+        static constexpr std::array<std::string_view, 4> presets{"joy", "fun", "angry", "sorrow"};
+        for (const auto preset : presets) {
+            if (vrmRuntime_->HasExpression(preset)) vrmRuntime_->SetExpressionQuiet(preset, 0.0F);
+        }
+        if (vrmRuntime_->HasExpression("blink")) {
+            vrmRuntime_->SetExpressionQuiet("blink", 0.0F);
+        }
+        expressionWeights_.fill(0.0F);
+        lastBlinkWeight_ = 0.0F;
+    }
+
+    float NextBlinkDelay() noexcept {
+        // A tiny deterministic PRNG avoids allocating or pulling in a heavier
+        // random library on Quest. Reseeding at avatar load keeps the cadence
+        // from looking mechanically periodic between sessions.
+        expressionRandomState_ = expressionRandomState_ * 1664525U + 1013904223U;
+        const auto unit = static_cast<float>((expressionRandomState_ >> 8U) & 0x00FFFFFFU) /
+            static_cast<float>(0x01000000U);
+        return 2.4F + unit * 4.2F;
+    }
+
+    void RefreshGameplayExpressionSources(std::int32_t frame) noexcept {
+        const auto comboReady = IsAlive(comboController_) && comboController_->get_isActiveAndEnabled();
+        const auto energyReady = IsAlive(energyCounter_) && energyCounter_->get_isActiveAndEnabled();
+        const auto audioReady = IsAlive(audioTimeSyncController_) && audioTimeSyncController_->get_isActiveAndEnabled();
+        if (comboReady && energyReady && audioReady) return;
+
+        auto* previousController = comboController_;
+        if (!comboReady) comboController_ = nullptr;
+        if (!energyReady) energyCounter_ = nullptr;
+        if (!audioReady) audioTimeSyncController_ = nullptr;
+        if (frame < nextExpressionSourceDiscoveryFrame_) return;
+        nextExpressionSourceDiscoveryFrame_ = frame + 60;
+        try {
+            if (!comboController_) {
+                for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::ComboController*>()) {
+                    if (!IsAlive(candidate) || !candidate->get_isActiveAndEnabled()) continue;
+                    comboController_ = candidate;
+                    break;
+                }
+            }
+            // ComboController only exists in an active gameplay scene. Stop
+            // here while in menus so the optional expression feature does not
+            // perform two additional global Unity object scans every retry.
+            if (!comboController_) return;
+            if (!energyCounter_) {
+                for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::GameEnergyCounter*>()) {
+                    if (!IsAlive(candidate) || !candidate->get_isActiveAndEnabled()) continue;
+                    energyCounter_ = candidate;
+                    break;
+                }
+            }
+            if (!audioTimeSyncController_) {
+                for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::AudioTimeSyncController*>()) {
+                    if (!IsAlive(candidate) || !candidate->get_isActiveAndEnabled()) continue;
+                    audioTimeSyncController_ = candidate;
+                    break;
+                }
+            }
+        } catch (...) {
+            comboController_ = nullptr;
+            energyCounter_ = nullptr;
+            audioTimeSyncController_ = nullptr;
+        }
+        if (comboController_ != previousController) {
+            // A new gameplay scene starts at combo zero. Do not mistake that
+            // scene transition for a missed note from the previous map.
+            previousCombo_ = -1;
+            previousEnergy_ = -1.0F;
+            angryReactionSeconds_ = 0.0F;
+            missBurstWindowSeconds_ = 0.0F;
+            missRegistrationCooldownSeconds_ = 0.0F;
+            missBurstCount_ = 0;
+        }
+    }
+
+    void BlendExpressionTargets(std::array<float, 4> targets, float deltaTime) noexcept {
+        if (!vrmRuntime_) return;
+        static constexpr std::array<std::string_view, 4> presets{"joy", "fun", "angry", "sorrow"};
+
+        // VRM 0 avatars are allowed to omit presets. Preserve the intent using
+        // the nearest authored fallback rather than silently losing the whole
+        // gameplay reaction.
+        if (!vrmRuntime_->HasExpression("joy") && vrmRuntime_->HasExpression("fun")) {
+            targets[1] = std::max(targets[1], targets[0]);
+            targets[0] = 0.0F;
+        }
+        if (!vrmRuntime_->HasExpression("fun") && vrmRuntime_->HasExpression("joy")) {
+            targets[0] = std::max(targets[0], targets[1]);
+            targets[1] = 0.0F;
+        }
+        if (!vrmRuntime_->HasExpression("angry") && vrmRuntime_->HasExpression("sorrow")) {
+            targets[3] = std::max(targets[3], targets[2] * 0.85F);
+            targets[2] = 0.0F;
+        }
+        if (!vrmRuntime_->HasExpression("sorrow") && vrmRuntime_->HasExpression("angry")) {
+            targets[2] = std::max(targets[2], targets[3] * 0.70F);
+            targets[3] = 0.0F;
+        }
+
+        constexpr float attackSeconds = 0.20F;
+        constexpr float releaseSeconds = 0.34F;
+        for (std::size_t index = 0; index < presets.size(); ++index) {
+            if (!vrmRuntime_->HasExpression(presets[index])) continue;
+            const auto target = std::clamp(targets[index], 0.0F, 1.0F);
+            const auto previous = expressionWeights_[index];
+            const auto maximumDelta = deltaTime /
+                (target > previous ? attackSeconds : releaseSeconds);
+            auto updated = previous + std::clamp(target - previous, -maximumDelta, maximumDelta);
+            if (std::abs(updated - target) < 0.002F) updated = target;
+            if (std::abs(updated - previous) < 0.008F && updated != 0.0F && updated != 1.0F) continue;
+            expressionWeights_[index] = updated;
+            vrmRuntime_->SetExpressionQuiet(presets[index], updated);
+        }
+    }
+
+    void UpdateBlink(float deltaTime) noexcept {
+        if (!vrmRuntime_ || !vrmRuntime_->HasExpression("blink")) return;
+        constexpr float closeSeconds = 0.055F;
+        constexpr float holdSeconds = 0.030F;
+        constexpr float openSeconds = 0.085F;
+        constexpr float totalSeconds = closeSeconds + holdSeconds + openSeconds;
+
+        float weight = 0.0F;
+        if (blinkElapsedSeconds_ >= 0.0F) {
+            blinkElapsedSeconds_ += deltaTime;
+            if (blinkElapsedSeconds_ < closeSeconds) {
+                weight = blinkElapsedSeconds_ / closeSeconds;
+            } else if (blinkElapsedSeconds_ < closeSeconds + holdSeconds) {
+                weight = 1.0F;
+            } else if (blinkElapsedSeconds_ < totalSeconds) {
+                weight = 1.0F -
+                    (blinkElapsedSeconds_ - closeSeconds - holdSeconds) / openSeconds;
+            } else {
+                blinkElapsedSeconds_ = -1.0F;
+                blinkCountdownSeconds_ = NextBlinkDelay();
+            }
+        } else {
+            if (blinkCountdownSeconds_ < 0.0F) blinkCountdownSeconds_ = NextBlinkDelay();
+            blinkCountdownSeconds_ -= deltaTime;
+            if (blinkCountdownSeconds_ <= 0.0F) {
+                blinkElapsedSeconds_ = 0.0F;
+                weight = 0.0F;
+            }
+        }
+
+        // Only touch Unity blend-shape state while a blink is changing. Idle
+        // frames incur the timer arithmetic above but no renderer writes.
+        if (std::abs(weight - lastBlinkWeight_) >= 0.02F ||
+            (weight == 0.0F && lastBlinkWeight_ != 0.0F) ||
+            (weight == 1.0F && lastBlinkWeight_ != 1.0F)) {
+            vrmRuntime_->SetExpressionQuiet("blink", weight);
+            lastBlinkWeight_ = weight;
+        }
+    }
+
+    void UpdateAutomaticExpressions(float deltaTime) noexcept {
+        if (!automaticExpressionsEnabled_ || !vrmRuntime_) return;
+        deltaTime = std::clamp(deltaTime, 0.0F, 0.10F);
+        RefreshGameplayExpressionSources(UnityEngine::Time::get_frameCount());
+
+        const auto inGameplay = IsAlive(comboController_) && comboController_->get_isActiveAndEnabled();
+        auto combo = 0;
+        bool missedThisFrame = false;
+        if (inGameplay) {
+            combo = std::max(comboController_->__cordl_internal_get__combo(), 0);
+            missedThisFrame = previousCombo_ > 0 && combo == 0;
+            previousCombo_ = combo;
+        } else {
+            previousCombo_ = -1;
+        }
+
+        bool failed = false;
+        float energy = 1.0F;
+        if (IsAlive(energyCounter_) && energyCounter_->get_isActiveAndEnabled()) {
+            energy = std::clamp(energyCounter_->get_energy(), 0.0F, 1.0F);
+            failed = energyCounter_->__cordl_internal_get__didReach0Energy() &&
+                !energyCounter_->__cordl_internal_get__noFail_k__BackingField();
+            // Once combo is already zero, another miss cannot be inferred from
+            // the combo transition. The accompanying energy drop provides a
+            // low-cost second signal so clustered misses can strengthen the
+            // frustration reaction without subscribing another managed event.
+            if (inGameplay && previousEnergy_ >= 0.0F &&
+                energy < previousEnergy_ - 0.008F && combo == 0) {
+                missedThisFrame = true;
+            }
+            previousEnergy_ = energy;
+        } else {
+            previousEnergy_ = -1.0F;
+        }
+
+        missRegistrationCooldownSeconds_ = std::max(0.0F, missRegistrationCooldownSeconds_ - deltaTime);
+        missBurstWindowSeconds_ = std::max(0.0F, missBurstWindowSeconds_ - deltaTime);
+        angryReactionSeconds_ = std::max(0.0F, angryReactionSeconds_ - deltaTime);
+        failureReactionSeconds_ = std::max(0.0F, failureReactionSeconds_ - deltaTime);
+        completionReactionSeconds_ = std::max(0.0F, completionReactionSeconds_ - deltaTime);
+        if (missedThisFrame && missRegistrationCooldownSeconds_ <= 0.0F && !failed) {
+            missBurstCount_ = missBurstWindowSeconds_ > 0.0F
+                ? std::min(missBurstCount_ + 1, 3)
+                : 1;
+            missBurstWindowSeconds_ = 2.25F;
+            missRegistrationCooldownSeconds_ = 0.16F;
+            angryReactionSeconds_ = 0.68F + 0.14F * static_cast<float>(missBurstCount_ - 1);
+        }
+
+        if (IsAlive(audioTimeSyncController_) && audioTimeSyncController_->get_isActiveAndEnabled()) {
+            const auto songLength = audioTimeSyncController_->get_songLength();
+            const auto songTime = audioTimeSyncController_->get_songTime();
+            // Recompute rather than latch this value so restarting after
+            // reaching the end cannot later be mistaken for a completion.
+            lastGameplayNearEnd_ = songLength > 1.0F && songTime >= songLength - 0.75F;
+        }
+        if (failed) {
+            lastGameplayFailed_ = true;
+            failureReactionSeconds_ = 2.5F;
+        }
+        if (wasInGameplay_ && !inGameplay) {
+            if (lastGameplayNearEnd_ && !lastGameplayFailed_) completionReactionSeconds_ = 2.4F;
+            lastGameplayNearEnd_ = false;
+            lastGameplayFailed_ = false;
+        } else if (!wasInGameplay_ && inGameplay) {
+            lastGameplayNearEnd_ = false;
+            lastGameplayFailed_ = false;
+        }
+        wasInGameplay_ = inGameplay;
+
+        // joy, fun, angry, sorrow. Blinking is intentionally evaluated in a
+        // separate channel below, so even a failure or miss never freezes the
+        // avatar's small facial motion.
+        std::array<float, 4> targets{};
+        if (failureReactionSeconds_ > 0.0F) {
+            targets[2] = 0.38F;
+            targets[3] = 0.92F;
+        } else if (completionReactionSeconds_ > 0.0F) {
+            targets[0] = 0.82F;
+            targets[1] = 0.30F;
+        } else if (angryReactionSeconds_ > 0.0F) {
+            targets[2] = 0.66F + 0.10F * static_cast<float>(std::max(missBurstCount_ - 1, 0));
+        } else if (inGameplay && energy < 0.28F) {
+            targets[3] = std::clamp((0.28F - energy) / 0.28F, 0.20F, 0.72F);
+        } else if (!inGameplay) {
+            // The menu face is intentionally subtle: it removes the unnerving
+            // blank stare without forcing a full open-mouth laugh expression.
+            targets[0] = 0.20F;
+        } else if (combo >= 14) {
+            targets[0] = 0.82F; // x8 multiplier: confident/happy
+        } else if (combo >= 6) {
+            targets[0] = 0.34F; // x4 multiplier: slight smile
+        }
+        // x1/x2 and a zero combo retain the avatar's authored focused face.
+        BlendExpressionTargets(targets, deltaTime);
+        UpdateBlink(deltaTime);
+    }
+
     bool SaberGripReady(int side) const noexcept {
-        return IsAlive(sabers_[side]) && sabers_[side]->get_isActiveAndEnabled() &&
-            IsAlive(saberGripTransforms_[side]);
+        if (!IsAlive(sabers_[side]) || !IsAlive(saberGripTransforms_[side])) return false;
+        auto objectReference = saberGripTransforms_[side]->get_gameObject();
+        auto* object = objectReference ? objectReference.ptr() : nullptr;
+        if (!IsAlive(object) || !object->get_activeInHierarchy()) return false;
+        // Resources can retain the prior scene's Saber hierarchy. A handle
+        // farther than a controller-length away is stale and must be replaced.
+        if (sample_.controllerHand[side].valid &&
+            Length(FromUnity(saberGripTransforms_[side]->get_position()) -
+                sample_.controllerHand[side].pose.position) > 0.45F) {
+            return false;
+        }
+        return true;
     }
 
     void RefreshSaberGripTransforms(std::int32_t frame) noexcept {
@@ -1283,13 +1599,27 @@ private:
         saberGripTransforms_[0] = nullptr;
         saberGripTransforms_[1] = nullptr;
         try {
+            std::array<float, 2> bestDistanceSquared{
+                std::numeric_limits<float>::infinity(),
+                std::numeric_limits<float>::infinity()};
             for (auto* saber : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::Saber*>()) {
-                if (!IsAlive(saber) || !saber->get_isActiveAndEnabled()) continue;
+                if (!IsAlive(saber)) continue;
                 const auto side = saber->get_saberType().value__;
-                if (side < 0 || side > 1 || SaberGripReady(side)) continue;
+                if (side < 0 || side > 1) continue;
                 auto handleReference = saber->__cordl_internal_get__handleTransform();
                 auto* handle = handleReference ? handleReference.ptr() : nullptr;
                 if (!IsAlive(handle)) continue;
+                auto objectReference = handle->get_gameObject();
+                auto* object = objectReference ? objectReference.ptr() : nullptr;
+                if (!IsAlive(object) || !object->get_activeInHierarchy()) continue;
+                float distanceSquared = 0.0F;
+                if (sample_.controllerHand[side].valid) {
+                    distanceSquared = LengthSquared(
+                        FromUnity(handle->get_position()) - sample_.controllerHand[side].pose.position);
+                    if (distanceSquared > 0.45F * 0.45F) continue;
+                }
+                if (distanceSquared >= bestDistanceSquared[side]) continue;
+                bestDistanceSquared[side] = distanceSquared;
                 sabers_[side] = saber;
                 saberGripTransforms_[side] = handle;
             }
@@ -1479,6 +1809,9 @@ private:
     GlobalNamespace::VRController* handControllers_[2]{};
     GlobalNamespace::Saber* sabers_[2]{};
     UnityEngine::Transform* saberGripTransforms_[2]{};
+    GlobalNamespace::ComboController* comboController_ = nullptr;
+    GlobalNamespace::GameEnergyCounter* energyCounter_ = nullptr;
+    GlobalNamespace::AudioTimeSyncController* audioTimeSyncController_ = nullptr;
     UnityEngine::Transform* originTransform_ = nullptr;
     AvatarCalibration calibration_{};
     PlayerCalibration player_{};
@@ -1502,6 +1835,24 @@ private:
     std::unique_ptr<vrm::VrmUnityRuntime> vrmRuntime_;
     std::int32_t nextTrackingDiscoveryFrame_ = 0;
     std::int32_t nextSaberDiscoveryFrame_ = 0;
+    std::int32_t nextExpressionSourceDiscoveryFrame_ = 0;
+    std::array<float, 4> expressionWeights_{};
+    float blinkCountdownSeconds_ = -1.0F;
+    float blinkElapsedSeconds_ = -1.0F;
+    float lastBlinkWeight_ = -1.0F;
+    float angryReactionSeconds_ = 0.0F;
+    float missBurstWindowSeconds_ = 0.0F;
+    float missRegistrationCooldownSeconds_ = 0.0F;
+    float failureReactionSeconds_ = 0.0F;
+    float completionReactionSeconds_ = 0.0F;
+    float previousEnergy_ = -1.0F;
+    std::uint32_t expressionRandomState_ = 0x6D2B79F5U;
+    int previousCombo_ = -1;
+    int missBurstCount_ = 0;
+    bool automaticExpressionsEnabled_ = true;
+    bool wasInGameplay_ = false;
+    bool lastGameplayNearEnd_ = false;
+    bool lastGameplayFailed_ = false;
     bool animatorWasEnabled_ = false;
     bool bound_ = false;
     bool started_ = false;
