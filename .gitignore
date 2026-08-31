@@ -44,3 +44,7 @@ tools/avatar-shader/Temp/
 tools/avatar-shader/obj/
 tools/avatar-shader/Build/
 tools/avatar-shader/UserSettings/
+
+# PC-only IK observation tool build output. Keep source and presets, never local binaries.
+tools/pc-pose-analyzer/bin/
+tools/pc-pose-analyzer/obj/

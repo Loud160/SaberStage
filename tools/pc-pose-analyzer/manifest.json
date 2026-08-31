@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/bsmg/BSIPA-MetadataFileSchema/master/Schema.json",
+  "id": "SaberStage.PcPoseAnalyzer",
+  "name": "SaberStage PC Pose Analyzer",
+  "author": "Loud160 (AKA Whisp)",
+  "version": "0.1.0",
+  "description": "PC-only black-box avatar pose and calibration analyzer for SaberStage development.",
+  "gameVersion": "1.37.1",
+  "dependsOn": {
+    "BSIPA": "^4.3.0",
+    "CustomAvatar": "^5.4.1"
+  }
+}
