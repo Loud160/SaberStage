@@ -152,11 +152,13 @@ PlayerCalibration BuildPlayer(const TrackingSample& tracking) {
 void TestCalibration() {
     const auto calibration = BuildAvatar();
     Check(Near(calibration.eyeHeight, 1.66F), "eye height is measured from eye bones to toe floor");
-    Check(Near(calibration.shoulderWidth, 0.32F), "shoulder width is measured");
+    Check(Near(calibration.shoulderWidth, 0.48F),
+          "shoulder-joint width includes the clavicle reach to both upper arms");
     Check(calibration.spineSegmentCount == 5, "all mapped spine segments are measured");
     Check(calibration.upperArmLength[0] > 0.25F, "upper arm length is measured");
     Check(calibration.footLength[0] > 0.18F, "toe length is measured when available");
-    Check(calibration.approximateArmSpan > 1.25F, "avatar arm span is measured independently from eye-height scale");
+    Check(calibration.approximateArmSpan > 1.40F,
+          "avatar arm span includes shoulder-joint separation and both complete arm chains");
 
     const auto explicitEye = BuildAvatar(Pose{{0.0F, 1.72F, 0.08F}, {}}, false);
     Check(Near(explicitEye.eyePosition.y, 1.72F) && Near(explicitEye.eyePosition.z, 0.08F),
@@ -242,8 +244,8 @@ void TestUpperBodyRegressionAndAllocations() {
           "head rotation follows the calibrated HMD delta exactly");
     const auto headDelta = Multiply(turnedHead.head.pose.rotation, Inverse(player.neutralHead.rotation));
     const Pose expectedHead{
-        turnedHead.head.pose.position + Rotate(
-            headDelta, neutralSolvedHead.position - player.neutralHead.position),
+        neutralSolvedHead.position +
+            (turnedHead.head.pose.position - player.neutralHead.position),
         Multiply(headDelta, neutralSolvedHead.rotation),
     };
     Check(Length(pose.bones[BoneIndex(HumanoidBone::Head)].position - expectedHead.position) < 0.0001F &&
@@ -280,6 +282,66 @@ void TestUpperBodyRegressionAndAllocations() {
     Check(Dot(previousLeftElbowPole, state.previousElbowPole[0]) > 0.0F &&
           Dot(previousRightElbowPole, state.previousElbowPole[1]) > 0.0F,
           "elbow history preserves bend hemispheres across dynamic body updates");
+}
+
+void TestArmSpanScalingAndHeightRetargeting() {
+    const auto avatar = BuildAvatar();
+    const auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    calibration::RuntimePlayerProfile profile{};
+    profile.valid = true;
+    profile.playerArmSpan = avatar.approximateArmSpan * 0.90F;
+    profile.playerArmSpanConfidence = 0.90F;
+
+    const auto natural = ComputeAvatarRetargeting(avatar, player, profile, false, 0.0F);
+    Check(natural.valid && natural.armSpanBased && Near(natural.uniformScale, 0.90F),
+          "trusted T-pose arm span selects the uniform base scale");
+    Check(!natural.heightCorrectionApplied &&
+              natural.finalEyeHeight < player.standingHmdHeight - 0.05F,
+          "height matching off preserves the arm-scaled avatar's natural height");
+    SolvedHumanoidPose naturalPose{};
+    Check(BuildRetargetedNeutralPose(avatar, player, natural, naturalPose),
+          "arm-span neutral pose is reconstructed");
+    const auto naturalFloor = std::min(
+        naturalPose.bones[BoneIndex(HumanoidBone::LeftToes)].position.y,
+        naturalPose.bones[BoneIndex(HumanoidBone::RightToes)].position.y);
+    Check(Near(naturalFloor, player.floorHeight, 0.001F),
+          "arm-span neutral pose keeps both feet on the tracking floor");
+
+    const auto legs = ComputeAvatarRetargeting(avatar, player, profile, true, -1.0F);
+    const auto even = ComputeAvatarRetargeting(avatar, player, profile, true, 0.0F);
+    const auto torso = ComputeAvatarRetargeting(avatar, player, profile, true, 1.0F);
+    Check(legs.heightCorrectionApplied && even.heightCorrectionApplied &&
+              torso.heightCorrectionApplied,
+          "height matching applies bounded vertical skeletal correction");
+    Check(std::abs(even.residualHeightError) < 0.01F &&
+              std::abs(legs.residualHeightError) < 0.01F &&
+              std::abs(torso.residualHeightError) < 0.01F,
+          "all balance positions reach the same requested eye height");
+    Check(legs.lowerBodyScale > torso.lowerBodyScale &&
+              torso.torsoScale > legs.torsoScale,
+          "slider left favours legs and slider right favours torso");
+    Check(Near(legs.uniformScale, torso.uniformScale) &&
+              Near(legs.uniformScale, even.uniformScale),
+          "height balance never changes arm-span scale");
+
+    StaticTrackerlessAvatarSolver solver{};
+    Check(solver.SetRetargetingSettings(true, 0.0F) &&
+              solver.SetRetargetingSettings(false, 0.0F),
+          "retarget setting changes are reported for solver reseeding");
+    SolverPersistentState state{};
+    SolvedHumanoidPose first{};
+    SolverDiagnostics diagnostics{};
+    Check(solver.Solve(tracking, avatar, player, profile, state, first, &diagnostics),
+          "arm-span-scaled runtime pose solves");
+    auto moved = NextFrame(tracking, tracking.head.pose.position + Vec3{0.08F, -0.04F, 0.03F});
+    SolvedHumanoidPose second{};
+    Check(solver.Solve(moved, avatar, player, profile, state, second, &diagnostics),
+          "relative-head retargeted pose solves");
+    const auto headMotion = second.bones[BoneIndex(HumanoidBone::Head)].position -
+        first.bones[BoneIndex(HumanoidBone::Head)].position;
+    Check(Length(headMotion - Vec3{0.08F, -0.04F, 0.03F}) < 0.001F,
+          "HMD motion is applied relative to the calibrated neutral avatar head");
 }
 
 calibration::RuntimePlayerProfile BuildRuntimePlayerProfile() {
@@ -589,7 +651,7 @@ void TestArmReachBendAndGripAuthority() {
           "cross-body hand retains authority while the elbow selects a bent plane");
 
     tracking = NextFrame(tracking, tracking.head.pose.position);
-    tracking.leftHand.pose.position = {-0.72F, 1.40F, 0.12F};
+    tracking.leftHand.pose.position = {-0.74F, 1.40F, 0.12F};
     Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "near-full arm extension solves");
     if (!(diagnostics.armReachRatio[0] > 0.80F && diagnostics.handTargetError[0] < 0.001F)) {
         std::cerr << "near-full reachRatio=" << diagnostics.armReachRatio[0]
@@ -1249,6 +1311,7 @@ void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); 
 
 int main() {
     TestCalibration();
+    TestArmSpanScalingAndHeightRetargeting();
     TestTwoBone();
     TestFabrik();
     TestUpperBodyRegressionAndAllocations();

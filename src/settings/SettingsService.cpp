@@ -134,6 +134,183 @@ void AddAvatarControllerOffset(
     object.AddMember(Value(name, allocator), value, allocator);
 }
 
+void DecodeAvatarSettings(
+    const Value& avatar,
+    AvatarSettings& settings,
+    bool& repaired) {
+    if (!avatar.IsObject()) {
+        repaired = true;
+        return;
+    }
+    settings.enabled = Bool(avatar, "enabled", settings.enabled, repaired);
+    settings.visible = Bool(avatar, "visible", settings.visible, repaired);
+    settings.selectedPath = String(avatar, "selectedPath", settings.selectedPath, repaired);
+    settings.selectedFile = String(avatar, "selectedFile", settings.selectedFile, repaired);
+    settings.maximumTextureDimension = Int(
+        avatar, "maximumTextureDimension", settings.maximumTextureDimension, repaired);
+    settings.qualityPreset = EnumValue(
+        avatar, "qualityPreset", settings.qualityPreset,
+        [](std::string_view value, AvatarQualityPreset& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.toonLighting = Bool(avatar, "toonLighting", settings.toonLighting, repaired);
+    settings.normalMaps = Bool(avatar, "normalMaps", settings.normalMaps, repaired);
+    settings.rimLighting = Bool(avatar, "rimLighting", settings.rimLighting, repaired);
+    settings.matcap = Bool(avatar, "matcap", settings.matcap, repaired);
+    settings.emission = Bool(avatar, "emission", settings.emission, repaired);
+    settings.animatedExpressions = Bool(
+        avatar, "animatedExpressions", settings.animatedExpressions, repaired);
+    settings.outlines = EnumValue(
+        avatar, "outlines", settings.outlines,
+        [](std::string_view value, AvatarOutlineMode& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.materialStage = EnumValue(
+        avatar, "materialStage", settings.materialStage,
+        [](std::string_view value, AvatarMaterialStage& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.lightingMode = EnumValue(
+        avatar, "lightingMode", settings.lightingMode,
+        [](std::string_view value, AvatarLightingMode& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.springBones = Bool(avatar, "springBones", settings.springBones, repaired);
+    settings.springBoneQuality = EnumValue(
+        avatar, "springBoneQuality", settings.springBoneQuality,
+        [](std::string_view value, SpringBoneQuality& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.springCollisions = EnumValue(
+        avatar, "springCollisions", settings.springCollisions,
+        [](std::string_view value, SpringCollisionQuality& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.springUpdateRateHz = Int(
+        avatar, "springUpdateRateHz", settings.springUpdateRateHz, repaired);
+    settings.springSubsteps = Int(avatar, "springSubsteps", settings.springSubsteps, repaired);
+    settings.maximumSpringChains = Int(
+        avatar, "maximumSpringChains", settings.maximumSpringChains, repaired);
+    settings.maximumSpringJoints = Int(
+        avatar, "maximumSpringJoints", settings.maximumSpringJoints, repaired);
+    settings.sideStepLeanLimitPercent = Float(
+        avatar, "sideStepLeanLimitPercent", settings.sideStepLeanLimitPercent, repaired);
+    settings.plantedLegLeanLimitPercent = Float(
+        avatar, "plantedLegLeanLimitPercent", settings.plantedLegLeanLimitPercent, repaired);
+    settings.stanceWidthPercent = Float(
+        avatar, "stanceWidthPercent", settings.stanceWidthPercent, repaired);
+    settings.backwardSpineCurveLimitPercent = Float(
+        avatar, "backwardSpineCurveLimitPercent", settings.backwardSpineCurveLimitPercent, repaired);
+    if (const auto* retargeting = Member(avatar, "retargetingProfiles")) {
+        if (!retargeting->IsArray()) {
+            repaired = true;
+        } else {
+            settings.retargetingProfiles.clear();
+            settings.retargetingProfiles.reserve(retargeting->Size());
+            for (const auto& value : retargeting->GetArray()) {
+                if (!value.IsObject()) {
+                    repaired = true;
+                    continue;
+                }
+                AvatarRetargetingSettings profile{};
+                profile.avatarKey = String(value, "avatarKey", {}, repaired);
+                profile.matchPlayerHeight = Bool(
+                    value, "matchPlayerHeight", profile.matchPlayerHeight, repaired);
+                profile.heightAdjustmentBalance = Float(
+                    value, "heightAdjustmentBalance", profile.heightAdjustmentBalance, repaired);
+                settings.retargetingProfiles.push_back(std::move(profile));
+            }
+        }
+    }
+    settings.leftControllerToWrist = AvatarControllerOffset(
+        avatar, "leftControllerToWrist", settings.leftControllerToWrist, repaired);
+    settings.rightControllerToWrist = AvatarControllerOffset(
+        avatar, "rightControllerToWrist", settings.rightControllerToWrist, repaired);
+    settings.wearAvatar = Bool(avatar, "wearAvatar", settings.wearAvatar, repaired);
+    settings.wearHideFace = Bool(avatar, "wearHideFace", settings.wearHideFace, repaired);
+    settings.wearHideHair = Bool(avatar, "wearHideHair", settings.wearHideHair, repaired);
+    settings.wearHideNeckAccessories = Bool(
+        avatar, "wearHideNeckAccessories", settings.wearHideNeckAccessories, repaired);
+    if (const auto* legacyCoverage = Member(avatar, "wearCoverage");
+        legacyCoverage && legacyCoverage->IsString() && !Member(avatar, "wearHideFace")) {
+        const std::string coverage(legacyCoverage->GetString(), legacyCoverage->GetStringLength());
+        settings.wearHideFace = true;
+        settings.wearHideHair = coverage == "hide_hair" || coverage == "body_only";
+        settings.wearHideNeckAccessories = coverage == "body_only";
+        repaired = true;
+    }
+    settings.standinEnabled = Bool(avatar, "standinEnabled", settings.standinEnabled, repaired);
+    settings.standinVisibility = EnumValue(
+        avatar, "standinVisibility", settings.standinVisibility,
+        [](std::string_view value, AvatarStandinVisibility& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.standinScale = Float(avatar, "standinScale", settings.standinScale, repaired);
+    settings.standinCount = Int(avatar, "standinCount", settings.standinCount, repaired);
+    settings.standinShowSabers = Bool(
+        avatar, "standinShowSabers", settings.standinShowSabers, repaired);
+    settings.standinShowPointers = Bool(
+        avatar, "standinShowPointers", settings.standinShowPointers, repaired);
+    settings.standinPosition = Vector(
+        avatar, "standinPosition", settings.standinPosition, repaired);
+    settings.standinYawDegrees = Float(
+        avatar, "standinYawDegrees", settings.standinYawDegrees, repaired);
+    settings.standinPosition2 = Vector(
+        avatar, "standinPosition2", settings.standinPosition2, repaired);
+    settings.standinYawDegrees2 = Float(
+        avatar, "standinYawDegrees2", settings.standinYawDegrees2, repaired);
+    settings.standinPosition3 = Vector(
+        avatar, "standinPosition3", settings.standinPosition3, repaired);
+    settings.standinYawDegrees3 = Float(
+        avatar, "standinYawDegrees3", settings.standinYawDegrees3, repaired);
+}
+
+Value EncodeAvatarSettings(
+    const AvatarSettings& settings,
+    Document::AllocatorType& allocator) {
+    Value avatar(rapidjson::kObjectType);
+    avatar.AddMember("enabled", settings.enabled, allocator);
+    avatar.AddMember("visible", settings.visible, allocator);
+    avatar.AddMember("selectedPath", Value(settings.selectedPath.c_str(), allocator), allocator);
+    avatar.AddMember("selectedFile", Value(settings.selectedFile.c_str(), allocator), allocator);
+    avatar.AddMember("maximumTextureDimension", settings.maximumTextureDimension, allocator);
+    avatar.AddMember("qualityPreset", Value(ToString(settings.qualityPreset).data(), allocator), allocator);
+    avatar.AddMember("toonLighting", settings.toonLighting, allocator);
+    avatar.AddMember("normalMaps", settings.normalMaps, allocator);
+    avatar.AddMember("rimLighting", settings.rimLighting, allocator);
+    avatar.AddMember("matcap", settings.matcap, allocator);
+    avatar.AddMember("emission", settings.emission, allocator);
+    avatar.AddMember("animatedExpressions", settings.animatedExpressions, allocator);
+    avatar.AddMember("outlines", Value(ToString(settings.outlines).data(), allocator), allocator);
+    avatar.AddMember("materialStage", Value(ToString(settings.materialStage).data(), allocator), allocator);
+    avatar.AddMember("lightingMode", Value(ToString(settings.lightingMode).data(), allocator), allocator);
+    avatar.AddMember("springBones", settings.springBones, allocator);
+    avatar.AddMember("springBoneQuality", Value(ToString(settings.springBoneQuality).data(), allocator), allocator);
+    avatar.AddMember("springCollisions", Value(ToString(settings.springCollisions).data(), allocator), allocator);
+    avatar.AddMember("springUpdateRateHz", settings.springUpdateRateHz, allocator);
+    avatar.AddMember("springSubsteps", settings.springSubsteps, allocator);
+    avatar.AddMember("maximumSpringChains", settings.maximumSpringChains, allocator);
+    avatar.AddMember("maximumSpringJoints", settings.maximumSpringJoints, allocator);
+    avatar.AddMember("sideStepLeanLimitPercent", settings.sideStepLeanLimitPercent, allocator);
+    avatar.AddMember("plantedLegLeanLimitPercent", settings.plantedLegLeanLimitPercent, allocator);
+    avatar.AddMember("stanceWidthPercent", settings.stanceWidthPercent, allocator);
+    avatar.AddMember("backwardSpineCurveLimitPercent", settings.backwardSpineCurveLimitPercent, allocator);
+    Value retargetingProfiles(rapidjson::kArrayType);
+    for (const auto& profile : settings.retargetingProfiles) {
+        Value value(rapidjson::kObjectType);
+        value.AddMember("avatarKey", Value(profile.avatarKey.c_str(), allocator), allocator);
+        value.AddMember("matchPlayerHeight", profile.matchPlayerHeight, allocator);
+        value.AddMember("heightAdjustmentBalance", profile.heightAdjustmentBalance, allocator);
+        retargetingProfiles.PushBack(value, allocator);
+    }
+    avatar.AddMember("retargetingProfiles", retargetingProfiles, allocator);
+    AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.leftControllerToWrist, allocator);
+    AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.rightControllerToWrist, allocator);
+    avatar.AddMember("wearAvatar", settings.wearAvatar, allocator);
+    avatar.AddMember("wearHideFace", settings.wearHideFace, allocator);
+    avatar.AddMember("wearHideHair", settings.wearHideHair, allocator);
+    avatar.AddMember("wearHideNeckAccessories", settings.wearHideNeckAccessories, allocator);
+    avatar.AddMember("standinEnabled", settings.standinEnabled, allocator);
+    avatar.AddMember("standinVisibility", Value(ToString(settings.standinVisibility).data(), allocator), allocator);
+    avatar.AddMember("standinScale", settings.standinScale, allocator);
+    avatar.AddMember("standinCount", settings.standinCount, allocator);
+    avatar.AddMember("standinShowSabers", settings.standinShowSabers, allocator);
+    avatar.AddMember("standinShowPointers", settings.standinShowPointers, allocator);
+    AddVector(avatar, "standinPosition", settings.standinPosition, allocator);
+    avatar.AddMember("standinYawDegrees", settings.standinYawDegrees, allocator);
+    AddVector(avatar, "standinPosition2", settings.standinPosition2, allocator);
+    avatar.AddMember("standinYawDegrees2", settings.standinYawDegrees2, allocator);
+    AddVector(avatar, "standinPosition3", settings.standinPosition3, allocator);
+    avatar.AddMember("standinYawDegrees3", settings.standinYawDegrees3, allocator);
+    return avatar;
+}
+
 void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bool& repaired) {
     profile.profileId = String(source, "profileId", profile.profileId, repaired);
     profile.displayName = String(source, "displayName", profile.displayName, repaired);
@@ -336,100 +513,44 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
     }
     settings.companion = Feature(document, "companion", settings.companion, repaired);
     if (const auto* avatar = Member(document, "avatar")) {
-        if (!avatar->IsObject()) repaired = true;
-        else {
-            settings.avatar.enabled = Bool(*avatar, "enabled", settings.avatar.enabled, repaired);
-            settings.avatar.visible = Bool(*avatar, "visible", settings.avatar.visible, repaired);
-            settings.avatar.selectedPath = String(*avatar, "selectedPath", settings.avatar.selectedPath, repaired);
-            settings.avatar.selectedFile = String(*avatar, "selectedFile", settings.avatar.selectedFile, repaired);
-            settings.avatar.maximumTextureDimension = Int(
-                *avatar, "maximumTextureDimension", settings.avatar.maximumTextureDimension, repaired);
-            settings.avatar.qualityPreset = EnumValue(
-                *avatar, "qualityPreset", settings.avatar.qualityPreset,
-                [](std::string_view value, AvatarQualityPreset& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.toonLighting = Bool(*avatar, "toonLighting", settings.avatar.toonLighting, repaired);
-            settings.avatar.normalMaps = Bool(*avatar, "normalMaps", settings.avatar.normalMaps, repaired);
-            settings.avatar.rimLighting = Bool(*avatar, "rimLighting", settings.avatar.rimLighting, repaired);
-            settings.avatar.matcap = Bool(*avatar, "matcap", settings.avatar.matcap, repaired);
-            settings.avatar.emission = Bool(*avatar, "emission", settings.avatar.emission, repaired);
-            settings.avatar.animatedExpressions = Bool(
-                *avatar, "animatedExpressions", settings.avatar.animatedExpressions, repaired);
-            settings.avatar.outlines = EnumValue(
-                *avatar, "outlines", settings.avatar.outlines,
-                [](std::string_view value, AvatarOutlineMode& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.materialStage = EnumValue(
-                *avatar, "materialStage", settings.avatar.materialStage,
-                [](std::string_view value, AvatarMaterialStage& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.lightingMode = EnumValue(
-                *avatar, "lightingMode", settings.avatar.lightingMode,
-                [](std::string_view value, AvatarLightingMode& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.springBones = Bool(*avatar, "springBones", settings.avatar.springBones, repaired);
-            settings.avatar.springBoneQuality = EnumValue(
-                *avatar, "springBoneQuality", settings.avatar.springBoneQuality,
-                [](std::string_view value, SpringBoneQuality& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.springCollisions = EnumValue(
-                *avatar, "springCollisions", settings.avatar.springCollisions,
-                [](std::string_view value, SpringCollisionQuality& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.springUpdateRateHz = Int(
-                *avatar, "springUpdateRateHz", settings.avatar.springUpdateRateHz, repaired);
-            settings.avatar.springSubsteps = Int(
-                *avatar, "springSubsteps", settings.avatar.springSubsteps, repaired);
-            settings.avatar.maximumSpringChains = Int(
-                *avatar, "maximumSpringChains", settings.avatar.maximumSpringChains, repaired);
-            settings.avatar.maximumSpringJoints = Int(
-                *avatar, "maximumSpringJoints", settings.avatar.maximumSpringJoints, repaired);
-            settings.avatar.sideStepLeanLimitPercent = Float(
-                *avatar, "sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, repaired);
-            settings.avatar.plantedLegLeanLimitPercent = Float(
-                *avatar, "plantedLegLeanLimitPercent", settings.avatar.plantedLegLeanLimitPercent, repaired);
-            settings.avatar.stanceWidthPercent = Float(
-                *avatar, "stanceWidthPercent", settings.avatar.stanceWidthPercent, repaired);
-            settings.avatar.backwardSpineCurveLimitPercent = Float(
-                *avatar, "backwardSpineCurveLimitPercent", settings.avatar.backwardSpineCurveLimitPercent, repaired);
-            settings.avatar.leftControllerToWrist = AvatarControllerOffset(
-                *avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, repaired);
-            settings.avatar.rightControllerToWrist = AvatarControllerOffset(
-                *avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, repaired);
-            settings.avatar.wearAvatar = Bool(*avatar, "wearAvatar", settings.avatar.wearAvatar, repaired);
-            settings.avatar.wearHideFace = Bool(*avatar, "wearHideFace", settings.avatar.wearHideFace, repaired);
-            settings.avatar.wearHideHair = Bool(*avatar, "wearHideHair", settings.avatar.wearHideHair, repaired);
-            settings.avatar.wearHideNeckAccessories = Bool(
-                *avatar, "wearHideNeckAccessories", settings.avatar.wearHideNeckAccessories, repaired);
-            // Migrate the earlier tiered wearCoverage key into the independent
-            // hide switches (only when the new keys are absent, so a file that
-            // has both keeps the explicit new values).
-            if (const auto* legacyCoverage = Member(*avatar, "wearCoverage");
-                legacyCoverage && legacyCoverage->IsString() && !Member(*avatar, "wearHideFace")) {
-                const std::string coverage(legacyCoverage->GetString(), legacyCoverage->GetStringLength());
-                settings.avatar.wearHideFace = true;
-                settings.avatar.wearHideHair = coverage == "hide_hair" || coverage == "body_only";
-                settings.avatar.wearHideNeckAccessories = coverage == "body_only";
+        DecodeAvatarSettings(*avatar, settings.avatar, repaired);
+    }
+
+    const auto* avatarProfiles = Member(document, "avatarPlayerProfiles");
+    if (avatarProfiles == nullptr) {
+        // Schema 13 and earlier stored one global Avatar configuration. Make
+        // that exact configuration the default player's snapshot so updating
+        // does not change the selected avatar or any existing calibration UI.
+        settings.activeAvatarPlayerProfileId = "default";
+        settings.avatarPlayerProfiles = {{
+            .id = "default",
+            .displayName = "Default",
+            .avatar = settings.avatar}};
+    } else if (!avatarProfiles->IsArray()) {
+        repaired = true;
+        settings.avatarPlayerProfiles.clear();
+    } else {
+        settings.activeAvatarPlayerProfileId = String(
+            document,
+            "activeAvatarPlayerProfileId",
+            settings.activeAvatarPlayerProfileId,
+            repaired);
+        settings.avatarPlayerProfiles.clear();
+        settings.avatarPlayerProfiles.reserve(avatarProfiles->Size());
+        for (const auto& value : avatarProfiles->GetArray()) {
+            if (!value.IsObject()) {
+                repaired = true;
+                continue;
+            }
+            AvatarPlayerProfile profile{};
+            profile.id = String(value, "id", {}, repaired);
+            profile.displayName = String(value, "displayName", {}, repaired);
+            if (const auto* profileAvatar = Member(value, "avatar")) {
+                DecodeAvatarSettings(*profileAvatar, profile.avatar, repaired);
+            } else {
                 repaired = true;
             }
-            settings.avatar.standinEnabled = Bool(*avatar, "standinEnabled", settings.avatar.standinEnabled, repaired);
-            settings.avatar.standinVisibility = EnumValue(
-                *avatar, "standinVisibility", settings.avatar.standinVisibility,
-                [](std::string_view value, AvatarStandinVisibility& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.avatar.standinScale = Float(
-                *avatar, "standinScale", settings.avatar.standinScale, repaired);
-            settings.avatar.standinCount = Int(
-                *avatar, "standinCount", settings.avatar.standinCount, repaired);
-            settings.avatar.standinShowSabers = Bool(
-                *avatar, "standinShowSabers", settings.avatar.standinShowSabers, repaired);
-            settings.avatar.standinShowPointers = Bool(
-                *avatar, "standinShowPointers", settings.avatar.standinShowPointers, repaired);
-            settings.avatar.standinPosition = Vector(
-                *avatar, "standinPosition", settings.avatar.standinPosition, repaired);
-            settings.avatar.standinYawDegrees = Float(
-                *avatar, "standinYawDegrees", settings.avatar.standinYawDegrees, repaired);
-            settings.avatar.standinPosition2 = Vector(
-                *avatar, "standinPosition2", settings.avatar.standinPosition2, repaired);
-            settings.avatar.standinYawDegrees2 = Float(
-                *avatar, "standinYawDegrees2", settings.avatar.standinYawDegrees2, repaired);
-            settings.avatar.standinPosition3 = Vector(
-                *avatar, "standinPosition3", settings.avatar.standinPosition3, repaired);
-            settings.avatar.standinYawDegrees3 = Float(
-                *avatar, "standinYawDegrees3", settings.avatar.standinYawDegrees3, repaired);
+            settings.avatarPlayerProfiles.push_back(std::move(profile));
         }
     }
     settings.scenes = Feature(document, "scenes", settings.scenes, repaired);
@@ -511,52 +632,21 @@ std::string Encode(const SettingsDocument& settings) {
     document.AddMember("recording", recording, allocator);
 
     AddFeature(document, "companion", settings.companion, allocator);
-    Value avatar(rapidjson::kObjectType);
-    avatar.AddMember("enabled", settings.avatar.enabled, allocator);
-    avatar.AddMember("visible", settings.avatar.visible, allocator);
-    avatar.AddMember("selectedPath", Value(settings.avatar.selectedPath.c_str(), allocator), allocator);
-    avatar.AddMember("selectedFile", Value(settings.avatar.selectedFile.c_str(), allocator), allocator);
-    avatar.AddMember("maximumTextureDimension", settings.avatar.maximumTextureDimension, allocator);
-    avatar.AddMember("qualityPreset", Value(ToString(settings.avatar.qualityPreset).data(), allocator), allocator);
-    avatar.AddMember("toonLighting", settings.avatar.toonLighting, allocator);
-    avatar.AddMember("normalMaps", settings.avatar.normalMaps, allocator);
-    avatar.AddMember("rimLighting", settings.avatar.rimLighting, allocator);
-    avatar.AddMember("matcap", settings.avatar.matcap, allocator);
-    avatar.AddMember("emission", settings.avatar.emission, allocator);
-    avatar.AddMember("animatedExpressions", settings.avatar.animatedExpressions, allocator);
-    avatar.AddMember("outlines", Value(ToString(settings.avatar.outlines).data(), allocator), allocator);
-    avatar.AddMember("materialStage", Value(ToString(settings.avatar.materialStage).data(), allocator), allocator);
-    avatar.AddMember("lightingMode", Value(ToString(settings.avatar.lightingMode).data(), allocator), allocator);
-    avatar.AddMember("springBones", settings.avatar.springBones, allocator);
-    avatar.AddMember("springBoneQuality", Value(ToString(settings.avatar.springBoneQuality).data(), allocator), allocator);
-    avatar.AddMember("springCollisions", Value(ToString(settings.avatar.springCollisions).data(), allocator), allocator);
-    avatar.AddMember("springUpdateRateHz", settings.avatar.springUpdateRateHz, allocator);
-    avatar.AddMember("springSubsteps", settings.avatar.springSubsteps, allocator);
-    avatar.AddMember("maximumSpringChains", settings.avatar.maximumSpringChains, allocator);
-    avatar.AddMember("maximumSpringJoints", settings.avatar.maximumSpringJoints, allocator);
-    avatar.AddMember("sideStepLeanLimitPercent", settings.avatar.sideStepLeanLimitPercent, allocator);
-    avatar.AddMember("plantedLegLeanLimitPercent", settings.avatar.plantedLegLeanLimitPercent, allocator);
-    avatar.AddMember("stanceWidthPercent", settings.avatar.stanceWidthPercent, allocator);
-    avatar.AddMember("backwardSpineCurveLimitPercent", settings.avatar.backwardSpineCurveLimitPercent, allocator);
-    AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, allocator);
-    AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
-    avatar.AddMember("wearAvatar", settings.avatar.wearAvatar, allocator);
-    avatar.AddMember("wearHideFace", settings.avatar.wearHideFace, allocator);
-    avatar.AddMember("wearHideHair", settings.avatar.wearHideHair, allocator);
-    avatar.AddMember("wearHideNeckAccessories", settings.avatar.wearHideNeckAccessories, allocator);
-    avatar.AddMember("standinEnabled", settings.avatar.standinEnabled, allocator);
-    avatar.AddMember("standinVisibility", Value(ToString(settings.avatar.standinVisibility).data(), allocator), allocator);
-    avatar.AddMember("standinScale", settings.avatar.standinScale, allocator);
-    avatar.AddMember("standinCount", settings.avatar.standinCount, allocator);
-    avatar.AddMember("standinShowSabers", settings.avatar.standinShowSabers, allocator);
-    avatar.AddMember("standinShowPointers", settings.avatar.standinShowPointers, allocator);
-    AddVector(avatar, "standinPosition", settings.avatar.standinPosition, allocator);
-    avatar.AddMember("standinYawDegrees", settings.avatar.standinYawDegrees, allocator);
-    AddVector(avatar, "standinPosition2", settings.avatar.standinPosition2, allocator);
-    avatar.AddMember("standinYawDegrees2", settings.avatar.standinYawDegrees2, allocator);
-    AddVector(avatar, "standinPosition3", settings.avatar.standinPosition3, allocator);
-    avatar.AddMember("standinYawDegrees3", settings.avatar.standinYawDegrees3, allocator);
-    document.AddMember("avatar", avatar, allocator);
+    document.AddMember("avatar", EncodeAvatarSettings(settings.avatar, allocator), allocator);
+
+    document.AddMember(
+        "activeAvatarPlayerProfileId",
+        Value(settings.activeAvatarPlayerProfileId.c_str(), allocator),
+        allocator);
+    Value avatarPlayerProfiles(rapidjson::kArrayType);
+    for (const auto& profile : settings.avatarPlayerProfiles) {
+        Value value(rapidjson::kObjectType);
+        value.AddMember("id", Value(profile.id.c_str(), allocator), allocator);
+        value.AddMember("displayName", Value(profile.displayName.c_str(), allocator), allocator);
+        value.AddMember("avatar", EncodeAvatarSettings(profile.avatar, allocator), allocator);
+        avatarPlayerProfiles.PushBack(value, allocator);
+    }
+    document.AddMember("avatarPlayerProfiles", avatarPlayerProfiles, allocator);
     AddFeature(document, "scenes", settings.scenes, allocator);
     Value broadcast(rapidjson::kObjectType);
     broadcast.AddMember("enabled", settings.broadcast.enabled, allocator);
@@ -624,7 +714,11 @@ LoadResult SettingsService::Load() {
     return result;
 }
 
-bool SettingsService::Save(std::string* error) const {
+bool SettingsService::Save(std::string* error) {
+    // Avatar settings are edited through the established active working copy.
+    // Snapshot it immediately before every save so new and existing call sites
+    // cannot accidentally persist a stale player profile.
+    SyncActiveAvatarPlayerProfile(settings_);
     std::error_code ec;
     std::filesystem::create_directories(path_.parent_path(), ec);
     if (ec) {

@@ -34,6 +34,7 @@ public:
     explicit PlayerCalibrationSession(std::filesystem::path profilePath);
 
     ProfileLoadResult Load() noexcept;
+    ProfileLoadResult SwitchProfilePath(std::filesystem::path profilePath) noexcept;
     bool Prepare(CalibrationMode mode, std::string* error = nullptr) noexcept;
     bool StartPrepared(CalibrationProgression progression, std::string* error = nullptr) noexcept;
     bool Start(CalibrationMode mode, std::string* error = nullptr) noexcept;

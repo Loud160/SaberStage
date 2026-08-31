@@ -17,6 +17,7 @@ class ViewController;
 
 namespace BSML {
 class SliderSetting;
+class ToggleSetting;
 class ModalView;
 class FloatingScreen;
 }
@@ -81,6 +82,9 @@ private:
     void RecordingWorldPanelPrimaryAction();
     void RefreshAvatarStatus();
     void RefreshCalibrationStatus();
+    void RefreshRetargetingControls();
+    void RequestAvatarSettingsRebuild() noexcept;
+    void RebuildAvatarSettingsPanel();
     void EnsureStandinProxy(int slot);
     void DestroyStandinProxy(int slot) noexcept;
     void DestroyAllStandinProxies() noexcept;
@@ -124,6 +128,9 @@ private:
     TMPro::TextMeshProUGUI* recordingWorldPanelFpsText_ = nullptr;
     TMPro::TextMeshProUGUI* avatarStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationStatusText_ = nullptr;
+    HMUI::ViewController* avatarSettingsView_ = nullptr;
+    BSML::ToggleSetting* matchPlayerHeightToggle_ = nullptr;
+    BSML::SliderSetting* heightAdjustmentBalanceSlider_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelTitleText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelProgressText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelInstructionText_ = nullptr;
@@ -190,6 +197,8 @@ private:
     bool calibrationPanelCreationFailureLogged_ = false;
     bool calibrationPanelTickFailureLogged_ = false;
     bool livestreamKeyVisible_ = false;
+    bool refreshingRetargetingControls_ = false;
+    bool avatarSettingsRebuildPending_ = false;
     int selectedAvatarTab_ = 0;
     int selectedTab_ = 0;
     int selectedRecordingTab_ = 0;

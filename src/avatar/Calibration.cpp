@@ -69,11 +69,13 @@ CalibrationResult MeasureAvatarRestPose(
     calibration.lowerLegLength[0] = Distance(rest, HumanoidBone::LeftLowerLeg, HumanoidBone::LeftFoot);
     calibration.lowerLegLength[1] = Distance(rest, HumanoidBone::RightLowerLeg, HumanoidBone::RightFoot);
 
-    const auto leftShoulder = Has(rest, HumanoidBone::LeftShoulder)
-        ? HumanoidBone::LeftShoulder : HumanoidBone::LeftUpperArm;
-    const auto rightShoulder = Has(rest, HumanoidBone::RightShoulder)
-        ? HumanoidBone::RightShoulder : HumanoidBone::RightUpperArm;
-    calibration.shoulderWidth = Distance(rest, leftShoulder, rightShoulder);
+    // Humanoid "Shoulder" bones are clavicle-chain pivots and can sit only a
+    // few centimetres apart near the upper chest. The actual arm-span chain
+    // begins at the upper-arm joints. Using the clavicle pivots here omitted
+    // both shoulder-to-upper-arm offsets and made ordinary avatars appear to
+    // have implausibly short arms, which inflated player/avatar scale ratios.
+    calibration.shoulderWidth = Distance(
+        rest, HumanoidBone::LeftUpperArm, HumanoidBone::RightUpperArm);
     calibration.hipWidth = Distance(rest, HumanoidBone::LeftUpperLeg, HumanoidBone::RightUpperLeg);
 
     constexpr HumanoidBone spineChain[] = {
@@ -137,6 +139,10 @@ CalibrationResult MeasureAvatarRestPose(
         calibration.floorHeight = std::min(calibration.floorHeight, Bone(rest, HumanoidBone::RightToes).world.position.y);
     }
     calibration.eyeHeight = calibration.eyePosition.y - calibration.floorHeight;
+    // Wrist-to-wrist anatomical chain: upper-arm joint separation plus both
+    // complete arm chains. This uses the same held-grip endpoint convention as
+    // player calibration as closely as the humanoid skeleton permits, without
+    // silently dropping the avatar's clavicle/shoulder reach.
     calibration.approximateArmSpan =
         calibration.shoulderWidth +
         calibration.upperArmLength[0] + calibration.lowerArmLength[0] +

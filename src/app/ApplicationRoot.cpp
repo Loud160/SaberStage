@@ -33,6 +33,43 @@ avatar::Pose AvatarOffsetPose(const settings::AvatarControllerOffsetSettings& of
 ApplicationRoot::ApplicationRoot(std::filesystem::path settingsPath) : settings_(std::move(settingsPath)) {}
 ApplicationRoot::~ApplicationRoot() { Stop(); }
 
+std::filesystem::path ApplicationRoot::AvatarCalibrationPath(std::string_view profileId) const {
+    const auto base = settings_.Path().parent_path();
+    if (profileId.empty() || profileId == "default") {
+        // Preserve the legacy location so the first profile immediately uses
+        // the player's existing calibration after the schema migration.
+        return base / "PlayerCalibration.json";
+    }
+    return base / "PlayerProfiles" / std::string(profileId) / "PlayerCalibration.json";
+}
+
+bool ApplicationRoot::ApplyConfiguredAvatar(std::string* error) {
+    if (!avatar_) {
+        if (error) *error = "avatar manager is not available";
+        return false;
+    }
+    avatar_->UnloadVrmAvatar();
+    const auto& avatarProfile = settings_.Get().avatar;
+    if (!avatarProfile.enabled) return true;
+
+    const auto avatarDirectory = settings_.Path().parent_path() / "Avatars";
+    const auto path = avatarProfile.selectedPath.empty()
+        ? avatarDirectory / avatarProfile.selectedFile
+        : std::filesystem::path(avatarProfile.selectedPath);
+    if (!avatar_->LoadVrmAvatar(
+            path,
+            static_cast<std::uint32_t>(avatarProfile.maximumTextureDimension),
+            error)) {
+        return false;
+    }
+    avatar_->SetControllerToWristOffsets(
+        AvatarOffsetPose(avatarProfile.leftControllerToWrist),
+        AvatarOffsetPose(avatarProfile.rightControllerToWrist));
+    avatar_->SetAvatarVisible(avatarProfile.visible);
+    avatar_->ApplyAvatarSettings(avatarProfile);
+    return true;
+}
+
 bool ApplicationRoot::Start() {
     if (started_) return true;
 
@@ -69,7 +106,7 @@ bool ApplicationRoot::Start() {
     // with it while avatar integration is still under development.
     avatar_ = std::make_unique<avatar::AvatarManager>(
         *camera_,
-        settings_.Path().parent_path() / "PlayerCalibration.json");
+        AvatarCalibrationPath(settings_.Get().activeAvatarPlayerProfileId));
     if (!avatar_->Start()) {
         Logging::Logger.error(
             "Avatar manager failed to start; camera and recording remain available");
@@ -80,21 +117,11 @@ bool ApplicationRoot::Start() {
         if (directoryError) {
             Logging::Logger.error("Could not create avatar directory '{}': {}", avatarDirectory.string(), directoryError.message());
         }
-        const auto& avatarProfile = settings_.Get().avatar;
-        if (avatarProfile.enabled) {
-            std::string avatarError;
-            const auto path = avatarProfile.selectedPath.empty()
-                ? avatarDirectory / avatarProfile.selectedFile
-                : std::filesystem::path(avatarProfile.selectedPath);
-            if (!avatar_->LoadVrmAvatar(path, static_cast<std::uint32_t>(avatarProfile.maximumTextureDimension), &avatarError)) {
-                Logging::Logger.error("Configured avatar did not auto-load; camera and recording remain available: {}", avatarError);
-            } else {
-                avatar_->SetControllerToWristOffsets(
-                    AvatarOffsetPose(avatarProfile.leftControllerToWrist),
-                    AvatarOffsetPose(avatarProfile.rightControllerToWrist));
-                avatar_->SetAvatarVisible(avatarProfile.visible);
-                avatar_->ApplyAvatarSettings(avatarProfile);
-            }
+        std::string avatarError;
+        if (!ApplyConfiguredAvatar(&avatarError) && settings_.Get().avatar.enabled) {
+            Logging::Logger.error(
+                "Configured avatar did not auto-load; camera and recording remain available: {}",
+                avatarError);
         }
     }
 
@@ -125,5 +152,63 @@ camera::CameraManager& ApplicationRoot::Camera() noexcept { return *camera_; }
 preview::PreviewManager& ApplicationRoot::Preview() noexcept { return *preview_; }
 recording::RecordingController& ApplicationRoot::Recording() noexcept { return *recording_; }
 avatar::AvatarManager& ApplicationRoot::Avatar() noexcept { return *avatar_; }
+
+bool ApplicationRoot::SwitchAvatarPlayerProfile(
+    std::string_view profileId,
+    std::string* error) {
+    auto previous = settings_.Get();
+    if (!settings::SwitchAvatarPlayerProfile(settings_.Edit(), profileId)) {
+        if (error) *error = "avatar player profile was not found";
+        return false;
+    }
+    settings::ValidateAndRepair(settings_.Edit());
+    if (!settings_.Save(error)) {
+        settings_.Edit() = std::move(previous);
+        return false;
+    }
+
+    std::string calibrationMessage;
+    avatar_->SwitchPlayerCalibrationProfile(
+        AvatarCalibrationPath(settings_.Get().activeAvatarPlayerProfileId),
+        &calibrationMessage);
+    std::string avatarError;
+    const auto loaded = ApplyConfiguredAvatar(&avatarError);
+    if (!calibrationMessage.empty()) {
+        Logging::Logger.warn("Avatar profile calibration needs attention: {}", calibrationMessage);
+    }
+    if (!loaded && settings_.Get().avatar.enabled) {
+        if (error) *error = avatarError;
+        return false;
+    }
+    Logging::Logger.info(
+        "Avatar player profile switched to '{}'",
+        settings_.Get().activeAvatarPlayerProfileId);
+    return true;
+}
+
+bool ApplicationRoot::CreateAvatarPlayerProfile(std::string* error) {
+    auto previous = settings_.Get();
+    settings::SyncActiveAvatarPlayerProfile(settings_.Edit());
+    const auto id = settings::CreateAvatarPlayerProfile(settings_.Edit()).id;
+    if (!settings_.Save(error)) {
+        settings_.Edit() = std::move(previous);
+        return false;
+    }
+    return SwitchAvatarPlayerProfile(id, error);
+}
+
+bool ApplicationRoot::DeleteActiveAvatarPlayerProfile(std::string* error) {
+    auto previous = settings_.Get();
+    if (!settings::DeleteActiveAvatarPlayerProfile(settings_.Edit())) {
+        if (error) *error = "the only player profile cannot be deleted";
+        return false;
+    }
+    const auto id = settings_.Get().activeAvatarPlayerProfileId;
+    if (!settings_.Save(error)) {
+        settings_.Edit() = std::move(previous);
+        return false;
+    }
+    return SwitchAvatarPlayerProfile(id, error);
+}
 
 } // namespace saberstage::app

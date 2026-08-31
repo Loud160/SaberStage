@@ -12,7 +12,7 @@
 namespace saberstage::avatar::calibration {
 
 inline constexpr std::uint32_t kPlayerProfileVersion = 1;
-inline constexpr std::uint32_t kCalibrationAlgorithmVersion = 2;
+inline constexpr std::uint32_t kCalibrationAlgorithmVersion = 3;
 
 enum class CalibrationMode : std::uint8_t { Basic, Advanced };
 
@@ -142,6 +142,11 @@ struct ReachModel {
     float overheadReachNormalized[2]{};
     float crossBodyReachNormalized[2]{};
     float confidence[2]{};
+    // Distance between the two accepted saber-grip/controller endpoints in
+    // the stable T-pose. This is the player's useful Beat Saber arm span and
+    // intentionally excludes hand/finger length beyond the held grip.
+    float playerArmSpan = 0.0F;
+    float playerArmSpanConfidence = 0.0F;
 };
 
 struct DirectionalMotionSignature {
@@ -220,6 +225,8 @@ struct RuntimePlayerProfile {
     // calibration can contain a poor grip or reach fit on one side.
     float gripConfidence[2]{};
     float reachConfidence[2]{};
+    float playerArmSpan = 0.0F;
+    float playerArmSpanConfidence = 0.0F;
     float overallConfidence = 0.0F;
     bool valid = false;
 };

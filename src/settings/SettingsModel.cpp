@@ -1,6 +1,7 @@
 #include "saberstage/settings/SettingsModel.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <filesystem>
@@ -8,6 +9,11 @@
 
 namespace saberstage::settings {
 namespace {
+
+constexpr std::array<std::string_view, 5> kAvatarPlayerProfileIds{
+    "default", "player-2", "player-3", "player-4", "player-5"};
+constexpr std::array<std::string_view, 5> kAvatarPlayerProfileNames{
+    "Player 1", "Player 2", "Player 3", "Player 4", "Player 5"};
 
 template <typename T>
 void RepairEnum(T& value, T first, T last, T fallback, ValidationResult& result) {
@@ -52,6 +58,106 @@ void RepairVector(camera::Vec3& value, camera::Vec3 fallback, ValidationResult& 
 } // namespace
 
 SettingsDocument Defaults() { return {}; }
+
+std::string AvatarRetargetingKey(const AvatarSettings& settings) {
+    if (!settings.selectedPath.empty()) {
+        return std::filesystem::path(settings.selectedPath).lexically_normal().generic_string();
+    }
+    return settings.selectedFile;
+}
+
+AvatarRetargetingSettings RetargetingForSelectedAvatar(const AvatarSettings& settings) {
+    const auto key = AvatarRetargetingKey(settings);
+    for (const auto& profile : settings.retargetingProfiles) {
+        if (profile.avatarKey == key) return profile;
+    }
+    AvatarRetargetingSettings result{};
+    result.avatarKey = key;
+    return result;
+}
+
+AvatarRetargetingSettings& EditRetargetingForSelectedAvatar(AvatarSettings& settings) {
+    const auto key = AvatarRetargetingKey(settings);
+    for (auto& profile : settings.retargetingProfiles) {
+        if (profile.avatarKey == key) return profile;
+    }
+    settings.retargetingProfiles.push_back({.avatarKey = key});
+    return settings.retargetingProfiles.back();
+}
+
+void SyncActiveAvatarPlayerProfile(SettingsDocument& settings) {
+    const auto iterator = std::find_if(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
+    if (iterator != settings.avatarPlayerProfiles.end()) {
+        iterator->avatar = settings.avatar;
+        return;
+    }
+
+    AvatarPlayerProfile profile{};
+    profile.id = settings.activeAvatarPlayerProfileId.empty()
+        ? "default"
+        : settings.activeAvatarPlayerProfileId;
+    profile.displayName = profile.id == "default" ? "Default" : "Player";
+    profile.avatar = settings.avatar;
+    settings.activeAvatarPlayerProfileId = profile.id;
+    settings.avatarPlayerProfiles.push_back(std::move(profile));
+}
+
+bool SwitchAvatarPlayerProfile(SettingsDocument& settings, std::string_view profileId) {
+    const auto target = std::find_if(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == profileId; });
+    if (target == settings.avatarPlayerProfiles.end()) return false;
+
+    SyncActiveAvatarPlayerProfile(settings);
+    // Sync may append and reallocate, so resolve the target again before
+    // copying its Avatar-only settings into the active working view.
+    const auto resolved = std::find_if(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == profileId; });
+    if (resolved == settings.avatarPlayerProfiles.end()) return false;
+    settings.activeAvatarPlayerProfileId = resolved->id;
+    settings.avatar = resolved->avatar;
+    return true;
+}
+
+AvatarPlayerProfile& CreateAvatarPlayerProfile(SettingsDocument& settings) {
+    SyncActiveAvatarPlayerProfile(settings);
+    std::uint32_t suffix = 2;
+    std::string id;
+    do {
+        id = "player-" + std::to_string(suffix++);
+    } while (std::any_of(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == id; }));
+
+    AvatarPlayerProfile profile{};
+    profile.id = id;
+    profile.displayName = "Player " + id.substr(7);
+    profile.avatar = AvatarSettings{};
+    settings.avatarPlayerProfiles.push_back(std::move(profile));
+    settings.activeAvatarPlayerProfileId = id;
+    settings.avatar = settings.avatarPlayerProfiles.back().avatar;
+    return settings.avatarPlayerProfiles.back();
+}
+
+bool DeleteActiveAvatarPlayerProfile(SettingsDocument& settings) {
+    if (settings.avatarPlayerProfiles.size() <= 1) return false;
+    const auto active = std::find_if(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
+    if (active == settings.avatarPlayerProfiles.end()) return false;
+    settings.avatarPlayerProfiles.erase(active);
+    settings.activeAvatarPlayerProfileId = settings.avatarPlayerProfiles.front().id;
+    settings.avatar = settings.avatarPlayerProfiles.front().avatar;
+    return true;
+}
 
 ValidationResult ValidateAndRepair(SettingsDocument& settings) {
     ValidationResult result;
@@ -247,10 +353,107 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                 defaults.avatar.stanceWidthPercent, result);
     RepairFloat(settings.avatar.backwardSpineCurveLimitPercent, 0.0F, 100.0F,
                 defaults.avatar.backwardSpineCurveLimitPercent, result);
+    if (settings.avatar.retargetingProfiles.size() > 64) {
+        settings.avatar.retargetingProfiles.resize(64);
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    std::vector<AvatarRetargetingSettings> repairedRetargeting;
+    repairedRetargeting.reserve(settings.avatar.retargetingProfiles.size());
+    for (auto profile : settings.avatar.retargetingProfiles) {
+        if (profile.avatarKey.empty() || profile.avatarKey.size() > 1024 ||
+            profile.avatarKey.find('\0') != std::string::npos) {
+            result.changed = true;
+            ++result.repairedFields;
+            continue;
+        }
+        if (!std::isfinite(profile.heightAdjustmentBalance) ||
+            profile.heightAdjustmentBalance < -1.0F ||
+            profile.heightAdjustmentBalance > 1.0F) {
+            profile.heightAdjustmentBalance = 0.0F;
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        const auto duplicate = std::find_if(
+            repairedRetargeting.begin(), repairedRetargeting.end(),
+            [&](const auto& prior) { return prior.avatarKey == profile.avatarKey; });
+        if (duplicate != repairedRetargeting.end()) {
+            *duplicate = std::move(profile);
+            result.changed = true;
+            ++result.repairedFields;
+        } else {
+            repairedRetargeting.push_back(std::move(profile));
+        }
+    }
+    settings.avatar.retargetingProfiles = std::move(repairedRetargeting);
     RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
     RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
     RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
     RepairVector(settings.avatar.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
+    // The active AvatarSettings object is the editable working copy. Preserve
+    // it in its current slot before normalizing older dynamic-profile files to
+    // the five fixed slots exposed by the dropdown.
+    SyncActiveAvatarPlayerProfile(settings);
+    std::vector<AvatarPlayerProfile> repairedProfiles;
+    repairedProfiles.reserve(settings.avatarPlayerProfiles.size());
+    for (auto profile : settings.avatarPlayerProfiles) {
+        const bool invalidId = profile.id.empty() || profile.id.size() > 64 ||
+            profile.id.find('\0') != std::string::npos ||
+            !std::all_of(profile.id.begin(), profile.id.end(), [](unsigned char value) {
+                return std::isalnum(value) || value == '-' || value == '_';
+            });
+        if (invalidId || std::any_of(
+                repairedProfiles.begin(), repairedProfiles.end(),
+                [&](const auto& prior) { return prior.id == profile.id; })) {
+            result.changed = true;
+            ++result.repairedFields;
+            continue;
+        }
+        if (profile.displayName.empty() || profile.displayName.size() > 32 ||
+            profile.displayName.find('\0') != std::string::npos) {
+            profile.displayName = profile.id == "default" ? "Player 1" : "Player";
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        repairedProfiles.push_back(std::move(profile));
+    }
+    std::vector<AvatarPlayerProfile> fixedProfiles;
+    fixedProfiles.reserve(kAvatarPlayerProfileIds.size());
+    for (std::size_t slot = 0; slot < kAvatarPlayerProfileIds.size(); ++slot) {
+        const auto existing = std::find_if(
+            repairedProfiles.begin(), repairedProfiles.end(),
+            [&](const auto& profile) { return profile.id == kAvatarPlayerProfileIds[slot]; });
+        if (existing != repairedProfiles.end()) {
+            fixedProfiles.push_back(std::move(*existing));
+        } else {
+            fixedProfiles.push_back({
+                .id = std::string(kAvatarPlayerProfileIds[slot]),
+                .displayName = std::string(kAvatarPlayerProfileNames[slot]),
+                .avatar = AvatarSettings{}});
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        if (fixedProfiles.back().displayName != kAvatarPlayerProfileNames[slot]) {
+            fixedProfiles.back().displayName = std::string(kAvatarPlayerProfileNames[slot]);
+            result.changed = true;
+            ++result.repairedFields;
+        }
+    }
+    if (repairedProfiles.size() != fixedProfiles.size()) {
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    settings.avatarPlayerProfiles = std::move(fixedProfiles);
+    const auto activeProfile = std::find_if(
+        settings.avatarPlayerProfiles.begin(),
+        settings.avatarPlayerProfiles.end(),
+        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
+    if (activeProfile == settings.avatarPlayerProfiles.end()) {
+        settings.activeAvatarPlayerProfileId = settings.avatarPlayerProfiles.front().id;
+        settings.avatar = settings.avatarPlayerProfiles.front().avatar;
+        result.changed = true;
+        ++result.repairedFields;
+    }
     RepairEnum(
         settings.broadcast.provider,
         LivestreamProvider::Twitch,

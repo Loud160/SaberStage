@@ -326,6 +326,7 @@ public:
         rendererNeckFraction_.clear();
         rendererIsHair_.clear();
         wearAvatar_ = false;
+        rootUniformScale_ = 1.0F;
     }
 
     void BuildNodes() {
@@ -1042,6 +1043,25 @@ public:
         }
     }
 
+    void SetUniformScale(float scale) noexcept {
+        try {
+            const auto bounded = std::clamp(scale, 0.05F, 10.0F);
+            if (std::abs(rootUniformScale_ - bounded) <= 1.0e-4F) return;
+            rootUniformScale_ = bounded;
+            if (IsAlive(root_)) {
+                root_->get_transform()->set_localScale({bounded, bounded, bounded});
+            }
+            // Display-clone size is a user multiplier on top of the fitted
+            // avatar size. Reapply their root poses so an already-visible
+            // clone changes fit on the same frame as the live avatar.
+            for (auto& instance : standins_) ApplyStandinRootPose(instance);
+            ResetSecondaryMotion();
+            Logging::Logger.info("VRM root uniform scale changed to {:.3f}", bounded);
+        } catch (...) {
+            Logging::Logger.error("Could not apply the VRM root uniform scale");
+        }
+    }
+
     struct SpringColliderRuntime {
         UnityEngine::Transform* transform = nullptr;
         UnityEngine::Vector3 localOffset{};
@@ -1541,7 +1561,8 @@ public:
         auto* transform = instance.root->get_transform().ptr();
         transform->set_position({instance.positionX, instance.positionY, instance.positionZ});
         transform->set_rotation(UnityEngine::Quaternion::Euler({0.0F, instance.yawDegrees, 0.0F}));
-        transform->set_localScale({instance.scale, instance.scale, instance.scale});
+        const auto fittedScale = instance.scale * rootUniformScale_;
+        transform->set_localScale({fittedScale, fittedScale, fittedScale});
     }
 
     void ApplyStandinLayer(StandinInstance& instance, std::int32_t layer) {
@@ -1881,6 +1902,9 @@ public:
     bool wearHideHair_ = false;
     bool wearHideNeckAccessories_ = false;
     std::int32_t wearBothLayer_ = 0;
+    // The live hierarchy and every display clone use the same player-fit
+    // scale. Stand-in scale remains a separate user-selected multiplier.
+    float rootUniformScale_ = 1.0F;
     // Free-standing display clone state (up to three instances, one shared
     // layer and blend-shape dirty flag).
     std::vector<StandinInstance> standins_;
@@ -1930,6 +1954,7 @@ std::unique_ptr<VrmUnityRuntime> VrmUnityRuntime::Load(
 
 void VrmUnityRuntime::Destroy() noexcept { if (impl_) impl_->Destroy(); }
 void VrmUnityRuntime::SetVisible(bool visible) noexcept { if (impl_) impl_->SetVisible(visible); }
+void VrmUnityRuntime::SetUniformScale(float scale) noexcept { if (impl_) impl_->SetUniformScale(scale); }
 void VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { if (impl_) impl_->ApplyOptions(options); }
 void VrmUnityRuntime::UpdateSecondaryMotion(float deltaTime) noexcept { if (impl_) impl_->UpdateSecondaryMotion(deltaTime); }
 void VrmUnityRuntime::ResetSecondaryMotion() noexcept { if (impl_) impl_->ResetSecondaryMotion(); }

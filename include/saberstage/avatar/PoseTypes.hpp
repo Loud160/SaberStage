@@ -106,6 +106,35 @@ struct PlayerCalibration {
     bool valid = false;
 };
 
+// Allocation-free description of the neutral avatar fit used by the runtime
+// solver. The root always remains uniformly scaled. Optional height matching
+// changes only the vertical rest-pose spans of the lower-body and torso chains
+// so arm reach, shoulder width, hands, head, and feet retain the arm-span fit.
+struct AvatarRetargeting {
+    float uniformScale = 1.0F;
+    float playerArmSpan = 0.0F;
+    float playerArmSpanConfidence = 0.0F;
+    float avatarArmSpan = 0.0F;
+    float naturalEyeHeight = 0.0F;
+    float targetEyeHeight = 0.0F;
+    float requestedHeightDelta = 0.0F;
+    float appliedHeightDelta = 0.0F;
+    float lowerBodyVerticalLength = 0.0F;
+    float torsoVerticalLength = 0.0F;
+    float lowerBodyScale = 1.0F;
+    float torsoScale = 1.0F;
+    float finalEyeHeight = 0.0F;
+    float residualHeightError = 0.0F;
+    float heightAdjustmentBalance = 0.0F;
+    bool armSpanBased = false;
+    bool matchPlayerHeight = false;
+    bool heightCorrectionApplied = false;
+    bool scaleClamped = false;
+    bool heightCorrectionClamped = false;
+    bool geometryFallback = false;
+    bool valid = false;
+};
+
 struct SolvedHumanoidPose {
     std::array<Pose, kHumanoidBoneCount> bones{};
     std::array<bool, kHumanoidBoneCount> valid{};
@@ -295,11 +324,13 @@ struct SolverDiagnostics {
     std::uint32_t transformWrites = 0;
     double nativeSolveMicroseconds = 0.0;
     bool duplicateSequenceSkipped = false;
+    AvatarRetargeting retargeting{};
 };
 
 static_assert(std::is_trivially_copyable_v<TrackingSample>);
 static_assert(std::is_trivially_copyable_v<AvatarCalibration>);
 static_assert(std::is_trivially_copyable_v<PlayerCalibration>);
+static_assert(std::is_trivially_copyable_v<AvatarRetargeting>);
 static_assert(std::is_trivially_copyable_v<SolvedHumanoidPose>);
 static_assert(std::is_trivially_copyable_v<FootPersistentState>);
 static_assert(std::is_trivially_copyable_v<SolverPersistentState>);

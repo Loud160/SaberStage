@@ -702,6 +702,7 @@ void MenuController::Register() {
 
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
+    active_->avatarSettingsView_ = view;
     static std::array<std::string_view, 3> tabNames{"Avatar", "Quality", "Calibration"};
     active_->avatarTabViewRoots_.fill(nullptr);
     active_->avatarTabContentRoots_.fill(nullptr);
@@ -1291,12 +1292,91 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     calibrationNote->set_enableWordWrapping(true);
     calibrationNote->set_alignment(TMPro::TextAlignmentOptions::Center);
 
+    CreateCenterPanelSubheader(container->get_transform(), "Player Profile");
+    const auto& playerProfiles = active_->root_.Settings().Get().avatarPlayerProfiles;
+    const auto activeProfileId = active_->root_.Settings().Get().activeAvatarPlayerProfileId;
+    const auto activeProfile = std::find_if(
+        playerProfiles.begin(),
+        playerProfiles.end(),
+        [&](const auto& profile) { return profile.id == activeProfileId; });
+    const auto profileName = activeProfile == playerProfiles.end()
+        ? std::string("Player 1")
+        : activeProfile->displayName;
+    static std::array<std::string_view, 5> playerProfileNames{
+        "Player 1", "Player 2", "Player 3", "Player 4", "Player 5"};
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
+        container,
+        "Player Profile",
+        profileName,
+        playerProfileNames,
+        [](StringW value) {
+            if (!active_) return;
+            const auto name = static_cast<std::string>(value);
+            const auto slot = std::find(playerProfileNames.begin(), playerProfileNames.end(), name);
+            if (slot == playerProfileNames.end()) return;
+            static constexpr std::array<std::string_view, 5> ids{
+                "default", "player-2", "player-3", "player-4", "player-5"};
+            const auto id = ids[static_cast<std::size_t>(std::distance(playerProfileNames.begin(), slot))];
+            if (id == active_->root_.Settings().Get().activeAvatarPlayerProfileId) return;
+            std::string error;
+            if (!active_->root_.SwitchAvatarPlayerProfile(id, &error)) {
+                Logging::Logger.error("Could not switch avatar player profile: {}", error);
+                return;
+            }
+            active_->DestroyAllStandinProxies();
+            active_->RequestAvatarSettingsRebuild();
+        }), "Selects one of five local players. Each slot keeps independent calibration and Avatar settings; camera and recording settings remain shared."));
+
     // Current profile state before the actions: the user should know whether
     // a saved profile exists before choosing to start or reset anything.
     active_->calibrationStatusText_ = BSML::Lite::CreateText(
         container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
     active_->calibrationStatusText_->set_enableWordWrapping(true);
     active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    CreateCenterPanelSubheader(container->get_transform(), "Avatar Fit");
+    const auto retargeting = settings::RetargetingForSelectedAvatar(avatar);
+    active_->matchPlayerHeightToggle_ = ConstrainCenterPanelRow(WithHint(
+        BSML::Lite::CreateToggle(
+            container,
+            "Match Player Height",
+            retargeting.matchPlayerHeight,
+            [](bool enabled) {
+                if (!active_ || active_->refreshingRetargetingControls_) return;
+                auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+                settings::EditRetargetingForSelectedAvatar(avatarSettings).matchPlayerHeight = enabled;
+                active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+                active_->root_.Settings().Save(nullptr);
+                if (active_->heightAdjustmentBalanceSlider_) {
+                    active_->heightAdjustmentBalanceSlider_->set_interactable(enabled);
+                }
+            }),
+        "Off keeps the avatar's natural height after matching your calibrated arm span. On adjusts only vertical leg and torso lengths to reach your standing height."));
+
+    // Use the same proven full-row slider construction as the other Avatar
+    // controls. Nesting this native row inside a second horizontal row left
+    // its stock geometry outside the center panel's mask on Quest.
+    active_->heightAdjustmentBalanceSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Height Balance",
+        0.05F,
+        retargeting.heightAdjustmentBalance,
+        -1.0F,
+        1.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [](float value) {
+            if (!active_ || active_->refreshingRetargetingControls_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            settings::EditRetargetingForSelectedAvatar(avatarSettings).heightAdjustmentBalance = value;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }), "Changes where height correction is applied without changing the requested final height. Left favours legs; right favours torso."));
+    active_->heightAdjustmentBalanceSlider_->set_interactable(retargeting.matchPlayerHeight);
+    auto* fitBalanceCaption = BSML::Lite::CreateText(
+        container->get_transform(), "Legs  ←  Even  →  Torso", 3.0F, {0.0F, 0.0F}, {52.0F, 5.0F});
+    fitBalanceCaption->set_alignment(TMPro::TextAlignmentOptions::Center);
 
     auto* calibrationStart = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
     calibrationStart->set_spacing(1.0F);
@@ -1337,6 +1417,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->BuildAvatarFilePicker(view);
     active_->RefreshAvatarStatus();
     active_->RefreshCalibrationStatus();
+    active_->RefreshRetargetingControls();
     active_->ShowAvatarTab(0);
     if (active_->avatarTabs_) active_->avatarTabs_->SelectCellWithNumber(0);
 
@@ -1544,6 +1625,18 @@ void MenuController::SelectAvatarFile(const std::filesystem::path& selected) {
     Logging::Logger.info("Selected VRM avatar '{}'", normalized.string());
     if (avatarPickerModal_) avatarPickerModal_->Hide();
     RefreshAvatarStatus();
+    RefreshRetargetingControls();
+}
+
+void MenuController::RefreshRetargetingControls() {
+    const auto fit = settings::RetargetingForSelectedAvatar(root_.Settings().Get().avatar);
+    refreshingRetargetingControls_ = true;
+    if (matchPlayerHeightToggle_) matchPlayerHeightToggle_->set_Value(fit.matchPlayerHeight);
+    if (heightAdjustmentBalanceSlider_) {
+        heightAdjustmentBalanceSlider_->set_Value(fit.heightAdjustmentBalance);
+        heightAdjustmentBalanceSlider_->set_interactable(fit.matchPlayerHeight);
+    }
+    refreshingRetargetingControls_ = false;
 }
 
 std::filesystem::path MenuController::ConfiguredAvatarPath() const {
@@ -3615,6 +3708,7 @@ void MenuController::TickCalibrationPanel() noexcept {
     TickRecordingWorldPanel();
     TickAvatarStandinProxy();
     try {
+        if (avatarSettingsRebuildPending_) RebuildAvatarSettingsPanel();
         const auto phase = root_.Avatar().CalibrationStatus().phase;
         if (phase == avatar::calibration::CalibrationPhase::Idle ||
                 phase == avatar::calibration::CalibrationPhase::Complete) {
@@ -3646,6 +3740,35 @@ void MenuController::TickCalibrationPanel() noexcept {
             Logging::Logger.error("Player-calibration panel update failed with a non-standard exception");
         }
     }
+}
+
+void MenuController::RequestAvatarSettingsRebuild() noexcept {
+    avatarSettingsRebuildPending_ = true;
+}
+
+void MenuController::RebuildAvatarSettingsPanel() {
+    avatarSettingsRebuildPending_ = false;
+    if (!IsAlive(avatarSettingsView_)) return;
+    DestroyCalibrationPanel();
+    avatarTabs_ = nullptr;
+    avatarTabViewRoots_.fill(nullptr);
+    avatarTabContentRoots_.fill(nullptr);
+    avatarStatusText_ = nullptr;
+    calibrationStatusText_ = nullptr;
+    matchPlayerHeightToggle_ = nullptr;
+    heightAdjustmentBalanceSlider_ = nullptr;
+    avatarPickerModal_ = nullptr;
+    avatarPickerListContent_ = nullptr;
+    avatarPickerRows_.clear();
+    auto* root = avatarSettingsView_->get_transform().ptr();
+    while (root->get_childCount() > 0) {
+        auto* child = root->GetChild(root->get_childCount() - 1)->get_gameObject().ptr();
+        UnityEngine::Object::DestroyImmediate(child);
+    }
+    BuildSettingsPanel(avatarSettingsView_);
+    ShowAvatarTab(2);
+    if (avatarTabs_) avatarTabs_->SelectCellWithNumber(2);
+    Logging::Logger.info("Rebuilt Avatar settings UI after player-profile change");
 }
 
 void MenuController::RefreshCalibrationStatus() {

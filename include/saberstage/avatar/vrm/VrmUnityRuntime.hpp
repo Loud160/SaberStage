@@ -104,6 +104,11 @@ public:
 
     void Destroy() noexcept;
     void SetVisible(bool visible) noexcept;
+    // Applies the solver's player-fit scale to the complete VRM hierarchy.
+    // Bone world poses are still written by AvatarManager, but the mesh,
+    // rigid attachments, spring chains, and unmapped nodes must share the
+    // same root scale or moving the solved joints merely stretches the skin.
+    void SetUniformScale(float scale) noexcept;
     void ApplyOptions(const RuntimeOptions& options) noexcept;
     void UpdateSecondaryMotion(float deltaTime) noexcept;
     void ResetSecondaryMotion() noexcept;

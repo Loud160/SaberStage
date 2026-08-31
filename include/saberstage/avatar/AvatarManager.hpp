@@ -56,6 +56,9 @@ public:
     bool CompletePlayerCalibration(std::string* error = nullptr) noexcept;
     void CancelPlayerCalibration() noexcept;
     bool ResetPlayerCalibration(std::string* error = nullptr) noexcept;
+    bool SwitchPlayerCalibrationProfile(
+        const std::filesystem::path& profilePath,
+        std::string* error = nullptr) noexcept;
     void SetCalibrationStatusChangedHandler(std::function<void()> handler);
 
     bool LoadVrmAvatar(

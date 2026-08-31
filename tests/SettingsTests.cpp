@@ -75,6 +75,14 @@ int main() {
     Check(defaults.avatar.stanceWidthPercent == 100.0F &&
               defaults.avatar.backwardSpineCurveLimitPercent == 100.0F,
           "stance width and backward spine controls default to original solver behavior");
+    Check(defaults.avatar.retargetingProfiles.empty() &&
+              !RetargetingForSelectedAvatar(defaults.avatar).matchPlayerHeight,
+          "avatar fit defaults to natural arm-span height until explicitly enabled");
+    Check(defaults.activeAvatarPlayerProfileId == "default" &&
+              defaults.avatarPlayerProfiles.size() == 5 &&
+              defaults.avatarPlayerProfiles.front().displayName == "Player 1" &&
+              defaults.avatarPlayerProfiles.back().displayName == "Player 5",
+          "five fixed migration-safe Avatar player slots are available");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
@@ -106,6 +114,10 @@ int main() {
     invalid.avatar.plantedLegLeanLimitPercent = 10.0F;
     invalid.avatar.stanceWidthPercent = 20.0F;
     invalid.avatar.backwardSpineCurveLimitPercent = 150.0F;
+    invalid.avatar.retargetingProfiles.push_back({
+        .avatarKey = "/sdcard/Download/Test.vrm",
+        .matchPlayerHeight = true,
+        .heightAdjustmentBalance = 5.0F});
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -126,6 +138,24 @@ int main() {
               invalid.avatar.backwardSpineCurveLimitPercent ==
                   defaults.avatar.backwardSpineCurveLimitPercent,
           "invalid stance and backward spine limits repair to original behavior");
+    Check(invalid.avatar.retargetingProfiles.size() == 1 &&
+              invalid.avatar.retargetingProfiles[0].heightAdjustmentBalance == 0.0F,
+          "invalid per-avatar height balance repairs without losing the avatar key");
+
+    auto playerProfiles = defaults;
+    playerProfiles.camera.Primary().fovDegrees = 77.0F;
+    playerProfiles.avatar.visible = false;
+    SyncActiveAvatarPlayerProfile(playerProfiles);
+    Check(SwitchAvatarPlayerProfile(playerProfiles, "player-2") && playerProfiles.avatar.visible,
+          "unused fixed Avatar player slots start from safe Avatar defaults");
+    playerProfiles.avatar.selectedPath = "/sdcard/Download/Player Two.vrm";
+    Check(SwitchAvatarPlayerProfile(playerProfiles, "default") &&
+              !playerProfiles.avatar.visible &&
+              playerProfiles.camera.Primary().fovDegrees == 77.0F,
+          "switching players restores Avatar settings without changing shared camera settings");
+    Check(SwitchAvatarPlayerProfile(playerProfiles, "player-2") &&
+              playerProfiles.avatar.selectedPath == "/sdcard/Download/Player Two.vrm",
+          "Avatar settings remain independent between player profiles");
 
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
@@ -223,6 +253,9 @@ int main() {
     first.Edit().avatar.plantedLegLeanLimitPercent = 55.0F;
     first.Edit().avatar.stanceWidthPercent = 145.0F;
     first.Edit().avatar.backwardSpineCurveLimitPercent = 35.0F;
+    auto& savedFit = EditRetargetingForSelectedAvatar(first.Edit().avatar);
+    savedFit.matchPlayerHeight = true;
+    savedFit.heightAdjustmentBalance = -0.35F;
     first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
@@ -285,6 +318,23 @@ int main() {
               second.Get().avatar.stanceWidthPercent == 145.0F &&
               second.Get().avatar.backwardSpineCurveLimitPercent == 35.0F,
           "avatar selection, visual quality, SpringBone budget, and wrist calibration survive restart");
+    const auto loadedFit = RetargetingForSelectedAvatar(second.Get().avatar);
+    Check(loadedFit.avatarKey == "/sdcard/Download/Black Heart.vrm" &&
+              loadedFit.matchPlayerHeight && loadedFit.heightAdjustmentBalance == -0.35F,
+          "per-avatar height matching and balance survive restart");
+    const auto savedSecondPlayerId = std::string("player-2");
+    Check(SwitchAvatarPlayerProfile(second.Edit(), savedSecondPlayerId),
+          "second fixed player slot can be selected");
+    second.Edit().avatar.selectedPath = "/sdcard/Download/Second Player.vrm";
+    second.Edit().avatar.visible = false;
+    Check(second.Save(&error), "multiple Avatar player profiles save safely");
+    SettingsService third(path);
+    Check(third.Load().loadedExisting &&
+              third.Get().activeAvatarPlayerProfileId == savedSecondPlayerId &&
+              third.Get().avatarPlayerProfiles.size() == 5 &&
+              third.Get().avatar.selectedPath == "/sdcard/Download/Second Player.vrm" &&
+              !third.Get().avatar.visible,
+          "active player identity and complete Avatar-only profile survive restart");
 
     auto preset = defaults.avatar;
     ApplyAvatarQualityPreset(preset, AvatarQualityPreset::Performance);

@@ -21,7 +21,7 @@ public:
     explicit SettingsService(std::filesystem::path path);
 
     LoadResult Load();
-    bool Save(std::string* error = nullptr) const;
+    bool Save(std::string* error = nullptr);
     bool Reset(Subsystem subsystem, std::string* error = nullptr);
     bool FactoryReset(std::string* error = nullptr);
 

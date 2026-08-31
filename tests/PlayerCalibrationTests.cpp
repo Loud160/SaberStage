@@ -199,6 +199,9 @@ void TestMultiPoseFit() {
     Check(profile.reach.effectiveReachNormalized[0] > 0.30F &&
           profile.reach.effectiveReachNormalized[1] > 0.30F,
           "effective reach is derived from multiple static poses");
+    Check(profile.reach.playerArmSpan > 1.20F &&
+              profile.reach.playerArmSpanConfidence > 0.50F,
+          "stable T-pose endpoints produce a confident player arm span");
     Check(Near(profile.lean.leftNormalized, 0.085F) &&
           Near(profile.lean.forwardNormalized, 0.115F),
           "directional lean boundaries remain asymmetric");
@@ -208,6 +211,9 @@ void TestMultiPoseFit() {
           Near(profile.crouch.duckForwardNormalized, 0.13F),
           "squat and forward-duck geometry are independently calibrated");
     const auto runtime = BuildRuntimeProfile(profile);
+    Check(Near(runtime.playerArmSpan, profile.reach.playerArmSpan) &&
+              Near(runtime.playerArmSpanConfidence, profile.reach.playerArmSpanConfidence),
+          "runtime profile carries allocation-free arm-span fit data");
     Check(runtime.valid && Near(runtime.overallConfidence, profile.overallConfidence),
           "persistent profile builds a fixed-size valid runtime view");
 }
@@ -225,43 +231,17 @@ void TestBasicConfidenceExcludesAdvancedOnlyCaptures() {
         SetStaticCapture(profile, step);
         profile.staticCaptures[Index(step)].confidence = 0.52F;
     }
-    SetDirectionalMotion(profile, CalibrationStep::LeanLeft, -0.08F, 0.0F, true);
-    SetDirectionalMotion(profile, CalibrationStep::LeanRight, 0.08F, 0.0F, true);
-    SetDirectionalMotion(profile, CalibrationStep::StepLeft, -0.13F, 0.0F, false);
-    SetDirectionalMotion(profile, CalibrationStep::StepRight, 0.13F, 0.0F, false);
-    for (const auto step : {
-             CalibrationStep::LeanLeft,
-             CalibrationStep::LeanRight,
-             CalibrationStep::StepLeft,
-             CalibrationStep::StepRight}) {
-        profile.motionCaptures[Index(step)].confidence = 0.46F;
-    }
-    for (const auto step : {CalibrationStep::Squat, CalibrationStep::ForwardDuck}) {
-        auto& capture = profile.motionCaptures[Index(step)];
-        capture.step = step;
-        capture.valid = true;
-        capture.confidence = 0.46F;
-        capture.features.durationSeconds = 2.4F;
-        capture.features.peakHeadDisplacementNormalized = step == CalibrationStep::Squat
-            ? Vec3{0.0F, -0.16F, 0.02F} : Vec3{0.0F, -0.13F, 0.10F};
-    }
-    for (const auto step : {CalibrationStep::TurnLeft45, CalibrationStep::TurnRight45}) {
-        auto& capture = profile.motionCaptures[Index(step)];
-        capture.step = step;
-        capture.valid = true;
-        capture.confidence = 0.46F;
-        capture.features.durationSeconds = 2.4F;
-        capture.features.finalYawRadians = step == CalibrationStep::TurnLeft45 ? -0.72F : 0.72F;
-    }
-
     std::string error;
     Check(FitPlayerCalibrationProfile(profile, &error),
-          "a complete basic calibration fits without advanced-only captures");
-    Check(profile.overallConfidence > 0.52F,
-          "advanced-only lean and step directions are not averaged into basic quality as zeros");
-    Check(!profile.motionCaptures[Index(CalibrationStep::LeanForward)].valid &&
-              !profile.motionCaptures[Index(CalibrationStep::StepForward)].valid,
-          "basic fitting does not invent missing advanced-only source captures");
+          "six static Basic captures fit without any Advanced movement captures");
+    Check(profile.lean.leftNormalized == 0.08F &&
+              profile.lean.rightNormalized == 0.08F &&
+              profile.lean.forwardNormalized == 0.10F &&
+              profile.lean.backwardNormalized == 0.07F,
+          "Basic fitting retains safe generic lean boundaries");
+    Check(profile.turn.bodyYawDegreesPerSecond == 105.0F &&
+              profile.crouch.squatDropNormalized == 0.22F,
+          "Basic fitting retains generic turn and crouch behavior");
 }
 
 void TestControllerOnlyFitSource() {
@@ -610,8 +590,9 @@ void TestIntroductionAndStepByStepGates() {
     Check(session.Prepare(CalibrationMode::Basic, &error),
           "basic calibration opens an introduction before any timer starts");
     Check(session.Status().phase == CalibrationPhase::Introduction &&
-              session.Status().countdownSecondsRemaining == 0,
-          "introduction is explicitly idle and has no countdown");
+              session.Status().countdownSecondsRemaining == 0 &&
+              session.Status().stepCount == 6,
+          "Basic introduction is idle and exposes the six-pose fit plan");
     auto sample = CalibrationTracking(CalibrationStep::Neutral, 10.0, 1);
     session.Update(sample);
     Check(session.Status().phase == CalibrationPhase::Introduction,

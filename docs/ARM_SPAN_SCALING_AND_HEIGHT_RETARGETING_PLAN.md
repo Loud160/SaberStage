@@ -6,7 +6,24 @@ This document records the complete design discussion for changing SaberStage fro
 
 It is written as a self-contained handoff for a future development conversation. It describes the desired behavior, current implementation, formulas, UI, persistence, solver consequences, risks, and testing needed to implement the feature correctly.
 
-This feature has **not** been implemented by this document. The repository state examined was branch `Avatar-Framework` at commit `09ca3ad9e949375898189e222690612991127f31` on August 30, 2026, plus then-current uncommitted work. Reinspect current code before editing.
+This design is implemented on branch `Avatar-Framework` as an on-device test candidate. Host tests and the Quest build pass. Visual behavior across unusually proportioned avatars, the settings UI, and profile switching still require the Quest 2 test matrix below before the work should be treated as complete.
+
+## Implementation status (August 30, 2026)
+
+- T-pose calibration now derives a versioned player arm span and confidence value. Compatible version-2 profiles are refitted from their saved source captures rather than discarded or trusted with stale derived values.
+- Avatar rest geometry supplies the matching skeletal arm span used for scale selection.
+- The neutral avatar uses arm-span uniform scaling when the player and avatar measurements are credible. Invalid or low-confidence measurements use the bounded legacy height-scale fallback.
+- The avatar's feet remain on the calibrated floor, while HMD translation is applied relative to the neutral player pose instead of forcing the neutral avatar head to the HMD's absolute world position.
+- `Match Player Height` is off by default. When enabled, only vertical lower-body and torso segments receive the bounded residual height correction; arms, shoulder width, hands, and fingers are unchanged.
+- `Height Balance` distributes that correction between the legs and torso using the locked `Legs  ←  Even  →  Torso` direction.
+- Leg, spine, crouch, lean, stepping, and reach-dependent measurements are rebuilt from the corrected neutral skeleton and the solver is reseeded whenever fit settings change.
+- Match-height and balance settings are stored independently for each avatar within a player's Avatar settings.
+- Shared-Quest player profiles own only player calibration and the complete Avatar settings group. Camera, recording, preview, broadcast, and other SaberStage settings remain shared.
+- Fit diagnostics record the player span, avatar span, confidence, selected scale source, uniform scale, residual height correction, and effective post-retarget dimensions.
+
+Safety bounds in the current implementation are a 0.55-1.80 uniform scale, a 0.70-1.30 per-region vertical scale, a maximum correction of the smaller of 0.45 metres or 28 percent of natural avatar height, and a 0.55 player-span confidence threshold. Invalid geometry or non-finite results fall back to the existing height-based scale without blocking avatar loading.
+
+Validation completed before on-device testing includes the host solver, calibration, settings migration/profile, camera, recording, and VRM test suites plus the ARM64 Quest build, including BSML UI compilation and the existing avatar-shader asset. Quest 2 visual and interaction testing remains required.
 
 ## Resume brief
 
@@ -134,6 +151,8 @@ left arm reach + shoulder width + right arm reach
 ```
 
 The exact measure must use the same grip/hand endpoint semantics as the solver. Do not mix fingertip span with wrist or saber-grip span without a documented correction.
+
+The implemented shoulder-chain width is the distance between the left and right upper-arm joints. It must not use the distance between the VRM `LeftShoulder` and `RightShoulder` clavicle pivots: some avatars place those pivots close to the chest while the clavicle-to-upper-arm segments contain most of the shoulder reach. Omitting that reach understates the avatar arm span and can incorrectly drive uniform scale to its upper safety clamp.
 
 ### Player arm span
 

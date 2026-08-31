@@ -82,14 +82,6 @@ float QuaternionAngleDegrees(Quaternion left, Quaternion right) noexcept {
     return 2.0F * std::acos(Clamp(dot, -1.0F, 1.0F)) * kRadiansToDegrees;
 }
 
-float SpineLength(const AvatarCalibration& avatar, float scale) noexcept {
-    float length = 0.0F;
-    for (std::uint8_t index = 0; index < avatar.spineSegmentCount; ++index) {
-        length += avatar.spineSegmentLengths[index] * scale;
-    }
-    return length;
-}
-
 Vec3 ClampAnatomicalLean(
     Vec3 value,
     Vec3 bodyRight,
@@ -111,32 +103,107 @@ Quaternion FacingRotation(const AvatarCalibration& avatar, const PlayerCalibrati
         Normalize(playerForward, {0.0F, 0.0F, 1.0F}));
 }
 
-float AvatarScale(const AvatarCalibration& avatar, const PlayerCalibration& player) noexcept {
+float LegacyAvatarScale(const AvatarCalibration& avatar, const PlayerCalibration& player) noexcept {
     if (avatar.eyeHeight <= kEpsilon) return 1.0F;
     return player.standingHmdHeight / avatar.eyeHeight;
 }
 
-float MinimumLegReach(const AvatarCalibration& avatar, float scale) noexcept {
-    return std::min(
-        (avatar.thighLength[0] + avatar.lowerLegLength[0]) * scale,
-        (avatar.thighLength[1] + avatar.lowerLegLength[1]) * scale);
+bool LowerBodyHeightEdge(HumanoidBone child) noexcept {
+    return child == HumanoidBone::LeftUpperLeg || child == HumanoidBone::LeftLowerLeg ||
+        child == HumanoidBone::LeftFoot || child == HumanoidBone::RightUpperLeg ||
+        child == HumanoidBone::RightLowerLeg || child == HumanoidBone::RightFoot;
 }
 
-void BuildNeutralPose(
+bool TorsoHeightEdge(HumanoidBone child) noexcept {
+    return child == HumanoidBone::Spine || child == HumanoidBone::Chest ||
+        child == HumanoidBone::UpperChest || child == HumanoidBone::Neck;
+}
+
+struct RetargetedModelGeometry {
+    std::array<Vec3, kHumanoidBoneCount> positions{};
+    std::array<bool, kHumanoidBoneCount> valid{};
+    Vec3 eye{};
+    float floor = 0.0F;
+    bool complete = false;
+};
+
+RetargetedModelGeometry BuildRetargetedModelGeometry(
     const AvatarCalibration& avatar,
-    const PlayerCalibration& player,
-    SolvedHumanoidPose& output) noexcept {
-    const auto scale = AvatarScale(avatar, player);
-    const auto facing = FacingRotation(avatar, player);
-    for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
-        const auto& rest = avatar.rest.bones[index];
-        output.valid[index] = rest.mapped;
-        if (!rest.mapped) continue;
-        output.bones[index] = {
-            player.neutralHead.position + Rotate(facing, (rest.world.position - avatar.eyePosition) * scale),
-            Multiply(facing, rest.world.rotation),
-        };
+    float uniformScale,
+    float lowerBodyScale,
+    float torsoScale) noexcept {
+    RetargetedModelGeometry geometry{};
+    for (std::size_t pass = 0; pass < kHumanoidBoneCount; ++pass) {
+        bool progressed = false;
+        for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
+            const auto& rest = avatar.rest.bones[index];
+            if (!rest.mapped || geometry.valid[index]) continue;
+            if (rest.parent == HumanoidBone::Count) {
+                geometry.positions[index] = rest.world.position * uniformScale;
+                geometry.valid[index] = true;
+                progressed = true;
+                continue;
+            }
+            const auto parentIndex = BoneIndex(rest.parent);
+            if (!geometry.valid[parentIndex]) continue;
+            auto delta = (rest.world.position - avatar.rest.bones[parentIndex].world.position) *
+                uniformScale;
+            const auto child = static_cast<HumanoidBone>(index);
+            if (LowerBodyHeightEdge(child)) delta.y *= lowerBodyScale;
+            else if (TorsoHeightEdge(child)) delta.y *= torsoScale;
+            geometry.positions[index] = geometry.positions[parentIndex] + delta;
+            geometry.valid[index] = true;
+            progressed = true;
+        }
+        if (!progressed) break;
     }
+
+    const auto headIndex = BoneIndex(HumanoidBone::Head);
+    const auto leftFootIndex = BoneIndex(HumanoidBone::LeftFoot);
+    const auto rightFootIndex = BoneIndex(HumanoidBone::RightFoot);
+    if (!geometry.valid[headIndex] || !geometry.valid[leftFootIndex] ||
+        !geometry.valid[rightFootIndex]) return geometry;
+    geometry.eye = geometry.positions[headIndex] +
+        (avatar.eyePosition - Rest(avatar, HumanoidBone::Head).world.position) * uniformScale;
+    geometry.floor = std::min(
+        geometry.positions[leftFootIndex].y,
+        geometry.positions[rightFootIndex].y);
+    for (const auto toe : {HumanoidBone::LeftToes, HumanoidBone::RightToes}) {
+        if (geometry.valid[BoneIndex(toe)]) {
+            geometry.floor = std::min(geometry.floor, geometry.positions[BoneIndex(toe)].y);
+        }
+    }
+    geometry.complete = std::isfinite(geometry.eye.y) && std::isfinite(geometry.floor) &&
+        geometry.eye.y - geometry.floor > kEpsilon;
+    return geometry;
+}
+
+float PoseSpineLength(const AvatarCalibration& avatar, const SolvedHumanoidPose& pose) noexcept {
+    constexpr HumanoidBone chain[] = {
+        HumanoidBone::Hips, HumanoidBone::Spine, HumanoidBone::Chest,
+        HumanoidBone::UpperChest, HumanoidBone::Neck, HumanoidBone::Head};
+    float length = 0.0F;
+    HumanoidBone previous = HumanoidBone::Count;
+    for (const auto bone : chain) {
+        if (!Has(avatar, bone)) continue;
+        if (previous != HumanoidBone::Count) {
+            length += Length(Solved(pose, bone).position - Solved(pose, previous).position);
+        }
+        previous = bone;
+    }
+    return length;
+}
+
+float PoseLegReach(const SolvedHumanoidPose& pose, int side) noexcept {
+    const auto upper = side == 0 ? HumanoidBone::LeftUpperLeg : HumanoidBone::RightUpperLeg;
+    const auto lower = side == 0 ? HumanoidBone::LeftLowerLeg : HumanoidBone::RightLowerLeg;
+    const auto foot = side == 0 ? HumanoidBone::LeftFoot : HumanoidBone::RightFoot;
+    return Length(Solved(pose, lower).position - Solved(pose, upper).position) +
+        Length(Solved(pose, foot).position - Solved(pose, lower).position);
+}
+
+float MinimumLegReach(const SolvedHumanoidPose& pose) noexcept {
+    return std::min(PoseLegReach(pose, 0), PoseLegReach(pose, 1));
 }
 
 Quaternion PoseDelta(Quaternion from, Quaternion to) noexcept { return Multiply(to, Inverse(from)); }
@@ -157,6 +224,7 @@ void SeedBodyState(
     const AvatarCalibration& avatar,
     const PlayerCalibration& player,
     const SolvedHumanoidPose& neutralPose,
+    float scale,
     float stanceWidthScale,
     SolverPersistentState& state) noexcept {
     state.bodyYawState = BodyYawState::Locked;
@@ -177,7 +245,6 @@ void SeedBodyState(
     state.leanAmount = 0.0F;
     state.crouchAmount = 0.0F;
     state.lastSteppedFoot = -1;
-    const auto scale = AvatarScale(avatar, player);
     const auto neutralFootCenter =
         (Solved(neutralPose, HumanoidBone::LeftFoot).position +
          Solved(neutralPose, HumanoidBone::RightFoot).position) * 0.5F;
@@ -363,17 +430,17 @@ Pose EstimatePelvis(
     const calibration::RuntimePlayerProfile& profile,
     Pose headTarget,
     Pose neutralPelvis,
+    float scale,
+    float legReach,
+    float spineReach,
     float sideStepLeanLimit,
     float plantedLegLeanLimit,
     float deltaSeconds,
     SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
-    const auto scale = AvatarScale(avatar, player);
-    const auto legReach = MinimumLegReach(avatar, scale);
     const auto eyeHeight = std::max(player.standingHmdHeight, kEpsilon);
     const auto bodyForward = Vec3{std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
     const auto bodyRight = Vec3{std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
-    const auto spineReach = SpineLength(avatar, scale);
     const auto hardMaximumLateralLean = std::max(
         legReach * 0.045F,
         std::min({
@@ -995,11 +1062,11 @@ IdealStance CalculateIdealStance(
     const PlayerCalibration& player,
     const SolvedHumanoidPose& neutralPose,
     Pose pelvis,
+    float scale,
+    float legReach,
     float stanceWidthScale,
     const SolverPersistentState& state) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
-    const auto scale = AvatarScale(avatar, player);
-    const auto legReach = MinimumLegReach(avatar, scale);
     auto lead = Horizontal(tracking.head.linearVelocity) * tuning.movementLeadSeconds;
     lead = ClampMagnitude(lead, legReach * tuning.maximumMovementLeadLegFraction);
     const auto yawLead = state.bodyYawState == BodyYawState::Turning
@@ -1233,15 +1300,15 @@ void UpdateFeet(
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
     Pose pelvis,
+    float scale,
+    float legReach,
     float stanceWidthScale,
     float deltaSeconds,
     SolverPersistentState& state,
     SolverDiagnostics* diagnostics) noexcept {
     const auto& tuning = kDefaultBodySolverTuning;
-    const auto scale = AvatarScale(avatar, player);
-    const auto legReach = MinimumLegReach(avatar, scale);
     const auto ideal = CalculateIdealStance(
-        tracking, avatar, player, neutralPose, pelvis, stanceWidthScale, state);
+        tracking, avatar, player, neutralPose, pelvis, scale, legReach, stanceWidthScale, state);
     const auto headRise = tracking.head.pose.position.y - player.neutralHead.position.y;
     const auto upwardVelocity = tracking.head.linearVelocity.y;
     const auto hipLeft = Solved(output, HumanoidBone::LeftUpperLeg);
@@ -1353,7 +1420,6 @@ void UpdateFeet(
 void SolveLeg(
     int side,
     const AvatarCalibration& avatar,
-    float scale,
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
     SolverPersistentState& state,
@@ -1367,7 +1433,9 @@ void SolveLeg(
     const auto neutralLower = Solved(neutralPose, lowerBone);
     const auto neutralFoot = Solved(neutralPose, footBone);
     const auto root = Solved(output, upperBone).position;
-    const auto legLength = (avatar.thighLength[side] + avatar.lowerLegLength[side]) * scale;
+    const auto upperLength = Length(neutralLower.position - neutralUpper.position);
+    const auto lowerLength = Length(neutralFoot.position - neutralLower.position);
+    const auto legLength = upperLength + lowerLength;
     const auto axis = Normalize(state.footAnchor[side] - root, {0.0F, -1.0F, 0.0F});
     const auto forward = Vec3{
         std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
@@ -1408,8 +1476,8 @@ void SolveLeg(
         .currentEnd = neutralFoot.position,
         .target = state.footAnchor[side],
         .poleVector = pole,
-        .rootToMiddleLength = avatar.thighLength[side] * scale,
-        .middleToEndLength = avatar.lowerLegLength[side] * scale,
+        .rootToMiddleLength = upperLength,
+        .middleToEndLength = lowerLength,
         .soften = 1.0F,
     });
     if (!result.valid) return;
@@ -1498,6 +1566,162 @@ bool TrackingFinite(const TrackingSample& tracking) noexcept {
 
 } // namespace
 
+AvatarRetargeting ComputeAvatarRetargeting(
+    const AvatarCalibration& avatar,
+    const PlayerCalibration& player,
+    const calibration::RuntimePlayerProfile& profile,
+    bool matchPlayerHeight,
+    float heightAdjustmentBalance) noexcept {
+    AvatarRetargeting result{};
+    result.avatarArmSpan = avatar.approximateArmSpan;
+    result.playerArmSpan = profile.playerArmSpan;
+    result.playerArmSpanConfidence = profile.playerArmSpanConfidence;
+    result.targetEyeHeight = player.standingHmdHeight;
+    result.matchPlayerHeight = matchPlayerHeight;
+    result.heightAdjustmentBalance = Clamp(heightAdjustmentBalance, -1.0F, 1.0F);
+    if (!avatar.valid || !player.valid || avatar.approximateArmSpan <= kEpsilon) return result;
+
+    constexpr float kMinimumArmSpanConfidence = 0.55F;
+    constexpr float kMinimumUniformScale = 0.55F;
+    constexpr float kMaximumUniformScale = 1.80F;
+    const auto armSpanAvailable = profile.valid &&
+        profile.playerArmSpanConfidence >= kMinimumArmSpanConfidence &&
+        std::isfinite(profile.playerArmSpan) && profile.playerArmSpan > 0.45F;
+    const auto requestedUniformScale = armSpanAvailable
+        ? profile.playerArmSpan / avatar.approximateArmSpan
+        : LegacyAvatarScale(avatar, player);
+    result.uniformScale = Clamp(
+        requestedUniformScale,
+        kMinimumUniformScale,
+        kMaximumUniformScale);
+    result.scaleClamped = std::abs(result.uniformScale - requestedUniformScale) > 1.0e-4F;
+    result.armSpanBased = armSpanAvailable;
+
+    const auto natural = BuildRetargetedModelGeometry(avatar, result.uniformScale, 1.0F, 1.0F);
+    if (!natural.complete) {
+        result.geometryFallback = true;
+        return result;
+    }
+    result.naturalEyeHeight = natural.eye.y - natural.floor;
+    result.finalEyeHeight = result.naturalEyeHeight;
+    result.requestedHeightDelta = player.standingHmdHeight - result.naturalEyeHeight;
+    result.residualHeightError = result.requestedHeightDelta;
+    result.valid = true;
+    if (!matchPlayerHeight || !armSpanAvailable) return result;
+
+    // Measuring each region by rebuilding it at 2x accounts for authored
+    // slanted bones without assuming that summed segment magnitudes equal the
+    // vertical height they contribute.
+    const auto doubledLower = BuildRetargetedModelGeometry(
+        avatar, result.uniformScale, 2.0F, 1.0F);
+    const auto doubledTorso = BuildRetargetedModelGeometry(
+        avatar, result.uniformScale, 1.0F, 2.0F);
+    if (!doubledLower.complete || !doubledTorso.complete) {
+        result.geometryFallback = true;
+        return result;
+    }
+    result.lowerBodyVerticalLength =
+        (doubledLower.eye.y - doubledLower.floor) - result.naturalEyeHeight;
+    result.torsoVerticalLength =
+        (doubledTorso.eye.y - doubledTorso.floor) - result.naturalEyeHeight;
+    if (result.lowerBodyVerticalLength <= 0.05F || result.torsoVerticalLength <= 0.05F) {
+        result.geometryFallback = true;
+        return result;
+    }
+
+    constexpr float kMinimumRegionScale = 0.70F;
+    constexpr float kMaximumRegionScale = 1.30F;
+    const auto maximumTotalCorrection = std::min(0.45F, result.naturalEyeHeight * 0.28F);
+    const auto boundedHeightDelta = Clamp(
+        result.requestedHeightDelta,
+        -maximumTotalCorrection,
+        maximumTotalCorrection);
+    result.heightCorrectionClamped =
+        std::abs(boundedHeightDelta - result.requestedHeightDelta) > 1.0e-4F;
+
+    const auto totalAdjustable = result.lowerBodyVerticalLength + result.torsoVerticalLength;
+    const auto centerLegWeight = Clamp(
+        result.lowerBodyVerticalLength / totalAdjustable,
+        0.15F,
+        0.85F);
+    const auto legWeight = result.heightAdjustmentBalance < 0.0F
+        ? centerLegWeight + (0.85F - centerLegWeight) * -result.heightAdjustmentBalance
+        : centerLegWeight + (0.15F - centerLegWeight) * result.heightAdjustmentBalance;
+    auto lowerDelta = Clamp(
+        boundedHeightDelta * legWeight,
+        result.lowerBodyVerticalLength * (kMinimumRegionScale - 1.0F),
+        result.lowerBodyVerticalLength * (kMaximumRegionScale - 1.0F));
+    auto torsoDelta = Clamp(
+        boundedHeightDelta - lowerDelta,
+        result.torsoVerticalLength * (kMinimumRegionScale - 1.0F),
+        result.torsoVerticalLength * (kMaximumRegionScale - 1.0F));
+    auto residual = boundedHeightDelta - lowerDelta - torsoDelta;
+    if (std::abs(residual) > 1.0e-5F) {
+        const auto prior = lowerDelta;
+        lowerDelta = Clamp(
+            lowerDelta + residual,
+            result.lowerBodyVerticalLength * (kMinimumRegionScale - 1.0F),
+            result.lowerBodyVerticalLength * (kMaximumRegionScale - 1.0F));
+        residual -= lowerDelta - prior;
+    }
+    if (std::abs(residual) > 1.0e-5F) {
+        const auto prior = torsoDelta;
+        torsoDelta = Clamp(
+            torsoDelta + residual,
+            result.torsoVerticalLength * (kMinimumRegionScale - 1.0F),
+            result.torsoVerticalLength * (kMaximumRegionScale - 1.0F));
+        residual -= torsoDelta - prior;
+    }
+    if (std::abs(residual) > 1.0e-4F) result.heightCorrectionClamped = true;
+    result.lowerBodyScale = 1.0F + lowerDelta / result.lowerBodyVerticalLength;
+    result.torsoScale = 1.0F + torsoDelta / result.torsoVerticalLength;
+
+    const auto corrected = BuildRetargetedModelGeometry(
+        avatar, result.uniformScale, result.lowerBodyScale, result.torsoScale);
+    if (!corrected.complete) {
+        result.lowerBodyScale = 1.0F;
+        result.torsoScale = 1.0F;
+        result.geometryFallback = true;
+        return result;
+    }
+    result.finalEyeHeight = corrected.eye.y - corrected.floor;
+    result.appliedHeightDelta = result.finalEyeHeight - result.naturalEyeHeight;
+    result.residualHeightError = player.standingHmdHeight - result.finalEyeHeight;
+    result.heightCorrectionApplied = std::abs(result.appliedHeightDelta) > 1.0e-4F;
+    return result;
+}
+
+bool BuildRetargetedNeutralPose(
+    const AvatarCalibration& avatar,
+    const PlayerCalibration& player,
+    const AvatarRetargeting& retargeting,
+    SolvedHumanoidPose& output) noexcept {
+    output = {};
+    if (!retargeting.valid) return false;
+    const auto geometry = BuildRetargetedModelGeometry(
+        avatar,
+        retargeting.uniformScale,
+        retargeting.lowerBodyScale,
+        retargeting.torsoScale);
+    if (!geometry.complete) return false;
+    const auto facing = FacingRotation(avatar, player);
+    const Vec3 modelFloorAnchor{geometry.eye.x, geometry.floor, geometry.eye.z};
+    const Vec3 playerFloorAnchor{
+        player.neutralHead.position.x,
+        player.floorHeight,
+        player.neutralHead.position.z};
+    for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
+        const auto& rest = avatar.rest.bones[index];
+        output.valid[index] = rest.mapped && geometry.valid[index];
+        if (!output.valid[index]) continue;
+        output.bones[index] = {
+            playerFloorAnchor + Rotate(facing, geometry.positions[index] - modelFloorAnchor),
+            Multiply(facing, rest.world.rotation),
+        };
+    }
+    return true;
+}
+
 void StaticTrackerlessAvatarSolver::Reset(SolverPersistentState& state) const noexcept {
     state = {};
 }
@@ -1516,6 +1740,17 @@ void StaticTrackerlessAvatarSolver::SetStanceWidthScale(float scale) noexcept {
 
 void StaticTrackerlessAvatarSolver::SetBackwardSpineCurveLimit(float fraction) noexcept {
     backwardSpineCurveLimit_ = Clamp(fraction, 0.0F, 1.0F);
+}
+
+bool StaticTrackerlessAvatarSolver::SetRetargetingSettings(
+    bool matchPlayerHeight,
+    float heightAdjustmentBalance) noexcept {
+    const auto boundedBalance = Clamp(heightAdjustmentBalance, -1.0F, 1.0F);
+    const auto changed = matchPlayerHeight_ != matchPlayerHeight ||
+        std::abs(heightAdjustmentBalance_ - boundedBalance) > 1.0e-4F;
+    matchPlayerHeight_ = matchPlayerHeight;
+    heightAdjustmentBalance_ = boundedBalance;
+    return changed;
 }
 
 bool StaticTrackerlessAvatarSolver::Solve(
@@ -1547,18 +1782,34 @@ bool StaticTrackerlessAvatarSolver::Solve(
     }
     ++state.solvesThisFrame;
 
-    BuildNeutralPose(avatar, player, output);
+    const auto retargeting = ComputeAvatarRetargeting(
+        avatar,
+        player,
+        profile,
+        matchPlayerHeight_,
+        heightAdjustmentBalance_);
+    if (!BuildRetargetedNeutralPose(avatar, player, retargeting, output)) return false;
     const auto neutralPose = output;
-    const auto scale = AvatarScale(avatar, player);
+    const auto scale = retargeting.uniformScale;
+    const auto legReach = MinimumLegReach(neutralPose);
+    const auto totalSpineLength = PoseSpineLength(avatar, neutralPose);
+    if (legReach <= kEpsilon || totalSpineLength <= kEpsilon) return false;
     if (!state.bodyStateValid || !state.footAnchorsValid || !PersistentStateFinite(state)) {
-        SeedBodyState(tracking, avatar, player, neutralPose, stanceWidthScale_, state);
+        SeedBodyState(tracking, avatar, player, neutralPose, scale, stanceWidthScale_, state);
     }
     const auto deltaSeconds = StateDeltaSeconds(tracking, state, newRenderFrame);
 
     const auto neutralHeadBone = Solved(neutralPose, HumanoidBone::Head);
-    const auto eyeToHead = RelativeTo(player.neutralHead, neutralHeadBone);
-    const auto headToEye = RelativeTo(neutralHeadBone, player.neutralHead);
-    const auto headTarget = Compose(tracking.head.pose, eyeToHead);
+    const Pose headToEye{
+        avatar.headToEye.position * scale,
+        avatar.headToEye.rotation};
+    const auto headRotationDelta = PoseDelta(
+        player.neutralHead.rotation,
+        tracking.head.pose.rotation);
+    const Pose headTarget{
+        neutralHeadBone.position +
+            (tracking.head.pose.position - player.neutralHead.position),
+        Multiply(headRotationDelta, neutralHeadBone.rotation)};
     Pose handTarget[2]{};
     Quaternion sourceToCanonicalHand[2]{};
     for (int side = 0; side < 2; ++side) {
@@ -1595,6 +1846,9 @@ bool StaticTrackerlessAvatarSolver::Solve(
         profile,
         headTarget,
         Solved(neutralPose, HumanoidBone::Hips),
+        scale,
+        legReach,
+        totalSpineLength,
         sideStepLeanLimit_,
         plantedLegLeanLimit_,
         deltaSeconds,
@@ -1624,7 +1878,6 @@ bool StaticTrackerlessAvatarSolver::Solve(
         std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
     const auto bodyRight = Vec3{
         std::cos(state.torsoYawRadians), 0.0F, -std::sin(state.torsoYawRadians)};
-    const auto totalSpineLength = SpineLength(avatar, scale);
     // Constrain the root/end relationship before FABRIK. The spine may bow
     // forward for a lunge, but a pelvis far in front of the head produces the
     // impossible rearward C-shape seen in recordings. Lateral displacement is
@@ -1667,7 +1920,11 @@ bool StaticTrackerlessAvatarSolver::Solve(
     const auto remainingLateralSupport = std::max(
         0.0F, state.maximumSupportOffset - std::abs(clampedPelvisSupportLateral));
     spine.maximumRootShift = std::min(
-        std::min(avatar.lowerLegLength[0], avatar.lowerLegLength[1]) * scale * 0.12F,
+        std::min(
+            Length(Solved(neutralPose, HumanoidBone::LeftFoot).position -
+                Solved(neutralPose, HumanoidBone::LeftLowerLeg).position),
+            Length(Solved(neutralPose, HumanoidBone::RightFoot).position -
+                Solved(neutralPose, HumanoidBone::RightLowerLeg).position)) * 0.12F,
         remainingLateralSupport);
     spine.maximumIterations = 6;
     const auto spineResult = SolveFabrikSpine(spine);
@@ -1759,12 +2016,14 @@ bool StaticTrackerlessAvatarSolver::Solve(
         neutralPose,
         output,
         solvedHips,
+        scale,
+        legReach,
         stanceWidthScale_,
         deltaSeconds,
         state,
         diagnostics);
-    SolveLeg(0, avatar, scale, neutralPose, output, state, diagnostics);
-    SolveLeg(1, avatar, scale, neutralPose, output, state, diagnostics);
+    SolveLeg(0, avatar, neutralPose, output, state, diagnostics);
+    SolveLeg(1, avatar, neutralPose, output, state, diagnostics);
 
     // Eye bones remain rigidly attached to the exact solved head pose.
     for (const auto eye : {HumanoidBone::LeftEye, HumanoidBone::RightEye}) {
@@ -1789,6 +2048,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
     if (diagnostics) {
         diagnostics->hmdTarget = tracking.head.pose;
         diagnostics->avatarEye = Compose(headTarget, headToEye);
+        diagnostics->retargeting = retargeting;
         diagnostics->headTarget = headTarget;
         diagnostics->handTarget[0] = handTarget[0];
         diagnostics->handTarget[1] = handTarget[1];
@@ -1829,8 +2089,14 @@ bool StaticTrackerlessAvatarSolver::Solve(
                     : (state.translationConfidence > state.leanConfidence
                         ? MotionClassification::Translation
                         : MotionClassification::Lean)));
+        // The neutral avatar eye intentionally does not coincide with the HMD
+        // when arm-span scaling is active and Match Player Height is off. The
+        // solver's authoritative target is therefore the neutral avatar eye
+        // plus the player's relative HMD movement, not the absolute HMD world
+        // position. Height residual is reported separately by retargeting.
+        const auto expectedAvatarEyePosition = Compose(headTarget, headToEye).position;
         diagnostics->eyeTargetError = Length(
-            diagnostics->avatarEye.position - tracking.head.pose.position);
+            diagnostics->avatarEye.position - expectedAvatarEyePosition);
         diagnostics->neckToHeadVector = Solved(output, HumanoidBone::Head).position -
             Solved(output, HumanoidBone::Neck).position;
         diagnostics->spineError = spineResult.error;

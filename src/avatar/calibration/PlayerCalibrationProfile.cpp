@@ -313,6 +313,8 @@ RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile
         runtime.gripConfidence[side] = profile.grip.confidence[side];
         runtime.reachConfidence[side] = profile.reach.confidence[side];
     }
+    runtime.playerArmSpan = profile.reach.playerArmSpan;
+    runtime.playerArmSpanConfidence = profile.reach.playerArmSpanConfidence;
     runtime.leanBoundaryNormalized[0] = profile.lean.leftNormalized;
     runtime.leanBoundaryNormalized[1] = profile.lean.rightNormalized;
     runtime.leanBoundaryNormalized[2] = profile.lean.forwardNormalized;
@@ -338,16 +340,6 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
             CalibrationStep::ArmsY,
             CalibrationStep::HandsChest,
         };
-        constexpr CalibrationStep basicMotion[] = {
-            CalibrationStep::LeanLeft,
-            CalibrationStep::LeanRight,
-            CalibrationStep::StepLeft,
-            CalibrationStep::StepRight,
-            CalibrationStep::Squat,
-            CalibrationStep::ForwardDuck,
-            CalibrationStep::TurnLeft45,
-            CalibrationStep::TurnRight45,
-        };
         const auto Missing = [&](CalibrationStep step) noexcept {
             return IsStaticCalibrationStep(step)
                 ? !profile.staticCaptures[Index(step)].valid
@@ -356,12 +348,6 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
         for (const auto step : basicStatic) {
             if (Missing(step)) {
                 if (error) *error = "missing required static capture: " + std::string(CalibrationStepName(step));
-                return false;
-            }
-        }
-        for (const auto step : basicMotion) {
-            if (Missing(step)) {
-                if (error) *error = "missing required motion capture: " + std::string(CalibrationStepName(step));
                 return false;
             }
         }
@@ -376,6 +362,19 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
             }
         }
         const auto height = StandingHeight(profile);
+        const auto& armsT = profile.staticCaptures[Index(CalibrationStep::ArmsT)];
+        profile.reach.playerArmSpan = Length(
+            armsT.grip[1].position - armsT.grip[0].position);
+        const auto spanPlausible = std::isfinite(profile.reach.playerArmSpan) &&
+            profile.reach.playerArmSpan >= height * 0.55F &&
+            profile.reach.playerArmSpan <= height * 1.45F;
+        profile.reach.playerArmSpanConfidence = spanPlausible
+            ? Clamp01(armsT.confidence * (0.65F + armsT.stableSampleFraction * 0.35F))
+            : 0.0F;
+        if (!spanPlausible) {
+            if (error) *error = "accepted T-pose arm span is not anatomically plausible";
+            return false;
+        }
         for (int side = 0; side < 2; ++side) {
             std::vector<Pose> controllerToGrip;
             std::vector<Quaternion> controllerToCanonical;
@@ -477,10 +476,16 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
                 ++leanConfidenceCount;
             }
         }
-        profile.lean.leftNormalized = std::max(0.035F, profile.lean.directions[0].peakDisplacementNormalized);
-        profile.lean.rightNormalized = std::max(0.035F, profile.lean.directions[1].peakDisplacementNormalized);
-        profile.lean.forwardNormalized = std::max(0.045F, profile.lean.directions[2].peakDisplacementNormalized);
-        profile.lean.backwardNormalized = std::max(0.035F, profile.lean.directions[3].peakDisplacementNormalized);
+        const float defaultLeanBoundaries[4]{0.08F, 0.08F, 0.10F, 0.07F};
+        for (int direction = 0; direction < 4; ++direction) {
+            const auto& capture = profile.motionCaptures[Index(leanSteps[direction])];
+            const auto minimum = direction < 2 ? 0.035F : (direction == 2 ? 0.045F : 0.035F);
+            const auto measured = std::max(minimum, profile.lean.directions[direction].peakDisplacementNormalized);
+            if (direction == 0) profile.lean.leftNormalized = capture.valid ? measured : defaultLeanBoundaries[direction];
+            else if (direction == 1) profile.lean.rightNormalized = capture.valid ? measured : defaultLeanBoundaries[direction];
+            else if (direction == 2) profile.lean.forwardNormalized = capture.valid ? measured : defaultLeanBoundaries[direction];
+            else profile.lean.backwardNormalized = capture.valid ? measured : defaultLeanBoundaries[direction];
+        }
         profile.lean.confidence = leanConfidenceCount > 0
             ? leanConfidence / static_cast<float>(leanConfidenceCount) : 0.0F;
 
@@ -498,28 +503,30 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
         }
         const auto& leftTurn = profile.motionCaptures[Index(CalibrationStep::TurnLeft45)];
         const auto& rightTurn = profile.motionCaptures[Index(CalibrationStep::TurnRight45)];
-        profile.turn.leftConfidence = leftTurn.confidence;
-        profile.turn.rightConfidence = rightTurn.confidence;
-        const auto averageTurnDuration = std::max(
-            0.25F,
-            (leftTurn.features.durationSeconds + rightTurn.features.durationSeconds) * 0.5F);
-        const auto averageYawDegrees = (
-            std::abs(leftTurn.features.finalYawRadians) +
-            std::abs(rightTurn.features.finalYawRadians)) * 0.5F * kRadiansToDegrees;
-        const auto& lookLeft = profile.motionCaptures[Index(CalibrationStep::LookLeft)];
-        const auto& lookRight = profile.motionCaptures[Index(CalibrationStep::LookRight)];
-        if (lookLeft.valid && lookRight.valid) {
-            const auto averageLookDegrees = (
-                std::abs(lookLeft.features.peakYawRadians) +
-                std::abs(lookRight.features.peakYawRadians)) * 0.5F * kRadiansToDegrees;
-            profile.turn.softNeckConeDegrees = Clamp(averageLookDegrees * 0.85F, 22.0F, 40.0F);
-        } else {
-            profile.turn.softNeckConeDegrees = Clamp(averageYawDegrees * 0.62F, 22.0F, 38.0F);
+        if (leftTurn.valid && rightTurn.valid) {
+            profile.turn.leftConfidence = leftTurn.confidence;
+            profile.turn.rightConfidence = rightTurn.confidence;
+            const auto averageTurnDuration = std::max(
+                0.25F,
+                (leftTurn.features.durationSeconds + rightTurn.features.durationSeconds) * 0.5F);
+            const auto averageYawDegrees = (
+                std::abs(leftTurn.features.finalYawRadians) +
+                std::abs(rightTurn.features.finalYawRadians)) * 0.5F * kRadiansToDegrees;
+            const auto& lookLeft = profile.motionCaptures[Index(CalibrationStep::LookLeft)];
+            const auto& lookRight = profile.motionCaptures[Index(CalibrationStep::LookRight)];
+            if (lookLeft.valid && lookRight.valid) {
+                const auto averageLookDegrees = (
+                    std::abs(lookLeft.features.peakYawRadians) +
+                    std::abs(lookRight.features.peakYawRadians)) * 0.5F * kRadiansToDegrees;
+                profile.turn.softNeckConeDegrees = Clamp(averageLookDegrees * 0.85F, 22.0F, 40.0F);
+            } else {
+                profile.turn.softNeckConeDegrees = Clamp(averageYawDegrees * 0.62F, 22.0F, 38.0F);
+            }
+            profile.turn.turnDwellSeconds = Clamp(averageTurnDuration * 0.08F, 0.08F, 0.24F);
+            profile.turn.settleHoldSeconds = Clamp(averageTurnDuration * 0.09F, 0.08F, 0.22F);
+            profile.turn.bodyYawDegreesPerSecond = Clamp(
+                averageYawDegrees / averageTurnDuration * 2.6F, 75.0F, 165.0F);
         }
-        profile.turn.turnDwellSeconds = Clamp(averageTurnDuration * 0.08F, 0.08F, 0.24F);
-        profile.turn.settleHoldSeconds = Clamp(averageTurnDuration * 0.09F, 0.08F, 0.22F);
-        profile.turn.bodyYawDegreesPerSecond = Clamp(
-            averageYawDegrees / averageTurnDuration * 2.6F, 75.0F, 165.0F);
         float captureConfidenceSum = 0.0F;
         int captureConfidenceCount = 0;
         for (const auto& capture : profile.staticCaptures) {
@@ -665,6 +672,11 @@ bool SavePlayerCalibrationProfile(
         }
         derived.AddMember("grip", grip, allocator);
         derived.AddMember("reach", reach, allocator);
+        derived.AddMember("playerArmSpan", profile.reach.playerArmSpan, allocator);
+        derived.AddMember(
+            "playerArmSpanConfidence",
+            profile.reach.playerArmSpanConfidence,
+            allocator);
         Value lean(rapidjson::kObjectType);
         Value boundaries(rapidjson::kArrayType);
         boundaries.PushBack(profile.lean.leftNormalized, allocator)
@@ -775,13 +787,17 @@ ProfileLoadResult LoadPlayerCalibrationProfile(
         if (version == document.MemberEnd() || algorithm == document.MemberEnd() ||
             !version->value.IsUint() || !algorithm->value.IsUint() ||
             version->value.GetUint() != kPlayerProfileVersion ||
-            algorithm->value.GetUint() != kCalibrationAlgorithmVersion) {
+            (algorithm->value.GetUint() != kCalibrationAlgorithmVersion &&
+             algorithm->value.GetUint() != 2U)) {
             result.incompatible = true;
             result.message = "saved player calibration version is incompatible; recalibration required";
             return result;
         }
         PlayerCalibrationProfile decoded{};
         decoded.profileVersion = version->value.GetUint();
+        // Version 3 adds an arm-span-derived fit computed entirely from the
+        // already persisted T-pose source capture. Version-2 profiles can be
+        // upgraded losslessly here without asking the player to recalibrate.
         decoded.algorithmVersion = algorithm->value.GetUint();
         if (const auto value = document.FindMember("calibratedAtUtc"); value != document.MemberEnd() && value->value.IsString())
             decoded.calibratedAtUtc = value->value.GetString();

@@ -1,5 +1,13 @@
 # Player calibration architecture
 
+## Shared-Quest player profiles
+
+SaberStage provides five fixed local player slots for people who share one headset. The Avatar tab exposes them through one `Player Profile` dropdown (`Player 1` through `Player 5`). A player profile contains only that player's calibration and the complete Avatar settings group, including selected avatar, avatar quality/visibility controls, controller-to-wrist offsets, display-clone placements, and per-avatar retargeting choices. Camera, recording, preview, broadcast, and every other SaberStage subsystem remain shared and are not changed when the active player changes.
+
+The migrated `Default` player becomes `Player 1` and continues to use `PlayerCalibration.json`, so an existing installation does not require recalibration. Players 2 through 5 store calibration beneath `PlayerProfiles/<profile-id>/PlayerCalibration.json`. The settings document snapshots each player's Avatar settings independently and restores the active Avatar UI when switching profiles.
+
+Version 3 calibration derives player arm span and confidence from the accepted T-pose endpoints. Compatible version-2 files are refitted from their saved captures on load. The resulting span drives avatar uniform scale when credible; a bounded legacy height-scale fallback remains available for incomplete or low-confidence calibration.
+
 Player calibration is separate from VRM geometry measurement, tracking acquisition, UI, and per-frame solver state. `PlayerCalibrationSession` owns the guided capture workflow and source trajectories. `PlayerCalibrationProfile` owns versioned persistent player measurements and derived fit parameters. `RuntimePlayerProfile` is the fixed-size, trivially copyable gameplay view. The solver receives both the avatar's authoritative skeletal calibration and the player's runtime profile; switching VRM files does not rewrite or invalidate player measurements.
 
 The profile is stored beside SaberStage's other mod data as `PlayerCalibration.json`. Version 1 stores profile and algorithm versions, UTC timestamp, tracking configuration, Basic/Advanced mode, accepted static summaries, full accepted motion trajectories, confidence values, and derived grip, reach, lean, step, crouch, and turn parameters. Loading discards incompatible, malformed, or incomplete source data and keeps the generic solver active. Compatible files are refitted from their source captures instead of trusting stale derived values. Saving uses a temporary file and backup rename so a partial write cannot become the active profile.

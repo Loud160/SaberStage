@@ -52,6 +52,10 @@ float QuaternionAngleDegrees(Quaternion a, Quaternion b) noexcept {
 std::size_t Index(CalibrationStep step) noexcept { return static_cast<std::size_t>(step); }
 
 std::vector<CalibrationStep> BasicPlan() {
+    // Basic calibration is deliberately limited to the measurements needed
+    // for grip, reach, and arm-span fitting. Personalized movement envelopes
+    // (lean, step, crouch, duck, and body turn) belong to Advanced; requiring
+    // them here made the supposedly quick path a 14-step full-body routine.
     return {
         CalibrationStep::Neutral,
         CalibrationStep::ArmsDown,
@@ -59,14 +63,6 @@ std::vector<CalibrationStep> BasicPlan() {
         CalibrationStep::ArmsForward,
         CalibrationStep::ArmsY,
         CalibrationStep::HandsChest,
-        CalibrationStep::LeanLeft,
-        CalibrationStep::LeanRight,
-        CalibrationStep::StepLeft,
-        CalibrationStep::StepRight,
-        CalibrationStep::Squat,
-        CalibrationStep::ForwardDuck,
-        CalibrationStep::TurnLeft45,
-        CalibrationStep::TurnRight45,
     };
 }
 
@@ -380,9 +376,14 @@ float ValidateMotion(CalibrationStep step, const MotionFeatures& features) noexc
         const auto peak = DirectionalAmount(step, features.peakHeadDisplacementNormalized);
         const auto final = DirectionalAmount(step, features.finalHeadDisplacementNormalized);
         const auto direction = Clamp((peak - 0.025F) / 0.07F, 0.0F, 1.0F);
-        const auto returned = features.returnFraction;
-        const auto persistentPenalty = Clamp(final / std::max(peak, 0.001F), 0.0F, 1.0F);
-        return Clamp(direction * 0.50F + returned * 0.40F + (1.0F - persistentPenalty) * 0.10F, 0.0F, 1.0F);
+        const auto returned = Clamp(features.returnFraction, 0.0F, 1.0F);
+        const auto held = Clamp(final / std::max(peak, 0.001F), 0.0F, 1.0F);
+        // A natural lean may be held through the shutter or returned to the
+        // starting pose. Both are useful measurements. The old formula gave
+        // a correctly directed held lean at most 50%, which made an accepted
+        // capture unnecessarily difficult even after exaggerated movement.
+        const auto completedShape = std::max(returned, held);
+        return Clamp(direction * 0.75F + completedShape * 0.25F, 0.0F, 1.0F);
     }
     if (step >= CalibrationStep::StepLeft && step <= CalibrationStep::StepBackward) {
         const auto peak = DirectionalAmount(step, features.peakHeadDisplacementNormalized);
@@ -507,7 +508,7 @@ std::string MotionRetryMessage(CalibrationStep step, const MotionFeatures& featu
         return "Head movement was too small or began before measurement. Start facing forward, move only during the tone, and hold until the shutter.";
     }
     if (step >= CalibrationStep::LeanLeft && step <= CalibrationStep::LeanBackward) {
-        return "The lean was too small, in the wrong direction, or began before measurement. Start upright and move only during the tone.";
+        return "The lean was too small, in the wrong direction, or began before measurement. Start upright, move when MEASURING appears, then either hold the lean or return upright.";
     }
     if (step >= CalibrationStep::StepLeft && step <= CalibrationStep::StepBackward) {
         return "The step was too small, in the wrong direction, or not held. Start centered, step during the tone, and remain there until the shutter.";
@@ -532,6 +533,22 @@ ProfileLoadResult PlayerCalibrationSession::Load() noexcept {
     status_.message = result.message;
     ++status_.revision;
     return result;
+}
+
+ProfileLoadResult PlayerCalibrationSession::SwitchProfilePath(
+    std::filesystem::path profilePath) noexcept {
+    Cancel();
+    profilePath_ = std::move(profilePath);
+    profile_ = {};
+    runtime_ = {};
+    profileBeforeSession_ = {};
+    runtimeBeforeSession_ = {};
+    plan_.clear();
+    frames_.clear();
+    status_ = {};
+    status_.cueRevision = cueRevisionCounter_;
+    status_.validationRevision = validationRevisionCounter_;
+    return Load();
 }
 
 bool PlayerCalibrationSession::Prepare(CalibrationMode mode, std::string* error) noexcept {

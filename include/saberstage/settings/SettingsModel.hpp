@@ -9,7 +9,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 13;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 14;
 
 enum class RecordingBackend {
     Hollywood,
@@ -193,6 +193,15 @@ struct AvatarControllerOffsetSettings {
     camera::Vec3 rotationDegrees{};
 };
 
+struct AvatarRetargetingSettings {
+    // Absolute normalized selectedPath when available; selectedFile is used
+    // only for the legacy mod-local avatar fallback.
+    std::string avatarKey;
+    bool matchPlayerHeight = false;
+    // -1 favours legs, 0 distributes proportionally, +1 favours torso.
+    float heightAdjustmentBalance = 0.0F;
+};
+
 struct AvatarSettings {
     bool enabled = false;
     bool visible = true;
@@ -237,6 +246,7 @@ struct AvatarSettings {
     // Scales only the permitted rearward spine bow. Forward bending retains
     // its full calibrated/anatomical range.
     float backwardSpineCurveLimitPercent = 100.0F;
+    std::vector<AvatarRetargetingSettings> retargetingProfiles;
     AvatarControllerOffsetSettings leftControllerToWrist;
     AvatarControllerOffsetSettings rightControllerToWrist;
     // First-person "wear the avatar" view: body renderers move to a layer the
@@ -274,6 +284,17 @@ struct AvatarSettings {
     float standinYawDegrees3 = 180.0F;
 };
 
+struct AvatarPlayerProfile {
+    std::string id = "default";
+    std::string displayName = "Default";
+    AvatarSettings avatar;
+};
+
+[[nodiscard]] std::string AvatarRetargetingKey(const AvatarSettings& settings);
+[[nodiscard]] AvatarRetargetingSettings RetargetingForSelectedAvatar(
+    const AvatarSettings& settings);
+AvatarRetargetingSettings& EditRetargetingForSelectedAvatar(AvatarSettings& settings);
+
 // Per-slot access to the display-clone placements (slot 0..2). Keeps callers
 // free of copy-pasted slot switches.
 inline camera::Vec3& StandinSlotPosition(AvatarSettings& settings, int slot) {
@@ -301,10 +322,28 @@ struct SettingsDocument {
     RecordingSettings recording;
     FeatureSettings companion;
     AvatarSettings avatar;
+    // Five fixed local player slots keep profile selection predictable in the
+    // headset UI. "default" remains Player 1's stable ID so existing settings
+    // and calibration filenames migrate without losing that player's data.
+    std::string activeAvatarPlayerProfileId = "default";
+    std::vector<AvatarPlayerProfile> avatarPlayerProfiles{
+        {.id = "default", .displayName = "Player 1", .avatar = {}},
+        {.id = "player-2", .displayName = "Player 2", .avatar = {}},
+        {.id = "player-3", .displayName = "Player 3", .avatar = {}},
+        {.id = "player-4", .displayName = "Player 4", .avatar = {}},
+        {.id = "player-5", .displayName = "Player 5", .avatar = {}},
+    };
     FeatureSettings scenes;
     LivestreamSettings broadcast;
     FeatureSettings chat;
 };
+
+void SyncActiveAvatarPlayerProfile(SettingsDocument& settings);
+[[nodiscard]] bool SwitchAvatarPlayerProfile(
+    SettingsDocument& settings,
+    std::string_view profileId);
+[[nodiscard]] AvatarPlayerProfile& CreateAvatarPlayerProfile(SettingsDocument& settings);
+[[nodiscard]] bool DeleteActiveAvatarPlayerProfile(SettingsDocument& settings);
 
 struct ValidationResult {
     bool changed = false;

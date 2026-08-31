@@ -486,6 +486,10 @@ public:
                 Logging::Logger.error("Avatar rest-pose restoration failed during unbind");
             }
         }
+        // Binding calibration is always measured from the authored VRM size.
+        // Leaving the previous player-fit scale on the root would make a
+        // later rebind measure an already-scaled skeleton and scale it again.
+        if (vrmRuntime_) vrmRuntime_->SetUniformScale(1.0F);
         transforms_.fill(nullptr);
         fingers_ = {};
         animator_ = nullptr;
@@ -620,6 +624,20 @@ public:
         return reset;
     }
 
+    bool SwitchPlayerCalibrationProfile(
+        const std::filesystem::path& profilePath,
+        std::string* error) noexcept {
+        const auto result = calibrationSession_.SwitchProfilePath(profilePath);
+        solver_.Reset(persistent_);
+        NotifyCalibrationStatus();
+        if ((result.incompatible || result.repairedFallback) && error) *error = result.message;
+        Logging::Logger.info(
+            "Avatar player calibration profile switched to '{}': {}",
+            profilePath.string(),
+            result.message);
+        return true;
+    }
+
     void SetCalibrationStatusChangedHandler(std::function<void()> handler) {
         calibrationStatusChanged_ = std::move(handler);
     }
@@ -750,6 +768,13 @@ public:
             current.nativeSolveMicroseconds =
                 std::chrono::duration<double, std::micro>(solveEnd - solveStart).count();
             current.transformReads = 3;
+            // The native solver returns player-space bone positions at the
+            // fitted scale. Apply that same scale to the complete VRM root
+            // before writing them so the model grows uniformly instead of
+            // stretching its skinned limbs between displaced joints.
+            if (vrmRuntime_ && current.retargeting.valid) {
+                vrmRuntime_->SetUniformScale(current.retargeting.uniformScale);
+            }
             current.transformWrites = WritePose();
             diagnostics_ = current;
         } catch (...) {
@@ -931,6 +956,20 @@ public:
         solver_.SetPlantedLegLeanLimit(settings.plantedLegLeanLimitPercent / 100.0F);
         solver_.SetStanceWidthScale(settings.stanceWidthPercent / 100.0F);
         solver_.SetBackwardSpineCurveLimit(settings.backwardSpineCurveLimitPercent / 100.0F);
+        const auto fit = settings::RetargetingForSelectedAvatar(settings);
+        if (solver_.SetRetargetingSettings(
+                fit.matchPlayerHeight,
+                fit.heightAdjustmentBalance)) {
+            // Neutral geometry, foot anchors, bend poles, and body history all
+            // belong to the previous skeleton fit. Carrying them across a fit
+            // change creates one-frame limb snaps and stale planted feet.
+            solver_.Reset(persistent_);
+            Logging::Logger.info(
+                "Avatar retargeting changed for '{}': matchHeight={} balance={:.2f}; solver state reseeded",
+                fit.avatarKey,
+                fit.matchPlayerHeight,
+                fit.heightAdjustmentBalance);
+        }
         if (automaticExpressionsEnabled_ != settings.animatedExpressions) {
             automaticExpressionsEnabled_ = settings.animatedExpressions;
             if (!automaticExpressionsEnabled_) ClearAutomaticExpressions();
@@ -1113,6 +1152,28 @@ public:
                 BodyYawStateName(diagnostics_.bodyYawState),
                 diagnostics_.headBodyYawErrorDegrees,
                 diagnostics_.torsoYawDegrees);
+            const auto& fit = diagnostics_.retargeting;
+            Logging::Logger.info(
+                "Avatar fit: source={} avatarSpan={:.3f}m playerSpan={:.3f}m confidence={:.2f} "
+                "scale={:.3f} naturalEye={:.3f}m targetEye={:.3f}m finalEye={:.3f}m "
+                "delta={:.3f}m residual={:.3f}m lowerScale={:.3f} torsoScale={:.3f} "
+                "balance={:.2f} scaleClamp={} heightClamp={} geometryFallback={}",
+                fit.armSpanBased ? "arm-span" : "legacy-height-fallback",
+                fit.avatarArmSpan,
+                fit.playerArmSpan,
+                fit.playerArmSpanConfidence,
+                fit.uniformScale,
+                fit.naturalEyeHeight,
+                fit.targetEyeHeight,
+                fit.finalEyeHeight,
+                fit.appliedHeightDelta,
+                fit.residualHeightError,
+                fit.lowerBodyScale,
+                fit.torsoScale,
+                fit.heightAdjustmentBalance,
+                fit.scaleClamped,
+                fit.heightCorrectionClamped,
+                fit.geometryFallback);
             Logging::Logger.info(
                 "Avatar body: pelvis=({:.3f},{:.3f},{:.3f}) lean={:.3f} lateralLean={:.3f}m crouch={:.3f} "
                 "hinge={:.3f} translation=({:.3f},{:.3f},{:.3f}) supportOffset={:.3f}/{:.3f}m predictedMargin={:.3f}m",
@@ -1920,9 +1981,12 @@ private:
     }
 
     void LogCalibration() const {
-        const auto scale = calibration_.eyeHeight > 1.0e-5F
-            ? player_.standingHmdHeight / calibration_.eyeHeight
-            : 1.0F;
+        const auto fit = ComputeAvatarRetargeting(
+            calibration_,
+            player_,
+            calibrationSession_.RuntimeProfile(),
+            false,
+            0.0F);
         const auto neutralControllerSpan = Length(
             player_.neutralHand[1].position - player_.neutralHand[0].position);
         Logging::Logger.info(
@@ -1940,11 +2004,19 @@ private:
             "Avatar proportion calibration: avatarEye={:.3f}m scaledArmSpan={:.3f}m neutralControllerSpan={:.3f}m "
             "headToEye=({:.3f},{:.3f},{:.3f})",
             calibration_.eyeHeight,
-            calibration_.approximateArmSpan * scale,
+            calibration_.approximateArmSpan * fit.uniformScale,
             neutralControllerSpan,
-            calibration_.headToEye.position.x * scale,
-            calibration_.headToEye.position.y * scale,
-            calibration_.headToEye.position.z * scale);
+            calibration_.headToEye.position.x * fit.uniformScale,
+            calibration_.headToEye.position.y * fit.uniformScale,
+            calibration_.headToEye.position.z * fit.uniformScale);
+        Logging::Logger.info(
+            "Avatar scale source: {} playerArmSpan={:.3f}m confidence={:.2f} avatarArmSpan={:.3f}m scale={:.3f}{}",
+            fit.armSpanBased ? "arm span" : "legacy height fallback",
+            fit.playerArmSpan,
+            fit.playerArmSpanConfidence,
+            fit.avatarArmSpan,
+            fit.uniformScale,
+            fit.scaleClamped ? " (clamped)" : "");
         for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
             if (calibration_.rest.bones[index].mapped) {
                 Logging::Logger.debug("Avatar mapped bone {}", BoneName(static_cast<HumanoidBone>(index)));
@@ -2074,6 +2146,11 @@ bool AvatarManager::CompletePlayerCalibration(std::string* error) noexcept {
 void AvatarManager::CancelPlayerCalibration() noexcept { impl_->CancelPlayerCalibration(); }
 bool AvatarManager::ResetPlayerCalibration(std::string* error) noexcept {
     return impl_->ResetPlayerCalibration(error);
+}
+bool AvatarManager::SwitchPlayerCalibrationProfile(
+    const std::filesystem::path& profilePath,
+    std::string* error) noexcept {
+    return impl_->SwitchPlayerCalibrationProfile(profilePath, error);
 }
 void AvatarManager::SetCalibrationStatusChangedHandler(std::function<void()> handler) {
     impl_->SetCalibrationStatusChangedHandler(std::move(handler));
