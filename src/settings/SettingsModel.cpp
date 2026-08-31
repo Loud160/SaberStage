@@ -225,6 +225,12 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                SpringBoneQuality::Custom, defaults.avatar.springBoneQuality, result);
     RepairEnum(settings.avatar.springCollisions, SpringCollisionQuality::Off,
                SpringCollisionQuality::Full, defaults.avatar.springCollisions, result);
+    RepairEnum(settings.avatar.standinVisibility, AvatarStandinVisibility::Both,
+               AvatarStandinVisibility::HeadsetOnly, defaults.avatar.standinVisibility, result);
+    RepairRange(settings.avatar.standinScale, 0.25F, 3.0F,
+                defaults.avatar.standinScale, result);
+    RepairRange(settings.avatar.standinCount, 1, 3,
+                defaults.avatar.standinCount, result);
     RepairRange(settings.avatar.springUpdateRateHz, 12, 90,
                 defaults.avatar.springUpdateRateHz, result);
     RepairRange(settings.avatar.springSubsteps, 1, 4,
@@ -442,6 +448,15 @@ std::string_view ToString(SpringCollisionQuality value) noexcept {
     return "reduced";
 }
 
+std::string_view ToString(AvatarStandinVisibility value) noexcept {
+    switch (value) {
+        case AvatarStandinVisibility::Both: return "both";
+        case AvatarStandinVisibility::CameraOnly: return "camera_only";
+        case AvatarStandinVisibility::HeadsetOnly: return "headset_only";
+    }
+    return "both";
+}
+
 #define SABERSTAGE_PARSE_ENUM_CASE(text, member) \
     if (value == text) { result = member; return true; }
 
@@ -536,6 +551,12 @@ bool TryParse(std::string_view value, SpringCollisionQuality& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("off", SpringCollisionQuality::Off)
     SABERSTAGE_PARSE_ENUM_CASE("reduced", SpringCollisionQuality::Reduced)
     SABERSTAGE_PARSE_ENUM_CASE("full", SpringCollisionQuality::Full)
+    return false;
+}
+bool TryParse(std::string_view value, AvatarStandinVisibility& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("both", AvatarStandinVisibility::Both)
+    SABERSTAGE_PARSE_ENUM_CASE("camera_only", AvatarStandinVisibility::CameraOnly)
+    SABERSTAGE_PARSE_ENUM_CASE("headset_only", AvatarStandinVisibility::HeadsetOnly)
     return false;
 }
 

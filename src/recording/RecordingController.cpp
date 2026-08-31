@@ -331,6 +331,10 @@ void RecordingController::StartVideoSegment() {
         videoCapture_->onOutputUnit = [this](std::uint8_t* data, std::size_t length) {
             if (!videoWriter_ || data == nullptr || length == 0) return;
             if (!videoWriter_->TrySubmit(data, length)) captureWriteFailed_.store(true);
+            // One MediaCodec output unit is one encoded access unit (frame)
+            // apart from rare codec-config buffers; good enough for a live
+            // capture-FPS readout on the floating recording controls.
+            encodedFrameCount_.fetch_add(1, std::memory_order_relaxed);
         };
         videoCapture_->Init(
             activeWidth_,
@@ -365,6 +369,7 @@ void RecordingController::StartVideoSegment() {
         [this](const EncodedVideoPacketView& packet) {
             if (!videoWriter_ || !packet.data || packet.size == 0) return;
             if (!videoWriter_->TrySubmit(packet.data, packet.size)) captureWriteFailed_.store(true);
+            encodedFrameCount_.fetch_add(1, std::memory_order_relaxed);
             {
                 std::lock_guard timingLock(videoTimingMutex_);
                 const auto segmentFrame = packet.presentationTimestamp >= 0
@@ -669,6 +674,7 @@ RecordingSnapshot RecordingController::Snapshot() const {
     if (recording::HasRecordingTimeline(snapshot.state)) {
         snapshot.elapsedSeconds = ElapsedSeconds(std::chrono::steady_clock::now());
     }
+    snapshot.encodedFrameCount = encodedFrameCount_.load(std::memory_order_relaxed);
     const auto live = LivestreamSnapshot();
     if (broadcast::CanStop(live.state)) snapshot.outputType = RecordingOutputType::LocalAndLive;
     return snapshot;

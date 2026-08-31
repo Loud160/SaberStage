@@ -317,6 +317,11 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 "worldControlsVisible",
                 settings.recording.worldControlsVisible,
                 repaired);
+            settings.recording.worldControlsShowFps = Bool(
+                *recording,
+                "worldControlsShowFps",
+                settings.recording.worldControlsShowFps,
+                repaired);
             settings.recording.worldControlsPosition = Vector(
                 *recording,
                 "worldControlsPosition",
@@ -385,6 +390,46 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 *avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, repaired);
             settings.avatar.rightControllerToWrist = AvatarControllerOffset(
                 *avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, repaired);
+            settings.avatar.wearAvatar = Bool(*avatar, "wearAvatar", settings.avatar.wearAvatar, repaired);
+            settings.avatar.wearHideFace = Bool(*avatar, "wearHideFace", settings.avatar.wearHideFace, repaired);
+            settings.avatar.wearHideHair = Bool(*avatar, "wearHideHair", settings.avatar.wearHideHair, repaired);
+            settings.avatar.wearHideNeckAccessories = Bool(
+                *avatar, "wearHideNeckAccessories", settings.avatar.wearHideNeckAccessories, repaired);
+            // Migrate the earlier tiered wearCoverage key into the independent
+            // hide switches (only when the new keys are absent, so a file that
+            // has both keeps the explicit new values).
+            if (const auto* legacyCoverage = Member(*avatar, "wearCoverage");
+                legacyCoverage && legacyCoverage->IsString() && !Member(*avatar, "wearHideFace")) {
+                const std::string coverage(legacyCoverage->GetString(), legacyCoverage->GetStringLength());
+                settings.avatar.wearHideFace = true;
+                settings.avatar.wearHideHair = coverage == "hide_hair" || coverage == "body_only";
+                settings.avatar.wearHideNeckAccessories = coverage == "body_only";
+                repaired = true;
+            }
+            settings.avatar.standinEnabled = Bool(*avatar, "standinEnabled", settings.avatar.standinEnabled, repaired);
+            settings.avatar.standinVisibility = EnumValue(
+                *avatar, "standinVisibility", settings.avatar.standinVisibility,
+                [](std::string_view value, AvatarStandinVisibility& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.avatar.standinScale = Float(
+                *avatar, "standinScale", settings.avatar.standinScale, repaired);
+            settings.avatar.standinCount = Int(
+                *avatar, "standinCount", settings.avatar.standinCount, repaired);
+            settings.avatar.standinShowSabers = Bool(
+                *avatar, "standinShowSabers", settings.avatar.standinShowSabers, repaired);
+            settings.avatar.standinShowPointers = Bool(
+                *avatar, "standinShowPointers", settings.avatar.standinShowPointers, repaired);
+            settings.avatar.standinPosition = Vector(
+                *avatar, "standinPosition", settings.avatar.standinPosition, repaired);
+            settings.avatar.standinYawDegrees = Float(
+                *avatar, "standinYawDegrees", settings.avatar.standinYawDegrees, repaired);
+            settings.avatar.standinPosition2 = Vector(
+                *avatar, "standinPosition2", settings.avatar.standinPosition2, repaired);
+            settings.avatar.standinYawDegrees2 = Float(
+                *avatar, "standinYawDegrees2", settings.avatar.standinYawDegrees2, repaired);
+            settings.avatar.standinPosition3 = Vector(
+                *avatar, "standinPosition3", settings.avatar.standinPosition3, repaired);
+            settings.avatar.standinYawDegrees3 = Float(
+                *avatar, "standinYawDegrees3", settings.avatar.standinYawDegrees3, repaired);
         }
     }
     settings.scenes = Feature(document, "scenes", settings.scenes, repaired);
@@ -456,6 +501,7 @@ std::string Encode(const SettingsDocument& settings) {
     recording.AddMember("gameplayOnly", settings.recording.gameplayOnly, allocator);
     recording.AddMember("controllerShortcutEnabled", settings.recording.controllerShortcutEnabled, allocator);
     recording.AddMember("worldControlsVisible", settings.recording.worldControlsVisible, allocator);
+    recording.AddMember("worldControlsShowFps", settings.recording.worldControlsShowFps, allocator);
     AddVector(recording, "worldControlsPosition", settings.recording.worldControlsPosition, allocator);
     AddVector(
         recording,
@@ -494,6 +540,22 @@ std::string Encode(const SettingsDocument& settings) {
     avatar.AddMember("backwardSpineCurveLimitPercent", settings.avatar.backwardSpineCurveLimitPercent, allocator);
     AddAvatarControllerOffset(avatar, "leftControllerToWrist", settings.avatar.leftControllerToWrist, allocator);
     AddAvatarControllerOffset(avatar, "rightControllerToWrist", settings.avatar.rightControllerToWrist, allocator);
+    avatar.AddMember("wearAvatar", settings.avatar.wearAvatar, allocator);
+    avatar.AddMember("wearHideFace", settings.avatar.wearHideFace, allocator);
+    avatar.AddMember("wearHideHair", settings.avatar.wearHideHair, allocator);
+    avatar.AddMember("wearHideNeckAccessories", settings.avatar.wearHideNeckAccessories, allocator);
+    avatar.AddMember("standinEnabled", settings.avatar.standinEnabled, allocator);
+    avatar.AddMember("standinVisibility", Value(ToString(settings.avatar.standinVisibility).data(), allocator), allocator);
+    avatar.AddMember("standinScale", settings.avatar.standinScale, allocator);
+    avatar.AddMember("standinCount", settings.avatar.standinCount, allocator);
+    avatar.AddMember("standinShowSabers", settings.avatar.standinShowSabers, allocator);
+    avatar.AddMember("standinShowPointers", settings.avatar.standinShowPointers, allocator);
+    AddVector(avatar, "standinPosition", settings.avatar.standinPosition, allocator);
+    avatar.AddMember("standinYawDegrees", settings.avatar.standinYawDegrees, allocator);
+    AddVector(avatar, "standinPosition2", settings.avatar.standinPosition2, allocator);
+    avatar.AddMember("standinYawDegrees2", settings.avatar.standinYawDegrees2, allocator);
+    AddVector(avatar, "standinPosition3", settings.avatar.standinPosition3, allocator);
+    avatar.AddMember("standinYawDegrees3", settings.avatar.standinYawDegrees3, allocator);
     document.AddMember("avatar", avatar, allocator);
     AddFeature(document, "scenes", settings.scenes, allocator);
     Value broadcast(rapidjson::kObjectType);

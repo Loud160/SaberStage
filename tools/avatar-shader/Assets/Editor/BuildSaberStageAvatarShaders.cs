@@ -59,8 +59,16 @@ internal static class BuildSaberStageAvatarShaders
         Directory.CreateDirectory(output);
         var build = new AssetBundleBuild {
             assetBundleName = "saberstage_avatar_shaders",
-            assetNames = new[] { "Assets/SaberStageMToon.shader", "Assets/SaberStageMToonOutline.shader" },
-            addressableNames = new[] { "saberstage-mtoon", "saberstage-mtoon-outline" }
+            assetNames = new[] {
+                "Assets/SaberStageMToon.shader",
+                "Assets/SaberStageMToonOutline.shader",
+                "Assets/SaberStageVideoPreview.shader"
+            },
+            addressableNames = new[] {
+                "saberstage-mtoon",
+                "saberstage-mtoon-outline",
+                "saberstage-video-preview"
+            }
         };
         var manifest = BuildPipeline.BuildAssetBundles(output, new[] { build },
             BuildAssetBundleOptions.ChunkBasedCompression |

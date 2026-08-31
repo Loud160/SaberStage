@@ -84,9 +84,46 @@ constexpr float kCalibrationPanelScale = 0.011F;
 // grabbable without introducing a dedicated move bar while button pointer
 // input can never be stolen by the physics handle.
 constexpr float kCalibrationPanelControlBandHeight = 22.0F;
-const UnityEngine::Vector2 kRecordingPanelSize{48.0F, 28.0F};
-const UnityEngine::Vector2 kRecordingPanelBodySize{43.0F, 23.0F};
+// Floating recording-controls geometry. Every value below is in FloatingScreen
+// canvas units; the world size is canvas units multiplied by
+// kRecordingPanelScale (48 x 24 units -> 60 x 30 cm at 0.0125). The panel has
+// two fixed bands: an information band on top (status + elapsed, plus an
+// optional FPS row) and a button band at the bottom. The invisible grab handle
+// must cover ONLY the information band — a physics handle hit always wins over
+// Unity's UI raycast, so any handle overlap with the button band turns button
+// clicks into panel grabs.
+constexpr float kRecordingPanelWidth = 48.0F;
+constexpr float kRecordingPanelButtonBandHeight = 11.0F;
+constexpr float kRecordingPanelHeaderHeight = 8.0F;
+constexpr float kRecordingPanelFpsRowHeight = 5.5F;
 constexpr float kRecordingPanelScale = 0.0125F;
+
+// The panel height depends on whether the FPS row is enabled. Toggling the
+// row rebuilds the panel at the matching size rather than leaving dead space.
+UnityEngine::Vector2 RecordingPanelSize(bool showFps) {
+    return {
+        kRecordingPanelWidth,
+        kRecordingPanelHeaderHeight + (showFps ? kRecordingPanelFpsRowHeight : 0.0F) +
+            kRecordingPanelButtonBandHeight + 2.0F};
+}
+
+// Grab proxy for the free-standing avatar display clone. The FloatingScreen
+// draws nothing: it exists purely to carry BSML's invisible physics grab
+// handle, which is enlarged into a body-sized box so the clone can be grabbed
+// anywhere on its body (a small tag at hip height ended up embedded inside
+// the body mesh, leaving only a sliver near the leg reachable). All handle
+// dimensions are in canvas units; world meters = units * kStandinProxyScale,
+// so 1 meter = 80 units. The screen origin floats a fixed height above the
+// clone's feet; the handle box is offset and scaled from there to track the
+// clone's Body and its user-chosen scale.
+const UnityEngine::Vector2 kStandinProxySize{8.0F, 8.0F};
+constexpr float kStandinProxyScale = 0.0125F;
+constexpr float kStandinProxyHeightMeters = 1.05F;
+// Approximate standing-body volume of a 1.0-scale humanoid avatar, in meters.
+constexpr float kStandinBodyWidthMeters = 0.85F;
+constexpr float kStandinBodyHeightMeters = 1.95F;
+constexpr float kStandinBodyDepthMeters = 0.55F;
+constexpr float kStandinBodyCenterHeightMeters = 0.95F;
 
 template <typename T>
 T* WithHint(T* control, std::string_view text) {
@@ -104,6 +141,30 @@ void RememberSelectables(T* control, std::vector<UnityEngine::UI::Selectable*>& 
 
 bool IsAlive(UnityEngine::Object* object) {
     return object != nullptr && UnityEngine::Object::op_Inequality(object, nullptr);
+}
+
+// Sizes the invisible grab handle to cover the clone's body at its current
+// scale. Called at creation and again whenever the scale setting changes.
+// (Defined after IsAlive: everything in this anonymous namespace must respect
+// declaration order.)
+void FitStandinProxyHandleToBody(BSML::FloatingScreen* screen, float cloneScale) {
+    if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
+    if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
+        renderer->set_enabled(false);
+    }
+    const float unitsPerMeter = 1.0F / kStandinProxyScale;
+    const float scale = std::max(0.05F, cloneScale);
+    // The screen origin sits kStandinProxyHeightMeters above the clone's
+    // feet; the body's center sits kStandinBodyCenterHeightMeters * scale
+    // above the feet, so the handle is offset by the difference.
+    const float centerOffsetMeters =
+        kStandinBodyCenterHeightMeters * scale - kStandinProxyHeightMeters;
+    screen->handle->get_transform()->set_localPosition({
+        0.0F, centerOffsetMeters * unitsPerMeter, 0.0F});
+    screen->handle->get_transform()->set_localScale({
+        kStandinBodyWidthMeters * scale * unitsPerMeter,
+        kStandinBodyHeightMeters * scale * unitsPerMeter,
+        kStandinBodyDepthMeters * scale * unitsPerMeter});
 }
 
 bool FloatingUiServicesReady() {
@@ -181,19 +242,25 @@ void ConfigureWorldPanelText(
     rect->set_sizeDelta(size);
 }
 
-void HideAndPlaceWorldPanelHandleInPadding(BSML::FloatingScreen* screen) {
+void HideAndFitWorldPanelHandleAboveButtons(
+    BSML::FloatingScreen* screen,
+    UnityEngine::Vector2 panelSize) {
     if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
     if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
         renderer->set_enabled(false);
     }
-    // Keep the native, reliable Top handle entirely inside the unpainted top
-    // padding. It remains easy to grab without drawing a handle bar or placing
-    // a physics hit volume over the two recording buttons.
-    constexpr float handleHeight = 2.5F;
+    // Same proven scheme as the calibration panel: one invisible native handle
+    // covering the full information band, stopping exactly at the top of the
+    // button band. The previous 2.5-unit sliver at the very top edge was a
+    // ~3 cm grab target at world scale, which is why the panel felt immovable.
+    // Never extend this collider over the buttons: the physics handle wins
+    // over UI raycasts and would swallow every click. The Z scale of 2 canvas
+    // units keeps the box thin enough not to shadow neighboring UI.
+    const float handleHeight = panelSize.y - kRecordingPanelButtonBandHeight;
     screen->handle->get_transform()->set_localPosition({
-        0.0F, (kRecordingPanelSize.y - handleHeight) * 0.5F, 0.0F});
+        0.0F, kRecordingPanelButtonBandHeight * 0.5F, 0.0F});
     screen->handle->get_transform()->set_localScale({
-        kRecordingPanelSize.x, handleHeight, 2.0F});
+        panelSize.x, handleHeight, 2.0F});
 }
 
 void HideAndFitCalibrationPanelHandleAboveControls(BSML::FloatingScreen* screen) {
@@ -497,7 +564,30 @@ TMPro::TextMeshProUGUI* CreateRightPanelSubheader(
     text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
     text->set_enableWordWrapping(false);
     text->set_raycastTarget(false);
+    // 48 units matches ConstrainRightPanelRow's row width so the label's left
+    // edge lines up with the setting rows beneath it. The extra height above
+    // a plain row provides the visual section break.
     ConfigureLayout(text, 48.0F, 4.5F, 0.0F, 0.0F);
+    text->set_color({0.55F, 0.78F, 0.95F, 1.0F});
+    return text;
+}
+
+TMPro::TextMeshProUGUI* CreateCenterPanelSubheader(
+    UnityEngine::Transform* parent,
+    std::string_view label) {
+    auto* text = BSML::Lite::CreateText(
+        parent, StringW(label), TMPro::FontStyles::Bold, 3.4F);
+    if (!IsAlive(text)) return nullptr;
+    text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+    text->set_enableWordWrapping(false);
+    text->set_raycastTarget(false);
+    // Center pages own a 52-unit content column (kCenterPanelRowWidth); the
+    // subheader takes the same width so it aligns with the rows it titles.
+    ConfigureLayout(text, kCenterPanelRowWidth, 5.0F, 0.0F, 0.0F);
+    if (auto* layout = text->get_gameObject()->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(kCenterPanelRowWidth);
+    }
+    text->set_color({0.55F, 0.78F, 0.95F, 1.0F});
     return text;
 }
 
@@ -577,6 +667,7 @@ MenuController::~MenuController() {
     root_.Recording().SetStatusChangedHandler({});
     root_.Avatar().SetCalibrationStatusChangedHandler({});
     DestroyRecordingWorldPanel();
+    DestroyAllStandinProxies();
     DestroyCalibrationPanel();
     UnbindCalibrationPanelRuntimeDriver(this);
     if (IsAlive(calibrationPanelDriverObject_)) {
@@ -690,6 +781,241 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     }), "Browse the headset and choose the VRM avatar SaberStage should display.");
     ConfigureLayout(chooseAvatar, 48.0F, 8.0F, 1.0F);
 
+    // Steps 2 and 3 side by side, directly under step 1, so the setup flow
+    // reads top-to-bottom. The status line follows the actions it reports on.
+    auto* loadActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
+    loadActions->set_spacing(1.0F);
+    loadActions->set_childControlWidth(true);
+    loadActions->set_childControlHeight(true);
+    loadActions->set_childForceExpandWidth(true);
+    loadActions->set_childForceExpandHeight(false);
+    ConfigureLayout(loadActions, 52.0F, 8.0F, 1.0F);
+    WithHint(BSML::Lite::CreateUIButton(loadActions, "Load Avatar", [] {
+        if (!active_) return;
+        auto& settings = active_->root_.Settings().Edit().avatar;
+        const auto path = active_->ConfiguredAvatarPath();
+        if (path.empty()) {
+            Logging::Logger.warn("Choose a VRM avatar file before loading");
+            active_->RefreshAvatarStatus();
+            return;
+        }
+        std::string error;
+        if (active_->root_.Avatar().LoadVrmAvatar(
+                path, static_cast<std::uint32_t>(settings.maximumTextureDimension), &error, false)) {
+            settings.enabled = true;
+            active_->root_.Avatar().SetControllerToWristOffsets(
+                AvatarOffsetPose(settings.leftControllerToWrist),
+                AvatarOffsetPose(settings.rightControllerToWrist));
+            active_->root_.Avatar().SetAvatarVisible(settings.visible);
+            active_->root_.Avatar().ApplyAvatarSettings(settings);
+            active_->root_.Settings().Save(nullptr);
+        } else {
+            Logging::Logger.error("Avatar load button failed: {}", error);
+        }
+        active_->RefreshAvatarStatus();
+    }), "Step 2: loads the selected VRM in its rest pose. A successfully loaded avatar safely replaces the current avatar; unloading first is not required.");
+    WithHint(BSML::Lite::CreateUIButton(loadActions, "Attach Tracking", [] {
+        if (!active_) return;
+        auto& settings = active_->root_.Settings().Edit().avatar;
+        active_->root_.Avatar().SetControllerToWristOffsets(
+            AvatarOffsetPose(settings.leftControllerToWrist),
+            AvatarOffsetPose(settings.rightControllerToWrist));
+        std::string error;
+        if (!active_->root_.Avatar().BindLoadedVrmAvatar(&error)) {
+            Logging::Logger.error("Avatar solver bind button failed: {}", error);
+        }
+        active_->RefreshAvatarStatus();
+    }), "Step 3: connects the loaded avatar to the Quest headset and controller tracking solver so it follows you.");
+
+    active_->avatarStatusText_ = BSML::Lite::CreateText(
+        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 21.0F});
+    active_->avatarStatusText_->set_enableWordWrapping(true);
+    active_->avatarStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    CreateCenterPanelSubheader(container->get_transform(), "Options");
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Visible", avatar.visible, [](bool visible) {
+        if (!active_) return;
+        active_->root_.Settings().Edit().avatar.visible = visible;
+        active_->root_.Avatar().SetAvatarVisible(visible);
+        std::string error;
+        if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar visibility: {}", error);
+    }), "Shows or hides the loaded avatar without unloading it."));
+
+    // Applies any avatar-settings change live and persists it; shared by the
+    // wear and display-clone rows below.
+    const auto applyAndSaveAvatar = [] {
+        if (!active_) return;
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        std::string error;
+        if (!active_->root_.Settings().Save(&error)) {
+            Logging::Logger.error("Could not save avatar view settings: {}", error);
+        }
+    };
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Wear Avatar", avatar.wearAvatar, [applyAndSaveAvatar](bool enabled) {
+        if (!active_) return;
+        active_->root_.Settings().Edit().avatar.wearAvatar = enabled;
+        applyAndSaveAvatar();
+    }), "Shows the avatar's body on you in the headset. The camera and recordings always show the complete avatar; the hide switches below only affect your own view."));
+    // Independent hide switches instead of tiered coverage: players asked to
+    // control each head element separately (e.g. keep hair out of their eyes
+    // without touching anything else).
+    const auto addWearToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
+        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [applyAndSaveAvatar, member](bool enabled) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().avatar.*member = enabled;
+            applyAndSaveAvatar();
+        }), hint));
+    };
+    addWearToggle("Hide Face In Headset", avatar.wearHideFace, &settings::AvatarSettings::wearHideFace,
+        "Hides the avatar's face geometry from your own view while worn. Leave this on: with it off you look through the inside of the head's eye and mouth meshes.");
+    addWearToggle("Hide Hair In Headset", avatar.wearHideHair, &settings::AvatarSettings::wearHideHair,
+        "Hides hair meshes from your own view while worn, for players who find hair at the edge of vision annoying. The camera still shows the hair.");
+    addWearToggle("Hide Neck Accessories", avatar.wearHideNeckAccessories, &settings::AvatarSettings::wearHideNeckAccessories,
+        "Hides collars, chokers, and scarves from your own view while worn. The camera still shows them.");
+
+    CreateCenterPanelSubheader(container->get_transform(), "Display Clone");
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Show Display Clone", avatar.standinEnabled, [applyAndSaveAvatar](bool enabled) {
+        if (!active_) return;
+        active_->root_.Settings().Edit().avatar.standinEnabled = enabled;
+        applyAndSaveAvatar();
+    }), "Places a free-standing copy of your avatar in the world that mirrors your movements live. Grab the clone's body anywhere to move and turn it."));
+    static std::array<std::string_view, 3> standinCounts{"1", "2", "3"};
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
+        container,
+        "Clone Count",
+        std::to_string(std::clamp(avatar.standinCount, 1, 3)),
+        standinCounts,
+        [applyAndSaveAvatar](StringW value) {
+            if (!active_) return;
+            const auto label = static_cast<std::string>(value);
+            active_->root_.Settings().Edit().avatar.standinCount =
+                label == "2" ? 2 : label == "3" ? 3 : 1;
+            applyAndSaveAvatar();
+        }), "How many clones to place (each is grabbed and positioned independently). Every visible clone renders a full extra avatar in each view that shows it; 2 or 3 clones can noticeably reduce performance during gameplay."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Clones Hold Sabers", avatar.standinShowSabers, [applyAndSaveAvatar](bool enabled) {
+        if (!active_) return;
+        active_->root_.Settings().Edit().avatar.standinShowSabers = enabled;
+        applyAndSaveAvatar();
+    }), "During a map, places visual copies of your sabers in the clones' hands, matching your saber motion."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Clones Hold Pointers", avatar.standinShowPointers, [applyAndSaveAvatar](bool enabled) {
+        if (!active_) return;
+        active_->root_.Settings().Edit().avatar.standinShowPointers = enabled;
+        applyAndSaveAvatar();
+    }), "In menus, places visual copies of the menu pointer grips in the clones' hands."));
+    static std::array<std::string_view, 3> standinVisibilities{"Headset + Camera", "Camera Only", "Headset Only"};
+    const auto standinVisibilityLabel = avatar.standinVisibility == settings::AvatarStandinVisibility::CameraOnly ? "Camera Only"
+        : avatar.standinVisibility == settings::AvatarStandinVisibility::HeadsetOnly ? "Headset Only" : "Headset + Camera";
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Clone Visibility", standinVisibilityLabel, standinVisibilities, [applyAndSaveAvatar](StringW value) {
+        if (!active_) return;
+        const auto label = static_cast<std::string>(value);
+        active_->root_.Settings().Edit().avatar.standinVisibility =
+            label == "Camera Only" ? settings::AvatarStandinVisibility::CameraOnly :
+            label == "Headset Only" ? settings::AvatarStandinVisibility::HeadsetOnly :
+            settings::AvatarStandinVisibility::Both;
+        applyAndSaveAvatar();
+    }), "Chooses which views render the clone. Camera Only keeps your headset view clear while the clone appears in recordings; Headset Only keeps it out of recordings."));
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
+        container,
+        "Clone Scale",
+        0.05F,
+        avatar.standinScale,
+        0.25F,
+        3.0F,
+        0.15F,
+        true,
+        {0.0F, 0.0F},
+        [applyAndSaveAvatar](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().avatar.standinScale = value;
+            applyAndSaveAvatar();
+        }),
+        "Physical size of the display clone. 1.0 is the avatar's real size."));
+    auto* resetStandin = WithHint(BSML::Lite::CreateUIButton(container, "Reset Clone Placement", [applyAndSaveAvatar] {
+        if (!active_) return;
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        // Line all three slots up 1.6 m in front of the player at floor
+        // level, facing them, spread 0.9 m apart sideways so multiple clones
+        // never rebuild stacked inside each other. Then drop the grab handles
+        // so they rebuild at the new poses.
+        float forwardX = 0.0F;
+        float forwardZ = 1.0F;
+        float facingYaw = 180.0F;
+        if (auto mainCamera = UnityEngine::Camera::get_main()) {
+            auto* head = mainCamera->get_transform().ptr();
+            const auto headPosition = head->get_position();
+            const auto headYaw = head->get_rotation().get_eulerAngles().y;
+            const auto forward = UnityEngine::Quaternion::op_Multiply(
+                UnityEngine::Quaternion::Euler({0.0F, headYaw, 0.0F}),
+                UnityEngine::Vector3::get_forward());
+            forwardX = forward.x;
+            forwardZ = forward.z;
+            facingYaw = camera::NormalizeDegrees(headYaw + 180.0F);
+            for (int slot = 0; slot < 3; ++slot) {
+                // Right vector = forward rotated -90 degrees around Y.
+                const float side = 0.9F * static_cast<float>(slot == 1 ? -1 : slot == 2 ? 1 : 0);
+                settings::StandinSlotPosition(avatarSettings, slot) = {
+                    headPosition.x + forwardX * 1.6F + forwardZ * side,
+                    0.0F,
+                    headPosition.z + forwardZ * 1.6F - forwardX * side};
+                settings::StandinSlotYaw(avatarSettings, slot) = facingYaw;
+            }
+        } else {
+            for (int slot = 0; slot < 3; ++slot) {
+                const float side = 0.9F * static_cast<float>(slot == 1 ? -1 : slot == 2 ? 1 : 0);
+                settings::StandinSlotPosition(avatarSettings, slot) = {side, 0.0F, 1.6F};
+                settings::StandinSlotYaw(avatarSettings, slot) = facingYaw;
+            }
+        }
+        active_->DestroyAllStandinProxies();
+        applyAndSaveAvatar();
+    }), "Moves every clone back in front of you at floor level, facing you, spread side by side.");
+    ConfigureLayout(resetStandin, 48.0F, 8.0F, 1.0F);
+    auto* standinNote = BSML::Lite::CreateText(
+        container->get_transform(),
+        "Each visible clone renders a full extra copy of the avatar in every view that shows it and can reduce performance during gameplay.",
+        3.0F, {0.0F, 0.0F}, {55.0F, 10.0F});
+    standinNote->set_enableWordWrapping(true);
+    standinNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    CreateCenterPanelSubheader(container->get_transform(), "Expression Test");
+    auto* expressionActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
+    expressionActions->set_spacing(1.0F);
+    expressionActions->set_childControlWidth(true);
+    expressionActions->set_childControlHeight(true);
+    expressionActions->set_childForceExpandWidth(true);
+    expressionActions->set_childForceExpandHeight(false);
+    ConfigureLayout(expressionActions, 52.0F, 8.0F, 1.0F);
+    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Blink", [] {
+        if (active_) active_->root_.Avatar().SetExpression("blink", 1.0F, nullptr);
+    }), "Tests the avatar's blink expression by closing its eyes.");
+    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Open Eyes", [] {
+        if (active_) active_->root_.Avatar().SetExpression("blink", 0.0F, nullptr);
+    }), "Clears the blink test and opens the avatar's eyes.");
+    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Joy", [] {
+        if (active_) active_->root_.Avatar().SetExpression("joy", 1.0F, nullptr);
+    }), "Tests the avatar's happy or joy expression, when the VRM supplies one.");
+
+    // Rarely used, potentially disruptive actions live at the bottom of the
+    // page under their own header so they cannot be mistaken for setup steps.
+    CreateCenterPanelSubheader(container->get_transform(), "Maintenance");
+    WithHint(BSML::Lite::CreateUIButton(container, "Unload Avatar", [] {
+        if (!active_) return;
+        active_->root_.Avatar().UnloadVrmAvatar();
+        active_->root_.Settings().Edit().avatar.enabled = false;
+        active_->root_.Settings().Save(nullptr);
+        active_->RefreshAvatarStatus();
+    }), "Removes the current avatar from the scene and frees its resources.");
+    WithHint(BSML::Lite::CreateUIButton(container, "Resync Player Pose", [] {
+        if (active_ && !active_->root_.Avatar().RecalibrateNeutral()) {
+            Logging::Logger.warn("Avatar neutral recalibration needs a loaded avatar and valid HMD/controller tracking");
+        }
+        if (active_) active_->RefreshAvatarStatus();
+    }), "Resynchronizes the avatar with your current standing height, floor, headset, and controller pose. This does not erase your saved Basic or Advanced calibration.");
+    WithHint(BSML::Lite::CreateUIButton(container, "Write Diagnostic Log", [] {
+        if (active_) active_->root_.Avatar().LogDiagnostics();
+    }), "Writes detailed avatar tracking and solver measurements to the SaberStage log for troubleshooting; it does not change the avatar.");
+
     container = pages[1];
     auto* qualityHeading = BSML::Lite::CreateText(
         container->get_transform(), "Avatar Quality and Motion", 5.0F, {0.0F, 0.0F}, {55.0F, 7.0F});
@@ -700,6 +1026,11 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
     qualityNote->set_enableWordWrapping(true);
     qualityNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+    // Page grouping: Rendering (preset + material features), Posture & Motion
+    // (solver limits), SpringBones (secondary motion), Expressions. Controls
+    // are unchanged; only the order and section headers differ so related
+    // rows sit together in the scroll.
+    CreateCenterPanelSubheader(container->get_transform(), "Rendering");
     static std::array<std::string_view, 4> qualityPresets{"Performance", "Balanced", "Quality", "Custom"};
     const auto presetLabel = [&] {
         switch (avatar.qualityPreset) {
@@ -787,6 +1118,43 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             std::string error;
             if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar texture limit: {}", error);
         }), "Limits avatar texture size. It takes effect the next time the avatar is loaded; other quality controls update live."));
+    const auto addQualityToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
+        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [member](bool enabled) {
+            if (!active_) return;
+            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+            avatarSettings.*member = enabled;
+            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+            active_->root_.Settings().Save(nullptr);
+        }), hint));
+    };
+    addQualityToggle("Toon Lighting", avatar.toonLighting, &settings::AvatarSettings::toonLighting,
+        "Uses the authored MToon light and shade model. Off is an emergency unlit fallback.");
+    addQualityToggle("Normal Maps", avatar.normalMaps, &settings::AvatarSettings::normalMaps,
+        "Adds authored surface detail. Turning it off removes the normal-map shader sample.");
+    addQualityToggle("Rim Lighting", avatar.rimLighting, &settings::AvatarSettings::rimLighting,
+        "Adds authored edge lighting. Turning it off removes rim texture and Fresnel work.");
+    addQualityToggle("MatCap", avatar.matcap, &settings::AvatarSettings::matcap,
+        "Adds authored sphere/matcap highlights. This can be expensive on complex avatars.");
+    addQualityToggle("Emission", avatar.emission, &settings::AvatarSettings::emission,
+        "Shows authored glowing materials while retaining a bounded Quest-safe intensity.");
+    static std::array<std::string_view, 3> outlineModes{"Off", "Reduced", "Full"};
+    const auto outlineLabel = avatar.outlines == settings::AvatarOutlineMode::Full ? "Full" :
+        avatar.outlines == settings::AvatarOutlineMode::Reduced ? "Reduced" : "Off";
+    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Outlines", outlineLabel, outlineModes, [](StringW value) {
+        if (!active_) return;
+        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
+        const auto label = static_cast<std::string>(value);
+        avatarSettings.outlines = label == "Full" ? settings::AvatarOutlineMode::Full :
+            label == "Reduced" ? settings::AvatarOutlineMode::Reduced : settings::AvatarOutlineMode::Off;
+        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
+        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
+        active_->root_.Settings().Save(nullptr);
+    }), "Off skips the outline pass. Reduced omits low-value transparent or tiny outlines; Full honors authored outlines."));
+
+    // Solver posture limits are not render-quality controls; they get their
+    // own section so the Rendering block above stays a coherent unit.
+    CreateCenterPanelSubheader(container->get_transform(), "Posture and Motion");
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
         container,
         "Side-Step Lean Limit",
@@ -859,41 +1227,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             active_->root_.Settings().Save(nullptr);
         }),
         "Limits only backward spine bowing. 0% prevents rearward curve; forward attack and lunge bending remain available."));
-    const auto addQualityToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
-        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [member](bool enabled) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.*member = enabled;
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
-        }), hint));
-    };
-    addQualityToggle("Toon Lighting", avatar.toonLighting, &settings::AvatarSettings::toonLighting,
-        "Uses the authored MToon light and shade model. Off is an emergency unlit fallback.");
-    addQualityToggle("Normal Maps", avatar.normalMaps, &settings::AvatarSettings::normalMaps,
-        "Adds authored surface detail. Turning it off removes the normal-map shader sample.");
-    addQualityToggle("Rim Lighting", avatar.rimLighting, &settings::AvatarSettings::rimLighting,
-        "Adds authored edge lighting. Turning it off removes rim texture and Fresnel work.");
-    addQualityToggle("MatCap", avatar.matcap, &settings::AvatarSettings::matcap,
-        "Adds authored sphere/matcap highlights. This can be expensive on complex avatars.");
-    addQualityToggle("Emission", avatar.emission, &settings::AvatarSettings::emission,
-        "Shows authored glowing materials while retaining a bounded Quest-safe intensity.");
-    addQualityToggle("Animated Expressions", avatar.animatedExpressions, &settings::AvatarSettings::animatedExpressions,
-        "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
-    static std::array<std::string_view, 3> outlineModes{"Off", "Reduced", "Full"};
-    const auto outlineLabel = avatar.outlines == settings::AvatarOutlineMode::Full ? "Full" :
-        avatar.outlines == settings::AvatarOutlineMode::Reduced ? "Reduced" : "Off";
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Outlines", outlineLabel, outlineModes, [](StringW value) {
-        if (!active_) return;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        const auto label = static_cast<std::string>(value);
-        avatarSettings.outlines = label == "Full" ? settings::AvatarOutlineMode::Full :
-            label == "Reduced" ? settings::AvatarOutlineMode::Reduced : settings::AvatarOutlineMode::Off;
-        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Off skips the outline pass. Reduced omits low-value transparent or tiny outlines; Full honors authored outlines."));
+
+    CreateCenterPanelSubheader(container->get_transform(), "SpringBones");
     addQualityToggle("SpringBones", avatar.springBones, &settings::AvatarSettings::springBones,
         "Animates VRM hair, clothing, and accessories. Off performs no secondary-motion work.");
     static std::array<std::string_view, 7> springQualities{"Off", "Very Low", "Low", "Medium", "High", "Ultra", "Custom"};
@@ -941,74 +1276,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             active_->root_.Settings().Save(nullptr);
         }), "Off skips SpringBone collider checks. Reduced uses the deterministic collider budget; Full honors all supported VRM colliders."));
 
-    container = pages[0];
-    WithHint(BSML::Lite::CreateToggle(container, "Visible", avatar.visible, [](bool visible) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.visible = visible;
-        active_->root_.Avatar().SetAvatarVisible(visible);
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar visibility: {}", error);
-    }), "Shows or hides the loaded avatar without unloading it.");
-
-    auto* loadActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    loadActions->set_spacing(1.0F);
-    loadActions->set_childControlWidth(true);
-    loadActions->set_childControlHeight(true);
-    loadActions->set_childForceExpandWidth(true);
-    loadActions->set_childForceExpandHeight(false);
-    ConfigureLayout(loadActions, 52.0F, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(loadActions, "Load Avatar", [] {
-        if (!active_) return;
-        auto& settings = active_->root_.Settings().Edit().avatar;
-        const auto path = active_->ConfiguredAvatarPath();
-        if (path.empty()) {
-            Logging::Logger.warn("Choose a VRM avatar file before loading");
-            active_->RefreshAvatarStatus();
-            return;
-        }
-        std::string error;
-        if (active_->root_.Avatar().LoadVrmAvatar(
-                path, static_cast<std::uint32_t>(settings.maximumTextureDimension), &error, false)) {
-            settings.enabled = true;
-            active_->root_.Avatar().SetControllerToWristOffsets(
-                AvatarOffsetPose(settings.leftControllerToWrist),
-                AvatarOffsetPose(settings.rightControllerToWrist));
-            active_->root_.Avatar().SetAvatarVisible(settings.visible);
-            active_->root_.Avatar().ApplyAvatarSettings(settings);
-            active_->root_.Settings().Save(nullptr);
-        } else {
-            Logging::Logger.error("Avatar load button failed: {}", error);
-        }
-        active_->RefreshAvatarStatus();
-    }), "Step 2: loads the selected VRM in its rest pose. A successfully loaded avatar safely replaces the current avatar; unloading first is not required.");
-    WithHint(BSML::Lite::CreateUIButton(loadActions, "Attach Tracking", [] {
-        if (!active_) return;
-        auto& settings = active_->root_.Settings().Edit().avatar;
-        active_->root_.Avatar().SetControllerToWristOffsets(
-            AvatarOffsetPose(settings.leftControllerToWrist),
-            AvatarOffsetPose(settings.rightControllerToWrist));
-        std::string error;
-        if (!active_->root_.Avatar().BindLoadedVrmAvatar(&error)) {
-            Logging::Logger.error("Avatar solver bind button failed: {}", error);
-        }
-        active_->RefreshAvatarStatus();
-    }), "Step 3: connects the loaded avatar to the Quest headset and controller tracking solver so it follows you.");
-    WithHint(BSML::Lite::CreateUIButton(container, "Unload Avatar", [] {
-        if (!active_) return;
-        active_->root_.Avatar().UnloadVrmAvatar();
-        active_->root_.Settings().Edit().avatar.enabled = false;
-        active_->root_.Settings().Save(nullptr);
-        active_->RefreshAvatarStatus();
-    }), "Removes the current avatar from the scene and frees its resources.");
-    WithHint(BSML::Lite::CreateUIButton(container, "Resync Player Pose", [] {
-        if (active_ && !active_->root_.Avatar().RecalibrateNeutral()) {
-            Logging::Logger.warn("Avatar neutral recalibration needs a loaded avatar and valid HMD/controller tracking");
-        }
-        if (active_) active_->RefreshAvatarStatus();
-    }), "Resynchronizes the avatar with your current standing height, floor, headset, and controller pose. This does not erase your saved Basic or Advanced calibration.");
-    WithHint(BSML::Lite::CreateUIButton(container, "Write Diagnostic Log", [] {
-        if (active_) active_->root_.Avatar().LogDiagnostics();
-    }), "Writes detailed avatar tracking and solver measurements to the SaberStage log for troubleshooting; it does not change the avatar.");
+    CreateCenterPanelSubheader(container->get_transform(), "Expressions");
+    addQualityToggle("Animated Expressions", avatar.animatedExpressions, &settings::AvatarSettings::animatedExpressions,
+        "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
 
     container = pages[2];
     auto* calibrationHeading = BSML::Lite::CreateText(
@@ -1020,6 +1290,13 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         3.0F, {0.0F, 0.0F}, {55.0F, 16.0F});
     calibrationNote->set_enableWordWrapping(true);
     calibrationNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    // Current profile state before the actions: the user should know whether
+    // a saved profile exists before choosing to start or reset anything.
+    active_->calibrationStatusText_ = BSML::Lite::CreateText(
+        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
+    active_->calibrationStatusText_->set_enableWordWrapping(true);
+    active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
 
     auto* calibrationStart = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
     calibrationStart->set_spacing(1.0F);
@@ -1056,33 +1333,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         active_->RefreshCalibrationStatus();
     }), "Permanently deletes the saved Basic or Advanced player measurements and returns to generic solver defaults. Resync Player Pose does not do this.");
     ConfigureLayout(resetCalibration, 48.0F, 8.0F, 1.0F);
-    active_->calibrationStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
-    active_->calibrationStatusText_->set_enableWordWrapping(true);
-    active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
 
-    container = pages[0];
-    auto* expressionActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    expressionActions->set_spacing(1.0F);
-    expressionActions->set_childControlWidth(true);
-    expressionActions->set_childControlHeight(true);
-    expressionActions->set_childForceExpandWidth(true);
-    expressionActions->set_childForceExpandHeight(false);
-    ConfigureLayout(expressionActions, 52.0F, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Blink", [] {
-        if (active_) active_->root_.Avatar().SetExpression("blink", 1.0F, nullptr);
-    }), "Tests the avatar's blink expression by closing its eyes.");
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Open Eyes", [] {
-        if (active_) active_->root_.Avatar().SetExpression("blink", 0.0F, nullptr);
-    }), "Clears the blink test and opens the avatar's eyes.");
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Joy", [] {
-        if (active_) active_->root_.Avatar().SetExpression("joy", 1.0F, nullptr);
-    }), "Tests the avatar's happy or joy expression, when the VRM supplies one.");
-
-    active_->avatarStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 21.0F});
-    active_->avatarStatusText_->set_enableWordWrapping(true);
-    active_->avatarStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
     active_->BuildAvatarFilePicker(view);
     active_->RefreshAvatarStatus();
     active_->RefreshCalibrationStatus();
@@ -1408,13 +1659,21 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         return;
     }
 
+    // ---- Record tab -------------------------------------------------------
+    // Page order is deliberate: current status first, the transport buttons
+    // directly under it in chronological order (Start -> Pause -> Resume ->
+    // Stop & Save), then grouped settings. Buttons stay as individual rows —
+    // nested horizontal layouts collapse inside this right-side scroll view
+    // on Quest, leaving only the heading and status text visible.
     auto* heading = BSML::Lite::CreateText(
         recordPage->get_transform(), "Local Recording", 4.0F, {0.0F, 0.0F}, {48.0F, 6.5F});
     heading->set_alignment(TMPro::TextAlignmentOptions::Center);
 
-    // Use ordinary native settings-page buttons as individual rows. The
-    // previous nested horizontal layouts collapsed inside this right-side
-    // scroll view on Quest, leaving only the heading and status text visible.
+    active_->recordingStatusText_ = BSML::Lite::CreateText(
+        recordPage->get_transform(), "", 3.0F, {0.0F, 0.0F}, {48.0F, 13.0F});
+    active_->recordingStatusText_->set_enableWordWrapping(true);
+    active_->recordingStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
     active_->startRecordingButton_ = WithHint(BSML::Lite::CreateUIButton(recordPage, "Start Recording", [] {
         if (!active_) return;
         std::string error;
@@ -1424,12 +1683,6 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         active_->RefreshRecordingStatus();
     }), "Starts saving the Primary camera and game audio to a local MP4. Recording continues through menus and songs unless Gameplay Only is enabled.");
     ConfigureRightPanelButton(active_->startRecordingButton_);
-    active_->stopRecordingButton_ = WithHint(BSML::Lite::CreateUIButton(recordPage, "Stop & Save", [] {
-        if (!active_) return;
-        active_->root_.Recording().Stop();
-        active_->RefreshRecordingStatus();
-    }), "Stops recording and finishes the MP4 in the SaberStage Recordings folder. This also ends a live stream that is using the same encoder.");
-    ConfigureRightPanelButton(active_->stopRecordingButton_);
     active_->pauseRecordingButton_ = WithHint(BSML::Lite::CreateUIButton(recordPage, "Pause Recording", [] {
         if (!active_) return;
         std::string error;
@@ -1448,13 +1701,15 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         active_->RefreshRecordingStatus();
     }), "Continues a paused local recording and starts a fresh hardware-encoder segment.");
     ConfigureRightPanelButton(active_->resumeRecordingButton_);
-
-    active_->recordingStatusText_ = BSML::Lite::CreateText(
-        recordPage->get_transform(), "", 3.0F, {0.0F, 0.0F}, {48.0F, 13.0F});
-    active_->recordingStatusText_->set_enableWordWrapping(true);
-    active_->recordingStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    active_->stopRecordingButton_ = WithHint(BSML::Lite::CreateUIButton(recordPage, "Stop & Save", [] {
+        if (!active_) return;
+        active_->root_.Recording().Stop();
+        active_->RefreshRecordingStatus();
+    }), "Stops recording and finishes the MP4 in the SaberStage Recordings folder. This also ends a live stream that is using the same encoder.");
+    ConfigureRightPanelButton(active_->stopRecordingButton_);
 
     const auto& recording = active_->root_.Settings().Get().recording;
+    CreateRightPanelSubheader(recordPage->get_transform(), "Options");
     auto* gameplayOnly = WithHint(BSML::Lite::CreateToggle(recordPage, "Gameplay Only", recording.gameplayOnly, [](bool value) {
         if (!active_) return;
         active_->root_.Settings().Edit().recording.gameplayOnly = value;
@@ -1483,9 +1738,25 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         recording.worldControlsVisible,
         [](bool value) {
             if (active_) active_->SetRecordingWorldPanelVisible(value);
-        }), "Shows a small movable world panel with play/pause, stop, elapsed time, and LOCAL or LOCAL + LIVE status.");
+        }), "Shows a small movable world panel with start and stop buttons, elapsed time, recording/stream status, and optional FPS counters.");
     ConstrainRightPanelRow(floatingControls);
+    auto* panelFpsCounters = WithHint(BSML::Lite::CreateToggle(
+        recordPage,
+        "Panel FPS Counters",
+        recording.worldControlsShowFps,
+        [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().recording.worldControlsShowFps = value;
+            std::string error;
+            if (!active_->root_.Settings().Save(&error)) {
+                Logging::Logger.error("Could not save panel FPS counter setting: {}", error);
+            }
+            // The floating panel notices the change on its next tick and
+            // rebuilds itself with or without the FPS row.
+        }), "Adds a live row to the Floating Recording Controls showing the capture frame rate and the headset frame rate.");
+    ConstrainRightPanelRow(panelFpsCounters);
 
+    CreateRightPanelSubheader(recordPage->get_transform(), "Encoder");
     const auto settingsEditable = [] {
         return active_ && active_->root_.Recording().Snapshot().CanStart();
     };
@@ -1575,6 +1846,10 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     RememberSelectables(targetBitrate, active_->recordingEncodingControls_);
     ConstrainRightPanelRow(targetBitrate);
 
+    // Everything below applies only to the Direct FFmpeg backend; grouping it
+    // under one subheader keeps the common controls above compact and makes
+    // the interactable/grayed state of these rows self-explanatory.
+    CreateRightPanelSubheader(recordPage->get_transform(), "Advanced - Direct FFmpeg");
     std::string selectedPeak = std::to_string(recording.peakBitrateBitsPerSecond / 1'000'000) + " Mbps";
     auto* peakBitrate = WithHint(BSML::Lite::CreateDropdown(
         recordPage, "Peak Bitrate", selectedPeak, bitrates,
@@ -1699,6 +1974,10 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     captureNote->set_enableWordWrapping(true);
     captureNote->set_alignment(TMPro::TextAlignmentOptions::Center);
 
+    // ---- Live Stream tab --------------------------------------------------
+    // Same shape as the Record tab: status first, the two primary actions
+    // directly under it, then the one-time service setup, then reliability.
+    // Mid-session the user only needs the top of this page.
     auto* liveHeading = BSML::Lite::CreateText(
         livestreamPage->get_transform(), "Direct Live Stream", 4.0F, {0.0F, 0.0F}, {48.0F, 6.5F});
     liveHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
@@ -1707,6 +1986,25 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     active_->livestreamStatusText_->set_enableWordWrapping(true);
     active_->livestreamStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
 
+    active_->startLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Go Live", [] {
+            if (!active_) return;
+            std::string error;
+            if (!active_->root_.Recording().StartLivestream(&error)) {
+                Logging::Logger.error("Live stream start failed: {}", error);
+            }
+            active_->RefreshRecordingStatus();
+        }), "Starts broadcasting the Primary camera and game audio. Direct FFmpeg is required. If no local recording is running, SaberStage also starts a local safety recording from the same single hardware encode.");
+    ConfigureRightPanelButton(active_->startLivestreamButton_);
+    active_->stopLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Stop Stream", [] {
+            if (!active_) return;
+            active_->root_.Recording().StopLivestream();
+            active_->RefreshRecordingStatus();
+        }), "Ends the network broadcast in the background. The local recording keeps running until you use Stop & Save.");
+    ConfigureRightPanelButton(active_->stopLivestreamButton_);
+
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Service Setup");
     const auto& stream = active_->root_.Settings().Get().broadcast;
     static std::array<std::string_view, 4> providers{"Twitch", "YouTube", "Kick", "Custom"};
     std::string selectedProvider = stream.provider == settings::LivestreamProvider::YouTube ? "YouTube"
@@ -1785,6 +2083,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         }), "Removes the in-memory stream key. It cannot be changed or cleared while a stream is active.");
     ConfigureRightPanelButton(active_->clearLivestreamKeyButton_);
 
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Reliability");
     auto* reconnect = WithHint(BSML::Lite::CreateToggle(
         livestreamPage, "Automatic Reconnect", stream.reconnectEnabled,
         [](bool value) {
@@ -1806,24 +2105,6 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         }), "Limits how many times SaberStage retries a lost stream. Zero means a network failure ends the stream immediately.");
     RememberSelectables(reconnectAttempts, active_->livestreamConfigurationControls_);
     ConstrainRightPanelRow(reconnectAttempts);
-
-    active_->startLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Go Live", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Recording().StartLivestream(&error)) {
-                Logging::Logger.error("Live stream start failed: {}", error);
-            }
-            active_->RefreshRecordingStatus();
-        }), "Starts broadcasting the Primary camera and game audio. Direct FFmpeg is required. If no local recording is running, SaberStage also starts a local safety recording from the same single hardware encode.");
-    ConfigureRightPanelButton(active_->startLivestreamButton_);
-    active_->stopLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Stop Stream", [] {
-            if (!active_) return;
-            active_->root_.Recording().StopLivestream();
-            active_->RefreshRecordingStatus();
-        }), "Ends the network broadcast in the background. The local recording keeps running until you use Stop & Save.");
-    ConfigureRightPanelButton(active_->stopLivestreamButton_);
 
     auto* liveNote = BSML::Lite::CreateText(
         livestreamPage->get_transform(),
@@ -1987,6 +2268,9 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     }), "Chooses what drives camera movement: fixed in place, following the player, or following head movement.");
 
     auto* placeContainer = pages[1];
+    // Give every left-panel tab the same heading treatment; Place previously
+    // opened straight into body text while the other three tabs had titles.
+    addHeading(placeContainer, "Placement");
     auto* placementHint = BSML::Lite::CreateText(
         placeContainer->get_transform(), "Grab the camera-shaped gizmo to move and rotate Primary.",
         3.0F, {0.0F, 0.0F}, {48.0F, 10.0F});
@@ -2081,7 +2365,7 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     previewHint->set_alignment(TMPro::TextAlignmentOptions::Center);
     WithHint(BSML::Lite::CreateToggle(previewContainer, "Show Movable Preview", preview.visible, [](bool value) {
         if (active_) active_->root_.Preview().SetFloatingVisible(value);
-    }), "Shows a movable world panel containing the third-person camera view. It is hidden from recordings.");
+    }), "Shows a movable world panel containing the third-person camera view. Turning it on always places it directly in front of you; it is hidden from recordings.");
     rememberSlider(3, WithHint(BSML::Lite::CreateSliderSetting(previewContainer, "Preview Scale", 0.1F, preview.scale, 0.25F, 4.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->root_.Preview().SetFloatingScale(value);
     }), "Changes the physical size of the movable preview panel without changing camera resolution."));
@@ -2242,8 +2526,12 @@ void MenuController::EnsureRecordingWorldPanel() {
     }
 
     const auto& settings = root_.Settings().Get().recording;
+    // The panel height depends on the FPS-counters setting; remember which
+    // variant was built so the tick can rebuild when the toggle changes.
+    recordingWorldPanelShowsFps_ = settings.worldControlsShowFps;
+    const auto panelSize = RecordingPanelSize(recordingWorldPanelShowsFps_);
     recordingWorldPanelScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
-        kRecordingPanelSize,
+        panelSize,
         true,
         ToUnity(settings.worldControlsPosition),
         UnityEngine::Quaternion::Euler(ToUnity(settings.worldControlsRotationDegrees)),
@@ -2264,11 +2552,13 @@ void MenuController::EnsureRecordingWorldPanel() {
         return;
     }
     screenObject->set_name("SaberStage Movable Recording Controls");
+    // Layer 5 (UI) so the HMD renders the panel in every scene; the preview
+    // manager's capture-exclusion path keeps it out of recordings.
     screenObject->set_layer(5);
     UnityEngine::Object::DontDestroyOnLoad(screenObject);
     recordingWorldPanelScreen_->set_HandleSide(BSML::Side::Top);
     recordingWorldPanelScreen_->set_HighlightHandle(false);
-    HideAndPlaceWorldPanelHandleInPadding(recordingWorldPanelScreen_);
+    HideAndFitWorldPanelHandleAboveButtons(recordingWorldPanelScreen_, panelSize);
     recordingWorldPanelScreen_->get_transform()->set_localScale({
         kRecordingPanelScale, kRecordingPanelScale, kRecordingPanelScale});
 
@@ -2279,27 +2569,77 @@ void MenuController::EnsureRecordingWorldPanel() {
         DestroyRecordingWorldPanel();
         return;
     }
+
+    // Visual stack (draw order = sibling creation order on one canvas):
+    // rounded body first, then the accent strip, then text, then buttons.
+    // All positions are canvas units from the panel center.
+    const auto half = panelSize.y * 0.5F;
+    const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.96F};
+    const UnityEngine::Color accentColor{0.0F, 0.80F, 1.0F, 1.0F};
     ConfigureWorldPanelImage(
         BSML::Lite::CreateImage(parent, whitePixel),
         {0.0F, 0.0F},
-        kRecordingPanelBodySize,
-        {0.025F, 0.055F, 0.095F, 0.96F});
+        {panelSize.x - 1.0F, panelSize.y - 1.0F},
+        panelColor);
+    // Thin accent line under the header band; matches the calibration panel
+    // and movable preview borders so the SaberStage surfaces read as a family.
+    ConfigureWorldPanelImage(
+        BSML::Lite::CreateImage(parent, whitePixel),
+        {0.0F, half - 1.0F - kRecordingPanelHeaderHeight},
+        {panelSize.x - 4.0F, 0.6F},
+        accentColor);
 
+    // Header band: output type on the left half, elapsed time on the right.
+    const float headerY = half - 1.0F - kRecordingPanelHeaderHeight * 0.5F;
     recordingWorldPanelTypeText_ = BSML::Lite::CreateText(
         parent, "LOCAL", TMPro::FontStyles::Bold, 4.5F);
     ConfigureWorldPanelText(
-        recordingWorldPanelTypeText_, {-10.5F, 6.0F}, {18.0F, 6.0F}, 4.5F);
+        recordingWorldPanelTypeText_, {-11.0F, headerY}, {22.0F, 6.0F}, 4.5F);
     recordingWorldPanelTimeText_ = BSML::Lite::CreateText(
         parent, "00:00", TMPro::FontStyles::Bold, 5.0F);
     ConfigureWorldPanelText(
-        recordingWorldPanelTimeText_, {10.0F, 6.0F}, {20.0F, 6.0F}, 5.0F);
+        recordingWorldPanelTimeText_, {11.0F, headerY}, {22.0F, 6.0F}, 5.0F);
 
+    // Optional FPS band directly under the header: capture rate on the left,
+    // headset rate on the right, refreshed at 2 Hz by TickRecordingWorldPanel.
+    recordingWorldPanelFpsText_ = nullptr;
+    if (recordingWorldPanelShowsFps_) {
+        const float fpsY = half - 1.0F - kRecordingPanelHeaderHeight -
+            kRecordingPanelFpsRowHeight * 0.5F;
+        recordingWorldPanelFpsText_ = BSML::Lite::CreateText(
+            parent, "REC --.- FPS   HMD --.- FPS", TMPro::FontStyles::Normal, 3.4F);
+        ConfigureWorldPanelText(
+            recordingWorldPanelFpsText_, {0.0F, fpsY}, {panelSize.x - 4.0F, 5.0F}, 3.4F);
+        if (IsAlive(recordingWorldPanelFpsText_)) {
+            recordingWorldPanelFpsText_->set_color({0.65F, 0.82F, 0.92F, 1.0F});
+        }
+    }
+
+    // Button band, pinned to the very bottom of the panel with a clear gap
+    // below the grab handle (see HideAndFitWorldPanelHandleAboveButtons).
+    // Stock button prefabs carry ContentSizeFitters and their own anchors, so
+    // every rect is forced explicitly after creation; otherwise the visual
+    // button grows past the requested size and its top half lands under the
+    // grab handle, leaving only the bottom half clickable.
+    const auto pinWorldPanelButton = [](UnityEngine::UI::Button* button,
+                                        UnityEngine::Vector2 position,
+                                        UnityEngine::Vector2 size) {
+        if (!IsAlive(button)) return;
+        NeutralizeContentSizeFitter(button);
+        auto rect = button->get_transform().cast<UnityEngine::RectTransform>();
+        rect->set_anchorMin({0.5F, 0.5F});
+        rect->set_anchorMax({0.5F, 0.5F});
+        rect->set_pivot({0.5F, 0.5F});
+        rect->set_anchoredPosition(position);
+        rect->set_sizeDelta(size);
+    };
+    const float buttonsY = -half + 4.5F;
     recordingWorldPanelPrimaryButton_ = BSML::Lite::CreateUIButton(
         parent,
-        "▶",
+        "●",
         "PlayButton",
-        {-8.0F, -5.0F},
-        {13.0F, 8.0F},
+        {-8.5F, buttonsY},
+        {14.0F, 7.0F},
         [] {
             if (active_) active_->RecordingWorldPanelPrimaryAction();
         });
@@ -2307,28 +2647,26 @@ void MenuController::EnsureRecordingWorldPanel() {
         parent,
         "■",
         "PlayButton",
-        {8.0F, -5.0F},
-        {13.0F, 8.0F},
+        {8.5F, buttonsY},
+        {14.0F, 7.0F},
         [] {
             if (!active_) return;
             active_->root_.Recording().Stop("Stopped from movable recording controls.");
             active_->RefreshRecordingStatus();
         });
+    // No hover hints on world panels: the hint system is menu-scoped and
+    // renders an empty white box out here instead of tooltip text.
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
         recordingWorldPanelPrimaryButton_->get_gameObject()->set_name(
-            "SaberStage Movable Play Pause Recording");
+            "SaberStage Movable Record Pause Resume");
         BSML::Lite::SetButtonTextSize(recordingWorldPanelPrimaryButton_, 5.0F);
-        BSML::Lite::AddHoverHint(
-            recordingWorldPanelPrimaryButton_,
-            "Start, pause, or resume the current recording.");
+        pinWorldPanelButton(recordingWorldPanelPrimaryButton_, {-8.5F, buttonsY}, {14.0F, 7.0F});
     }
     if (IsAlive(recordingWorldPanelStopButton_)) {
         recordingWorldPanelStopButton_->get_gameObject()->set_name(
             "SaberStage Movable Stop Recording");
         BSML::Lite::SetButtonTextSize(recordingWorldPanelStopButton_, 5.0F);
-        BSML::Lite::AddHoverHint(
-            recordingWorldPanelStopButton_,
-            "Stop and save the current local recording.");
+        pinWorldPanelButton(recordingWorldPanelStopButton_, {8.5F, buttonsY}, {14.0F, 7.0F});
     }
     if (!IsAlive(recordingWorldPanelTypeText_) || !IsAlive(recordingWorldPanelTimeText_) ||
             !IsAlive(recordingWorldPanelPrimaryButton_) ||
@@ -2357,12 +2695,16 @@ void MenuController::DestroyRecordingWorldPanel() noexcept {
     recordingWorldPanelScreen_ = nullptr;
     recordingWorldPanelTypeText_ = nullptr;
     recordingWorldPanelTimeText_ = nullptr;
+    recordingWorldPanelFpsText_ = nullptr;
     recordingWorldPanelPrimaryButton_ = nullptr;
     recordingWorldPanelStopButton_ = nullptr;
     recordingWorldPanelPoseDirty_ = false;
     recordingWorldPanelStableSeconds_ = 0.0F;
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDisplayedState_ = -1;
+    recordingWorldPanelFpsWindowSeconds_ = 0.0F;
+    recordingWorldPanelFpsWindowStartFrames_ = 0;
+    recordingWorldPanelHmdFrameSeconds_ = 0.0F;
 }
 
 void MenuController::RefreshRecordingWorldPanel() {
@@ -2376,17 +2718,28 @@ void MenuController::RefreshRecordingWorldPanel() {
     if (IsAlive(recordingWorldPanelTypeText_)) {
         recordingWorldPanelTypeText_->set_text(
             recording::RecordingOutputTypeName(snapshot.outputType));
+        // Color communicates state at a glance: red while the encoder is
+        // rolling, amber while paused, neutral gray otherwise.
+        if (snapshot.state == recording::RecordingState::Recording ||
+                snapshot.state == recording::RecordingState::Starting ||
+                snapshot.state == recording::RecordingState::Resuming) {
+            recordingWorldPanelTypeText_->set_color({1.0F, 0.32F, 0.30F, 1.0F});
+        } else if (snapshot.state == recording::RecordingState::Paused ||
+                snapshot.state == recording::RecordingState::Pausing) {
+            recordingWorldPanelTypeText_->set_color({1.0F, 0.72F, 0.20F, 1.0F});
+        } else {
+            recordingWorldPanelTypeText_->set_color({0.72F, 0.82F, 0.92F, 1.0F});
+        }
     }
     if (IsAlive(recordingWorldPanelTimeText_)) {
         recordingWorldPanelTimeText_->set_text(RecordingElapsed(snapshot.elapsedSeconds));
     }
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
-        const bool showPause = snapshot.state == recording::RecordingState::Recording ||
-            snapshot.state == recording::RecordingState::Pausing;
-        BSML::Lite::SetButtonText(
-            recordingWorldPanelPrimaryButton_, showPause ? "Ⅱ" : "▶");
-        recordingWorldPanelPrimaryButton_->set_interactable(
-            snapshot.CanStart() || snapshot.CanPause() || snapshot.CanResume());
+        // The panel is deliberately just start/stop — no pause: the record
+        // glyph starts a recording and is disabled while one is rolling.
+        // Pause/resume remain available in the mod's Record tab.
+        BSML::Lite::SetButtonText(recordingWorldPanelPrimaryButton_, "●");
+        recordingWorldPanelPrimaryButton_->set_interactable(snapshot.CanStart());
     }
     if (IsAlive(recordingWorldPanelStopButton_)) {
         recordingWorldPanelStopButton_->set_interactable(snapshot.CanStop());
@@ -2394,13 +2747,13 @@ void MenuController::RefreshRecordingWorldPanel() {
 }
 
 void MenuController::RecordingWorldPanelPrimaryAction() {
+    // Start only — the floating panel is a simple start/stop surface. The
+    // stop button next to it ends the recording (and any live stream sharing
+    // the encoder); pause/resume live in the mod's Record tab.
     const auto snapshot = root_.Recording().Snapshot();
+    if (!snapshot.CanStart()) return;
     std::string error;
-    bool changed = false;
-    if (snapshot.CanStart()) changed = root_.Recording().Start(&error);
-    else if (snapshot.CanPause()) changed = root_.Recording().Pause(&error);
-    else if (snapshot.CanResume()) changed = root_.Recording().Resume(&error);
-    if (!changed && !error.empty()) {
+    if (!root_.Recording().Start(&error) && !error.empty()) {
         Logging::Logger.error("Movable recording control failed: {}", error);
     }
     RefreshRecordingStatus();
@@ -2438,9 +2791,16 @@ void MenuController::UpdateRecordingWorldPanelPersistence() {
 
 void MenuController::TickRecordingWorldPanel() noexcept {
     try {
-        if (!root_.Settings().Get().recording.worldControlsVisible) {
+        const auto& recordingSettings = root_.Settings().Get().recording;
+        if (!recordingSettings.worldControlsVisible) {
             DestroyRecordingWorldPanel();
             return;
+        }
+        // The FPS row changes the panel height, so a toggle flip while the
+        // panel exists rebuilds it in place at its saved world pose.
+        if (IsAlive(recordingWorldPanelScreen_) &&
+                recordingWorldPanelShowsFps_ != recordingSettings.worldControlsShowFps) {
+            DestroyRecordingWorldPanel();
         }
         EnsureRecordingWorldPanel();
         if (!IsAlive(recordingWorldPanelScreen_)) return;
@@ -2453,6 +2813,41 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         if (recordingWorldPanelDisplayedSecond_ != elapsedSecond ||
                 recordingWorldPanelDisplayedState_ != static_cast<int>(snapshot.state)) {
             RefreshRecordingWorldPanel();
+        }
+        if (IsAlive(recordingWorldPanelFpsText_)) {
+            const auto delta = std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+            // Headset FPS: exponential moving average of the frame interval so
+            // the number is readable rather than flickering every frame.
+            if (delta > 0.0F) {
+                recordingWorldPanelHmdFrameSeconds_ =
+                    recordingWorldPanelHmdFrameSeconds_ <= 0.0F
+                        ? delta
+                        : recordingWorldPanelHmdFrameSeconds_ * 0.9F + delta * 0.1F;
+            }
+            recordingWorldPanelFpsWindowSeconds_ += delta;
+            // Capture FPS: encoded packets over a half-second window. Both
+            // encoder backends feed RecordingSnapshot::encodedFrameCount.
+            if (recordingWorldPanelFpsWindowSeconds_ >= 0.5F) {
+                const auto framesInWindow =
+                    snapshot.encodedFrameCount >= recordingWorldPanelFpsWindowStartFrames_
+                        ? snapshot.encodedFrameCount - recordingWorldPanelFpsWindowStartFrames_
+                        : 0;
+                const auto captureFps = static_cast<float>(framesInWindow) /
+                    recordingWorldPanelFpsWindowSeconds_;
+                const auto hmdFps = recordingWorldPanelHmdFrameSeconds_ > 0.0F
+                    ? 1.0F / recordingWorldPanelHmdFrameSeconds_
+                    : 0.0F;
+                std::ostringstream text;
+                text << std::fixed << std::setprecision(1);
+                if (recording::HasRecordingTimeline(snapshot.state)) {
+                    text << "REC " << captureFps << " FPS   HMD " << hmdFps << " FPS";
+                } else {
+                    text << "REC --.- FPS   HMD " << hmdFps << " FPS";
+                }
+                recordingWorldPanelFpsText_->set_text(text.str());
+                recordingWorldPanelFpsWindowSeconds_ = 0.0F;
+                recordingWorldPanelFpsWindowStartFrames_ = snapshot.encodedFrameCount;
+            }
         }
         recordingWorldPanelTickFailureLogged_ = false;
     } catch (const std::exception& exception) {
@@ -2468,6 +2863,155 @@ void MenuController::TickRecordingWorldPanel() noexcept {
             recordingWorldPanelTickFailureLogged_ = true;
             Logging::Logger.error(
                 "Movable recording-controls update failed with a non-standard exception");
+        }
+    }
+}
+
+void MenuController::EnsureStandinProxy(int slot) {
+    if (slot < 0 || slot >= static_cast<int>(standinProxyScreens_.size())) return;
+    if (IsAlive(standinProxyScreens_[slot]) || !FloatingUiServicesReady()) return;
+    const auto& avatarSettings = root_.Settings().Get().avatar;
+    const auto& slotPosition = settings::StandinSlotPosition(avatarSettings, slot);
+    const auto slotYaw = settings::StandinSlotYaw(avatarSettings, slot);
+    const UnityEngine::Vector3 proxyPosition{
+        slotPosition.x,
+        slotPosition.y + kStandinProxyHeightMeters,
+        slotPosition.z};
+    auto* screen = BSML::FloatingScreen::CreateFloatingScreen(
+        kStandinProxySize,
+        true,
+        proxyPosition,
+        UnityEngine::Quaternion::Euler({0.0F, slotYaw, 0.0F}),
+        0.0F,
+        false);
+    if (!IsAlive(screen)) {
+        if (!standinProxyCreationFailureLogged_) {
+            standinProxyCreationFailureLogged_ = true;
+            Logging::Logger.error("Could not create an avatar display clone grab handle");
+        }
+        return;
+    }
+    standinProxyCreationFailureLogged_ = false;
+    auto* screenObject = screen->get_gameObject().ptr();
+    if (!IsAlive(screenObject)) return;
+    standinProxyScreens_[slot] = screen;
+    screenObject->set_name(
+        "SaberStage Avatar Display Grab Handle " + std::to_string(slot + 1));
+    UnityEngine::Object::DontDestroyOnLoad(screenObject);
+    screen->set_HandleSide(BSML::Side::Top);
+    screen->set_HighlightHandle(false);
+    screen->get_transform()->set_localScale({
+        kStandinProxyScale, kStandinProxyScale, kStandinProxyScale});
+    // No visuals at all: the visible "thing to grab" is the clone's own body,
+    // and this screen only supplies the invisible body-sized physics handle.
+    standinProxyAppliedScale_ = avatarSettings.standinScale;
+    FitStandinProxyHandleToBody(screen, standinProxyAppliedScale_);
+    // The physics grab handle must stay on the UI layer (5): the game's
+    // pointer raycast mask hits that layer, which is what makes the grab
+    // work. Its MeshRenderer is disabled, so no view ever draws the box.
+    if (IsAlive(screen->handle)) {
+        screen->handle->set_layer(5);
+    }
+
+    standinProxyLastPoses_[slot] = ReadWorldPose(screen->get_transform().ptr());
+    standinProxyPoseDirty_[slot] = false;
+    standinProxyStableSeconds_[slot] = 0.0F;
+    Logging::Logger.info(
+        "Created invisible body-sized grab handle for avatar display clone {}", slot + 1);
+}
+
+void MenuController::DestroyStandinProxy(int slot) noexcept {
+    if (slot < 0 || slot >= static_cast<int>(standinProxyScreens_.size())) return;
+    if (IsAlive(standinProxyScreens_[slot])) {
+        UnityEngine::Object::Destroy(standinProxyScreens_[slot]->get_gameObject().ptr());
+    }
+    standinProxyScreens_[slot] = nullptr;
+    standinProxyPoseDirty_[slot] = false;
+    standinProxyStableSeconds_[slot] = 0.0F;
+}
+
+void MenuController::DestroyAllStandinProxies() noexcept {
+    for (int slot = 0; slot < static_cast<int>(standinProxyScreens_.size()); ++slot) {
+        DestroyStandinProxy(slot);
+    }
+}
+
+void MenuController::TickAvatarStandinProxy() noexcept {
+    try {
+        const auto& avatarSettings = root_.Settings().Get().avatar;
+        const bool anyWanted = avatarSettings.standinEnabled && root_.Avatar().StandinActive();
+        const int wantedCount = anyWanted
+            ? std::clamp(avatarSettings.standinCount, 1, 3)
+            : 0;
+        const bool scaleChanged =
+            std::abs(standinProxyAppliedScale_ - avatarSettings.standinScale) > 0.001F;
+        if (scaleChanged) standinProxyAppliedScale_ = avatarSettings.standinScale;
+        for (int slot = 0; slot < static_cast<int>(standinProxyScreens_.size()); ++slot) {
+            if (slot >= wantedCount) {
+                DestroyStandinProxy(slot);
+                continue;
+            }
+            EnsureStandinProxy(slot);
+            auto* screen = standinProxyScreens_[slot];
+            if (!IsAlive(screen)) continue;
+            // Track the scale slider live so the grab volume always matches
+            // the body the user is reaching for.
+            if (scaleChanged) {
+                FitStandinProxyHandleToBody(screen, standinProxyAppliedScale_);
+            }
+            UpdateWorldPanelHandleRotation(screen);
+            auto* transform = screen->get_transform().ptr();
+            // The clone must stay upright: keep the grabbed yaw, discard
+            // pitch and roll from the controller's wrist angle.
+            const auto position = transform->get_position();
+            const auto yaw = camera::NormalizeDegrees(transform->get_rotation().get_eulerAngles().y);
+            transform->set_rotation(UnityEngine::Quaternion::Euler({0.0F, yaw, 0.0F}));
+            // The handle's screen origin floats a fixed height above the
+            // clone's feet.
+            root_.Avatar().SetStandinWorldPose(
+                static_cast<std::size_t>(slot),
+                {position.x, position.y - kStandinProxyHeightMeters, position.z},
+                yaw);
+
+            // Same debounced persistence as the other movable panels: save
+            // once this handle has been still for half a second after a move.
+            const auto pose = ReadWorldPose(transform);
+            if (WorldPoseDifference(pose, standinProxyLastPoses_[slot]) > 0.000001F) {
+                standinProxyLastPoses_[slot] = pose;
+                standinProxyPoseDirty_[slot] = true;
+                standinProxyStableSeconds_[slot] = 0.0F;
+            } else if (standinProxyPoseDirty_[slot]) {
+                standinProxyStableSeconds_[slot] += std::max(
+                    0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+                if (standinProxyStableSeconds_[slot] >= 0.5F) {
+                    auto& editable = root_.Settings().Edit().avatar;
+                    settings::StandinSlotPosition(editable, slot) = {
+                        pose.position.x,
+                        pose.position.y - kStandinProxyHeightMeters,
+                        pose.position.z};
+                    settings::StandinSlotYaw(editable, slot) = yaw;
+                    std::string error;
+                    if (!root_.Settings().Save(&error)) {
+                        Logging::Logger.error("Could not save avatar display clone placement: {}", error);
+                    } else {
+                        Logging::Logger.info("Saved avatar display clone {} placement", slot + 1);
+                    }
+                    standinProxyPoseDirty_[slot] = false;
+                }
+            }
+        }
+        standinProxyTickFailureLogged_ = false;
+    } catch (const std::exception& exception) {
+        DestroyAllStandinProxies();
+        if (!standinProxyTickFailureLogged_) {
+            standinProxyTickFailureLogged_ = true;
+            Logging::Logger.error("Avatar display grab-handle update failed: {}", exception.what());
+        }
+    } catch (...) {
+        DestroyAllStandinProxies();
+        if (!standinProxyTickFailureLogged_) {
+            standinProxyTickFailureLogged_ = true;
+            Logging::Logger.error("Avatar display grab-handle update failed with a non-standard exception");
         }
     }
 }
@@ -3066,9 +3610,10 @@ void MenuController::RefreshCalibrationPanel() {
 
 void MenuController::TickCalibrationPanel() noexcept {
     // This persistent driver also services the independent movable recording
-    // controls so their elapsed time and saved placement continue updating
-    // while SaberStage's menu is closed or gameplay is active.
+    // controls and the display-clone grab handle so both keep updating while
+    // SaberStage's menu is closed or gameplay is active.
     TickRecordingWorldPanel();
+    TickAvatarStandinProxy();
     try {
         const auto phase = root_.Avatar().CalibrationStatus().phase;
         if (phase == avatar::calibration::CalibrationPhase::Idle ||

@@ -10,9 +10,18 @@ namespace saberstage::camera {
 
 inline constexpr std::string_view kPrimaryCameraId = "primary";
 inline constexpr std::int32_t kUiLayerMask = 1 << 5;
-inline constexpr std::int32_t kFirstPersonLayerMask = 1 << 6;
+// Beat Saber's first-person-only layer: the HMD renders it, and
+// ResolveSpectatorCullingMask always excludes it from the third-person
+// camera. SaberStage uses it for HMD-only world objects (grab handles, a
+// headset-only display clone).
+inline constexpr std::int32_t kFirstPersonLayer = 6;
+inline constexpr std::int32_t kFirstPersonLayerMask = 1 << kFirstPersonLayer;
 inline constexpr std::int32_t kAvatarLayer = 3;
 inline constexpr std::int32_t kAvatarLayerMask = 1 << kAvatarLayer;
+// Layer 0 (Default) is rendered by the HMD and inherited into the spectator
+// mask, so it is the "visible in both views" home for worn avatar geometry
+// and for the display clone's default visibility.
+inline constexpr std::int32_t kBothViewsLayer = 0;
 
 // Beat Saber uses dedicated layers for objects that a headset camera may
 // intentionally omit but a Camera2-style spectator view normally shows.

@@ -81,6 +81,10 @@ private:
     void RecordingWorldPanelPrimaryAction();
     void RefreshAvatarStatus();
     void RefreshCalibrationStatus();
+    void EnsureStandinProxy(int slot);
+    void DestroyStandinProxy(int slot) noexcept;
+    void DestroyAllStandinProxies() noexcept;
+    void TickAvatarStandinProxy() noexcept;
     void EnsureCalibrationPanel();
     void DestroyCalibrationPanel() noexcept;
     void RefreshCalibrationPanel();
@@ -115,6 +119,9 @@ private:
     HMUI::InputFieldView* livestreamKeyInput_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelTypeText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelTimeText_ = nullptr;
+    // Optional FPS row on the floating recording controls; null when the
+    // "Panel FPS Counters" setting is off (the panel is built shorter then).
+    TMPro::TextMeshProUGUI* recordingWorldPanelFpsText_ = nullptr;
     TMPro::TextMeshProUGUI* avatarStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelTitleText_ = nullptr;
@@ -148,6 +155,24 @@ private:
     int recordingWorldPanelDisplayedSecond_ = -1;
     int recordingWorldPanelDisplayedState_ = -1;
     bool recordingWorldPanelPoseDirty_ = false;
+    // FPS readout state: which panel variant is built, the encoded-frame count
+    // at the start of the current sampling window, the window's accumulated
+    // seconds, and the smoothed headset frame interval.
+    bool recordingWorldPanelShowsFps_ = false;
+    float recordingWorldPanelFpsWindowSeconds_ = 0.0F;
+    std::uint64_t recordingWorldPanelFpsWindowStartFrames_ = 0;
+    float recordingWorldPanelHmdFrameSeconds_ = 0.0F;
+    // Invisible body-sized grab handles for the free-standing avatar display
+    // clones, one per slot (up to three), each driving its clone's placement.
+    std::array<BSML::FloatingScreen*, 3> standinProxyScreens_{};
+    std::array<camera::Pose, 3> standinProxyLastPoses_{};
+    std::array<float, 3> standinProxyStableSeconds_{};
+    std::array<bool, 3> standinProxyPoseDirty_{};
+    // Clone scale the grab handles were last fitted to; the tick refits every
+    // handle when the scale setting changes.
+    float standinProxyAppliedScale_ = 1.0F;
+    bool standinProxyCreationFailureLogged_ = false;
+    bool standinProxyTickFailureLogged_ = false;
     bool recordingWorldPanelCreationFailureLogged_ = false;
     bool recordingWorldPanelTickFailureLogged_ = false;
     UnityEngine::GameObject* calibrationPanelDriverObject_ = nullptr;

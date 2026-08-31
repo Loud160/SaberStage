@@ -311,16 +311,31 @@ class RepositoryInvariantTests(unittest.TestCase):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         settings = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
         self.assertIn('"Floating Recording Controls"', menu)
-        self.assertIn('"▶"', menu)
-        self.assertIn('"Ⅱ"', menu)
+        # The floating panel is deliberately start/stop only: a record glyph
+        # that starts, a stop glyph that ends recording (and any stream on the
+        # same encoder). No pause/resume and no play arrow — pause lives in
+        # the Record tab. Hover hints are menu-scoped and render as empty
+        # white boxes on world panels, so the panel must not use them.
+        self.assertIn('"●"', menu)
         self.assertIn('"■"', menu)
+        self.assertNotIn('"Ⅱ"', menu)
+        self.assertNotIn("AddHoverHint(\n            recordingWorldPanel", menu)
         self.assertIn("RecordingOutputTypeName(snapshot.outputType)", menu)
         self.assertIn("RecordingElapsed(snapshot.elapsedSeconds)", menu)
-        self.assertIn("HideAndPlaceWorldPanelHandleInPadding", menu)
-        self.assertIn("kRecordingPanelBodySize", menu)
+        # The grab handle covers the full information band and stops at the
+        # top of the button band (the old 2.5-unit top-edge sliver was nearly
+        # impossible to grab at world scale). The panel is height-variant:
+        # RecordingPanelSize() adds the optional FPS row.
+        self.assertIn("HideAndFitWorldPanelHandleAboveButtons", menu)
+        self.assertIn("RecordingPanelSize(", menu)
+        self.assertIn("kRecordingPanelButtonBandHeight", menu)
+        self.assertIn('"Panel FPS Counters"', menu)
+        self.assertIn("encodedFrameCount", menu)
         self.assertIn("RegisterCaptureExcludedRoot(screenObject)", menu)
         self.assertNotIn("SaberStage Recording Grab Bar", menu)
+        self.assertNotIn("HideAndPlaceWorldPanelHandleInPadding", menu)
         self.assertIn('"worldControlsVisible"', settings)
+        self.assertIn('"worldControlsShowFps"', settings)
         self.assertIn('"worldControlsPosition"', settings)
         self.assertIn('"worldControlsRotationDegrees"', settings)
 
@@ -366,7 +381,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("FindObjectsOfTypeAll<UnityEngine::AudioListener*>()", controller)
         self.assertIn("RestoreAudioListenerOwnership();", controller)
 
-    def test_spectator_camera_keeps_popout_visible_but_excludes_docked_preview(self):
+    def test_spectator_camera_excludes_both_preview_monitors(self):
         camera = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
         profile = (ROOT / "include/saberstage/camera/CameraProfile.hpp").read_text(encoding="utf-8")
         preview = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
@@ -389,9 +404,17 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("captureCanvasGroupSnapshot_", preview)
         self.assertIn("capturePreviewCullSnapshot_", preview)
         self.assertIn("cullPreview(dockedImage_)", preview)
-        self.assertNotIn("cullPreview(floatingImage_)", preview)
-        self.assertNotIn("cacheRoot(floatingCaptureRoot_)", preview)
+        # Both camera monitors are excluded from the spectator frame. The
+        # movable popout was once deliberately left camera-visible as a
+        # recursion diagnostic; that produced an infinite picture-in-picture
+        # feed in recordings and must never come back.
+        self.assertIn("cullPreview(floatingImage_)", preview)
+        self.assertIn("cacheRoot(floatingScreen_->get_gameObject().ptr())", preview)
         self.assertNotIn("UnityEngine::GameObject* floatingCaptureRoot_", preview)
+        # The popout owns its own opaque material instance; sharing one
+        # material between the HMUI docked canvas and the world-space
+        # FloatingScreen canvas lets UI pipeline state leak between monitors.
+        self.assertIn("floatingMaterial_", preview)
         self.assertIn("Canvas::ForceUpdateCanvases()", preview)
         self.assertIn("renderer->set_cull(false)", preview)
         self.assertIn("CreateWorldSpaceVideoSurface", preview)

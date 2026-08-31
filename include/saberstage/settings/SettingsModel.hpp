@@ -108,6 +108,16 @@ enum class SpringCollisionQuality {
     Full,
 };
 
+// Which views render the free-standing display clone. Implemented purely with
+// layers: Both -> Default (0), CameraOnly -> the spectator-mandatory avatar
+// layer (3), HeadsetOnly -> Beat Saber's first-person layer (6), which the
+// spectator camera always excludes.
+enum class AvatarStandinVisibility {
+    Both,
+    CameraOnly,
+    HeadsetOnly,
+};
+
 enum class Subsystem {
     General,
     Camera,
@@ -155,6 +165,9 @@ struct RecordingSettings {
     bool gameplayOnly = false;
     bool controllerShortcutEnabled = false;
     bool worldControlsVisible = false;
+    // Adds a live "capture FPS / headset FPS" row to the floating recording
+    // controls. On by default; off keeps the compact two-row panel.
+    bool worldControlsShowFps = true;
     camera::Vec3 worldControlsPosition{0.42F, 1.25F, 1.45F};
     camera::Vec3 worldControlsRotationDegrees{0.0F, 180.0F, 0.0F};
 };
@@ -226,7 +239,59 @@ struct AvatarSettings {
     float backwardSpineCurveLimitPercent = 100.0F;
     AvatarControllerOffsetSettings leftControllerToWrist;
     AvatarControllerOffsetSettings rightControllerToWrist;
+    // First-person "wear the avatar" view: body renderers move to a layer the
+    // HMD renders while the selected head geometry stays on the spectator-only
+    // avatar layer, so recordings always show the whole avatar. The three
+    // hide switches are independent so players can, for example, keep hair
+    // out of their eyes without changing anything else. (These replaced the
+    // earlier tiered wearCoverage dropdown; the legacy key is migrated on
+    // load.) Hiding the face is the default: with it shown the player looks
+    // through the inside of the head's eye and mouth meshes.
+    bool wearAvatar = false;
+    bool wearHideFace = true;
+    bool wearHideHair = false;
+    bool wearHideNeckAccessories = false;
+    // Free-standing display clones that mirror the player's live pose. Up to
+    // three clones share one visibility mode and scale; each has its own
+    // placement (feet position + facing yaw), kept updated by its body-sized
+    // grab handle with the same debounced persistence as other panels. Slot 1
+    // keeps the original standinPosition/standinYawDegrees keys so existing
+    // settings files load unchanged.
+    bool standinEnabled = false;
+    std::int32_t standinCount = 1;
+    AvatarStandinVisibility standinVisibility = AvatarStandinVisibility::Both;
+    float standinScale = 1.0F;
+    // Optional hand props for the clones: stripped visual copies of the
+    // gameplay sabers while a map is playing, and of the menu pointer grips
+    // while menus are up.
+    bool standinShowSabers = true;
+    bool standinShowPointers = true;
+    camera::Vec3 standinPosition{0.0F, 0.0F, 1.4F};
+    float standinYawDegrees = 180.0F;
+    camera::Vec3 standinPosition2{-0.9F, 0.0F, 1.4F};
+    float standinYawDegrees2 = 180.0F;
+    camera::Vec3 standinPosition3{0.9F, 0.0F, 1.4F};
+    float standinYawDegrees3 = 180.0F;
 };
+
+// Per-slot access to the display-clone placements (slot 0..2). Keeps callers
+// free of copy-pasted slot switches.
+inline camera::Vec3& StandinSlotPosition(AvatarSettings& settings, int slot) {
+    return slot == 1 ? settings.standinPosition2
+        : slot == 2 ? settings.standinPosition3 : settings.standinPosition;
+}
+inline const camera::Vec3& StandinSlotPosition(const AvatarSettings& settings, int slot) {
+    return slot == 1 ? settings.standinPosition2
+        : slot == 2 ? settings.standinPosition3 : settings.standinPosition;
+}
+inline float& StandinSlotYaw(AvatarSettings& settings, int slot) {
+    return slot == 1 ? settings.standinYawDegrees2
+        : slot == 2 ? settings.standinYawDegrees3 : settings.standinYawDegrees;
+}
+inline float StandinSlotYaw(const AvatarSettings& settings, int slot) {
+    return slot == 1 ? settings.standinYawDegrees2
+        : slot == 2 ? settings.standinYawDegrees3 : settings.standinYawDegrees;
+}
 
 struct SettingsDocument {
     std::uint32_t schemaVersion = kCurrentSchemaVersion;
@@ -265,6 +330,7 @@ std::string_view ToString(AvatarMaterialStage value) noexcept;
 std::string_view ToString(AvatarLightingMode value) noexcept;
 std::string_view ToString(SpringBoneQuality value) noexcept;
 std::string_view ToString(SpringCollisionQuality value) noexcept;
+std::string_view ToString(AvatarStandinVisibility value) noexcept;
 bool TryParse(std::string_view value, RecordingBackend& result) noexcept;
 bool TryParse(std::string_view value, RecordingResolution& result) noexcept;
 bool TryParse(std::string_view value, RateControlMode& result) noexcept;
@@ -278,6 +344,7 @@ bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept;
 bool TryParse(std::string_view value, AvatarLightingMode& result) noexcept;
 bool TryParse(std::string_view value, SpringBoneQuality& result) noexcept;
 bool TryParse(std::string_view value, SpringCollisionQuality& result) noexcept;
+bool TryParse(std::string_view value, AvatarStandinVisibility& result) noexcept;
 void ApplyAvatarQualityPreset(AvatarSettings& settings, AvatarQualityPreset preset) noexcept;
 void ResolutionDimensions(RecordingResolution resolution, std::int32_t& width, std::int32_t& height) noexcept;
 

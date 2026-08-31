@@ -2,6 +2,7 @@
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/preview/PreviewRuntimeDriver.hpp"
@@ -250,6 +251,8 @@ public:
             DestroyPlacementPreview();
             if (IsAlive(previewMaterial_)) UnityEngine::Object::Destroy(previewMaterial_);
             previewMaterial_ = nullptr;
+            if (IsAlive(floatingMaterial_)) UnityEngine::Object::Destroy(floatingMaterial_);
+            floatingMaterial_ = nullptr;
             UnbindPreviewRuntimeDriver(&owner_);
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
             driverObject_ = nullptr;
@@ -277,12 +280,28 @@ public:
             // frame instead of leaving registered HMD-only controls hidden.
             if (captureExclusionDepth_ != 0) RestoreCaptureRoots();
             ApplyVisibility();
+            // Self-heal for the popout's spectator-exclusion CanvasGroup: if
+            // anything ever leaves its alpha at 0 outside an exclusion window
+            // (an interrupted render, an exception between hide and restore),
+            // the panel would exist but be permanently invisible in the HMD.
+            if (IsAlive(floatingScreen_) && captureExclusionDepth_ == 0) {
+                auto* group = floatingScreen_->get_gameObject()->GetComponent<UnityEngine::CanvasGroup*>();
+                if (IsAlive(group) && group->get_alpha() < 0.999F) {
+                    group->set_alpha(1.0F);
+                    if (!floatingAlphaHealLogged_) {
+                        floatingAlphaHealLogged_ = true;
+                        Logging::Logger.warn(
+                            "Movable popout preview CanvasGroup alpha was stuck at 0 and was restored");
+                    }
+                }
+            }
             EnsurePlacementPreview();
             UpdateExpandedHandleRotation(floatingScreen_);
             UpdateExpandedHandleRotation(placementScreen_);
             UpdatePlacementDrag();
             UpdateFloatingPersistence();
             SetPreviewTexture(camera_.OutputTexture(camera::kPrimaryCameraId));
+            UpdateFloatingFeedStatus();
         } catch (const std::exception& exception) {
             if (!tickFailureLogged_) {
                 tickFailureLogged_ = true;
@@ -350,8 +369,39 @@ public:
         RefreshCaptureRendererCache();
     }
 
+    // Places the preview 1.5 m ahead of the head, slightly below eye level,
+    // facing the player. Shared by Reset and by every enable so the panel
+    // always appears where the user is looking (a stale saved pose behind or
+    // beside the player made "enabled but nothing shows" reports).
+    void MovePreviewPoseInFrontOfPlayer(settings::PreviewSettings& preview) {
+        auto mainCamera = UnityEngine::Camera::get_main();
+        if (!mainCamera) return;
+        auto* transform = mainCamera->get_transform().ptr();
+        const auto headPosition = transform->get_position();
+        const auto headRotation = transform->get_rotation();
+        auto forward = UnityEngine::Quaternion::op_Multiply(
+            headRotation, UnityEngine::Vector3::get_forward());
+        const auto horizontalLength = std::sqrt(forward.x * forward.x + forward.z * forward.z);
+        if (horizontalLength > 0.001F) {
+            forward.x /= horizontalLength;
+            forward.y = 0.0F;
+            forward.z /= horizontalLength;
+        }
+        const auto ahead = UnityEngine::Vector3::op_Multiply(forward, 1.5F);
+        const auto lowered = UnityEngine::Vector3::op_Addition(ahead, {0.0F, -0.35F, 0.0F});
+        preview.position = FromUnity(UnityEngine::Vector3::op_Addition(headPosition, lowered));
+        preview.rotationDegrees = {
+            0.0F,
+            camera::NormalizeDegrees(camera::YawDegrees(FromUnity(headRotation)) + 180.0F),
+            0.0F};
+    }
+
     void SetFloatingVisible(bool visible) {
-        settings_.Edit().preview.visible = visible;
+        auto& preview = settings_.Edit().preview;
+        preview.visible = visible;
+        // Destroy on enable so CreateFloatingPreview runs again; creation
+        // always recenters the panel in front of the player (see below).
+        if (visible) DestroyFloatingPreview();
         std::string error;
         if (!settings_.Save(&error)) Logging::Logger.error("Preview visibility save failed: {}", error);
         ApplyVisibility();
@@ -368,24 +418,7 @@ public:
 
     bool ResetFloatingPreview(std::string* error) {
         auto reset = settings::Defaults().preview;
-        auto mainCamera = UnityEngine::Camera::get_main();
-        if (mainCamera) {
-            auto* transform = mainCamera->get_transform().ptr();
-            const auto headPosition = transform->get_position();
-            const auto headRotation = transform->get_rotation();
-            auto forward = UnityEngine::Quaternion::op_Multiply(
-                headRotation, UnityEngine::Vector3::get_forward());
-            const auto horizontalLength = std::sqrt(forward.x * forward.x + forward.z * forward.z);
-            if (horizontalLength > 0.001F) {
-                forward.x /= horizontalLength;
-                forward.y = 0.0F;
-                forward.z /= horizontalLength;
-            }
-            const auto ahead = UnityEngine::Vector3::op_Multiply(forward, 1.5F);
-            const auto lowered = UnityEngine::Vector3::op_Addition(ahead, {0.0F, -0.35F, 0.0F});
-            reset.position = FromUnity(UnityEngine::Vector3::op_Addition(headPosition, lowered));
-            reset.rotationDegrees = {0.0F, camera::NormalizeDegrees(camera::YawDegrees(FromUnity(headRotation)) + 180.0F), 0.0F};
-        }
+        MovePreviewPoseInFrontOfPlayer(reset);
         reset.visible = settings_.Get().preview.visible;
         settings_.Edit().preview = reset;
         if (!settings_.Save(error)) return false;
@@ -451,11 +484,16 @@ private:
                 capturePreviewCullSnapshot_.emplace_back(renderer.ptr(), renderer->get_cull());
                 renderer->set_cull(true);
             };
-            // Keep only the known-working docked/floor preview out of the
-            // spectator frame. The movable popout is deliberately visible to
-            // the camera and is never touched by this exclusion path, allowing
-            // its complete surface and recursive feed to be diagnosed.
+            // Both camera monitors stay out of the spectator frame. The docked
+            // /floor preview always did; the movable popout was temporarily
+            // left visible as a recursion diagnostic, which put an infinite
+            // picture-in-picture feed into recordings and into the popout
+            // itself whenever the camera could see the panel. The popout's
+            // whole screen root is hidden through the CanvasGroup path (added
+            // in RefreshCaptureRendererCache), and its RawImage is culled here
+            // like the docked one for the same one-frame guarantee.
             cullPreview(dockedImage_);
+            cullPreview(floatingImage_);
             for (auto* renderer : cachedCaptureMeshRenderers_) {
                 if (!IsAlive(renderer)) continue;
                 captureMeshSnapshot_.emplace_back(renderer, renderer->get_enabled());
@@ -508,38 +546,75 @@ private:
             }
         };
         cacheRoot(dockedCaptureRoot_);
+        // The movable popout is a camera monitor, not scene content: hide its
+        // entire screen (video, borders, captions) from the spectator frame so
+        // recordings never contain the panel or a recursive feed of itself.
+        // CanvasGroup alpha is the proven non-destructive hide used for every
+        // other SaberStage HMD-only surface.
+        if (IsAlive(floatingScreen_)) cacheRoot(floatingScreen_->get_gameObject().ptr());
         for (auto* root : captureExcludedRoots_) cacheRoot(root);
         captureCanvasGroupSnapshot_.reserve(cachedCaptureCanvasGroups_.size());
         captureMeshSnapshot_.reserve(cachedCaptureMeshRenderers_.size());
     }
 
-    bool EnsurePreviewMaterial() {
-        if (IsAlive(previewMaterial_)) return true;
+    UnityEngine::Material* CreateOpaquePreviewMaterial(const char* name) {
         // The camera's post-effect texture contains correct RGB (Hollywood
         // records it correctly) but its alpha channel is Beat Saber's bloom
         // weight, not ordinary image opacity. UI materials alpha-blend with
         // that channel and consequently show only emissive effects, pointers,
-        // and floor markers. Use Unity's opaque texture shader so the preview
-        // displays the final RGB regardless of the bloom-alpha contents.
-        auto shader = UnityEngine::Shader::Find("Unlit/Texture");
-        if (!shader) {
+        // and floor markers.
+        //
+        // Prefer the embedded SaberStage/VideoPreview shader: it forces
+        // opaque output AND is built with guaranteed STEREO_MULTIVIEW_ON
+        // variants. A stock shader located with Shader.Find carries only the
+        // variants Beat Saber happened to package; when its multiview variant
+        // is missing it binds without error and rasterizes NOTHING in the
+        // headset while the mono spectator camera still sees it — the exact
+        // "popout invisible in HMD but floor works" failure. (Lesson imported
+        // from the author's Big Screen mod, which hit the same stripping.)
+        auto* embedded = avatar::vrm::EmbeddedVideoPreviewShader();
+        UnityEngine::Shader* shader = embedded;
+        if (!IsAlive(shader)) shader = UnityEngine::Shader::Find("Unlit/Texture");
+        if (!IsAlive(shader)) {
             if (!previewMaterialFailureLogged_) {
                 previewMaterialFailureLogged_ = true;
-                Logging::Logger.error("Unity's opaque texture shader is unavailable for camera previews");
+                Logging::Logger.error("No opaque texture shader is available for camera previews");
             }
-            return false;
+            return nullptr;
         }
-        previewMaterial_ = UnityEngine::Material::New_ctor(shader);
+        auto* material = UnityEngine::Material::New_ctor(shader);
+        if (!IsAlive(material)) return nullptr;
+        material->set_name(name);
+        material->set_color(UnityEngine::Color::get_white());
+        if (embedded == nullptr) {
+            // Stock-shader fallback: keep the previous two-sided/queue setup.
+            material->SetInt("_Cull", 0);
+            material->set_renderQueue(3000);
+        }
+        UnityEngine::Object::DontDestroyOnLoad(material);
+        Logging::Logger.info(
+            "Camera preview material '{}' uses {} shader",
+            name, embedded != nullptr ? "embedded multiview VideoPreview" : "stock Unlit/Texture fallback");
+        return material;
+    }
+
+    bool EnsurePreviewMaterial() {
+        if (IsAlive(previewMaterial_)) return true;
+        previewMaterial_ = CreateOpaquePreviewMaterial("SaberStage Opaque Camera Preview");
         if (!IsAlive(previewMaterial_)) return false;
-        previewMaterial_->set_name("SaberStage Opaque Camera Preview");
-        previewMaterial_->set_color(UnityEngine::Color::get_white());
-        // Keep the preview material two-sided for retained world-space UI and
-        // camera-placement surfaces that may be viewed from either side.
-        previewMaterial_->SetInt("_Cull", 0);
-        previewMaterial_->set_renderQueue(3000);
-        UnityEngine::Object::DontDestroyOnLoad(previewMaterial_);
         Logging::Logger.info("Using alpha-independent opaque RGB material for camera previews");
         return true;
+    }
+
+    bool EnsureFloatingPreviewMaterial() {
+        if (IsAlive(floatingMaterial_)) return true;
+        // The movable popout gets its OWN material instance. Sharing one
+        // material between the HMUI docked canvas and the world-space
+        // FloatingScreen canvas lets one canvas's UI pipeline (masking /
+        // material-modifier state) leak into the other's draw; per-surface
+        // instances keep the two monitors fully independent.
+        floatingMaterial_ = CreateOpaquePreviewMaterial("SaberStage Opaque Popout Preview");
+        return IsAlive(floatingMaterial_);
     }
 
     void ApplyPreviewMaterial(UnityEngine::UI::RawImage* image) {
@@ -560,7 +635,7 @@ private:
 
     UnityEngine::UI::RawImage* BuildMovablePreviewVisuals() {
         const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
-        if (!whitePixel || !EnsurePreviewMaterial()) return nullptr;
+        if (!whitePixel || !EnsureFloatingPreviewMaterial()) return nullptr;
         auto* parent = floatingScreen_->get_transform().ptr();
         const UnityEngine::Color borderColor{0.0F, 0.80F, 1.0F, 1.0F};
         const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.98F};
@@ -571,11 +646,20 @@ private:
         constexpr float bodyBottom = -halfCanvas + kPreviewFooterHeight;
         constexpr float bodyCenter = (bodyTop + bodyBottom) * 0.5F;
 
+        // Opaque near-black backdrop behind the video surface. If the feed is
+        // missing or the surface fails to draw, the panel shows an obviously
+        // empty dark screen instead of the world behind it — which makes
+        // "panel missing" and "video missing" distinguishable at a glance.
+        ConfigureImage(
+            BSML::Lite::CreateImage(parent, whitePixel),
+            {0.0F, bodyCenter},
+            {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F},
+            {0.01F, 0.02F, 0.045F, 1.0F});
         auto* preview = CreateWorldSpaceVideoSurface(
             parent,
             {0.0F, bodyCenter},
             {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F},
-            previewMaterial_);
+            floatingMaterial_);
         if (!IsAlive(preview)) return nullptr;
 
         const auto addBorder = [&](UnityEngine::Vector2 position, UnityEngine::Vector2 size) {
@@ -608,10 +692,13 @@ private:
         auto* title = BSML::Lite::CreateText(
             parent, "SaberStage | Primary", TMPro::FontStyles::Bold, 5.0F);
         ConfigureText(title, titleCenter, {58.0F, kPreviewHeaderHeight - 1.0F}, 3.0F, 5.0F);
-        auto* instruction = BSML::Lite::CreateText(
+        // The footer doubles as a live feed-status line (see Tick): it shows
+        // the grab hint while the camera feed is bound, and a clear
+        // "waiting for camera feed" message when no texture is available yet.
+        floatingStatusText_ = BSML::Lite::CreateText(
             parent, "Grab anywhere to move", TMPro::FontStyles::Normal, 3.8F);
         ConfigureText(
-            instruction, instructionCenter, {54.0F, kPreviewFooterHeight - 1.0F}, 2.4F, 3.8F);
+            floatingStatusText_, instructionCenter, {54.0F, kPreviewFooterHeight - 1.0F}, 2.4F, 3.8F);
         return preview;
     }
 
@@ -649,7 +736,16 @@ private:
     }
 
     void CreateFloatingPreview() {
-        const auto& preview = settings_.Get().preview;
+        // The popout ALWAYS (re)appears directly in front of the player —
+        // session start included, not only when the toggle is flipped. A pose
+        // saved in an earlier session can be behind the player or facing away,
+        // and world-space UI renders nothing from its back side, so honoring a
+        // stale pose at creation reads as "enabled but nothing shows". The
+        // recentered pose is written back to settings so ApplySettings cannot
+        // later snap the panel to the stale one; in-session grabs still stick
+        // because the screen persists until hidden.
+        auto& preview = settings_.Edit().preview;
+        MovePreviewPoseInFrontOfPlayer(preview);
         floatingScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
             {kPreviewWidth, kPreviewCanvasHeight},
             true,
@@ -689,6 +785,39 @@ private:
         lastFloatingPose_ = ReadPose(floatingScreen_->get_transform().ptr());
         floatingPoseDirty_ = false;
         floatingStableSeconds_ = 0.0F;
+        // Schedule a one-shot state audit a few seconds after creation so the
+        // log captures the panel's settled, post-layout reality rather than
+        // its construction-time values.
+        floatingAuditSeconds_ = 3.0F;
+        // Full state dump so an on-device "enabled but nothing visible"
+        // report can be diagnosed from one log line: where the panel is, how
+        // big it is, whether Unity considers it active, and how far from the
+        // player's head it spawned.
+        try {
+            auto* screenTransform = floatingScreen_->get_transform().ptr();
+            const auto position = screenTransform->get_position();
+            const auto scale = screenTransform->get_lossyScale();
+            float headDistance = -1.0F;
+            if (auto mainCamera = UnityEngine::Camera::get_main()) {
+                const auto head = mainCamera->get_transform()->get_position();
+                const auto dx = position.x - head.x;
+                const auto dy = position.y - head.y;
+                const auto dz = position.z - head.z;
+                headDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            auto* group = floatingScreen_->get_gameObject()->GetComponent<UnityEngine::CanvasGroup*>();
+            Logging::Logger.info(
+                "Movable popout preview created: position=({:.2f},{:.2f},{:.2f}) scale={:.4f} "
+                "headDistance={:.2f}m layer={} activeInHierarchy={} canvasGroupAlpha={:.2f} "
+                "videoSurface={}",
+                position.x, position.y, position.z, scale.x,
+                headDistance,
+                floatingScreen_->get_gameObject()->get_layer(),
+                floatingScreen_->get_gameObject()->get_activeInHierarchy(),
+                IsAlive(group) ? group->get_alpha() : -1.0F,
+                IsAlive(floatingImage_));
+        } catch (...) {
+        }
         Logging::Logger.info("Created movable HMD-only camera preview");
     }
 
@@ -697,6 +826,10 @@ private:
         if (IsAlive(floatingScreen_)) UnityEngine::Object::Destroy(floatingScreen_->get_gameObject());
         floatingScreen_ = nullptr;
         floatingImage_ = nullptr;
+        floatingStatusText_ = nullptr;
+        floatingStatusSeconds_ = 1.0F;
+        floatingAuditSeconds_ = 0.0F;
+        floatingStatusShownFeed_ = -1;
         RefreshCaptureRendererCache();
         floatingPoseDirty_ = false;
         floatingStableSeconds_ = 0.0F;
@@ -819,11 +952,79 @@ private:
         if (IsAlive(dockedImage_)) dockedImage_->set_texture(texture);
     }
 
+    // Once per second: refresh the popout's footer between the grab hint and
+    // a "waiting" message so the panel itself reports whether a camera feed
+    // is bound, and nudge the video surface's canvas geometry. The periodic
+    // SetAllDirty is cheap insurance against any missed dirty propagation
+    // after the camera recreates its RenderTexture.
+    void UpdateFloatingFeedStatus() {
+        if (!IsAlive(floatingScreen_)) return;
+        if (floatingAuditSeconds_ > 0.0F) {
+            floatingAuditSeconds_ -= std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+            if (floatingAuditSeconds_ <= 0.0F) {
+                try {
+                    auto* screenTransform = floatingScreen_->get_transform().ptr();
+                    const auto position = screenTransform->get_position();
+                    float headDistance = -1.0F;
+                    float facingDot = 0.0F;
+                    if (auto mainCamera = UnityEngine::Camera::get_main()) {
+                        auto* head = mainCamera->get_transform().ptr();
+                        const auto headPosition = head->get_position();
+                        const auto dx = position.x - headPosition.x;
+                        const auto dy = position.y - headPosition.y;
+                        const auto dz = position.z - headPosition.z;
+                        headDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        // Positive dot = the canvas front faces the player.
+                        const auto panelForward = UnityEngine::Quaternion::op_Multiply(
+                            screenTransform->get_rotation(), UnityEngine::Vector3::get_forward());
+                        if (headDistance > 0.001F) {
+                            facingDot = -(panelForward.x * dx + panelForward.y * dy +
+                                panelForward.z * dz) / headDistance;
+                        }
+                    }
+                    auto* group = floatingScreen_->get_gameObject()->GetComponent<UnityEngine::CanvasGroup*>();
+                    Logging::Logger.info(
+                        "Movable popout preview settled state: position=({:.2f},{:.2f},{:.2f}) "
+                        "headDistance={:.2f}m facingDot={:.2f} activeInHierarchy={} "
+                        "canvasGroupAlpha={:.2f} videoTexture={}",
+                        position.x, position.y, position.z,
+                        headDistance, facingDot,
+                        floatingScreen_->get_gameObject()->get_activeInHierarchy(),
+                        IsAlive(group) ? group->get_alpha() : -1.0F,
+                        IsAlive(floatingImage_) && floatingImage_->get_texture() != nullptr);
+                } catch (...) {
+                }
+            }
+        }
+        floatingStatusSeconds_ += std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+        if (floatingStatusSeconds_ < 1.0F) return;
+        floatingStatusSeconds_ = 0.0F;
+        auto* feed = camera_.OutputTexture(camera::kPrimaryCameraId);
+        const int feedState = IsAlive(feed) ? 1 : 0;
+        if (IsAlive(floatingImage_) && feedState == 1) floatingImage_->SetAllDirty();
+        if (IsAlive(floatingStatusText_) && feedState != floatingStatusShownFeed_) {
+            floatingStatusShownFeed_ = feedState;
+            floatingStatusText_->set_text(
+                feedState == 1 ? "Grab anywhere to move" : "Waiting for camera feed...");
+        }
+    }
+
     void SetPreviewTexture(UnityEngine::RenderTexture* texture) {
+        // Rebind on both the material and the RawImage. The camera recreates
+        // its RenderTexture whenever the combined render demand changes size
+        // (for example when the mod menu closes and only the popout demand
+        // remains), so this runs every tick and must survive stale pointers.
         if (IsAlive(previewMaterial_)) previewMaterial_->set_mainTexture(texture);
+        if (IsAlive(floatingMaterial_)) floatingMaterial_->set_mainTexture(texture);
         if (IsAlive(floatingImage_) && floatingImage_->get_texture() != texture) {
             floatingImage_->set_texture(texture);
             floatingImage_->SetMaterialDirty();
+            if (texture != nullptr && !floatingFirstFrameLogged_) {
+                floatingFirstFrameLogged_ = true;
+                Logging::Logger.info(
+                    "Movable popout preview received its first live camera texture ({}x{})",
+                    texture->get_width(), texture->get_height());
+            }
         }
         SetDockedImageTexture(texture);
     }
@@ -849,10 +1050,19 @@ private:
     std::vector<UnityEngine::MeshRenderer*> cachedCaptureMeshRenderers_;
     std::vector<UnityEngine::GameObject*> captureExcludedRoots_;
     camera::Pose lastFloatingPose_{};
+    bool floatingFirstFrameLogged_ = false;
+    bool floatingAlphaHealLogged_ = false;
     UnityEngine::GameObject* driverObject_ = nullptr;
     UnityEngine::Material* previewMaterial_ = nullptr;
+    // Dedicated material for the movable popout; see EnsureFloatingPreviewMaterial.
+    UnityEngine::Material* floatingMaterial_ = nullptr;
     BSML::FloatingScreen* floatingScreen_ = nullptr;
     UnityEngine::UI::RawImage* floatingImage_ = nullptr;
+    // Footer text on the popout that doubles as a live feed-status readout.
+    TMPro::TextMeshProUGUI* floatingStatusText_ = nullptr;
+    float floatingStatusSeconds_ = 1.0F;
+    float floatingAuditSeconds_ = 0.0F;
+    int floatingStatusShownFeed_ = -1;
     BSML::FloatingScreen* placementScreen_ = nullptr;
     UnityEngine::UI::RawImage* dockedImage_ = nullptr;
     UnityEngine::GameObject* dockedCaptureRoot_ = nullptr;

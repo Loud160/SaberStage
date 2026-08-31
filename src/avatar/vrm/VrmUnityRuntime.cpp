@@ -23,6 +23,9 @@
 #include "UnityEngine/MeshRenderer.hpp"
 #include "UnityEngine/Object.hpp"
 #include "UnityEngine/Quaternion.hpp"
+#include "UnityEngine/Behaviour.hpp"
+#include "UnityEngine/Collider.hpp"
+#include "UnityEngine/Rigidbody.hpp"
 #include "UnityEngine/Rendering/IndexFormat.hpp"
 #include "UnityEngine/Renderer.hpp"
 #include "UnityEngine/Shader.hpp"
@@ -41,6 +44,8 @@
 #include "beatsaber-hook/shared/utils/typedefs-wrappers.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -180,6 +185,11 @@ struct AvatarShaderResources {
     SafePtrUnity<UnityEngine::AssetBundle> bundle;
     SafePtrUnity<UnityEngine::Shader> mtoon;
     SafePtrUnity<UnityEngine::Shader> outline;
+    // Optional camera-preview surface shader (SaberStage/VideoPreview): built
+    // with guaranteed STEREO_MULTIVIEW_ON variants so world-space preview
+    // surfaces render in the headset. Missing from older bundles; its absence
+    // never blocks avatar loading.
+    SafePtrUnity<UnityEngine::Shader> videoPreview;
     bool attempted = false;
 };
 
@@ -217,6 +227,16 @@ bool LoadAvatarShaders() {
         if (!RetainShader(mtoon) || !RetainShader(outline)) {
             bundle->Unload(true);
             throw std::runtime_error("embedded bundle does not contain both SaberStage MToon shaders");
+        }
+        auto* videoPreview = static_cast<UnityEngine::Shader*>(
+            bundle->LoadAsset<UnityEngine::Shader*>("saberstage-video-preview"));
+        if (RetainShader(videoPreview)) {
+            resources.videoPreview = videoPreview;
+        } else {
+            // Older bundle without the preview shader: avatars still work and
+            // camera previews fall back to a stock shader.
+            Logging::Logger.warn(
+                "Embedded bundle has no saberstage-video-preview shader; previews use the stock fallback");
         }
         resources.bundle = bundle;
         resources.mtoon = mtoon;
@@ -269,6 +289,7 @@ public:
     }
 
     void Destroy() noexcept {
+        DestroyStandin();
         try {
             if (IsAlive(root_)) UnityEngine::Object::Destroy(root_);
             root_ = nullptr;
@@ -301,6 +322,10 @@ public:
         springAccumulator_ = 0.0F;
         springWindowSeconds_ = 0.0;
         springWindowUpdates_ = 0;
+        rendererHeadFraction_.clear();
+        rendererNeckFraction_.clear();
+        rendererIsHair_.clear();
+        wearAvatar_ = false;
     }
 
     void BuildNodes() {
@@ -825,14 +850,75 @@ public:
         return mesh;
     }
 
+    // Fraction of a primitive's vertices whose strongest skin weight lands in
+    // `subtreeNodes`. Rigid primitives count as fully inside when their node
+    // is in the subtree. Used to classify head/neck geometry for the
+    // first-person wear view; must run while joints0/weights0 CPU data still
+    // exists (BuildMeshes releases it afterwards).
+    static float SubtreeWeightFraction(
+        const Primitive& primitive,
+        const Skin* skin,
+        std::size_t nodeIndex,
+        const std::unordered_set<std::size_t>& subtreeNodes) {
+        if (!skin || primitive.joints0.empty() || primitive.weights0.empty()) {
+            return subtreeNodes.contains(nodeIndex) ? 1.0F : 0.0F;
+        }
+        std::size_t inside = 0;
+        const auto vertexCount = std::min(primitive.joints0.size(), primitive.weights0.size());
+        if (vertexCount == 0) return 0.0F;
+        for (std::size_t vertex = 0; vertex < vertexCount; ++vertex) {
+            const auto& joints = primitive.joints0[vertex];
+            const auto& weights = primitive.weights0[vertex];
+            const std::array<std::pair<float, std::uint16_t>, 4> candidates{{
+                {weights.x, joints.x}, {weights.y, joints.y},
+                {weights.z, joints.z}, {weights.w, joints.w}}};
+            const auto dominant = std::max_element(
+                candidates.begin(), candidates.end(),
+                [](const auto& left, const auto& right) { return left.first < right.first; });
+            if (dominant->second < skin->joints.size() &&
+                    subtreeNodes.contains(skin->joints[dominant->second])) {
+                ++inside;
+            }
+        }
+        return static_cast<float>(inside) / static_cast<float>(vertexCount);
+    }
+
+    [[nodiscard]] std::unordered_set<std::size_t> HumanoidSubtree(const char* boneName) const {
+        std::unordered_set<std::size_t> nodes;
+        const auto found = asset_.humanoidBones.find(boneName);
+        if (found == asset_.humanoidBones.end()) return nodes;
+        const auto add = [&](auto&& self, std::size_t node) -> void {
+            if (node >= asset_.nodes.size() || !nodes.insert(node).second) return;
+            for (const auto child : asset_.nodes[node].children) self(self, child);
+        };
+        add(add, found->second);
+        return nodes;
+    }
+
     void BuildMeshes() {
+        // Head subtree covers face/hair/head accessories (VRoid parents hair
+        // spring bones under the head). The neck subtree additionally catches
+        // collar-height accessories for the strictest wear coverage.
+        const auto headNodes = HumanoidSubtree("head");
+        auto neckNodes = HumanoidSubtree("neck");
+        neckNodes.insert(headNodes.begin(), headNodes.end());
         for (std::size_t nodeIndex = 0; nodeIndex < asset_.nodes.size(); ++nodeIndex) {
             const auto& node = asset_.nodes[nodeIndex];
             if (!node.mesh) continue;
             const auto& sourceMesh = asset_.meshes[*node.mesh];
+            const auto meshNameLower = [&] {
+                auto name = sourceMesh.name;
+                std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return name;
+            }();
             const Skin* skin = node.skin ? &asset_.skins[*node.skin] : nullptr;
             for (std::size_t primitiveIndex = 0; primitiveIndex < sourceMesh.primitives.size(); ++primitiveIndex) {
                 const auto& primitive = sourceMesh.primitives[primitiveIndex];
+                rendererHeadFraction_.push_back(SubtreeWeightFraction(primitive, skin, nodeIndex, headNodes));
+                rendererNeckFraction_.push_back(SubtreeWeightFraction(primitive, skin, nodeIndex, neckNodes));
+                rendererIsHair_.push_back(meshNameLower.find("hair") != std::string::npos);
                 auto* object = UnityEngine::GameObject::New_ctor(sourceMesh.name + "__primitive_" + std::to_string(primitiveIndex));
                 if (!IsAlive(object)) throw std::runtime_error("Unity could not create a VRM renderer object");
                 object->set_layer(options_.avatarLayer);
@@ -1307,6 +1393,9 @@ public:
                 if (error) *error = "VRM expression has no matching runtime renderer: " + std::string(presetName);
                 return false;
             }
+            // The display clone copies blend-shape weights lazily; flag it so
+            // the next SyncStandin mirrors this expression change.
+            standinBlendShapesDirty_ = true;
             if (writeDiagnostic) {
                 Logging::Logger.debug(
                     "Applied VRM expression '{}' weight={:.2f} across {} renderer bindings",
@@ -1328,6 +1417,419 @@ public:
     bool SetExpressionQuiet(std::string_view presetName, float weight) noexcept {
         return ApplyExpression(presetName, weight, nullptr, false);
     }
+
+    void ApplyViewMode(
+        bool wearAvatar,
+        bool hideFace,
+        bool hideHair,
+        bool hideNeckAccessories,
+        std::int32_t bothViewsLayer) noexcept {
+        try {
+            // ApplyAvatarSettings re-applies every avatar option on any change
+            // (including unrelated slider drags); only log when the wear state
+            // itself changed.
+            const bool changed = wearAvatar_ != wearAvatar || wearHideFace_ != hideFace ||
+                wearHideHair_ != hideHair || wearHideNeckAccessories_ != hideNeckAccessories ||
+                wearBothLayer_ != bothViewsLayer;
+            wearAvatar_ = wearAvatar;
+            wearHideFace_ = hideFace;
+            wearHideHair_ = hideHair;
+            wearHideNeckAccessories_ = hideNeckAccessories;
+            wearBothLayer_ = bothViewsLayer;
+            std::size_t hiddenFromFirstPerson = 0;
+            for (std::size_t i = 0; i < allRenderers_.size(); ++i) {
+                auto* renderer = allRenderers_[i];
+                if (!IsAlive(renderer)) continue;
+                bool headGeometry = false;
+                if (wearAvatar_) {
+                    const auto head = i < rendererHeadFraction_.size() ? rendererHeadFraction_[i] : 0.0F;
+                    const auto neck = i < rendererNeckFraction_.size() ? rendererNeckFraction_[i] : 0.0F;
+                    const bool hair = i < rendererIsHair_.size() && rendererIsHair_[i];
+                    // Thresholds: a renderer mostly skinned to the head (60%+)
+                    // is face/hair/head-accessory even when a few vertices
+                    // blend into the neck; a quarter of vertices at neck level
+                    // marks collars, scarves, and chokers. The three switches
+                    // are independent so players can, e.g., hide only hair.
+                    const bool faceGeometry = head >= 0.6F && !hair;
+                    headGeometry = (hideFace && faceGeometry) ||
+                        (hideHair && hair) ||
+                        (hideNeckAccessories && neck >= 0.25F);
+                }
+                // Worn body parts go to the both-views layer so the player and
+                // the camera see them; hidden head geometry (and everything,
+                // when wear is off) stays on the spectator-only avatar layer,
+                // so recordings always contain the complete avatar.
+                const auto layer = (wearAvatar_ && !headGeometry) ? wearBothLayer_ : options_.avatarLayer;
+                renderer->get_gameObject()->set_layer(layer);
+                if (wearAvatar_ && headGeometry) ++hiddenFromFirstPerson;
+            }
+            if (changed) {
+                Logging::Logger.info(
+                    "Avatar view mode: wear={} hideFace={} hideHair={} hideNeck={} headRenderersHiddenFromHmd={}/{}",
+                    wearAvatar_, wearHideFace_, wearHideHair_, wearHideNeckAccessories_,
+                    hiddenFromFirstPerson, allRenderers_.size());
+            }
+        } catch (...) {
+            Logging::Logger.warn("Could not apply the avatar first-person view mode");
+        }
+    }
+
+    // One free-standing display clone. Everything Unity-owned lives on root;
+    // pairs/rendererPairs are cached lookups into the shared hierarchy copy.
+    struct StandinInstance {
+        UnityEngine::GameObject* root = nullptr;
+        std::vector<std::pair<UnityEngine::Transform*, UnityEngine::Transform*>> pairs;
+        std::vector<std::pair<UnityEngine::SkinnedMeshRenderer*, UnityEngine::SkinnedMeshRenderer*>> rendererPairs;
+        std::vector<std::int32_t> blendShapeCounts;
+        // Clone-side hand bones (index 0 = left, 1 = right) plus the current
+        // hand-prop replica and the live source it was built from.
+        std::array<UnityEngine::Transform*, 2> handBones{};
+        std::array<UnityEngine::Transform*, 2> propSources{};
+        std::array<UnityEngine::GameObject*, 2> propReplicas{};
+        float positionX = 0.0F;
+        float positionY = 0.0F;
+        float positionZ = 1.4F;
+        float yawDegrees = 180.0F;
+        float scale = 1.0F;
+        bool activeState = true;
+    };
+
+    // Source-avatar hand bone (0 = left, 1 = right) from the VRM humanoid map.
+    UnityEngine::Transform* SourceHandBone(std::size_t hand) const {
+        const auto found = asset_.humanoidBones.find(hand == 0 ? "leftHand" : "rightHand");
+        if (found == asset_.humanoidBones.end() || found->second >= nodeTransforms_.size()) {
+            return nullptr;
+        }
+        auto* bone = nodeTransforms_[found->second];
+        return IsAlive(bone) ? bone : nullptr;
+    }
+
+    // Removes everything except transforms and render components from a prop
+    // replica so no game script, collider, or physics body runs on it.
+    // DestroyImmediate (not Destroy) so cloned MonoBehaviours cannot execute
+    // an Update between now and end of frame.
+    static void StripReplicaToVisuals(UnityEngine::GameObject* replica) {
+        for (auto* behaviour : replica->GetComponentsInChildren<UnityEngine::Behaviour*>(true)) {
+            if (IsAlive(behaviour)) UnityEngine::Object::DestroyImmediate(behaviour);
+        }
+        for (auto* collider : replica->GetComponentsInChildren<UnityEngine::Collider*>(true)) {
+            if (IsAlive(collider)) UnityEngine::Object::DestroyImmediate(collider);
+        }
+        for (auto* body : replica->GetComponentsInChildren<UnityEngine::Rigidbody*>(true)) {
+            if (IsAlive(body)) UnityEngine::Object::DestroyImmediate(body);
+        }
+    }
+
+    void CollectStandinPairs(
+        StandinInstance& instance,
+        UnityEngine::Transform* source,
+        UnityEngine::Transform* clone) {
+        // Instantiate preserves child order, so identical recursive traversal
+        // of both hierarchies pairs every node with its copy.
+        const auto count = std::min(source->get_childCount(), clone->get_childCount());
+        for (int child = 0; child < count; ++child) {
+            auto* sourceChild = source->GetChild(child).ptr();
+            auto* cloneChild = clone->GetChild(child).ptr();
+            if (!IsAlive(sourceChild) || !IsAlive(cloneChild)) continue;
+            instance.pairs.emplace_back(sourceChild, cloneChild);
+            CollectStandinPairs(instance, sourceChild, cloneChild);
+        }
+    }
+
+    void ApplyStandinRootPose(StandinInstance& instance) {
+        if (!IsAlive(instance.root)) return;
+        auto* transform = instance.root->get_transform().ptr();
+        transform->set_position({instance.positionX, instance.positionY, instance.positionZ});
+        transform->set_rotation(UnityEngine::Quaternion::Euler({0.0F, instance.yawDegrees, 0.0F}));
+        transform->set_localScale({instance.scale, instance.scale, instance.scale});
+    }
+
+    void ApplyStandinLayer(StandinInstance& instance, std::int32_t layer) {
+        if (!IsAlive(instance.root)) return;
+        // Walk every transform under the root (rather than the cached pairs)
+        // so later additions such as hand-prop replicas are re-layered too.
+        instance.root->set_layer(layer);
+        for (auto* transform : instance.root->GetComponentsInChildren<UnityEngine::Transform*>(true)) {
+            if (IsAlive(transform)) transform->get_gameObject()->set_layer(layer);
+        }
+    }
+
+    void DestroyStandinProp(StandinInstance& instance, std::size_t hand) noexcept {
+        try {
+            if (IsAlive(instance.propReplicas[hand])) {
+                UnityEngine::Object::Destroy(instance.propReplicas[hand]);
+            }
+        } catch (...) {
+        }
+        instance.propReplicas[hand] = nullptr;
+        instance.propSources[hand] = nullptr;
+    }
+
+    void CreateStandinProp(StandinInstance& instance, std::size_t hand, UnityEngine::Transform* source) {
+        auto* handBone = instance.handBones[hand];
+        if (!IsAlive(handBone) || !IsAlive(source)) return;
+        auto* replica = UnityEngine::Object::Instantiate<UnityEngine::GameObject*>(
+            source->get_gameObject().ptr());
+        if (!IsAlive(replica)) return;
+        replica->set_name(hand == 0 ? "SaberStage Clone Prop L" : "SaberStage Clone Prop R");
+        StripReplicaToVisuals(replica);
+        auto* replicaTransform = replica->get_transform().ptr();
+        replicaTransform->SetParent(handBone, false);
+        // Preserve the prop's authored world size relative to the hand: local
+        // scale = source world scale over the SOURCE hand bone's world scale.
+        // The clone's own scale then multiplies in through the bone chain.
+        auto* sourceHand = SourceHandBone(hand);
+        const auto sourceScale = source->get_lossyScale();
+        const auto handScale = IsAlive(sourceHand)
+            ? sourceHand->get_lossyScale() : UnityEngine::Vector3{1.0F, 1.0F, 1.0F};
+        const auto safeAxis = [](float value) { return std::abs(value) > 1.0e-5F ? value : 1.0F; };
+        replicaTransform->set_localScale({
+            sourceScale.x / safeAxis(handScale.x),
+            sourceScale.y / safeAxis(handScale.y),
+            sourceScale.z / safeAxis(handScale.z)});
+        replica->set_layer(standinLayer_);
+        for (auto* transform : replica->GetComponentsInChildren<UnityEngine::Transform*>(true)) {
+            if (IsAlive(transform)) transform->get_gameObject()->set_layer(standinLayer_);
+        }
+        replica->SetActive(true);
+        instance.propReplicas[hand] = replica;
+        instance.propSources[hand] = source;
+    }
+
+    void UpdateStandinProps(StandinInstance& instance) {
+        for (std::size_t hand = 0; hand < 2; ++hand) {
+            auto* desired = standinPropSources_[hand];
+            if (!IsAlive(desired) || !desired->get_gameObject()->get_activeInHierarchy()) {
+                desired = nullptr;
+            }
+            if (instance.propSources[hand] != desired) {
+                DestroyStandinProp(instance, hand);
+                if (desired != nullptr) CreateStandinProp(instance, hand, desired);
+            }
+            auto* replica = instance.propReplicas[hand];
+            auto* source = instance.propSources[hand];
+            auto* sourceHand = SourceHandBone(hand);
+            if (!IsAlive(replica) || !IsAlive(source) || !IsAlive(sourceHand)) continue;
+            // Mirror the prop's live pose relative to the source hand bone:
+            // the clone hand bone already mirrors the source hand, so the same
+            // local offset reproduces the exact grip every frame (including
+            // controller-to-wrist offset changes).
+            auto* replicaTransform = replica->get_transform().ptr();
+            replicaTransform->set_localPosition(
+                sourceHand->InverseTransformPoint(source->get_position()));
+            replicaTransform->set_localRotation(UnityEngine::Quaternion::op_Multiply(
+                UnityEngine::Quaternion::Inverse(sourceHand->get_rotation()),
+                source->get_rotation()));
+        }
+    }
+
+    bool CreateStandinInstance(StandinInstance& instance, std::size_t slot) {
+        if (!IsAlive(root_)) return false;
+        auto* clone = UnityEngine::Object::Instantiate<UnityEngine::GameObject*>(root_);
+        if (!IsAlive(clone)) return false;
+        clone->set_name("SaberStage Avatar Display Clone " + std::to_string(slot + 1));
+        UnityEngine::Object::DontDestroyOnLoad(clone);
+        // The clone must not keep a second humanoid Animator: Unity would
+        // treat it as an independent humanoid and fight the per-frame
+        // transform copy below.
+        if (auto* cloneAnimator = clone->GetComponent<UnityEngine::Animator*>(); IsAlive(cloneAnimator)) {
+            UnityEngine::Object::DestroyImmediate(cloneAnimator);
+        }
+        instance.root = clone;
+        instance.pairs.clear();
+        CollectStandinPairs(instance, root_->get_transform().ptr(), clone->get_transform().ptr());
+        // Blend-shape pairs: GetComponentsInChildren returns hierarchy order
+        // and both hierarchies are structurally identical, so the arrays pair
+        // by index. Only renderers with morph targets matter.
+        instance.rendererPairs.clear();
+        instance.blendShapeCounts.clear();
+        auto sourceRenderers = root_->GetComponentsInChildren<UnityEngine::SkinnedMeshRenderer*>(true);
+        auto cloneRenderers = clone->GetComponentsInChildren<UnityEngine::SkinnedMeshRenderer*>(true);
+        const auto rendererCount = std::min(sourceRenderers.size(), cloneRenderers.size());
+        for (il2cpp_array_size_t i = 0; i < rendererCount; ++i) {
+            auto* sourceRenderer = sourceRenderers[i];
+            auto* cloneRenderer = cloneRenderers[i];
+            if (!IsAlive(sourceRenderer) || !IsAlive(cloneRenderer)) continue;
+            auto mesh = sourceRenderer->get_sharedMesh();
+            const auto blendShapes = IsAlive(mesh.ptr()) ? mesh->get_blendShapeCount() : 0;
+            if (blendShapes <= 0) continue;
+            instance.rendererPairs.emplace_back(sourceRenderer, cloneRenderer);
+            instance.blendShapeCounts.push_back(blendShapes);
+        }
+        // Resolve the clone-side hand bones once: find the pair whose source
+        // is the avatar's humanoid hand bone.
+        for (std::size_t hand = 0; hand < 2; ++hand) {
+            instance.handBones[hand] = nullptr;
+            auto* sourceHand = SourceHandBone(hand);
+            if (!sourceHand) continue;
+            for (const auto& [source, cloneTransform] : instance.pairs) {
+                if (source == sourceHand) {
+                    instance.handBones[hand] = cloneTransform;
+                    break;
+                }
+            }
+        }
+        ApplyStandinLayer(instance, standinLayer_);
+        ApplyStandinRootPose(instance);
+        instance.activeState = true;
+        clone->SetActive(true);
+        Logging::Logger.info(
+            "Created avatar display clone {}: nodePairs={} morphRenderers={} handBones={}/{} layer={}",
+            slot + 1, instance.pairs.size(), instance.rendererPairs.size(),
+            IsAlive(instance.handBones[0]), IsAlive(instance.handBones[1]), standinLayer_);
+        return true;
+    }
+
+    void DestroyStandinInstance(StandinInstance& instance) noexcept {
+        try {
+            if (IsAlive(instance.root)) UnityEngine::Object::Destroy(instance.root);
+        } catch (...) {
+        }
+        instance.root = nullptr;
+        instance.pairs.clear();
+        instance.rendererPairs.clear();
+        instance.blendShapeCounts.clear();
+        // Prop replicas are children of root and die with it; just clear.
+        instance.handBones = {};
+        instance.propSources = {};
+        instance.propReplicas = {};
+    }
+
+    bool SetStandinCount(std::size_t count) noexcept {
+        try {
+            count = std::min<std::size_t>(count, 3);
+            while (standins_.size() > count) {
+                DestroyStandinInstance(standins_.back());
+                standins_.pop_back();
+            }
+            bool allCreated = true;
+            while (standins_.size() < count) {
+                standins_.emplace_back();
+                if (!CreateStandinInstance(standins_.back(), standins_.size() - 1)) {
+                    Logging::Logger.error(
+                        "Could not create avatar display clone {}", standins_.size());
+                    standins_.pop_back();
+                    allCreated = false;
+                    break;
+                }
+            }
+            if (standins_.empty()) {
+                standinBlendShapesDirty_ = false;
+                standinSyncFailureLogged_ = false;
+            } else {
+                // New clones start from the source's current blend-shape state
+                // via Instantiate, but mark dirty so all slots converge.
+                standinBlendShapesDirty_ = true;
+                SyncStandin();
+            }
+            return allCreated;
+        } catch (const std::exception& failure) {
+            Logging::Logger.error("Could not resize avatar display clones: {}", failure.what());
+            return false;
+        } catch (...) {
+            Logging::Logger.error("Could not resize avatar display clones");
+            return false;
+        }
+    }
+
+    void DestroyStandin() noexcept {
+        for (auto& instance : standins_) DestroyStandinInstance(instance);
+        standins_.clear();
+        standinBlendShapesDirty_ = false;
+        standinSyncFailureLogged_ = false;
+    }
+
+    void SetStandinLayer(std::int32_t layer) noexcept {
+        standinLayer_ = layer;
+        try {
+            for (auto& instance : standins_) ApplyStandinLayer(instance, layer);
+        } catch (...) {
+        }
+    }
+
+    void SetStandinHandProps(
+        UnityEngine::Transform* leftSource, UnityEngine::Transform* rightSource) noexcept {
+        // Stored only; SyncStandin reconciles replicas against these each
+        // frame so source death or scene changes are handled in one place.
+        standinPropSources_[0] = leftSource;
+        standinPropSources_[1] = rightSource;
+    }
+
+    void SetStandinPose(
+        std::size_t index,
+        float worldX, float worldY, float worldZ,
+        float yawDegrees, float scale) noexcept {
+        if (index >= standins_.size()) return;
+        auto& instance = standins_[index];
+        instance.positionX = worldX;
+        instance.positionY = worldY;
+        instance.positionZ = worldZ;
+        instance.yawDegrees = yawDegrees;
+        instance.scale = std::clamp(scale, 0.05F, 10.0F);
+        try {
+            ApplyStandinRootPose(instance);
+        } catch (...) {
+        }
+    }
+
+    void SyncStandin() noexcept {
+        if (standins_.empty()) return;
+        try {
+            // A hidden or unloaded source stops producing poses; freeze-frame
+            // would look broken, so clones follow the source's liveness.
+            const bool sourceLive = IsAlive(root_) && root_->get_activeInHierarchy();
+            const bool copyBlendShapes = standinBlendShapesDirty_;
+            if (sourceLive) standinBlendShapesDirty_ = false;
+            for (auto& instance : standins_) {
+                if (!IsAlive(instance.root)) continue;
+                if (instance.activeState != sourceLive) {
+                    instance.activeState = sourceLive;
+                    instance.root->SetActive(sourceLive);
+                }
+                if (!sourceLive) continue;
+                // Copy the local pose of every node after the solver and
+                // SpringBones have written the frame. Local position +
+                // rotation covers humanoid IK, stretch, and spring motion.
+                for (const auto& [source, clone] : instance.pairs) {
+                    if (!IsAlive(source) || !IsAlive(clone)) continue;
+                    clone->set_localPosition(source->get_localPosition());
+                    clone->set_localRotation(source->get_localRotation());
+                }
+                // Hand props follow after the bones so their live grip offset
+                // is computed against this frame's hand pose.
+                UpdateStandinProps(instance);
+                // Expressions change rarely relative to frames; the dirty
+                // flag is set by ApplyExpression so steady-state cost is zero.
+                if (copyBlendShapes) {
+                    for (std::size_t i = 0; i < instance.rendererPairs.size(); ++i) {
+                        auto* sourceRenderer = instance.rendererPairs[i].first;
+                        auto* cloneRenderer = instance.rendererPairs[i].second;
+                        if (!IsAlive(sourceRenderer) || !IsAlive(cloneRenderer)) continue;
+                        for (int shape = 0; shape < instance.blendShapeCounts[i]; ++shape) {
+                            cloneRenderer->SetBlendShapeWeight(
+                                shape, sourceRenderer->GetBlendShapeWeight(shape));
+                        }
+                    }
+                }
+            }
+            standinSyncFailureLogged_ = false;
+        } catch (...) {
+            if (!standinSyncFailureLogged_) {
+                standinSyncFailureLogged_ = true;
+                Logging::Logger.error("Avatar display clone sync failed");
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t StandinCount() const noexcept {
+        std::size_t alive = 0;
+        for (const auto& instance : standins_) {
+            if (IsAlive(instance.root)) ++alive;
+        }
+        return alive;
+    }
+
+    [[nodiscard]] bool StandinActive() const noexcept { return StandinCount() > 0; }
 
     std::optional<RuntimeAnchor> FirstPersonAnchorWorld() const noexcept {
         try {
@@ -1369,7 +1871,36 @@ public:
     float springAccumulator_ = 0.0F;
     double springWindowSeconds_ = 0.0;
     std::size_t springWindowUpdates_ = 0;
+    // Per-renderer wear classification, parallel to allRenderers_. Computed in
+    // BuildMeshes while skin weights are still in CPU memory.
+    std::vector<float> rendererHeadFraction_;
+    std::vector<float> rendererNeckFraction_;
+    std::vector<bool> rendererIsHair_;
+    bool wearAvatar_ = false;
+    bool wearHideFace_ = true;
+    bool wearHideHair_ = false;
+    bool wearHideNeckAccessories_ = false;
+    std::int32_t wearBothLayer_ = 0;
+    // Free-standing display clone state (up to three instances, one shared
+    // layer and blend-shape dirty flag).
+    std::vector<StandinInstance> standins_;
+    std::int32_t standinLayer_ = 0;
+    // Desired hand-prop sources (0 = left, 1 = right); set by the manager,
+    // consumed by SyncStandin.
+    std::array<UnityEngine::Transform*, 2> standinPropSources_{};
+    bool standinBlendShapesDirty_ = false;
+    bool standinSyncFailureLogged_ = false;
 };
+
+UnityEngine::Shader* EmbeddedVideoPreviewShader() noexcept {
+    try {
+        LoadAvatarShaders();
+        auto& resources = AvatarShaders();
+        return resources.videoPreview ? resources.videoPreview.ptr() : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
 
 VrmUnityRuntime::~VrmUnityRuntime() = default;
 
@@ -1411,6 +1942,35 @@ bool VrmUnityRuntime::SetExpression(std::string_view preset, float weight, std::
 bool VrmUnityRuntime::SetExpressionQuiet(std::string_view preset, float weight) noexcept {
     return impl_ && impl_->SetExpressionQuiet(preset, weight);
 }
+void VrmUnityRuntime::ApplyViewMode(
+    bool wearAvatar,
+    bool hideFace,
+    bool hideHair,
+    bool hideNeckAccessories,
+    std::int32_t bothViewsLayer) noexcept {
+    if (impl_) impl_->ApplyViewMode(wearAvatar, hideFace, hideHair, hideNeckAccessories, bothViewsLayer);
+}
+bool VrmUnityRuntime::SetStandinCount(std::size_t count) noexcept {
+    return impl_ && impl_->SetStandinCount(count);
+}
+void VrmUnityRuntime::SetStandinLayer(std::int32_t layer) noexcept {
+    if (impl_) impl_->SetStandinLayer(layer);
+}
+void VrmUnityRuntime::SetStandinHandProps(
+    UnityEngine::Transform* leftSource, UnityEngine::Transform* rightSource) noexcept {
+    if (impl_) impl_->SetStandinHandProps(leftSource, rightSource);
+}
+void VrmUnityRuntime::SetStandinPose(
+    std::size_t index,
+    float worldX, float worldY, float worldZ,
+    float yawDegrees, float scale) noexcept {
+    if (impl_) impl_->SetStandinPose(index, worldX, worldY, worldZ, yawDegrees, scale);
+}
+void VrmUnityRuntime::SyncStandin() noexcept { if (impl_) impl_->SyncStandin(); }
+std::size_t VrmUnityRuntime::StandinCount() const noexcept {
+    return impl_ ? impl_->StandinCount() : 0;
+}
+bool VrmUnityRuntime::StandinActive() const noexcept { return impl_ && impl_->StandinActive(); }
 UnityEngine::Animator* VrmUnityRuntime::Animator() const noexcept { return impl_ ? impl_->animator_ : nullptr; }
 UnityEngine::GameObject* VrmUnityRuntime::Root() const noexcept { return impl_ ? impl_->root_ : nullptr; }
 const VrmAsset& VrmUnityRuntime::Asset() const noexcept { return impl_->asset_; }

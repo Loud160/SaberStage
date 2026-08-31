@@ -400,23 +400,39 @@ public:
                 finger.localRotation = FromUnity(localRotation);
                 finger.valid = true;
             }
+            // Flexion axes from the VRM binding pose. The spec requires a
+            // T-pose with palms facing down, so for every finger joint the
+            // curl axis is the horizontal axis perpendicular to the finger
+            // segment: cross(segment, worldDown). Rotating a segment around
+            // it moves the fingertip toward the palm on BOTH hands, for every
+            // joint. (The previous construction projected the joint-to-wrist
+            // vector perpendicular to the segment; a finger points almost
+            // exactly away from the wrist, so that projection was numerical
+            // noise and each finger received an arbitrary bend axis — the
+            // visibly "broken fingers" grip. Distal joints additionally
+            // borrowed an axis expressed in a different bone's local frame.)
             for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
                 auto& finger = fingers_[index];
                 if (!finger.valid) continue;
                 const auto childIndex = kFingerMap[index].child;
+                Vec3 segment{};
                 if (childIndex >= 0 && fingers_[static_cast<std::size_t>(childIndex)].valid) {
-                    const auto segment = Normalize(
+                    segment = Normalize(
                         fingers_[static_cast<std::size_t>(childIndex)].worldPosition - finger.worldPosition);
-                    const auto handBone = kFingerMap[index].side == 0
-                        ? HumanoidBone::LeftHand : HumanoidBone::RightHand;
-                    const auto towardPalm = Normalize(ProjectOnPlane(
-                        rest.bones[BoneIndex(handBone)].world.position - finger.worldPosition,
-                        segment));
-                    const auto axisWorld = Normalize(Cross(segment, towardPalm));
-                    finger.curlAxisLocal = Rotate(Inverse(finger.worldRotation), axisWorld);
-                } else if (index > 0 && kFingerMap[index - 1].side == kFingerMap[index].side) {
-                    finger.curlAxisLocal = fingers_[index - 1].curlAxisLocal;
+                } else if (index > 0 && fingers_[index - 1].valid &&
+                        kFingerMap[index - 1].side == kFingerMap[index].side) {
+                    // Distal joints have no child; their segment continues
+                    // from the intermediate joint into this one.
+                    segment = Normalize(finger.worldPosition - fingers_[index - 1].worldPosition);
+                } else {
+                    continue;
                 }
+                const Vec3 kWorldDown{0.0F, -1.0F, 0.0F};
+                const auto axisWorld = Cross(segment, kWorldDown);
+                if (LengthSquared(axisWorld) < 1.0e-6F) continue;
+                // Expressed in this joint's own local frame so the axis stays
+                // correct however the hand is oriented at runtime.
+                finger.curlAxisLocal = Rotate(Inverse(finger.worldRotation), Normalize(axisWorld));
             }
             const auto measured = MeasureAvatarRestPose(rest, eyeAnchor);
             if (!measured.calibration.valid) {
@@ -747,6 +763,9 @@ public:
         // culling instead of relying on MonoBehaviour LateUpdate ordering.
         SampleTracking();
         SolveAndWrite();
+        // Keep the display clone on the same sub-frame pose the spectator is
+        // about to render instead of one solve behind.
+        if (vrmRuntime_) vrmRuntime_->SyncStandin();
     }
 
     bool LoadVrmAvatar(
@@ -898,6 +917,15 @@ public:
         if (vrmRuntime_) vrmRuntime_->SetVisible(visible);
     }
 
+    static std::int32_t StandinLayerFromVisibility(settings::AvatarStandinVisibility visibility) noexcept {
+        switch (visibility) {
+            case settings::AvatarStandinVisibility::CameraOnly: return camera::kAvatarLayer;
+            case settings::AvatarStandinVisibility::HeadsetOnly: return camera::kFirstPersonLayer;
+            case settings::AvatarStandinVisibility::Both: break;
+        }
+        return camera::kBothViewsLayer;
+    }
+
     void ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept {
         solver_.SetSideStepLeanLimit(settings.sideStepLeanLimitPercent / 100.0F);
         solver_.SetPlantedLegLeanLimit(settings.plantedLegLeanLimitPercent / 100.0F);
@@ -908,13 +936,134 @@ public:
             if (!automaticExpressionsEnabled_) ClearAutomaticExpressions();
             ResetAutomaticExpressionState();
         }
-        if (vrmRuntime_) vrmRuntime_->ApplyOptions(RuntimeOptionsFromSettings(settings));
+        lastStandinScale_ = settings.standinScale;
+        standinShowSabers_ = settings.standinShowSabers;
+        standinShowPointers_ = settings.standinShowPointers;
+        if (vrmRuntime_) {
+            vrmRuntime_->ApplyOptions(RuntimeOptionsFromSettings(settings));
+            // First-person wear view: body renderers become visible to the HMD
+            // while the selected head geometry stays camera-only.
+            vrmRuntime_->ApplyViewMode(
+                settings.wearAvatar,
+                settings.wearHideFace,
+                settings.wearHideHair,
+                settings.wearHideNeckAccessories,
+                camera::kBothViewsLayer);
+            // Free-standing display clones. Poses come from settings here; the
+            // menu's grab handles refresh them live through SetStandinWorldPose.
+            const auto standinCount = settings.standinEnabled
+                ? static_cast<std::size_t>(std::clamp(settings.standinCount, 1, 3))
+                : std::size_t{0};
+            vrmRuntime_->SetStandinCount(standinCount);
+            if (standinCount > 0) {
+                vrmRuntime_->SetStandinLayer(StandinLayerFromVisibility(settings.standinVisibility));
+                for (std::size_t slot = 0; slot < standinCount; ++slot) {
+                    const auto& position = settings::StandinSlotPosition(settings, static_cast<int>(slot));
+                    vrmRuntime_->SetStandinPose(
+                        slot,
+                        position.x,
+                        position.y,
+                        position.z,
+                        settings::StandinSlotYaw(settings, static_cast<int>(slot)),
+                        settings.standinScale);
+                }
+            }
+        }
     }
+
+    void SetStandinWorldPose(std::size_t index, Vec3 position, float yawDegrees) noexcept {
+        if (!vrmRuntime_ || !vrmRuntime_->StandinActive()) return;
+        lastStandinScale_ = lastStandinScale_ > 0.0F ? lastStandinScale_ : 1.0F;
+        vrmRuntime_->SetStandinPose(
+            index, position.x, position.y, position.z, yawDegrees, lastStandinScale_);
+    }
+
+    std::size_t StandinCount() const noexcept { return vrmRuntime_ ? vrmRuntime_->StandinCount() : 0; }
+    bool StandinActive() const noexcept { return vrmRuntime_ && vrmRuntime_->StandinActive(); }
 
     void UpdateSecondaryMotion(float deltaTime) noexcept {
         if (!vrmRuntime_) return;
         UpdateAutomaticExpressions(deltaTime);
         vrmRuntime_->UpdateSecondaryMotion(deltaTime);
+        // Hand-prop sources are chosen before the sync so a saber appearing or
+        // a scene change swaps the clones' props on the same frame.
+        UpdateStandinHandProps();
+        // The display clones copy the final frame pose (solver + expressions
+        // + SpringBones) once everything above has written it.
+        vrmRuntime_->SyncStandin();
+    }
+
+    // Chooses what the display clones hold: the live gameplay sabers when a
+    // map is running, otherwise the menu pointer grips. Sources are handed to
+    // the runtime as transforms; it replicates their visuals per clone.
+    void UpdateStandinHandProps() noexcept {
+        if (!vrmRuntime_ || !vrmRuntime_->StandinActive()) return;
+        UnityEngine::Transform* props[2] = {nullptr, nullptr};
+        try {
+            bool wantControllerDiscovery = false;
+            for (int side = 0; side < 2; ++side) {
+                if (standinShowSabers_ && IsAlive(sabers_[side])) {
+                    auto gameObject = sabers_[side]->get_gameObject();
+                    if (gameObject && gameObject->get_activeInHierarchy()) {
+                        props[side] = sabers_[side]->get_transform().ptr();
+                        continue;
+                    }
+                }
+                if (!standinShowPointers_) continue;
+                auto* controller = ActivePropController(side);
+                if (controller == nullptr) {
+                    wantControllerDiscovery = true;
+                    continue;
+                }
+                props[side] = PointerGripTransform(controller);
+            }
+            // The solver's controller cache only exists in the main menu; a
+            // gameplay pause menu needs its own throttled discovery so the
+            // clones can hold pointers there too.
+            if (wantControllerDiscovery && --propControllerDiscoveryCountdown_ <= 0) {
+                propControllerDiscoveryCountdown_ = 45;
+                propControllers_[0] = nullptr;
+                propControllers_[1] = nullptr;
+                for (auto* controller : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::VRController*>()) {
+                    if (!IsAlive(controller) || !controller->get_isActiveAndEnabled()) continue;
+                    const auto node = controller->get_node();
+                    if (node.value__ == UnityEngine::XR::XRNode::LeftHand.value__ && !IsAlive(propControllers_[0])) {
+                        propControllers_[0] = controller;
+                    } else if (node.value__ == UnityEngine::XR::XRNode::RightHand.value__ && !IsAlive(propControllers_[1])) {
+                        propControllers_[1] = controller;
+                    }
+                }
+            }
+        } catch (...) {
+            props[0] = nullptr;
+            props[1] = nullptr;
+        }
+        vrmRuntime_->SetStandinHandProps(props[0], props[1]);
+    }
+
+    GlobalNamespace::VRController* ActivePropController(int side) noexcept {
+        for (auto* candidate : {handControllers_[side], propControllers_[side]}) {
+            if (IsAlive(candidate) && candidate->get_isActiveAndEnabled()) return candidate;
+        }
+        return nullptr;
+    }
+
+    static UnityEngine::Transform* PointerGripTransform(GlobalNamespace::VRController* controller) noexcept {
+        try {
+            auto transform = controller->get_transform();
+            if (!transform) return nullptr;
+            // Beat Saber's visible grip lives on the "MenuHandle" child; the
+            // whole controller (minus scripts) is a safe fallback if a game
+            // update renames it. Cloned inactive children stay invisible.
+            if (auto handle = transform->Find("MenuHandle");
+                handle && IsAlive(handle.ptr()) &&
+                handle->get_gameObject()->get_activeInHierarchy()) {
+                return handle.ptr();
+            }
+            return transform.ptr();
+        } catch (...) {
+            return nullptr;
+        }
     }
 
     void SetControllerToWristOffsets(Pose left, Pose right) noexcept {
@@ -1741,17 +1890,22 @@ private:
             transform->SetPositionAndRotation(ToUnity(pose.position), ToUnity(pose.rotation));
             ++writes;
         }
-        // Close the fingers around a live saber only after the solved hand has
-        // been written. Axes come from this VRM's rest geometry, avoiding the
-        // fragile assumption that every exporter uses the same local axes.
-        constexpr float kCurlDegrees[3] = {46.0F, 58.0F, 38.0F};
-        constexpr float kThumbCurlDegrees[3] = {24.0F, 32.0F, 24.0F};
+        // Fixed controller grip, Custom-Avatars style: the fingers curl into a
+        // relaxed hold around the hilt whenever the avatar is driven by
+        // controllers — menus (pointer grip) included, since Quest controllers
+        // provide no per-finger tracking to follow. Applied after the solved
+        // hand pose so the curl always stacks on this frame's wrist. Angles
+        // are per-phalanx (proximal, intermediate, distal): deeper bend at
+        // the middle joint, shallower at the tip, and a shorter arc for the
+        // thumb, which wraps the hilt from the side.
+        constexpr float kCurlDegrees[3] = {50.0F, 62.0F, 40.0F};
+        constexpr float kThumbCurlDegrees[3] = {26.0F, 30.0F, 22.0F};
         for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
             const auto& mapping = kFingerMap[index];
             auto& finger = fingers_[index];
             if (!finger.valid || !IsAlive(finger.transform)) continue;
             auto rotation = finger.localRotation;
-            if (sample_.handIsSaberGrip[mapping.side] && LengthSquared(finger.curlAxisLocal) > 1.0e-5F) {
+            if (LengthSquared(finger.curlAxisLocal) > 1.0e-5F) {
                 const auto isThumb = index % 15 < 3;
                 const auto degrees = isThumb
                     ? kThumbCurlDegrees[mapping.joint]
@@ -1850,6 +2004,15 @@ private:
     int previousCombo_ = -1;
     int missBurstCount_ = 0;
     bool automaticExpressionsEnabled_ = true;
+    // Last applied display-clone scale; live grab-handle pose updates reuse it
+    // so moving the clone never resets a slider-chosen size.
+    float lastStandinScale_ = 1.0F;
+    // Hand-prop toggles plus a pause-menu VRController cache with throttled
+    // rediscovery (the solver's own controller cache is main-menu only).
+    bool standinShowSabers_ = true;
+    bool standinShowPointers_ = true;
+    GlobalNamespace::VRController* propControllers_[2]{};
+    std::int32_t propControllerDiscoveryCountdown_ = 0;
     bool wasInGameplay_ = false;
     bool lastGameplayNearEnd_ = false;
     bool lastGameplayFailed_ = false;
@@ -1932,6 +2095,11 @@ void AvatarManager::SetControllerToWristOffsets(Pose left, Pose right) noexcept 
 bool AvatarManager::SetExpression(std::string_view preset, float weight, std::string* error) noexcept {
     return impl_->SetExpression(preset, weight, error);
 }
+void AvatarManager::SetStandinWorldPose(std::size_t index, Vec3 position, float yawDegrees) noexcept {
+    impl_->SetStandinWorldPose(index, position, yawDegrees);
+}
+std::size_t AvatarManager::StandinCount() const noexcept { return impl_->StandinCount(); }
+bool AvatarManager::StandinActive() const noexcept { return impl_->StandinActive(); }
 void AvatarManager::SampleTracking() noexcept { impl_->SampleTracking(); }
 void AvatarManager::SolveAndWrite() noexcept { impl_->SolveAndWrite(); }
 void AvatarManager::UpdateSecondaryMotion(float deltaTime) noexcept { impl_->UpdateSecondaryMotion(deltaTime); }

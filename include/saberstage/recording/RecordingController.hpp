@@ -57,6 +57,11 @@ struct RecordingSnapshot {
     std::filesystem::path outputDirectory;
     std::filesystem::path lastSavedFile;
     double elapsedSeconds = 0.0;
+    // Monotonic count of encoded video packets across the whole session
+    // (both Hollywood and Direct FFmpeg increment it from their encoder
+    // callbacks). UI consumers difference it over wall time to display the
+    // achieved capture frame rate; it is never reset mid-recording.
+    std::uint64_t encodedFrameCount = 0;
 
     [[nodiscard]] bool CanStart() const noexcept {
         return recording::CanStart(state);
@@ -149,6 +154,9 @@ private:
     std::unique_ptr<AsyncVideoWriter> videoWriter_;
     std::thread finalizer_;
     std::atomic<RecordingState> state_{RecordingState::Idle};
+    // Incremented from encoder callback threads; read by Snapshot() on the
+    // main thread. Relaxed ordering is sufficient for a display counter.
+    std::atomic<std::uint64_t> encodedFrameCount_{0};
     std::atomic<bool> captureWriteFailed_{false};
     std::string captureFailureDetail_;
     std::chrono::steady_clock::time_point recordingStarted_{};

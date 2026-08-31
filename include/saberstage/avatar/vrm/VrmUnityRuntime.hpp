@@ -12,6 +12,8 @@
 namespace UnityEngine {
 class Animator;
 class GameObject;
+class Shader;
+class Transform;
 }
 
 namespace saberstage::avatar::vrm {
@@ -78,6 +80,13 @@ struct RuntimeAnchor {
     Float4 rotation{};
 };
 
+// The embedded SaberStage/VideoPreview shader from the avatar shader bundle,
+// or nullptr when the bundle (or that asset) is unavailable. Built with the
+// Oculus Multiview XR configuration, so its stereo variants are guaranteed —
+// stock shaders located with Shader.Find can silently lack them on Quest and
+// then rasterize nothing in the headset. Used by the camera preview surfaces.
+UnityEngine::Shader* EmbeddedVideoPreviewShader() noexcept;
+
 // Owns every Unity object created for one VRM. Destruction is centralized so
 // AvatarManager can unbind the humanoid first and then unload without leaving
 // meshes, materials, textures, or a hidden Animator behind.
@@ -103,6 +112,44 @@ public:
     // Runtime animation uses the same validated blend-shape path without
     // producing a diagnostic line for every blink animation sample.
     bool SetExpressionQuiet(std::string_view presetName, float weight) noexcept;
+
+    // First-person "wear the avatar" view. When enabled, renderers the player
+    // may see on their own body move to bothViewsLayer (rendered by both the
+    // HMD and the spectator camera) while the selected head geometry stays on
+    // the spectator-only avatar layer, so recordings always show the complete
+    // avatar. The three hide switches are independent: face geometry, hair
+    // meshes, and anything skinned to the neck (collars, chokers, scarves).
+    void ApplyViewMode(
+        bool wearAvatar,
+        bool hideFace,
+        bool hideHair,
+        bool hideNeckAccessories,
+        std::int32_t bothViewsLayer) noexcept;
+
+    // Free-standing display clones mirroring the live pose (up to three).
+    // Each clone is an Instantiate of the avatar hierarchy, so meshes,
+    // materials, and textures are shared and only transforms are duplicated.
+    // SyncStandin() copies bone poses to every clone each frame after the
+    // solver and SpringBones have written them; expression changes propagate
+    // lazily through one shared dirty flag. All clones share one layer;
+    // placement and scale are per-clone (scale is currently fed the same
+    // value for every slot by AvatarManager).
+    bool SetStandinCount(std::size_t count) noexcept;
+    void SetStandinLayer(std::int32_t layer) noexcept;
+    // Hand props for the display clones: per hand, a live scene transform
+    // whose visual hierarchy is replicated (scripts, colliders, and physics
+    // stripped) into every clone's matching hand bone. nullptr removes that
+    // hand's prop. The manager chooses the sources: gameplay sabers while a
+    // map runs, menu pointer grips otherwise.
+    void SetStandinHandProps(
+        UnityEngine::Transform* leftSource, UnityEngine::Transform* rightSource) noexcept;
+    void SetStandinPose(
+        std::size_t index,
+        float worldX, float worldY, float worldZ,
+        float yawDegrees, float scale) noexcept;
+    void SyncStandin() noexcept;
+    [[nodiscard]] std::size_t StandinCount() const noexcept;
+    [[nodiscard]] bool StandinActive() const noexcept;
 
     [[nodiscard]] UnityEngine::Animator* Animator() const noexcept;
     [[nodiscard]] UnityEngine::GameObject* Root() const noexcept;

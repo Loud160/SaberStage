@@ -69,6 +69,12 @@ public:
     void ApplyAvatarSettings(const settings::AvatarSettings& settings) noexcept;
     void SetControllerToWristOffsets(Pose left, Pose right) noexcept;
     bool SetExpression(std::string_view presetName, float weight, std::string* error = nullptr) noexcept;
+    // Live placement updates for the free-standing display clones (from their
+    // in-world grab handles); index is the clone slot (0..2). Enabled state,
+    // count, visibility layer, and scale flow through ApplyAvatarSettings.
+    void SetStandinWorldPose(std::size_t index, Vec3 position, float yawDegrees) noexcept;
+    [[nodiscard]] std::size_t StandinCount() const noexcept;
+    [[nodiscard]] bool StandinActive() const noexcept;
 
     void SampleTracking() noexcept;
     void SolveAndWrite() noexcept;
