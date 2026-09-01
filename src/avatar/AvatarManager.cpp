@@ -264,6 +264,9 @@ struct FingerRestPose {
     Quaternion worldRotation{};
     Vec3 worldPosition{};
     Vec3 curlAxisLocal{};
+    // Thumb opposition needs an axial base-joint rotation in addition to the
+    // ordinary joint flexion. Fingers do not use this axis.
+    Vec3 oppositionTwistAxisLocal{};
     bool valid = false;
 };
 
@@ -508,32 +511,12 @@ public:
                 finger.valid = true;
             }
             // Flexion axes come from the VRM binding pose. Ordinary fingers
-            // curl toward world-down from the required palms-down T-pose. A
-            // thumb cannot use that same plane: doing so leaves it beside the
-            // fingers instead of opposing them around a cylindrical grip.
-            // Derive one stable world-space thumb plane from the proximal
-            // thumb toward the middle-finger base, then express that same
-            // anatomical plane in each thumb joint's local coordinates.
-            Vec3 thumbAxisWorld[2]{};
-            bool thumbAxisValid[2]{};
-            for (std::size_t side = 0; side < 2; ++side) {
-                const auto thumb = side * 15;
-                const auto middle = thumb + 6;
-                if (!fingers_[thumb].valid || !fingers_[thumb + 1].valid ||
-                        !fingers_[middle].valid) {
-                    continue;
-                }
-                const auto segment = Normalize(
-                    fingers_[thumb + 1].worldPosition - fingers_[thumb].worldPosition);
-                auto towardOpposingFingers =
-                    fingers_[middle].worldPosition - fingers_[thumb].worldPosition;
-                towardOpposingFingers = towardOpposingFingers -
-                    segment * Dot(towardOpposingFingers, segment);
-                const auto axis = Cross(segment, towardOpposingFingers);
-                if (LengthSquared(axis) < 1.0e-6F) continue;
-                thumbAxisWorld[side] = Normalize(axis);
-                thumbAxisValid[side] = true;
-            }
+            // curl toward world-down from the required palms-down T-pose.
+            // Each thumb joint instead aims toward the opposing middle-finger
+            // base, giving the chain a C-shaped closure rather than treating
+            // the thumb as a fifth coplanar finger. The proximal joint also
+            // receives axial opposition below so its pad rotates around the
+            // opposite side of a cylindrical grip.
             for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
                 auto& finger = fingers_[index];
                 if (!finger.valid) continue;
@@ -551,15 +534,30 @@ public:
                     continue;
                 }
                 const auto side = static_cast<std::size_t>(kFingerMap[index].side);
-                const auto isThumb = index % 15 < 3;
+                const auto digitIndex = index % 15;
+                const auto isThumb = digitIndex < 3;
                 const Vec3 kWorldDown{0.0F, -1.0F, 0.0F};
-                const auto axisWorld = isThumb && thumbAxisValid[side]
-                    ? thumbAxisWorld[side]
-                    : Normalize(Cross(segment, kWorldDown));
+                Vec3 axisWorld{};
+                if (isThumb) {
+                    const auto middle = side * 15 + 6;
+                    if (fingers_[middle].valid) {
+                        auto towardOpposingFingers =
+                            fingers_[middle].worldPosition - finger.worldPosition;
+                        towardOpposingFingers = towardOpposingFingers -
+                            segment * Dot(towardOpposingFingers, segment);
+                        axisWorld = Normalize(Cross(segment, towardOpposingFingers));
+                    }
+                } else {
+                    axisWorld = Normalize(Cross(segment, kWorldDown));
+                }
                 if (LengthSquared(axisWorld) < 1.0e-6F) continue;
                 // Expressed in this joint's own local frame so the axis stays
                 // correct however the hand is oriented at runtime.
                 finger.curlAxisLocal = Rotate(Inverse(finger.worldRotation), Normalize(axisWorld));
+                if (isThumb && digitIndex == 0) {
+                    finger.oppositionTwistAxisLocal = Rotate(
+                        Inverse(finger.worldRotation), segment);
+                }
             }
             const auto measured = MeasureAvatarRestPose(rest, eyeAnchor);
             if (!measured.calibration.valid) {
@@ -1111,7 +1109,13 @@ public:
         thumbCurveScale_[0] = std::clamp(fit.leftControllerToWrist.thumbCurvePercent / 100.0F, 0.0F, 1.5F);
         thumbCurveScale_[1] = std::clamp(fit.rightControllerToWrist.thumbCurvePercent / 100.0F, 0.0F, 1.5F);
         if (vrmRuntime_) {
-            const auto proportionsEnabled = fit.adjustBodyProportions;
+            // Arm-span sizing OFF is the original uniform-height avatar path.
+            // Runtime mesh deformation must be gated with the solver path;
+            // otherwise the solver returns legacy geometry while the rendered
+            // shoulders, torso, neck, head, or legs still retain new-system
+            // scaling and the compatibility switch appears to do nothing.
+            const auto proportionsEnabled =
+                fit.armSpanAvatarSizing && fit.adjustBodyProportions;
             vrmRuntime_->SetBodyProportionScales(
                 proportionsEnabled ? fit.torsoWidthPercent / 100.0F : 1.0F,
                 proportionsEnabled ? fit.lowerTorsoWidthPercent / 100.0F : 1.0F,
@@ -1190,8 +1194,11 @@ public:
         // filtered arm. Otherwise the explicit editor switch controls one
         // first-person-only arm and closing the editor always restores the
         // persisted view mode.
-        gripEditingPreviewSide_ = showArm && !lastWearAvatar_ && side >= 0 && side <= 1
-            ? side : -1;
+        // The editor's Show Avatar Arm switch is authoritative regardless of
+        // the persisted Wear Avatar option. Opening it isolates exactly one
+        // arm; it must never silently depend on a separate main-menu toggle or
+        // leave the player's headset inside the complete torso.
+        gripEditingPreviewSide_ = showArm && side >= 0 && side <= 1 ? side : -1;
         if (!vrmRuntime_) return;
         if (!vrmRuntime_->SetGripEditingArm(gripEditingPreviewSide_, camera::kFirstPersonLayer) &&
                 gripEditingPreviewSide_ >= 0) {
@@ -2308,7 +2315,7 @@ private:
         // the middle joint, shallower at the tip, and a shorter arc for the
         // thumb, which wraps the hilt from the side.
         constexpr float kCurlDegrees[3] = {50.0F, 62.0F, 40.0F};
-        constexpr float kThumbCurlDegrees[3] = {26.0F, 30.0F, 22.0F};
+        constexpr float kThumbCurlDegrees[3] = {48.0F, 42.0F, 30.0F};
         for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
             const auto& mapping = kFingerMap[index];
             auto& finger = fingers_[index];
@@ -2322,6 +2329,19 @@ private:
                     : kCurlDegrees[mapping.joint] * gripClosureScale_[side]);
                 rotation = Multiply(rotation, AxisAngle(
                     Normalize(finger.curlAxisLocal), degrees * 3.14159265358979323846F / 180.0F));
+                if (isThumb && mapping.joint == 0 &&
+                        LengthSquared(finger.oppositionTwistAxisLocal) > 1.0e-5F) {
+                    // Opposite hands twist toward the common grip center in
+                    // opposite directions. This base-joint opposition is what
+                    // moves the thumb pad onto the far side of the pointer;
+                    // the flexion above then closes the visible C shape.
+                    const auto sign = side == 0 ? -1.0F : 1.0F;
+                    constexpr float kThumbOppositionTwistDegrees = 28.0F;
+                    rotation = Multiply(rotation, AxisAngle(
+                        Normalize(finger.oppositionTwistAxisLocal),
+                        sign * kThumbOppositionTwistDegrees * thumbCurveScale_[side] *
+                            3.14159265358979323846F / 180.0F));
+                }
             }
             finger.transform->SetLocalPositionAndRotation(ToUnity(finger.localPosition), ToUnity(rotation));
             ++writes;

@@ -887,7 +887,7 @@ void SolveArm(
         const auto forward = Dot(relative, bodyForward);
         const auto lateralUnit = lateral / bodyRadius;
         const auto depthUnit = forward / bodyDepth;
-        if (std::abs(vertical) <= torsoHalfHeight &&
+        if (!keepHandsOnSabers && std::abs(vertical) <= torsoHalfHeight &&
             lateralUnit * lateralUnit + depthUnit * depthUnit < 1.0F) {
             // A tracked controller can physically be held against the chest,
             // but the avatar hand cannot occupy the torso volume. Move only
@@ -915,7 +915,8 @@ void SolveArm(
     const auto upperRoot = Solved(output, upperBone).position + (shoulder - originalShoulder);
     const auto shoulderToTargetDistance = Length(solveTarget.position - upperRoot);
     const auto reachRatio = shoulderToTargetDistance / std::max(armLength, kEpsilon);
-    const auto stretchLimit = handFromSaberGrip
+    const auto authoritativeGrip = handFromSaberGrip || manualGripAdjusted;
+    const auto stretchLimit = authoritativeGrip
         ? (keepHandsOnSabers ? 2.50F : 1.0F)
         : tuning.maximumArmStretchFraction;
     const auto stretch = Clamp(
@@ -1048,7 +1049,7 @@ void SolveArm(
     // inside the calibrated palm in menus as well as lock sabers in gameplay.
     // Honor that hard target while Keep Hands On Sabers is enabled; turning
     // the option off still restores the ordinary reachable-limb result.
-    const auto finalEnd = (handFromSaberGrip || manualGripAdjusted) && keepHandsOnSabers
+    const auto finalEnd = authoritativeGrip && keepHandsOnSabers
         ? solveTarget.position
         : result.end;
     hand.position = finalEnd;
@@ -1067,12 +1068,20 @@ void SolveArm(
     const auto wristLimit = handFromSaberGrip || manualGripAdjusted
         ? tuning.maximumTrackedGripWristDeviationDegrees
         : tuning.maximumWristDeviationDegrees;
-    hand.rotation = wristDeviation > wristLimit
-        ? Slerp(
-            anatomicalHandRotation,
-            desiredHandRotation,
-            wristLimit / std::max(wristDeviation, kEpsilon))
-        : desiredHandRotation;
+    // Once calibrated, the controller/saber-to-hand relationship is one rigid
+    // anchor. Clamping only the wrist rotation while hard-anchoring position
+    // lets the visible pointer sweep through the fingers as the controller is
+    // turned. Keep Hands on Sabers therefore makes both parts of the endpoint
+    // authoritative. The anatomical clamp remains only for the explicitly
+    // released/non-authoritative modes.
+    hand.rotation = authoritativeGrip && keepHandsOnSabers
+        ? desiredHandRotation
+        : wristDeviation > wristLimit
+            ? Slerp(
+                anatomicalHandRotation,
+                desiredHandRotation,
+                wristLimit / std::max(wristDeviation, kEpsilon))
+            : desiredHandRotation;
 
     if (state.armReachSampleCount[side] == 0) {
         state.armReachRatioMinimum[side] = reachRatio;
@@ -1104,7 +1113,7 @@ void SolveArm(
             Clamp(Dot(upperDirection, lowerDirection), -1.0F, 1.0F)) * kRadiansToDegrees;
         diagnostics->handTargetError[side] = Length(hand.position - solveTarget.position);
         diagnostics->preAnchorHandTargetError[side] = solvedTargetError;
-        diagnostics->trackedGripHardAnchored[side] = handFromSaberGrip && keepHandsOnSabers;
+        diagnostics->trackedGripHardAnchored[side] = authoritativeGrip && keepHandsOnSabers;
         diagnostics->wristRotationErrorDegrees[side] = QuaternionAngleDegrees(hand.rotation, desiredHandRotation);
         diagnostics->gripToHandRotation[side] = state.gripToHandRotation[side];
         diagnostics->handTargetFromSaberGrip[side] = handFromSaberGrip;
@@ -1747,6 +1756,42 @@ AvatarRetargeting ComputeAvatarRetargeting(
     constexpr float kMinimumArmSpanConfidence = 0.55F;
     constexpr float kMinimumUniformScale = 0.55F;
     constexpr float kMaximumUniformScale = 2.50F;
+    if (!options.armSpanAvatarSizing) {
+        // This switch is a genuine compatibility mode, not merely a different
+        // scale input to the new fitting pipeline. Restore the original
+        // uniform standing-height fit exactly: no post arm-span height
+        // compression, final-size multiplier, automatic shoulder fit, or
+        // authored proportion deformation may leak into this path.
+        const auto requested = LegacyAvatarScale(avatar, player);
+        result.baseUniformScale = requested;
+        result.uniformScale = result.baseUniformScale;
+        result.manualScale = 1.0F;
+        result.matchPlayerHeight = false;
+        result.heightAdjustmentBalance = 0.0F;
+        result.torsoWidthScale = 1.0F;
+        result.shoulderWidthScale = 1.0F;
+        result.waistHipWidthScale = 1.0F;
+        result.lowerTorsoWidthScale = 1.0F;
+        result.neckBaseWidthScale = 1.0F;
+        result.torsoHeightScale = 1.0F;
+        result.upperLegLengthScale = 1.0F;
+        result.lowerLegLengthScale = 1.0F;
+        result.legWidthScale = 1.0F;
+        result.scaleClamped = false;
+        result.targetEyeHeight = player.standingHmdHeight;
+        const auto geometry = BuildRetargetedModelGeometry(
+            avatar, result.uniformScale, 1.0F, 1.0F);
+        if (!geometry.complete) {
+            result.geometryFallback = true;
+            return result;
+        }
+        result.naturalEyeHeight = geometry.eye.y - geometry.floor;
+        result.finalEyeHeight = result.naturalEyeHeight;
+        result.residualHeightError = result.targetEyeHeight - result.finalEyeHeight;
+        result.avatarArmSpan = avatar.approximateArmSpan;
+        result.valid = true;
+        return result;
+    }
     const auto armSpanAvailable = profile.valid &&
         profile.playerArmSpanConfidence >= kMinimumArmSpanConfidence &&
         std::isfinite(profile.playerArmSpan) && profile.playerArmSpan > 0.45F;

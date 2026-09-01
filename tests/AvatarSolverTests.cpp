@@ -359,13 +359,26 @@ void TestExtendedAvatarFitOptions() {
           "arm-span sizing clamps only at the documented 2.5x safety maximum");
 
     options.armSpanAvatarSizing = false;
+    options.matchPlayerHeight = true;
+    options.heightAdjustmentBalance = -0.85F;
+    options.manualAvatarScaleEnabled = true;
+    options.manualAvatarScale = 1.75F;
+    options.adjustBodyProportions = true;
+    options.torsoWidthScale = 1.40F;
+    options.shoulderWidthScale = 1.60F;
+    options.upperLegLengthScale = 1.30F;
     fit = ComputeAvatarRetargeting(avatar, player, profile, options);
     Check(fit.valid && !fit.armSpanBased &&
-              Near(fit.baseUniformScale, player.standingHmdHeight / avatar.eyeHeight),
-          "legacy mode restores the original standing-height scale source");
+              Near(fit.baseUniformScale, player.standingHmdHeight / avatar.eyeHeight) &&
+              Near(fit.uniformScale, fit.baseUniformScale) &&
+              Near(fit.manualScale, 1.0F) &&
+              Near(fit.lowerBodyScale, 1.0F) && Near(fit.torsoScale, 1.0F) &&
+              Near(fit.torsoWidthScale, 1.0F) && Near(fit.shoulderWidthScale, 1.0F) &&
+              Near(fit.upperLegLengthScale, 1.0F),
+          "legacy mode restores the original uniform standing-height fit and excludes every new sizing layer");
 
     profile.playerArmSpan = avatar.approximateArmSpan * 0.90F;
-    options.armSpanAvatarSizing = true;
+    options = {};
     options.matchPlayerHeight = true;
     options.manualAvatarScaleEnabled = true;
     options.manualAvatarScale = 1.40F;
@@ -918,11 +931,11 @@ void TestArmReachBendAndGripAuthority() {
           "inverted saber wrist target solves");
     Check(diagnostics.handTargetError[0] < 0.0001F,
           "wrist inversion protection never releases the tracked saber position");
-    Check(!SameRotation(
+    Check(SameRotation(
               diagnostics.finalHand[0].rotation,
               diagnostics.handTarget[0].rotation,
-              0.01F) && diagnostics.wristRotationErrorDegrees[0] > 1.0F,
-          "an inverted tracked grip is rotation-limited instead of turning the hand inside-out");
+              0.001F) && diagnostics.wristRotationErrorDegrees[0] < 0.01F,
+          "an authoritative tracked grip preserves the complete pointer-to-palm anchor at every controller rotation");
 
     AvatarFitOptions releasedReach{};
     releasedReach.keepHandsOnSabers = false;
@@ -959,9 +972,20 @@ void TestArmReachBendAndGripAuthority() {
     solver.Reset(state);
     Check(solver.Solve(insideBodyTracking, avatar, player, state, pose, &diagnostics),
           "inside-body saber target solves with collision enabled");
+    Check(Length(diagnostics.finalHand[0].position - uncorrectedInsideBodyHand) < 0.0001F &&
+              diagnostics.trackedGripHardAnchored[0] &&
+              Length(diagnostics.handTarget[0].position - insideBodyTracking.leftHand.pose.position) < 0.0001F,
+          "collision prevention never displaces an authoritative saber grip");
+    releasedReach.keepHandsOnSabers = false;
+    Check(solver.SetFitOptions(releasedReach),
+          "collision test can explicitly release the authoritative grip");
+    solver.Reset(state);
+    Check(solver.Solve(insideBodyTracking, avatar, player, state, pose, &diagnostics),
+          "released inside-body target solves with collision enabled");
     Check(diagnostics.finalHand[0].position.z > uncorrectedInsideBodyHand.z + 0.05F &&
               Length(diagnostics.handTarget[0].position - insideBodyTracking.leftHand.pose.position) < 0.0001F,
-          "collision prevention moves an impossible inside-body hand to the torso surface without hiding the tracked target");
+          "collision prevention reroutes a released inside-body hand while retaining the tracked target in diagnostics");
+    releasedReach.keepHandsOnSabers = true;
     releasedReach.preventArmBodyClipping = false;
     Check(solver.SetFitOptions(releasedReach),
           "disabling arm-body clipping prevention restores the ordinary arm path");

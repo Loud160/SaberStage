@@ -589,6 +589,17 @@ void NeutralizeContentSizeFitter(UnityEngine::Component* component) {
     }
 }
 
+void FlattenFlatPanelDepth(UnityEngine::Transform* transform) {
+    if (!transform) return;
+    if (auto* rect = transform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()) {
+        const auto position = rect->get_localPosition();
+        rect->set_localPosition({position.x, position.y, 0.0F});
+    }
+    for (int child = 0; child < transform->get_childCount(); ++child) {
+        FlattenFlatPanelDepth(transform->GetChild(child).ptr());
+    }
+}
+
 template <typename T>
 T* ConstrainRightPanelRow(T* control) {
     if (!control) return nullptr;
@@ -604,6 +615,12 @@ T* ConstrainRightPanelRow(T* control) {
         layout->set_preferredWidth(48.0F);
         layout->set_flexibleWidth(0.0F);
     }
+    // Every SaberStage menu surface is flat. Some stock BSML setting prefabs
+    // retain child Z offsets intended for other menu canvases; on a flat side
+    // panel that can leave the caption visible while the interactive control
+    // is physically behind the panel. Flatten depth only--never X/Y layout or
+    // icon rotation--for the complete row hierarchy.
+    FlattenFlatPanelDepth(object->get_transform().ptr());
     return control;
 }
 
@@ -623,6 +640,10 @@ void ConstrainCenterPanelRowObject(UnityEngine::GameObject* object) {
     layout->set_minWidth(kCenterPanelRowWidth);
     layout->set_preferredWidth(kCenterPanelRowWidth);
     layout->set_flexibleWidth(0.0F);
+
+    // Center pages use the same flat geometry as the side pages. Keep the
+    // stock row on the panel plane before positioning its label/control halves.
+    FlattenFlatPanelDepth(object->get_transform().ptr());
 }
 
 void FitRectToParentRegion(
@@ -637,6 +658,8 @@ void FitRectToParentRegion(
     rect->set_pivot({0.5F, 0.5F});
     rect->set_offsetMin({leftInset, 0.0F});
     rect->set_offsetMax({-rightInset, 0.0F});
+    const auto position = rect->get_localPosition();
+    rect->set_localPosition({position.x, position.y, 0.0F});
 }
 
 BSML::DropdownListSetting* ConstrainCenterPanelRow(BSML::DropdownListSetting* control) {
@@ -1955,7 +1978,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             }
             settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).preventArmBodyClipping = enabled;
             applyFitAndSave();
-        }), "Keeps solved arms outside a low-cost torso volume. A hand held inside the avatar body is moved to the front surface, which can temporarily separate it from the saber. This adds solver work."));
+        }), "Keeps solved arms outside a low-cost torso volume. With Keep Hands on Sabers enabled, the grip stays authoritative and the solver reroutes the arm without moving the hand. This adds solver work."));
     active_->armSpringCollisionToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
         container, "Arms Affect SpringBones", fitSettings.armSpringBoneInteraction,
         [applyFitAndSave](bool enabled) {
@@ -2421,7 +2444,7 @@ void MenuController::ShowAvatarFitWarning(int warningKind) {
             "Turn off emergency arm extension? If the avatar is resized or your reach exceeds its authored arm length, its hands may separate from the saber handles.");
     } else {
         avatarFitWarningText_->set_text(warningKind == 2
-            ? "Enable arm-body collision? This adds IK work each frame. Hands held inside the avatar body are moved to its front surface, so they may briefly separate from a saber."
+            ? "Enable arm-body collision? This adds IK work each frame. With Keep Hands on Sabers enabled, the hand remains locked to the grip while the solver reroutes the arm around the torso."
             : "Enable arm interaction with compatible SpringBones? This adds collision work while hair, clothing, or accessories are simulated and may affect performance.");
     }
     avatarFitWarningModal_->Show();
@@ -2737,16 +2760,19 @@ void MenuController::MirrorGripEditorToOtherHand() {
     current.gripClosurePercent = gripEditorWorkingClosurePercent_;
     current.thumbCurvePercent = gripEditorWorkingThumbCurvePercent_;
 
-    // Mirror a rigid transform through the player's sagittal plane. Position
-    // is reflected on X; an axial rotation reflected through that plane keeps
-    // X rotation and reverses Y/Z. Finger geometry values copy unchanged.
+    // The adjustment is controller-local, not a world-space transform. Quest
+    // left/right controller frames mirror lateral translation and roll while
+    // retaining pitch and yaw (the same convention used by Qavatars' proven
+    // per-frame controller targets). Treating this as a world sagittal-plane
+    // quaternion reflection inverted yaw and placed the copied hand on a
+    // visibly different part of the opposite pointer.
     opposite.position = {
         -gripEditorWorkingPosition_.x,
         gripEditorWorkingPosition_.y,
         gripEditorWorkingPosition_.z};
     opposite.rotationDegrees = {
         gripEditorWorkingRotation_.x,
-        -gripEditorWorkingRotation_.y,
+        gripEditorWorkingRotation_.y,
         -gripEditorWorkingRotation_.z};
     opposite.gripClosurePercent = gripEditorWorkingClosurePercent_;
     opposite.thumbCurvePercent = gripEditorWorkingThumbCurvePercent_;
@@ -3608,6 +3634,11 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
         }
         if (!active_->tabViewRoots_[index]) active_->tabViewRoots_[index] = container;
         if (auto* rows = container->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
+            // Camera controls live on a flat side panel. Make the layout own
+            // their width so stock 90-unit setting rows cannot extend behind
+            // the panel and intercept pointers outside the visible surface.
+            rows->set_childControlWidth(true);
+            rows->set_childForceExpandWidth(false);
             rows->set_childControlHeight(true);
             rows->set_childForceExpandHeight(false);
             rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
@@ -3643,17 +3674,17 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
 
     auto* cameraContainer = pages[0];
     addHeading(cameraContainer, "Primary Camera");
-    WithHint(BSML::Lite::CreateToggle(cameraContainer, "Enabled", profile.enabled, [](bool value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(cameraContainer, "Enabled", profile.enabled, [](bool value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.enabled = value; }, "enabled");
-    }), "Turns the third-person camera on or off. Turning it off saves GPU time when it is not needed.");
-    rememberSlider(0, WithHint(BSML::Lite::CreateSliderSetting(cameraContainer, "Field of View", 1.0F, profile.fovDegrees, 10.0F, 170.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Turns the third-person camera on or off. Turning it off saves GPU time when it is not needed."));
+    rememberSlider(0, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(cameraContainer, "Field of View", 1.0F, profile.fovDegrees, 10.0F, 170.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.fovDegrees = value; }, "FOV");
-    }), "Controls how wide the camera can see. Lower values look zoomed in; higher values show more of the scene."));
+    }), "Controls how wide the camera can see. Lower values look zoomed in; higher values show more of the scene.")));
     static std::array<std::string_view, 3> resolutions{"960 x 540", "1280 x 720", "1920 x 1080"};
     std::string currentResolution = "1280 x 720";
     if (profile.requestedWidth == 960) currentResolution = "960 x 540";
     else if (profile.requestedWidth == 1920) currentResolution = "1920 x 1080";
-    WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Output Resolution", currentResolution, resolutions, [](StringW value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Output Resolution", currentResolution, resolutions, [](StringW value) {
         if (!active_) return;
         const auto selected = static_cast<std::string>(value);
         active_->EditCamera([&](auto& camera) {
@@ -3661,18 +3692,18 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
             else if (selected == "1920 x 1080") { camera.requestedWidth = 1920; camera.requestedHeight = 1080; }
             else { camera.requestedWidth = 1280; camera.requestedHeight = 720; }
         }, "output resolution");
-    }), "Sets the live camera texture size. Higher resolution looks sharper but uses more Quest GPU time and memory.");
+    }), "Sets the live camera texture size. Higher resolution looks sharper but uses more Quest GPU time and memory."));
     static std::array<std::string_view, 2> frameRates{"30 FPS", "60 FPS"};
-    WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Output Rate",
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Output Rate",
         profile.requestedFramesPerSecond == 60 ? "60 FPS" : "30 FPS", frameRates, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
             active_->EditCamera([&](auto& camera) { camera.requestedFramesPerSecond = selected == "60 FPS" ? 60 : 30; }, "frame rate");
-        }), "Sets how often the third-person camera renders. 30 FPS has less gameplay overhead; 60 FPS looks smoother.");
+        }), "Sets how often the third-person camera renders. 30 FPS has less gameplay overhead; 60 FPS looks smoother."));
     static std::array<std::string_view, 3> cameraMsaaValues{"Off", "2x", "4x"};
     const auto cameraMsaaLabel = profile.multisampleCount == 4 ? "4x" :
         profile.multisampleCount == 2 ? "2x" : "Off";
-    WithHint(BSML::Lite::CreateDropdown(
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(
         cameraContainer,
         "Third-Person Camera MSAA",
         cameraMsaaLabel,
@@ -3684,9 +3715,9 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
                 camera.multisampleCount = selected == "4x" ? 4 : selected == "2x" ? 2 : 1;
             }, "third-person camera MSAA");
         }),
-        "Smooths edges in SaberStage's movable preview and recorded camera only; it does not change Beat Saber's headset graphics. 2x and especially 4x use more GPU memory and rendering time and may reduce gameplay performance on Quest 2.");
+        "Smooths edges in SaberStage's movable preview and recorded camera only; it does not change Beat Saber's headset graphics. 2x and especially 4x use more GPU memory and rendering time and may reduce gameplay performance on Quest 2."));
     static std::array<std::string_view, 2> referenceFrames{"Player Relative", "World Relative"};
-    WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Reference Frame",
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Reference Frame",
         profile.referenceFrame == camera::ReferenceFrame::PlayerRelative ? "Player Relative" : "World Relative",
         referenceFrames, [](StringW value) {
             if (!active_) return;
@@ -3696,12 +3727,12 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
                     ? saberstage::camera::ReferenceFrame::WorldRelative
                     : saberstage::camera::ReferenceFrame::PlayerRelative;
             }, "reference frame");
-        }), "Player Relative keeps placement based on the player's start; World Relative keeps it fixed to the game world.");
+        }), "Player Relative keeps placement based on the player's start; World Relative keeps it fixed to the game world."));
     static std::array<std::string_view, 3> followModes{"Static", "Player", "Head"};
     std::string followMode = "Player";
     if (profile.followMode == camera::FollowMode::Static) followMode = "Static";
     else if (profile.followMode == camera::FollowMode::Head) followMode = "Head";
-    WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Follow", followMode, followModes, [](StringW value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(cameraContainer, "Follow", followMode, followModes, [](StringW value) {
         if (!active_) return;
         const auto selected = static_cast<std::string>(value);
         active_->EditCamera([&](auto& camera) {
@@ -3709,7 +3740,7 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
             else if (selected == "Head") camera.followMode = saberstage::camera::FollowMode::Head;
             else camera.followMode = saberstage::camera::FollowMode::Player;
         }, "follow mode");
-    }), "Chooses what drives camera movement: fixed in place, following the player, or following head movement.");
+    }), "Chooses what drives camera movement: fixed in place, following the player, or following head movement."));
 
     auto* placeContainer = pages[1];
     // Give every left-panel tab the same heading treatment; Place previously
@@ -3720,24 +3751,24 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
         3.0F, {0.0F, 0.0F}, {48.0F, 10.0F});
     placementHint->set_enableWordWrapping(true);
     placementHint->set_alignment(TMPro::TextAlignmentOptions::Center);
-    WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "X", 2, 0.05F, profile.position.x, -20.0F, 20.0F, [](float value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "X", 2, 0.05F, profile.position.x, -20.0F, 20.0F, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.position.x = value; }, "X position");
-    }), "Moves the camera left or right in meters.");
-    WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "Y", 2, 0.05F, profile.position.y, -20.0F, 20.0F, [](float value) {
+    }), "Moves the camera left or right in meters."));
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "Y", 2, 0.05F, profile.position.y, -20.0F, 20.0F, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.position.y = value; }, "Y position");
-    }), "Moves the camera up or down in meters.");
-    WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "Z", 2, 0.05F, profile.position.z, -20.0F, 20.0F, [](float value) {
+    }), "Moves the camera up or down in meters."));
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "Z", 2, 0.05F, profile.position.z, -20.0F, 20.0F, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.position.z = value; }, "Z position");
-    }), "Moves the camera forward or backward in meters.");
-    rememberSlider(1, WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Pitch", 1.0F, profile.rotationDegrees.x, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Moves the camera forward or backward in meters."));
+    rememberSlider(1, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Pitch", 1.0F, profile.rotationDegrees.x, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.rotationDegrees.x = value; }, "pitch");
-    }), "Tilts the camera up or down."));
-    rememberSlider(1, WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Yaw", 1.0F, profile.rotationDegrees.y, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Tilts the camera up or down.")));
+    rememberSlider(1, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Yaw", 1.0F, profile.rotationDegrees.y, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.rotationDegrees.y = value; }, "yaw");
-    }), "Turns the camera left or right."));
-    rememberSlider(1, WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Roll", 1.0F, profile.rotationDegrees.z, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Turns the camera left or right.")));
+    rememberSlider(1, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(placeContainer, "Roll", 1.0F, profile.rotationDegrees.z, -180.0F, 180.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.rotationDegrees.z = value; }, "roll");
-    }), "Rotates the camera sideways, like tilting your head."));
+    }), "Rotates the camera sideways, like tilting your head.")));
     auto* placementActions = BSML::Lite::CreateHorizontalLayoutGroup(placeContainer->get_transform());
     placementActions->set_spacing(1.0F);
     WithHint(BSML::Lite::CreateUIButton(placementActions, "Recenter", [] {
@@ -3747,6 +3778,14 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     }), "Makes the camera's current forward direction match where the player is facing now.");
     WithHint(BSML::Lite::CreateUIButton(placementActions, "Reset Camera", [] {
         if (!active_) return;
+        const camera::CameraProfile defaults{};
+        active_->EditCamera([&](auto& camera) {
+            camera.position = defaults.position;
+            camera.rotationDegrees = defaults.rotationDegrees;
+        }, "position reset");
+    }), "Restores only the Primary camera position and rotation while preserving its resolution, frame rate, smoothing, and other settings.");
+    auto* resetAllCamera = ConstrainRightPanelRow(WithHint(BSML::Lite::CreateUIButton(placeContainer, "Reset All Camera Settings", [] {
+        if (!active_) return;
         std::string error;
         if (!active_->root_.Camera().ResetCurrentCameraProfile(&error)) {
             Logging::Logger.error("Camera reset failed: {}", error);
@@ -3755,34 +3794,35 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
             active_->root_.Preview().RefreshRenderDemand();
             active_->RefreshScriptStatus();
         }
-    }), "Restores the Primary camera placement and camera settings to their defaults.");
+    }), "Restores every Primary camera setting, including placement, output, smoothing, and movement, to defaults."));
+    ConfigureLayout(resetAllCamera, 48.0F, 8.0F, 0.0F, 0.0F);
 
     auto* motionContainer = pages[2];
     addHeading(motionContainer, "Smoothing and Float");
-    rememberSlider(2, WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Position Smoothing", 0.01F, profile.positionSmoothingSeconds, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    rememberSlider(2, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Position Smoothing", 0.01F, profile.positionSmoothingSeconds, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.positionSmoothingSeconds = value; }, "position smoothing");
-    }), "Softens camera position changes. Higher values move more gently but react more slowly."));
-    rememberSlider(2, WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Rotation Smoothing", 0.01F, profile.rotationSmoothingSeconds, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Softens camera position changes. Higher values move more gently but react more slowly.")));
+    rememberSlider(2, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Rotation Smoothing", 0.01F, profile.rotationSmoothingSeconds, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.rotationSmoothingSeconds = value; }, "rotation smoothing");
-    }), "Softens camera turning. Higher values create slower, more cinematic rotation."));
-    WithHint(BSML::Lite::CreateToggle(motionContainer, "Anchored Float", profile.anchoredFloatEnabled, [](bool value) {
+    }), "Softens camera turning. Higher values create slower, more cinematic rotation.")));
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(motionContainer, "Anchored Float", profile.anchoredFloatEnabled, [](bool value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.anchoredFloatEnabled = value; }, "anchored float");
-    }), "Lets the camera drift smoothly side to side with the player's view while staying near its placed anchor.");
-    rememberSlider(2, WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Float Range", 0.05F, profile.anchoredFloatMaxOffsetMeters, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Lets the camera drift smoothly side to side with the player's view while staying near its placed anchor."));
+    rememberSlider(2, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Float Range", 0.05F, profile.anchoredFloatMaxOffsetMeters, 0.0F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.anchoredFloatMaxOffsetMeters = value; }, "float range");
-    }), "Limits how far Anchored Float may move from the camera's placed position."));
-    rememberSlider(2, WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Float Response", 0.05F, profile.anchoredFloatResponseSeconds, 0.05F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Limits how far Anchored Float may move from the camera's placed position.")));
+    rememberSlider(2, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(motionContainer, "Float Response", 0.05F, profile.anchoredFloatResponseSeconds, 0.05F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.anchoredFloatResponseSeconds = value; }, "float response");
-    }), "Controls how quickly Anchored Float follows head movement. Lower values react faster."));
+    }), "Controls how quickly Anchored Float follows head movement. Lower values react faster.")));
     addHeading(motionContainer, "Movement Script");
-    WithHint(BSML::Lite::CreateToggle(motionContainer, "Enable Script", profile.movementScriptEnabled, [](bool value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(motionContainer, "Enable Script", profile.movementScriptEnabled, [](bool value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.movementScriptEnabled = value; }, "movement script");
-    }), "Lets a Camera2-compatible JSON script control camera position, rotation, and field of view during a song.");
-    WithHint(BSML::Lite::CreateStringSetting(motionContainer, "Script (.json)", profile.movementScriptFile, [](StringW value) {
+    }), "Lets a Camera2-compatible JSON script control camera position, rotation, and field of view during a song."));
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateStringSetting(motionContainer, "Script (.json)", profile.movementScriptFile, [](StringW value) {
         if (!active_) return;
         const auto file = static_cast<std::string>(value);
         active_->EditCamera([&](auto& camera) { camera.movementScriptFile = file; }, "movement script file");
-    }), "Enter the camera movement script filename. The file must be in SaberStage's camera scripts folder.");
+    }), "Enter the camera movement script filename. The file must be in SaberStage's camera scripts folder."));
     active_->scriptStatusText_ = BSML::Lite::CreateText(
         motionContainer->get_transform(), active_->root_.Camera().MovementScriptStatus(),
         3.0F, {0.0F, 0.0F}, {48.0F, 9.0F});
@@ -3807,12 +3847,12 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
         3.0F, {0.0F, 0.0F}, {48.0F, 12.0F});
     previewHint->set_enableWordWrapping(true);
     previewHint->set_alignment(TMPro::TextAlignmentOptions::Center);
-    WithHint(BSML::Lite::CreateToggle(previewContainer, "Show Movable Preview", preview.visible, [](bool value) {
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(previewContainer, "Show Movable Preview", preview.visible, [](bool value) {
         if (active_) active_->root_.Preview().SetFloatingVisible(value);
-    }), "Shows a movable world panel containing the third-person camera view. Turning it on always places it directly in front of you; it is hidden from recordings.");
-    rememberSlider(3, WithHint(BSML::Lite::CreateSliderSetting(previewContainer, "Preview Scale", 0.1F, preview.scale, 0.25F, 4.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+    }), "Shows a movable world panel containing the third-person camera view. Turning it on always places it directly in front of you; it is hidden from recordings."));
+    rememberSlider(3, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(previewContainer, "Preview Scale", 0.1F, preview.scale, 0.25F, 4.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->root_.Preview().SetFloatingScale(value);
-    }), "Changes the physical size of the movable preview panel without changing camera resolution."));
+    }), "Changes the physical size of the movable preview panel without changing camera resolution.")));
     WithHint(BSML::Lite::CreateUIButton(previewContainer, "Reset Preview", [] {
         if (!active_) return;
         std::string error;

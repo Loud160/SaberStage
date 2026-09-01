@@ -1110,7 +1110,13 @@ public:
                             return nodeTransforms_[skin->joints[i]];
                         }));
                         skinned->set_rootBone(nodeTransforms_[skin->skeleton.value_or(skin->joints.front())]);
-                        skinned->set_updateWhenOffscreen(false);
+                        // The filtered mesh contains only a small arm subset,
+                        // so Unity's imported local bounds can miss it when the
+                        // complete source body is outside the HMD frustum. This
+                        // renderer exists only while the grip editor is open;
+                        // keep its skinning/bounds live so Show Avatar Arm is
+                        // reliable without enabling Wear Avatar first.
+                        skinned->set_updateWhenOffscreen(true);
                         armRenderer = skinned;
                     } else {
                         auto* filter = armObject->AddComponent<UnityEngine::MeshFilter*>();
@@ -1855,6 +1861,7 @@ public:
             for (auto& arm : gripArmRenderers_[static_cast<std::size_t>(side)]) {
                 if (!IsAlive(arm.source) || !IsAlive(arm.filtered)) continue;
                 arm.filtered->get_gameObject()->set_layer(firstPersonLayer);
+                arm.filtered->get_gameObject()->SetActive(true);
                 // Renderer::get_sharedMaterials uses UnityW entries while the
                 // generated setter accepts raw Material pointers. Preserve
                 // every slot (including the optional outline material) while
