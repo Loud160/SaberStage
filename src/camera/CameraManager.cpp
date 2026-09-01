@@ -25,6 +25,7 @@
 #include "UnityEngine/FilterMode.hpp"
 #include "UnityEngine/Events/UnityAction_2.hpp"
 #include "UnityEngine/GameObject.hpp"
+#include "UnityEngine/Graphics.hpp"
 #include "UnityEngine/InputSystem/XR/TrackedPoseDriver.hpp"
 #include "UnityEngine/MeshCollider.hpp"
 #include "UnityEngine/Object.hpp"
@@ -222,17 +223,29 @@ public:
     void SetExternalOutputTexture(UnityEngine::RenderTexture* texture) noexcept {
         if (!externalOutputActive_) return;
         if (IsUnityObjectAlive(texture) && IsUnityObjectAlive(renderTarget_)) ReleaseRenderTarget();
+        ReleaseExternalMultisampleTarget();
         externalOutputTexture_ = texture;
-        if (IsUnityObjectAlive(spectatorCamera_)) spectatorCamera_->set_targetTexture(texture);
+        if (IsUnityObjectAlive(texture) && ConfiguredMultisampleCount() > 1) {
+            EnsureExternalMultisampleTarget(texture);
+        }
+        if (IsUnityObjectAlive(spectatorCamera_)) {
+            spectatorCamera_->set_targetTexture(IsUnityObjectAlive(externalMultisampleTarget_)
+                ? externalMultisampleTarget_
+                : texture);
+        }
         scheduler_.Reset();
         if (IsUnityObjectAlive(texture)) {
-            Logging::Logger.info("Primary camera preview switched to recording encoder texture");
+            Logging::Logger.info(
+                "Primary camera switched to recording output (MSAA={}x, resolved={})",
+                ConfiguredMultisampleCount(), IsUnityObjectAlive(externalMultisampleTarget_));
         } else {
             Logging::Logger.info("Primary camera preview released the paused encoder texture");
         }
     }
 
     void EndExternalRenderOutput() noexcept {
+        ReleaseExternalMultisampleTarget();
+        if (IsUnityObjectAlive(spectatorCamera_)) spectatorCamera_->set_targetTexture(nullptr);
         externalOutputTexture_ = nullptr;
         externalOutputActive_ = false;
         scheduler_.Reset();
@@ -251,12 +264,31 @@ public:
         beforeRenderHandler_ = std::move(handler);
     }
 
+    void SetAfterRenderHandler(CameraManager::AfterRenderHandler handler) {
+        afterRenderHandler_ = std::move(handler);
+    }
+
     void PrepareForSpectatorRender() noexcept {
         if (!beforeRenderHandler_) return;
         try {
             beforeRenderHandler_();
         } catch (...) {
             Logging::Logger.error("Spectator pre-render handler failed safely");
+        }
+    }
+
+    void FinishSpectatorRender() noexcept {
+        try {
+            if (externalOutputActive_ && IsUnityObjectAlive(externalMultisampleTarget_) &&
+                IsUnityObjectAlive(externalOutputTexture_)) {
+                // MediaCodec bridges require an ordinary GL_TEXTURE_2D. The
+                // camera renders into the multisampled target, then this blit
+                // performs Unity's resolve into the encoder-owned texture.
+                UnityEngine::Graphics::Blit(externalMultisampleTarget_, externalOutputTexture_);
+            }
+            if (afterRenderHandler_) afterRenderHandler_();
+        } catch (...) {
+            Logging::Logger.error("Spectator post-render resolve/timing handler failed safely");
         }
     }
 
@@ -297,6 +329,17 @@ public:
         ReloadMovementScript();
         if (IsUnityObjectAlive(spectatorCamera_) && IsUnityObjectAlive(mainCamera_)) {
             ApplyProfileToCamera();
+        }
+        const auto samples = ConfiguredMultisampleCount();
+        if (externalOutputActive_ && IsUnityObjectAlive(externalOutputTexture_)) {
+            const auto currentlyResolved = IsUnityObjectAlive(externalMultisampleTarget_);
+            const auto currentSamples = currentlyResolved
+                ? externalMultisampleTarget_->get_antiAliasing()
+                : 1;
+            if (currentSamples != samples) SetExternalOutputTexture(externalOutputTexture_);
+        } else if (IsUnityObjectAlive(renderTarget_) &&
+                   renderTarget_->get_antiAliasing() != samples) {
+            ReleaseRenderTarget();
         }
     }
 
@@ -448,7 +491,9 @@ private:
         spectatorCamera_->set_forceIntoRenderTexture(true);
         spectatorCamera_->set_allowDynamicResolution(false);
         spectatorCamera_->set_useOcclusionCulling(false);
-        spectatorCamera_->set_targetTexture(externalOutputTexture_);
+        spectatorCamera_->set_targetTexture(IsUnityObjectAlive(externalMultisampleTarget_)
+            ? externalMultisampleTarget_
+            : externalOutputTexture_);
         spectatorCamera_->set_aspect(
             static_cast<float>(profile.requestedWidth) / static_cast<float>(profile.requestedHeight));
         spectatorCamera_->set_rect({0.0F, 0.0F, 1.0F, 1.0F});
@@ -475,6 +520,7 @@ private:
             }
         }
         ReleaseRenderTarget();
+        ReleaseExternalMultisampleTarget();
         if (IsUnityObjectAlive(cameraObject_)) UnityEngine::Object::Destroy(cameraObject_);
         cameraObject_ = nullptr;
         spectatorCamera_ = nullptr;
@@ -695,18 +741,17 @@ private:
     }
 
     bool EnsureRenderTarget(int width, int height) {
-        if (IsUnityObjectAlive(renderTarget_) && renderTarget_->get_width() == width && renderTarget_->get_height() == height) return true;
+        const auto samples = ConfiguredMultisampleCount();
+        if (IsUnityObjectAlive(renderTarget_) && renderTarget_->get_width() == width &&
+            renderTarget_->get_height() == height && renderTarget_->get_antiAliasing() == samples) {
+            return true;
+        }
         ReleaseRenderTarget();
         renderTarget_ = UnityEngine::RenderTexture::New_ctor(
             width, height, 24,
             UnityEngine::RenderTextureFormat::Default,
             UnityEngine::RenderTextureReadWrite::Default);
-        // 4x MSAA matters beyond edge smoothing: VRM cutout materials rely on
-        // AlphaToMask (alpha-to-coverage), which needs multisampling to
-        // produce gradients. On a 1-sample target it collapses to a hard
-        // 50% threshold and cutout clothing edges alias badly. Quest's tiled
-        // GPU resolves MSAA on-chip, so the cost is modest.
-        renderTarget_->set_antiAliasing(4);
+        renderTarget_->set_antiAliasing(samples);
         renderTarget_->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
         renderTarget_->set_filterMode(UnityEngine::FilterMode::Bilinear);
         if (!renderTarget_->Create()) {
@@ -723,8 +768,48 @@ private:
         spectatorCamera_->ResetProjectionMatrix();
         spectatorCamera_->ResetCullingMatrix();
         scheduler_.Reset();
-        Logging::Logger.info("Allocated spectator render target {}x{}", width, height);
+        Logging::Logger.info(
+            "Allocated spectator render target {}x{} with {}x MSAA", width, height, samples);
         return true;
+    }
+
+    [[nodiscard]] int ConfiguredMultisampleCount() const noexcept {
+        const auto requested = settings_.Get().camera.Primary().multisampleCount;
+        return requested == 2 || requested == 4 ? requested : 1;
+    }
+
+    bool EnsureExternalMultisampleTarget(UnityEngine::RenderTexture* output) noexcept {
+        if (!IsUnityObjectAlive(output) || ConfiguredMultisampleCount() <= 1) return false;
+        try {
+            externalMultisampleTarget_ = UnityEngine::RenderTexture::New_ctor(
+                output->get_width(), output->get_height(), 24,
+                UnityEngine::RenderTextureFormat::Default,
+                UnityEngine::RenderTextureReadWrite::Default);
+            externalMultisampleTarget_->set_antiAliasing(ConfiguredMultisampleCount());
+            externalMultisampleTarget_->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
+            externalMultisampleTarget_->set_filterMode(UnityEngine::FilterMode::Bilinear);
+            if (!externalMultisampleTarget_->Create()) {
+                UnityEngine::Object::Destroy(externalMultisampleTarget_);
+                externalMultisampleTarget_ = nullptr;
+                Logging::Logger.warn(
+                    "Could not allocate recording MSAA target; continuing with one sample");
+                return false;
+            }
+            return true;
+        } catch (...) {
+            ReleaseExternalMultisampleTarget();
+            Logging::Logger.warn(
+                "Recording MSAA allocation failed safely; continuing with one sample");
+            return false;
+        }
+    }
+
+    void ReleaseExternalMultisampleTarget() noexcept {
+        if (IsUnityObjectAlive(externalMultisampleTarget_)) {
+            externalMultisampleTarget_->Release();
+            UnityEngine::Object::Destroy(externalMultisampleTarget_);
+        }
+        externalMultisampleTarget_ = nullptr;
     }
 
     void ReleaseRenderTarget() noexcept {
@@ -789,6 +874,7 @@ private:
     CameraManager::RuntimeCameraInvalidatedHandler runtimeCameraInvalidatedHandler_;
     CameraManager::RuntimeCameraReadyHandler runtimeCameraReadyHandler_;
     CameraManager::BeforeRenderHandler beforeRenderHandler_;
+    CameraManager::AfterRenderHandler afterRenderHandler_;
     std::optional<MovementScript> script_;
     std::string movementScriptStatus_ = "No movement script selected.";
     UnityEngine::GameObject* driverObject_ = nullptr;
@@ -797,6 +883,7 @@ private:
     UnityEngine::Camera* spectatorCamera_ = nullptr;
     UnityEngine::RenderTexture* renderTarget_ = nullptr;
     UnityEngine::RenderTexture* externalOutputTexture_ = nullptr;
+    UnityEngine::RenderTexture* externalMultisampleTarget_ = nullptr;
     bool externalOutputActive_ = false;
     GlobalNamespace::AudioTimeSyncController* audioTimeSync_ = nullptr;
     GlobalNamespace::PlayerTransforms* playerTransforms_ = nullptr;
@@ -834,7 +921,11 @@ void CameraManager::SetRuntimeCameraReadyHandler(RuntimeCameraReadyHandler handl
 void CameraManager::SetBeforeRenderHandler(BeforeRenderHandler handler) {
     impl_->SetBeforeRenderHandler(std::move(handler));
 }
+void CameraManager::SetAfterRenderHandler(AfterRenderHandler handler) {
+    impl_->SetAfterRenderHandler(std::move(handler));
+}
 void CameraManager::PrepareForSpectatorRender() noexcept { impl_->PrepareForSpectatorRender(); }
+void CameraManager::FinishSpectatorRender() noexcept { impl_->FinishSpectatorRender(); }
 void CameraManager::SetPreviewCaptureExcluded(bool excluded) noexcept {
     impl_->SetPreviewCaptureExcluded(excluded);
 }

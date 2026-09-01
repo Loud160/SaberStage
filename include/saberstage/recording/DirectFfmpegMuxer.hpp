@@ -11,8 +11,10 @@ namespace saberstage::recording {
 // WAV into MP4 using SaberStage's private FFmpeg runtime. This runs only on the
 // finalizer thread and never falls back to a software video encoder.
 // Finalizes the raw H.264/WAV pair produced by either hardware capture
-// backend. Direct capture supplies exact scheduled frame positions; Hollywood
-// supplies an empty vector and uses the same offset-aware sequential fallback.
+// backend. Direct capture supplies exact scheduled frame positions. Hollywood
+// supplies the matching completed spectator-render deadlines because its raw
+// callback does not expose MediaCodec packet timestamps; either table keeps a
+// missed render from shortening the saved video relative to game audio.
 bool MuxSaberStageRecording(
     const std::filesystem::path& rawVideo,
     const std::filesystem::path& rawAudio,

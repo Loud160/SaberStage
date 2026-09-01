@@ -62,12 +62,14 @@ internal static class BuildSaberStageAvatarShaders
             assetNames = new[] {
                 "Assets/SaberStageMToon.shader",
                 "Assets/SaberStageMToonOutline.shader",
-                "Assets/SaberStageVideoPreview.shader"
+                "Assets/SaberStageVideoPreview.shader",
+                "Assets/SaberStageGripTarget.shader"
             },
             addressableNames = new[] {
                 "saberstage-mtoon",
                 "saberstage-mtoon-outline",
-                "saberstage-video-preview"
+                "saberstage-video-preview",
+                "saberstage-grip-target"
             }
         };
         var manifest = BuildPipeline.BuildAssetBundles(output, new[] { build },

@@ -29,6 +29,12 @@ EGL setup is failure-contained: shader or surface initialization restores Unity'
 
 Both paths still require fresh Quest validation for video content, color/orientation, audio, duration, sync, sustained gameplay performance, 1440p codec acceptance, and abnormal shutdown behavior.
 
+## Third-person camera multisampling
+
+The Primary camera profile exposes `Off`, `2x`, and `4x` MSAA. This setting belongs only to SaberStage's third-person camera: it affects the floor/movable preview and the image sent to either recording backend, but never changes Beat Saber's headset render target or overlaps a graphics-settings mod. `Off` is the Quest 2-safe default.
+
+MediaCodec and the Direct FFmpeg bridge require a normal single-sample encoder texture. When camera MSAA is enabled, the spectator camera therefore renders into a private multisampled target and resolves it into the backend-owned encoder texture after `OnPostRender`. Preview consumers continue to read the resolved encoder texture. Changing the setting while an output exists recreates only this owned intermediate target; allocation failure is logged and falls back safely to one sample.
+
 ## Direct packet fan-out
 
 ```text
@@ -42,6 +48,8 @@ Unity audio tap -> AAC packets ----+-> CaptureTimeline -> packet fan-out
 The direct packet path is GPU-native and hardware-only. One encode currently feeds local recording and direct livestreaming; the companion remains a later sink. Conservative Quest 2 defaults and higher modes remain gated by measured capability/performance tiers. Software H.264 fallback remains out of scope.
 
 The frame scheduler uses monotonic time and a fixed cadence independent of HMD refresh. It presents at most one due spectator frame per game frame. If Unity misses a capture deadline, the next submitted image retains its real presentation slot and the MP4 holds the prior picture over the gap; missed time is never compressed into consecutive frame numbers because doing so makes video progressively drift from continuously sampled game audio. Diagnostics report these skipped timeline deadlines separately from MediaCodec queue drops. Encoder drain tracks a bounded number of submitted surface frames and owns codec-output release.
+
+Hollywood's callback does not expose MediaCodec packet timestamps. SaberStage now records the monotonic presentation deadline of each completed Hollywood spectator render and gives that one-to-one timing table to the private finalizer. A missed Unity/Hollywood render therefore remains a duration gap instead of renumbering the surviving frames into a shorter video track. This brings Hollywood's long-session A/V behavior in line with the Direct backend's timestamp-preserving rule while retaining separate diagnostics for skipped presentation deadlines.
 
 The first packet actually emitted by the hardware encoder is normalized to the start of the saved video. Frames accepted but never emitted during encoder startup do not become a permanent picture delay; later deadline gaps keep their original duration, so startup normalization cannot reintroduce cumulative audio drift.
 

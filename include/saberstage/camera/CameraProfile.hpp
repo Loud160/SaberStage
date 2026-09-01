@@ -71,6 +71,10 @@ struct CameraProfile {
     std::int32_t requestedWidth = 1280;
     std::int32_t requestedHeight = 720;
     std::int32_t requestedFramesPerSecond = 30;
+    // Multisampling for SaberStage's third-person render target only. This
+    // covers the movable/floor preview and recording camera without changing
+    // Beat Saber's headset MSAA (which graphics-focused mods may own).
+    std::int32_t multisampleCount = 1;
     float nearClipMeters = 0.03F;
     float farClipMeters = 1000.0F;
     float positionSmoothingSeconds = 0.08F;

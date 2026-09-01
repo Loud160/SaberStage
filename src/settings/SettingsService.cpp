@@ -120,6 +120,10 @@ AvatarControllerOffsetSettings AvatarControllerOffset(
     }
     fallback.position = Vector(*source, "position", fallback.position, repaired);
     fallback.rotationDegrees = Vector(*source, "rotationDegrees", fallback.rotationDegrees, repaired);
+    fallback.gripClosurePercent = Float(
+        *source, "gripClosurePercent", fallback.gripClosurePercent, repaired);
+    fallback.thumbCurvePercent = Float(
+        *source, "thumbCurvePercent", fallback.thumbCurvePercent, repaired);
     return fallback;
 }
 
@@ -131,6 +135,8 @@ void AddAvatarControllerOffset(
     Value value(rapidjson::kObjectType);
     AddVector(value, "position", offset.position, allocator);
     AddVector(value, "rotationDegrees", offset.rotationDegrees, allocator);
+    value.AddMember("gripClosurePercent", offset.gripClosurePercent, allocator);
+    value.AddMember("thumbCurvePercent", offset.thumbCurvePercent, allocator);
     object.AddMember(Value(name, allocator), value, allocator);
 }
 
@@ -156,6 +162,11 @@ void DecodeAvatarSettings(
     settings.rimLighting = Bool(avatar, "rimLighting", settings.rimLighting, repaired);
     settings.matcap = Bool(avatar, "matcap", settings.matcap, repaired);
     settings.emission = Bool(avatar, "emission", settings.emission, repaired);
+    settings.cutoutSmoothing = EnumValue(
+        avatar, "cutoutSmoothing", settings.cutoutSmoothing,
+        [](std::string_view value, AvatarCutoutSmoothing& parsed) { return TryParse(value, parsed); }, repaired);
+    settings.alphaToMaskEnabled = Bool(
+        avatar, "alphaToMaskEnabled", settings.alphaToMaskEnabled, repaired);
     settings.animatedExpressions = Bool(
         avatar, "animatedExpressions", settings.animatedExpressions, repaired);
     settings.outlines = EnumValue(
@@ -202,10 +213,62 @@ void DecodeAvatarSettings(
                 }
                 AvatarRetargetingSettings profile{};
                 profile.avatarKey = String(value, "avatarKey", {}, repaired);
+                profile.armSpanAvatarSizing = Bool(
+                    value, "armSpanAvatarSizing", profile.armSpanAvatarSizing, repaired);
                 profile.matchPlayerHeight = Bool(
                     value, "matchPlayerHeight", profile.matchPlayerHeight, repaired);
                 profile.heightAdjustmentBalance = Float(
                     value, "heightAdjustmentBalance", profile.heightAdjustmentBalance, repaired);
+                profile.manualAvatarScaleEnabled = Bool(
+                    value, "manualAvatarScaleEnabled", profile.manualAvatarScaleEnabled, repaired);
+                profile.manualAvatarScalePercent = Float(
+                    value, "manualAvatarScalePercent", profile.manualAvatarScalePercent, repaired);
+                profile.keepHandsOnSabers = Bool(
+                    value, "keepHandsOnSabers", profile.keepHandsOnSabers, repaired);
+                profile.gripOffsetsInitialized = Bool(
+                    value, "gripOffsetsInitialized", profile.gripOffsetsInitialized, repaired);
+                profile.leftControllerToWrist = AvatarControllerOffset(
+                    value, "leftControllerToWrist", profile.leftControllerToWrist, repaired);
+                profile.rightControllerToWrist = AvatarControllerOffset(
+                    value, "rightControllerToWrist", profile.rightControllerToWrist, repaired);
+                profile.adjustBodyProportions = Bool(
+                    value, "adjustBodyProportions", profile.adjustBodyProportions, repaired);
+                profile.torsoWidthPercent = Float(
+                    value, "torsoWidthPercent", profile.torsoWidthPercent, repaired);
+                profile.autoShoulderWidth = Bool(
+                    value, "autoShoulderWidth", profile.autoShoulderWidth, repaired);
+                profile.shoulderWidthPercent = Float(
+                    value, "shoulderWidthPercent", profile.shoulderWidthPercent, repaired);
+                profile.waistHipWidthPercent = Float(
+                    value, "waistHipWidthPercent", profile.waistHipWidthPercent, repaired);
+                profile.lowerTorsoWidthPercent = Float(
+                    value, "lowerTorsoWidthPercent", profile.lowerTorsoWidthPercent, repaired);
+                profile.neckBaseWidthPercent = Float(
+                    value, "neckBaseWidthPercent", profile.neckBaseWidthPercent, repaired);
+                profile.headSizePercent = Float(
+                    value, "headSizePercent", profile.headSizePercent, repaired);
+                profile.torsoHeightPercent = Float(
+                    value, "torsoHeightPercent", profile.torsoHeightPercent, repaired);
+                profile.upperLegLengthPercent = Float(
+                    value, "upperLegLengthPercent", profile.upperLegLengthPercent, repaired);
+                profile.lowerLegLengthPercent = Float(
+                    value, "lowerLegLengthPercent", profile.lowerLegLengthPercent, repaired);
+                profile.legWidthPercent = Float(
+                    value, "legWidthPercent", profile.legWidthPercent, repaired);
+                profile.neutralKneeBendDegrees = Float(
+                    value, "neutralKneeBendDegrees", profile.neutralKneeBendDegrees, repaired);
+                profile.attackPoseDegrees = Float(
+                    value, "attackPoseDegrees", profile.attackPoseDegrees, repaired);
+                profile.backStiffnessPercent = Float(
+                    value, "backStiffnessPercent", profile.backStiffnessPercent, repaired);
+                profile.autoFloorHeight = Bool(
+                    value, "autoFloorHeight", profile.autoFloorHeight, repaired);
+                profile.floorOffsetMeters = Float(
+                    value, "floorOffsetMeters", profile.floorOffsetMeters, repaired);
+                profile.preventArmBodyClipping = Bool(
+                    value, "preventArmBodyClipping", profile.preventArmBodyClipping, repaired);
+                profile.armSpringBoneInteraction = Bool(
+                    value, "armSpringBoneInteraction", profile.armSpringBoneInteraction, repaired);
                 settings.retargetingProfiles.push_back(std::move(profile));
             }
         }
@@ -266,6 +329,9 @@ Value EncodeAvatarSettings(
     avatar.AddMember("rimLighting", settings.rimLighting, allocator);
     avatar.AddMember("matcap", settings.matcap, allocator);
     avatar.AddMember("emission", settings.emission, allocator);
+    avatar.AddMember(
+        "cutoutSmoothing", Value(ToString(settings.cutoutSmoothing).data(), allocator), allocator);
+    avatar.AddMember("alphaToMaskEnabled", settings.alphaToMaskEnabled, allocator);
     avatar.AddMember("animatedExpressions", settings.animatedExpressions, allocator);
     avatar.AddMember("outlines", Value(ToString(settings.outlines).data(), allocator), allocator);
     avatar.AddMember("materialStage", Value(ToString(settings.materialStage).data(), allocator), allocator);
@@ -285,8 +351,34 @@ Value EncodeAvatarSettings(
     for (const auto& profile : settings.retargetingProfiles) {
         Value value(rapidjson::kObjectType);
         value.AddMember("avatarKey", Value(profile.avatarKey.c_str(), allocator), allocator);
+        value.AddMember("armSpanAvatarSizing", profile.armSpanAvatarSizing, allocator);
         value.AddMember("matchPlayerHeight", profile.matchPlayerHeight, allocator);
         value.AddMember("heightAdjustmentBalance", profile.heightAdjustmentBalance, allocator);
+        value.AddMember("manualAvatarScaleEnabled", profile.manualAvatarScaleEnabled, allocator);
+        value.AddMember("manualAvatarScalePercent", profile.manualAvatarScalePercent, allocator);
+        value.AddMember("keepHandsOnSabers", profile.keepHandsOnSabers, allocator);
+        value.AddMember("gripOffsetsInitialized", profile.gripOffsetsInitialized, allocator);
+        AddAvatarControllerOffset(value, "leftControllerToWrist", profile.leftControllerToWrist, allocator);
+        AddAvatarControllerOffset(value, "rightControllerToWrist", profile.rightControllerToWrist, allocator);
+        value.AddMember("adjustBodyProportions", profile.adjustBodyProportions, allocator);
+        value.AddMember("torsoWidthPercent", profile.torsoWidthPercent, allocator);
+        value.AddMember("autoShoulderWidth", profile.autoShoulderWidth, allocator);
+        value.AddMember("shoulderWidthPercent", profile.shoulderWidthPercent, allocator);
+        value.AddMember("waistHipWidthPercent", profile.waistHipWidthPercent, allocator);
+        value.AddMember("lowerTorsoWidthPercent", profile.lowerTorsoWidthPercent, allocator);
+        value.AddMember("neckBaseWidthPercent", profile.neckBaseWidthPercent, allocator);
+        value.AddMember("headSizePercent", profile.headSizePercent, allocator);
+        value.AddMember("torsoHeightPercent", profile.torsoHeightPercent, allocator);
+        value.AddMember("upperLegLengthPercent", profile.upperLegLengthPercent, allocator);
+        value.AddMember("lowerLegLengthPercent", profile.lowerLegLengthPercent, allocator);
+        value.AddMember("legWidthPercent", profile.legWidthPercent, allocator);
+        value.AddMember("neutralKneeBendDegrees", profile.neutralKneeBendDegrees, allocator);
+        value.AddMember("attackPoseDegrees", profile.attackPoseDegrees, allocator);
+        value.AddMember("backStiffnessPercent", profile.backStiffnessPercent, allocator);
+        value.AddMember("autoFloorHeight", profile.autoFloorHeight, allocator);
+        value.AddMember("floorOffsetMeters", profile.floorOffsetMeters, allocator);
+        value.AddMember("preventArmBodyClipping", profile.preventArmBodyClipping, allocator);
+        value.AddMember("armSpringBoneInteraction", profile.armSpringBoneInteraction, allocator);
         retargetingProfiles.PushBack(value, allocator);
     }
     avatar.AddMember("retargetingProfiles", retargetingProfiles, allocator);
@@ -331,6 +423,8 @@ void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bo
     profile.requestedHeight = Int(source, "requestedHeight", profile.requestedHeight, repaired);
     profile.requestedFramesPerSecond = Int(
         source, "requestedFramesPerSecond", profile.requestedFramesPerSecond, repaired);
+    profile.multisampleCount = Int(
+        source, "multisampleCount", profile.multisampleCount, repaired);
     profile.nearClipMeters = Float(source, "nearClipMeters", profile.nearClipMeters, repaired);
     profile.farClipMeters = Float(source, "farClipMeters", profile.farClipMeters, repaired);
     profile.positionSmoothingSeconds = Float(
@@ -373,6 +467,7 @@ Value EncodeCameraProfile(const camera::CameraProfile& profile, Document::Alloca
     result.AddMember("requestedWidth", profile.requestedWidth, allocator);
     result.AddMember("requestedHeight", profile.requestedHeight, allocator);
     result.AddMember("requestedFramesPerSecond", profile.requestedFramesPerSecond, allocator);
+    result.AddMember("multisampleCount", profile.multisampleCount, allocator);
     result.AddMember("nearClipMeters", profile.nearClipMeters, allocator);
     result.AddMember("farClipMeters", profile.farClipMeters, allocator);
     result.AddMember("positionSmoothingSeconds", profile.positionSmoothingSeconds, allocator);

@@ -9,7 +9,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 14;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 19;
 
 enum class RecordingBackend {
     Hollywood,
@@ -67,6 +67,16 @@ enum class AvatarOutlineMode {
     Off,
     Reduced,
     Full,
+};
+
+// Controls the shader-local coverage transition used only by alpha-cutout
+// avatar materials. Unlike MSAA this can be applied to the avatar and its
+// clones without changing Beat Saber's complete headset render target.
+enum class AvatarCutoutSmoothing {
+    Off,
+    Low,
+    Medium,
+    High,
 };
 
 // Configured uses the ordinary per-feature quality toggles. The remaining
@@ -191,15 +201,65 @@ struct FeatureSettings {
 struct AvatarControllerOffsetSettings {
     camera::Vec3 position{};
     camera::Vec3 rotationDegrees{};
+    // 0 preserves the avatar's authored/rest finger pose, 100 is SaberStage's
+    // ordinary relaxed controller grip, and values above 100 close the hand
+    // more tightly. Stored per hand with the rest of the per-avatar grip fit.
+    float gripClosurePercent = 100.0F;
+    // Thumb opposition is independent from the four-finger closure. VRM
+    // thumbs start beside the palm rather than in the same flexion plane as
+    // the fingers, so this controls their wrap around the opposite side of a
+    // round controller or saber grip without over-closing the other digits.
+    float thumbCurvePercent = 100.0F;
 };
 
 struct AvatarRetargetingSettings {
     // Absolute normalized selectedPath when available; selectedFile is used
     // only for the legacy mod-local avatar fallback.
     std::string avatarKey;
+    // Arm-span sizing is the high-fidelity path. Turning it off restores the
+    // original standing-height/root-scale calculation without forking the IK
+    // solver or losing any of the newer posture controls.
+    bool armSpanAvatarSizing = true;
     bool matchPlayerHeight = false;
     // -1 favours legs, 0 distributes proportionally, +1 favours torso.
     float heightAdjustmentBalance = 0.0F;
+    bool manualAvatarScaleEnabled = false;
+    float manualAvatarScalePercent = 100.0F;
+    bool keepHandsOnSabers = true;
+
+    // One independently fitted controller/grip transform per hand, per player
+    // and avatar. The initialized bit allows schema-14 global offsets to be
+    // migrated exactly once without mistaking a legitimate zero offset for a
+    // missing value.
+    bool gripOffsetsInitialized = false;
+    AvatarControllerOffsetSettings leftControllerToWrist;
+    AvatarControllerOffsetSettings rightControllerToWrist;
+
+    bool adjustBodyProportions = false;
+    // Base width multiplier for the upper-body volume. Shoulder, waist/hip,
+    // and lower-torso controls are layered after this value.
+    float torsoWidthPercent = 100.0F;
+    bool autoShoulderWidth = false;
+    float shoulderWidthPercent = 100.0F;
+    float waistHipWidthPercent = 100.0F;
+    float lowerTorsoWidthPercent = 100.0F;
+    float neckBaseWidthPercent = 100.0F;
+    float headSizePercent = 100.0F;
+    float torsoHeightPercent = 100.0F;
+    float upperLegLengthPercent = 100.0F;
+    float lowerLegLengthPercent = 100.0F;
+    float legWidthPercent = 100.0F;
+
+    float neutralKneeBendDegrees = 0.0F;
+    float attackPoseDegrees = 0.0F;
+    float backStiffnessPercent = 50.0F;
+    bool autoFloorHeight = true;
+    float floorOffsetMeters = 0.0F;
+
+    // These optional collision passes are deliberately off by default. They
+    // use bounded analytic volumes rather than general-purpose Unity physics.
+    bool preventArmBodyClipping = false;
+    bool armSpringBoneInteraction = false;
 };
 
 struct AvatarSettings {
@@ -216,6 +276,12 @@ struct AvatarSettings {
     bool rimLighting = true;
     bool matcap = false;
     bool emission = true;
+    AvatarCutoutSmoothing cutoutSmoothing = AvatarCutoutSmoothing::Low;
+    // Alpha-to-coverage is meaningful only for MToon cutout materials and a
+    // multisampled target. The menu capability-gates the toggle after an
+    // avatar is loaded; keeping the persisted value separate lets the same
+    // player profile retain its preference across compatible avatars.
+    bool alphaToMaskEnabled = false;
     // Enables the low-frequency facial animation controller: a subtle idle
     // smile, randomized blinks, and gameplay expressions driven by combo,
     // misses, and level failure. Off performs no automatic expression work.
@@ -323,15 +389,15 @@ struct SettingsDocument {
     FeatureSettings companion;
     AvatarSettings avatar;
     // Five fixed local player slots keep profile selection predictable in the
-    // headset UI. "default" remains Player 1's stable ID so existing settings
+    // headset UI. "default" remains Profile 1's stable ID so existing settings
     // and calibration filenames migrate without losing that player's data.
     std::string activeAvatarPlayerProfileId = "default";
     std::vector<AvatarPlayerProfile> avatarPlayerProfiles{
-        {.id = "default", .displayName = "Player 1", .avatar = {}},
-        {.id = "player-2", .displayName = "Player 2", .avatar = {}},
-        {.id = "player-3", .displayName = "Player 3", .avatar = {}},
-        {.id = "player-4", .displayName = "Player 4", .avatar = {}},
-        {.id = "player-5", .displayName = "Player 5", .avatar = {}},
+        {.id = "default", .displayName = "Profile 1", .avatar = {}},
+        {.id = "player-2", .displayName = "Profile 2", .avatar = {}},
+        {.id = "player-3", .displayName = "Profile 3", .avatar = {}},
+        {.id = "player-4", .displayName = "Profile 4", .avatar = {}},
+        {.id = "player-5", .displayName = "Profile 5", .avatar = {}},
     };
     FeatureSettings scenes;
     LivestreamSettings broadcast;
@@ -365,6 +431,7 @@ std::string_view ToString(H264Level value) noexcept;
 std::string_view ToString(LivestreamProvider value) noexcept;
 std::string_view ToString(AvatarQualityPreset value) noexcept;
 std::string_view ToString(AvatarOutlineMode value) noexcept;
+std::string_view ToString(AvatarCutoutSmoothing value) noexcept;
 std::string_view ToString(AvatarMaterialStage value) noexcept;
 std::string_view ToString(AvatarLightingMode value) noexcept;
 std::string_view ToString(SpringBoneQuality value) noexcept;
@@ -379,6 +446,7 @@ bool TryParse(std::string_view value, H264Level& result) noexcept;
 bool TryParse(std::string_view value, LivestreamProvider& result) noexcept;
 bool TryParse(std::string_view value, AvatarQualityPreset& result) noexcept;
 bool TryParse(std::string_view value, AvatarOutlineMode& result) noexcept;
+bool TryParse(std::string_view value, AvatarCutoutSmoothing& result) noexcept;
 bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept;
 bool TryParse(std::string_view value, AvatarLightingMode& result) noexcept;
 bool TryParse(std::string_view value, SpringBoneQuality& result) noexcept;

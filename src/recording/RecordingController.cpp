@@ -7,6 +7,7 @@
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
 #include "saberstage/recording/AsyncVideoWriter.hpp"
+#include "saberstage/recording/CaptureTimeline.hpp"
 #include "saberstage/recording/DirectFfmpegCapture.hpp"
 #include "saberstage/recording/DirectFfmpegMuxer.hpp"
 #include "saberstage/recording/RealtimeAudioCapture.hpp"
@@ -75,6 +76,7 @@ RecordingController::RecordingController(
     driverObject_->AddComponent<RecordingRuntimeDriver*>();
     camera_.SetRuntimeCameraInvalidatedHandler([this] { HandleRuntimeCameraInvalidated(); });
     camera_.SetRuntimeCameraReadyHandler([this] { HandleRuntimeCameraReady(); });
+    camera_.SetAfterRenderHandler([this] { HandleSpectatorRendered(); });
 }
 
 RecordingController::~RecordingController() { Shutdown(); }
@@ -143,6 +145,8 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
         videoPresentationFrames_.clear();
         videoSegmentFrameBase_ = 0;
         videoSegmentLastPresentationFrame_ = -1;
+        hollywoodLastPresentationFrame_ = -1;
+        hollywoodSkippedPresentationFrames_ = 0;
     }
     settings::ResolutionDimensions(recording.resolution, activeWidth_, activeHeight_);
     activeFramesPerSecond_ = recording.framesPerSecond;
@@ -346,15 +350,6 @@ void RecordingController::StartVideoSegment() {
         if (!IsUnityObjectAlive(videoCapture_->texture)) {
             throw std::runtime_error("Hollywood did not create an encoder texture");
         }
-        // Hollywood does not expose MediaCodec packet timestamps. Its own
-        // scheduler epoch is established by Init(), so use the matching
-        // monotonic point as this segment's picture start. SaberStage's muxer
-        // can then align the first audio callback instead of forcing both raw
-        // streams to zero and baking startup skew into the MP4.
-        if (firstVideoFrameMonotonicNanos_ == 0) {
-            firstVideoFrameMonotonicNanos_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-        }
         camera_.SetExternalOutputTexture(videoCapture_->texture);
         return;
     }
@@ -492,6 +487,7 @@ void RecordingController::Shutdown() noexcept {
     shuttingDown_ = true;
     camera_.SetRuntimeCameraInvalidatedHandler({});
     camera_.SetRuntimeCameraReadyHandler({});
+    camera_.SetAfterRenderHandler({});
     if (state_.load() == RecordingState::Armed) {
         SetState(RecordingState::Idle, "Armed recording canceled during shutdown.");
     }
@@ -792,6 +788,42 @@ void RecordingController::HandleRuntimeCameraReady() noexcept {
     }
 }
 
+void RecordingController::HandleSpectatorRendered() noexcept {
+    if (state_.load(std::memory_order_acquire) != RecordingState::Recording ||
+        activeBackend_ != settings::RecordingBackend::Hollywood ||
+        recordingStarted_ == std::chrono::steady_clock::time_point{} ||
+        activeFramesPerSecond_ <= 0) {
+        return;
+    }
+
+    try {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(videoTimingMutex_);
+        auto decision = DecideCaptureTimelineFrame(
+            ElapsedSeconds(now), activeFramesPerSecond_, hollywoodLastPresentationFrame_);
+        if (!decision.frameDue) {
+            // A Hollywood camera render represents a submitted picture even
+            // if Unity reports two renders inside the same coarse timer slot.
+            // Keep the table one-to-one with encoded access units instead of
+            // silently losing an entry; normal scheduling never takes this
+            // branch because Hollywood already throttles to the target FPS.
+            decision.frameDue = true;
+            decision.presentationFrame = hollywoodLastPresentationFrame_ + 1;
+            decision.skippedDeadlines = 0;
+        }
+        hollywoodLastPresentationFrame_ = decision.presentationFrame;
+        hollywoodSkippedPresentationFrames_ += decision.skippedDeadlines;
+        videoPresentationFrames_.push_back(decision.presentationFrame);
+        if (firstVideoFrameMonotonicNanos_ == 0) {
+            firstVideoFrameMonotonicNanos_ =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    now.time_since_epoch()).count();
+        }
+    } catch (...) {
+        Logging::Logger.error("Hollywood presentation timeline sampling failed safely");
+    }
+}
+
 void RecordingController::CreatePersistentAudioCapture() {
     audioObject_ = UnityEngine::GameObject::New_ctor("SaberStage Persistent Game Audio Capture");
     if (!IsUnityObjectAlive(audioObject_)) throw std::runtime_error("cannot create persistent game-audio capture object");
@@ -974,9 +1006,10 @@ void RecordingController::FinalizeAsync() {
             : 0.0;
     Logging::Logger.info(
         "Recording A/V epoch: backend={} firstVideo={}ns firstAudio={}ns audioOffset={:.3f}ms "
-        "timestampedVideoFrames={}",
+        "timestampedVideoFrames={} hollywoodSkippedDeadlines={}",
         settings::ToString(backend), firstVideoFrameMonotonicNanos_, firstAudioSampleMonotonicNanos_,
-        audioStartOffsetSeconds * 1000.0, videoPresentationFrames.size());
+        audioStartOffsetSeconds * 1000.0, videoPresentationFrames.size(),
+        hollywoodSkippedPresentationFrames_);
     finalizer_ = std::thread(
         &RecordingController::FinalizeWorker,
         this,

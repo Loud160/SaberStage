@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 
 namespace {
@@ -42,6 +43,8 @@ int main() {
     Check(!defaults.camera.Primary().anchoredFloatEnabled, "anchored float defaults off");
     Check(defaults.camera.Primary().followMode == saberstage::camera::FollowMode::Player,
           "default camera follows the logical player anchor");
+    Check(defaults.camera.Primary().multisampleCount == 1,
+          "third-person MSAA defaults off to protect Quest 2 gameplay performance");
     Check(defaults.preview.selectedCameraId == "primary", "preview targets the stable primary camera");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
     Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
@@ -61,6 +64,8 @@ int main() {
               defaults.avatar.toonLighting && defaults.avatar.normalMaps &&
               defaults.avatar.rimLighting && !defaults.avatar.matcap &&
               defaults.avatar.emission && defaults.avatar.animatedExpressions &&
+              defaults.avatar.cutoutSmoothing == AvatarCutoutSmoothing::Low &&
+              !defaults.avatar.alphaToMaskEnabled &&
               defaults.avatar.outlines == AvatarOutlineMode::Off &&
               defaults.avatar.materialStage == AvatarMaterialStage::Configured &&
               defaults.avatar.lightingMode == AvatarLightingMode::Balanced,
@@ -76,12 +81,17 @@ int main() {
               defaults.avatar.backwardSpineCurveLimitPercent == 100.0F,
           "stance width and backward spine controls default to original solver behavior");
     Check(defaults.avatar.retargetingProfiles.empty() &&
-              !RetargetingForSelectedAvatar(defaults.avatar).matchPlayerHeight,
-          "avatar fit defaults to natural arm-span height until explicitly enabled");
+              RetargetingForSelectedAvatar(defaults.avatar).armSpanAvatarSizing &&
+              !RetargetingForSelectedAvatar(defaults.avatar).matchPlayerHeight &&
+              RetargetingForSelectedAvatar(defaults.avatar).manualAvatarScalePercent == 100.0F &&
+              RetargetingForSelectedAvatar(defaults.avatar).keepHandsOnSabers &&
+              !RetargetingForSelectedAvatar(defaults.avatar).adjustBodyProportions &&
+              RetargetingForSelectedAvatar(defaults.avatar).autoFloorHeight,
+          "new avatar fitting defaults preserve arm reach while leaving optional geometry passes off");
     Check(defaults.activeAvatarPlayerProfileId == "default" &&
               defaults.avatarPlayerProfiles.size() == 5 &&
-              defaults.avatarPlayerProfiles.front().displayName == "Player 1" &&
-              defaults.avatarPlayerProfiles.back().displayName == "Player 5",
+              defaults.avatarPlayerProfiles.front().displayName == "Profile 1" &&
+              defaults.avatarPlayerProfiles.back().displayName == "Profile 5",
           "five fixed migration-safe Avatar player slots are available");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
@@ -94,6 +104,7 @@ int main() {
     invalid.camera.Primary().profileId.clear();
     invalid.camera.Primary().fovDegrees = 500.0F;
     invalid.camera.Primary().requestedWidth = 1279;
+    invalid.camera.Primary().multisampleCount = 8;
     invalid.preview.scale = -1.0F;
     invalid.preview.selectedCameraId = "missing";
     invalid.preview.position.x = 2000.0F;
@@ -104,6 +115,7 @@ int main() {
     invalid.avatar.selectedFile = "../outside.vrm";
     invalid.avatar.selectedPath = "relative/outside.vrm";
     invalid.avatar.maximumTextureDimension = 8192;
+    invalid.avatar.cutoutSmoothing = static_cast<AvatarCutoutSmoothing>(99);
     invalid.avatar.materialStage = static_cast<AvatarMaterialStage>(99);
     invalid.avatar.lightingMode = static_cast<AvatarLightingMode>(99);
     invalid.avatar.springUpdateRateHz = 1000;
@@ -117,18 +129,34 @@ int main() {
     invalid.avatar.retargetingProfiles.push_back({
         .avatarKey = "/sdcard/Download/Test.vrm",
         .matchPlayerHeight = true,
-        .heightAdjustmentBalance = 5.0F});
+        .heightAdjustmentBalance = 5.0F,
+        .manualAvatarScalePercent = 500.0F,
+        .shoulderWidthPercent = 20.0F,
+        .waistHipWidthPercent = 300.0F,
+        .lowerTorsoWidthPercent = 400.0F,
+        .neckBaseWidthPercent = std::numeric_limits<float>::quiet_NaN(),
+        .torsoHeightPercent = 10.0F,
+        .upperLegLengthPercent = 300.0F,
+        .lowerLegLengthPercent = std::numeric_limits<float>::quiet_NaN(),
+        .legWidthPercent = 400.0F,
+        .neutralKneeBendDegrees = 40.0F,
+        .attackPoseDegrees = -80.0F,
+        .backStiffnessPercent = 200.0F,
+        .floorOffsetMeters = 4.0F});
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
     Check((invalid.camera.Primary().requestedWidth & 1) == 0, "odd encoder dimension becomes even");
+    Check(invalid.camera.Primary().multisampleCount == 1,
+          "unsupported third-person MSAA repairs to the Quest-safe default");
     Check(invalid.recording.framesPerSecond == 30, "recording FPS repairs to a supported hardware rate");
     Check(invalid.recording.peakBitrateBitsPerSecond == invalid.recording.bitrateBitsPerSecond,
           "recording peak bitrate repairs to at least the target bitrate");
     Check(invalid.broadcast.reconnectAttempts == defaults.broadcast.reconnectAttempts,
           "livestream reconnect count repairs to its bounded default");
     Check(invalid.avatar.materialStage == AvatarMaterialStage::Configured &&
-              invalid.avatar.lightingMode == AvatarLightingMode::Balanced,
+              invalid.avatar.lightingMode == AvatarLightingMode::Balanced &&
+              invalid.avatar.cutoutSmoothing == AvatarCutoutSmoothing::Low,
           "invalid avatar material diagnostics repair to configured balanced rendering");
     Check(invalid.avatar.sideStepLeanLimitPercent == defaults.avatar.sideStepLeanLimitPercent,
           "invalid side-step lean limit repairs to the original solver boundary");
@@ -139,8 +167,21 @@ int main() {
                   defaults.avatar.backwardSpineCurveLimitPercent,
           "invalid stance and backward spine limits repair to original behavior");
     Check(invalid.avatar.retargetingProfiles.size() == 1 &&
-              invalid.avatar.retargetingProfiles[0].heightAdjustmentBalance == 0.0F,
-          "invalid per-avatar height balance repairs without losing the avatar key");
+              invalid.avatar.retargetingProfiles[0].heightAdjustmentBalance == 0.0F &&
+              invalid.avatar.retargetingProfiles[0].manualAvatarScalePercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].shoulderWidthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].waistHipWidthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].lowerTorsoWidthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].neckBaseWidthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].torsoHeightPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].upperLegLengthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].lowerLegLengthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].legWidthPercent == 100.0F &&
+              invalid.avatar.retargetingProfiles[0].neutralKneeBendDegrees == 0.0F &&
+              invalid.avatar.retargetingProfiles[0].attackPoseDegrees == 0.0F &&
+              invalid.avatar.retargetingProfiles[0].backStiffnessPercent == 50.0F &&
+              invalid.avatar.retargetingProfiles[0].floorOffsetMeters == 0.0F,
+          "invalid per-avatar fit fields repair independently without losing the avatar key");
 
     auto playerProfiles = defaults;
     playerProfiles.camera.Primary().fovDegrees = 77.0F;
@@ -211,6 +252,7 @@ int main() {
     first.Edit().camera.Primary().fovDegrees = 92.0F;
     first.Edit().camera.Primary().position = {1.0F, 2.0F, -4.0F};
     first.Edit().camera.Primary().anchoredFloatMaxOffsetMeters = 1.25F;
+    first.Edit().camera.Primary().multisampleCount = 2;
     first.Edit().preview.visible = true;
     first.Edit().preview.position = {0.25F, 1.4F, 2.25F};
     first.Edit().preview.rotationDegrees = {5.0F, 175.0F, 0.0F};
@@ -239,6 +281,8 @@ int main() {
     first.Edit().avatar.maximumTextureDimension = 512;
     first.Edit().avatar.qualityPreset = AvatarQualityPreset::Custom;
     first.Edit().avatar.matcap = true;
+    first.Edit().avatar.cutoutSmoothing = AvatarCutoutSmoothing::High;
+    first.Edit().avatar.alphaToMaskEnabled = true;
     first.Edit().avatar.animatedExpressions = false;
     first.Edit().avatar.outlines = AvatarOutlineMode::Reduced;
     first.Edit().avatar.materialStage = AvatarMaterialStage::RimLighting;
@@ -254,8 +298,40 @@ int main() {
     first.Edit().avatar.stanceWidthPercent = 145.0F;
     first.Edit().avatar.backwardSpineCurveLimitPercent = 35.0F;
     auto& savedFit = EditRetargetingForSelectedAvatar(first.Edit().avatar);
+    savedFit.armSpanAvatarSizing = false;
     savedFit.matchPlayerHeight = true;
     savedFit.heightAdjustmentBalance = -0.35F;
+    savedFit.manualAvatarScaleEnabled = true;
+    savedFit.manualAvatarScalePercent = 137.0F;
+    savedFit.keepHandsOnSabers = false;
+    savedFit.gripOffsetsInitialized = true;
+    savedFit.leftControllerToWrist.position = {0.011F, -0.022F, 0.033F};
+    savedFit.leftControllerToWrist.rotationDegrees = {4.0F, 5.0F, 6.0F};
+    savedFit.leftControllerToWrist.gripClosurePercent = 135.0F;
+    savedFit.leftControllerToWrist.thumbCurvePercent = 120.0F;
+    savedFit.rightControllerToWrist.position = {-0.014F, 0.025F, 0.036F};
+    savedFit.rightControllerToWrist.rotationDegrees = {-7.0F, 8.0F, -9.0F};
+    savedFit.rightControllerToWrist.gripClosurePercent = 65.0F;
+    savedFit.rightControllerToWrist.thumbCurvePercent = 75.0F;
+    savedFit.adjustBodyProportions = true;
+    savedFit.torsoWidthPercent = 116.0F;
+    savedFit.autoShoulderWidth = true;
+    savedFit.shoulderWidthPercent = 121.0F;
+    savedFit.waistHipWidthPercent = 94.0F;
+    savedFit.lowerTorsoWidthPercent = 112.0F;
+    savedFit.neckBaseWidthPercent = 108.0F;
+    savedFit.headSizePercent = 125.0F;
+    savedFit.torsoHeightPercent = 106.0F;
+    savedFit.upperLegLengthPercent = 109.0F;
+    savedFit.lowerLegLengthPercent = 96.0F;
+    savedFit.legWidthPercent = 118.0F;
+    savedFit.neutralKneeBendDegrees = 7.0F;
+    savedFit.attackPoseDegrees = 9.0F;
+    savedFit.backStiffnessPercent = 73.0F;
+    savedFit.autoFloorHeight = false;
+    savedFit.floorOffsetMeters = -0.035F;
+    savedFit.preventArmBodyClipping = true;
+    savedFit.armSpringBoneInteraction = true;
     first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
@@ -272,6 +348,8 @@ int main() {
           "camera profile placement survives restart");
     Check(second.Get().camera.Primary().anchoredFloatMaxOffsetMeters == 1.25F,
           "anchored-float tuning survives restart");
+    Check(second.Get().camera.Primary().multisampleCount == 2,
+          "third-person camera MSAA survives restart");
     Check(second.Get().preview.visible && second.Get().preview.position.x == 0.25F &&
               second.Get().preview.rotationDegrees.y == 175.0F && second.Get().preview.scale == 1.5F,
           "floating preview pose, scale, and visibility survive restart");
@@ -305,7 +383,10 @@ int main() {
               second.Get().avatar.maximumTextureDimension == 512 &&
               second.Get().avatar.leftControllerToWrist.position.z == 0.03F &&
               second.Get().avatar.qualityPreset == AvatarQualityPreset::Custom &&
-              second.Get().avatar.matcap && !second.Get().avatar.animatedExpressions &&
+              second.Get().avatar.matcap &&
+              second.Get().avatar.cutoutSmoothing == AvatarCutoutSmoothing::High &&
+              second.Get().avatar.alphaToMaskEnabled &&
+              !second.Get().avatar.animatedExpressions &&
               second.Get().avatar.outlines == AvatarOutlineMode::Reduced &&
               second.Get().avatar.materialStage == AvatarMaterialStage::RimLighting &&
               second.Get().avatar.lightingMode == AvatarLightingMode::Studio &&
@@ -320,8 +401,33 @@ int main() {
           "avatar selection, visual quality, SpringBone budget, and wrist calibration survive restart");
     const auto loadedFit = RetargetingForSelectedAvatar(second.Get().avatar);
     Check(loadedFit.avatarKey == "/sdcard/Download/Black Heart.vrm" &&
-              loadedFit.matchPlayerHeight && loadedFit.heightAdjustmentBalance == -0.35F,
-          "per-avatar height matching and balance survive restart");
+              !loadedFit.armSpanAvatarSizing && loadedFit.matchPlayerHeight &&
+              loadedFit.heightAdjustmentBalance == -0.35F &&
+              loadedFit.manualAvatarScaleEnabled && loadedFit.manualAvatarScalePercent == 137.0F &&
+              !loadedFit.keepHandsOnSabers && loadedFit.gripOffsetsInitialized &&
+              loadedFit.leftControllerToWrist.position.z == 0.033F &&
+              loadedFit.leftControllerToWrist.gripClosurePercent == 135.0F &&
+              loadedFit.leftControllerToWrist.thumbCurvePercent == 120.0F &&
+              loadedFit.rightControllerToWrist.rotationDegrees.z == -9.0F &&
+              loadedFit.rightControllerToWrist.gripClosurePercent == 65.0F &&
+              loadedFit.rightControllerToWrist.thumbCurvePercent == 75.0F &&
+              loadedFit.adjustBodyProportions && loadedFit.autoShoulderWidth &&
+              loadedFit.torsoWidthPercent == 116.0F &&
+              loadedFit.shoulderWidthPercent == 121.0F &&
+              loadedFit.waistHipWidthPercent == 94.0F &&
+              loadedFit.lowerTorsoWidthPercent == 112.0F &&
+              loadedFit.neckBaseWidthPercent == 108.0F &&
+              loadedFit.headSizePercent == 125.0F &&
+              loadedFit.torsoHeightPercent == 106.0F &&
+              loadedFit.upperLegLengthPercent == 109.0F &&
+              loadedFit.lowerLegLengthPercent == 96.0F &&
+              loadedFit.legWidthPercent == 118.0F &&
+              loadedFit.neutralKneeBendDegrees == 7.0F &&
+              loadedFit.attackPoseDegrees == 9.0F &&
+              loadedFit.backStiffnessPercent == 73.0F &&
+              !loadedFit.autoFloorHeight && loadedFit.floorOffsetMeters == -0.035F &&
+              loadedFit.preventArmBodyClipping && loadedFit.armSpringBoneInteraction,
+          "all per-avatar fit, grip, posture, floor, and collision controls survive restart");
     const auto savedSecondPlayerId = std::string("player-2");
     Check(SwitchAvatarPlayerProfile(second.Edit(), savedSecondPlayerId),
           "second fixed player slot can be selected");

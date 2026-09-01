@@ -149,6 +149,17 @@ struct ReachModel {
     float playerArmSpanConfidence = 0.0F;
 };
 
+// Shoulder width is inferred from several accepted straight-arm poses rather
+// than copied from one headset-relative anthropometric constant. The residual
+// and confidence make the estimate explicitly optional: runtime fitting uses
+// it only when the observations agree closely enough on both sides.
+struct BodyFitModel {
+    float estimatedShoulderWidth = 0.0F;
+    float shoulderWidthResidual = 0.0F;
+    float shoulderWidthConfidence = 0.0F;
+    std::uint32_t shoulderObservationCount = 0;
+};
+
 struct DirectionalMotionSignature {
     float peakDisplacementNormalized = 0.0F;
     float finalDisplacementNormalized = 0.0F;
@@ -180,6 +191,10 @@ struct CrouchModel {
 
 struct TurnModel {
     float softNeckConeDegrees = 28.0F;
+    float softNeckPitchUpDegrees = 28.0F;
+    float softNeckPitchDownDegrees = 35.0F;
+    float hardNeckPitchUpDegrees = 50.0F;
+    float hardNeckPitchDownDegrees = 60.0F;
     float turnDwellSeconds = 0.16F;
     float settleHoldSeconds = 0.14F;
     float bodyYawDegreesPerSecond = 105.0F;
@@ -197,10 +212,12 @@ struct PlayerCalibrationProfile {
     std::array<MotionCapture, kCalibrationStepCount> motionCaptures{};
     GripFit grip{};
     ReachModel reach{};
+    BodyFitModel bodyFit{};
     LeanEnvelope lean{};
     DirectionalMotionSignature steps[4]{};
     CrouchModel crouch{};
     TurnModel turn{};
+    float calibratedFloorHeight = 0.0F;
     float overallConfidence = 0.0F;
     bool complete = false;
     bool valid = false;
@@ -219,6 +236,7 @@ struct RuntimePlayerProfile {
     DirectionalMotionSignature stepSignature[4]{};
     CrouchModel crouch{};
     TurnModel turn{};
+    float calibratedFloorHeight = 0.0F;
     float gripResidualDegrees[2]{};
     // Keep the component confidences in the allocation-free runtime view.
     // Overall confidence alone is not sufficient: an otherwise valid body
@@ -227,6 +245,10 @@ struct RuntimePlayerProfile {
     float reachConfidence[2]{};
     float playerArmSpan = 0.0F;
     float playerArmSpanConfidence = 0.0F;
+    float estimatedShoulderWidth = 0.0F;
+    float shoulderWidthResidual = 0.0F;
+    float shoulderWidthConfidence = 0.0F;
+    std::uint32_t shoulderObservationCount = 0;
     float overallConfidence = 0.0F;
     bool valid = false;
 };

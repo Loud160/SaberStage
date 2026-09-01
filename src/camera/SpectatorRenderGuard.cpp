@@ -108,7 +108,10 @@ void SpectatorRenderGuard::OnPreCull() {
 
 void SpectatorRenderGuard::OnPostRender() {
     RestoreTransitioningViewControllers();
-    if (activeManager != nullptr) activeManager->SetPreviewCaptureExcluded(false);
+    if (activeManager != nullptr) {
+        activeManager->FinishSpectatorRender();
+        activeManager->SetPreviewCaptureExcluded(false);
+    }
 }
 
 void SpectatorRenderGuard::OnDisable() {

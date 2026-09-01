@@ -18,16 +18,6 @@ namespace {
 // captures distinguishable from recordings made by the system recorder.
 const std::filesystem::path kQuestVideoShotsDirectory{"/sdcard/Oculus/VideoShots"};
 
-avatar::Pose AvatarOffsetPose(const settings::AvatarControllerOffsetSettings& offset) {
-    constexpr float degreesToRadians = 0.01745329251994329577F;
-    const auto pitch = avatar::AxisAngle({1.0F, 0.0F, 0.0F}, offset.rotationDegrees.x * degreesToRadians);
-    const auto yaw = avatar::AxisAngle({0.0F, 1.0F, 0.0F}, offset.rotationDegrees.y * degreesToRadians);
-    const auto roll = avatar::AxisAngle({0.0F, 0.0F, 1.0F}, offset.rotationDegrees.z * degreesToRadians);
-    return {
-        {offset.position.x, offset.position.y, offset.position.z},
-        avatar::Multiply(avatar::Multiply(yaw, pitch), roll)};
-}
-
 } // namespace
 
 ApplicationRoot::ApplicationRoot(std::filesystem::path settingsPath) : settings_(std::move(settingsPath)) {}
@@ -62,9 +52,6 @@ bool ApplicationRoot::ApplyConfiguredAvatar(std::string* error) {
             error)) {
         return false;
     }
-    avatar_->SetControllerToWristOffsets(
-        AvatarOffsetPose(avatarProfile.leftControllerToWrist),
-        AvatarOffsetPose(avatarProfile.rightControllerToWrist));
     avatar_->SetAvatarVisible(avatarProfile.visible);
     avatar_->ApplyAvatarSettings(avatarProfile);
     return true;

@@ -202,6 +202,35 @@ void TestMultiPoseFit() {
     Check(profile.reach.playerArmSpan > 1.20F &&
               profile.reach.playerArmSpanConfidence > 0.50F,
           "stable T-pose endpoints produce a confident player arm span");
+    Check(profile.bodyFit.estimatedShoulderWidth >= kHeight * 0.16F &&
+              profile.bodyFit.estimatedShoulderWidth <= kHeight * 0.34F &&
+              profile.bodyFit.shoulderObservationCount >= 8,
+          "multiple accepted straight-arm poses produce a bounded shoulder estimate");
+    Check(profile.bodyFit.shoulderWidthConfidence < 0.60F,
+          "inconsistent straight-arm lengths stay below the automatic shoulder confidence gate");
+
+    auto consistentShoulders = profile;
+    for (const auto step : {CalibrationStep::ArmsT, CalibrationStep::ArmsForward,
+             CalibrationStep::ArmsOutward45, CalibrationStep::ArmsY,
+             CalibrationStep::ArmsOverhead}) {
+        auto& capture = consistentShoulders.staticCaptures[Index(step)];
+        for (int side = 0; side < 2; ++side) {
+            const auto shoulder = capture.head.position + Vec3{
+                (side == 0 ? -1.0F : 1.0F) * kHeight * 0.105F,
+                -kHeight * 0.17F,
+                -kHeight * 0.025F};
+            const auto direction = Normalize(
+                capture.grip[side].position - shoulder,
+                {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F});
+            capture.grip[side].position = shoulder + direction * 0.54F;
+            capture.effectiveReach[side] = 0.54F;
+        }
+    }
+    std::string shoulderFitError;
+    Check(FitPlayerCalibrationProfile(consistentShoulders, &shoulderFitError) &&
+              consistentShoulders.bodyFit.shoulderWidthConfidence >= 0.60F &&
+              consistentShoulders.bodyFit.shoulderObservationCount >= 8,
+          "mutually consistent straight-arm observations pass the automatic shoulder confidence gate");
     Check(Near(profile.lean.leftNormalized, 0.085F) &&
           Near(profile.lean.forwardNormalized, 0.115F),
           "directional lean boundaries remain asymmetric");
@@ -214,6 +243,11 @@ void TestMultiPoseFit() {
     Check(Near(runtime.playerArmSpan, profile.reach.playerArmSpan) &&
               Near(runtime.playerArmSpanConfidence, profile.reach.playerArmSpanConfidence),
           "runtime profile carries allocation-free arm-span fit data");
+    Check(Near(runtime.estimatedShoulderWidth, profile.bodyFit.estimatedShoulderWidth) &&
+              Near(runtime.shoulderWidthConfidence, profile.bodyFit.shoulderWidthConfidence) &&
+              runtime.shoulderObservationCount == profile.bodyFit.shoulderObservationCount &&
+              Near(runtime.calibratedFloorHeight, profile.calibratedFloorHeight),
+          "runtime profile carries shoulder and calibrated-floor fit data without trajectories");
     Check(runtime.valid && Near(runtime.overallConfidence, profile.overallConfidence),
           "persistent profile builds a fixed-size valid runtime view");
 }

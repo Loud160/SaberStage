@@ -344,6 +344,209 @@ void TestArmSpanScalingAndHeightRetargeting() {
           "HMD motion is applied relative to the calibrated neutral avatar head");
 }
 
+void TestExtendedAvatarFitOptions() {
+    const auto avatar = BuildAvatar();
+    const auto tracking = BuildTracking();
+    const auto player = BuildPlayer(tracking);
+    calibration::RuntimePlayerProfile profile{};
+    profile.valid = true;
+    profile.playerArmSpanConfidence = 0.95F;
+    profile.playerArmSpan = avatar.approximateArmSpan * 4.0F;
+
+    AvatarFitOptions options{};
+    auto fit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(fit.valid && fit.armSpanBased && fit.scaleClamped && Near(fit.baseUniformScale, 2.50F),
+          "arm-span sizing clamps only at the documented 2.5x safety maximum");
+
+    options.armSpanAvatarSizing = false;
+    fit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(fit.valid && !fit.armSpanBased &&
+              Near(fit.baseUniformScale, player.standingHmdHeight / avatar.eyeHeight),
+          "legacy mode restores the original standing-height scale source");
+
+    profile.playerArmSpan = avatar.approximateArmSpan * 0.90F;
+    options.armSpanAvatarSizing = true;
+    options.matchPlayerHeight = true;
+    options.manualAvatarScaleEnabled = true;
+    options.manualAvatarScale = 1.40F;
+    fit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(fit.valid && fit.heightCorrectionApplied && Near(fit.manualScale, 1.40F) &&
+              Near(fit.uniformScale, fit.baseUniformScale * 1.40F) &&
+              Near(fit.finalEyeHeight, player.standingHmdHeight * 1.40F, 0.01F),
+          "manual avatar size establishes the final height before post-scale height balancing");
+    options.heightAdjustmentBalance = -1.0F;
+    const auto finalScaleLegBalance = ComputeAvatarRetargeting(avatar, player, profile, options);
+    options.heightAdjustmentBalance = 1.0F;
+    const auto finalScaleTorsoBalance = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(Near(finalScaleLegBalance.uniformScale, finalScaleTorsoBalance.uniformScale) &&
+              Near(finalScaleLegBalance.finalEyeHeight, finalScaleTorsoBalance.finalEyeHeight, 0.01F) &&
+              finalScaleLegBalance.lowerBodyScale > finalScaleTorsoBalance.lowerBodyScale &&
+              finalScaleTorsoBalance.torsoScale > finalScaleLegBalance.torsoScale,
+          "height balance runs after final scale and changes proportions without changing height or arm span");
+
+    calibration::RuntimePlayerProfile missingProfile{};
+    options.manualAvatarScaleEnabled = false;
+    options.heightAdjustmentBalance = 0.0F;
+    const auto fallbackEven = ComputeAvatarRetargeting(
+        avatar, player, missingProfile, options);
+    options.heightAdjustmentBalance = -1.0F;
+    const auto fallbackLegBalance = ComputeAvatarRetargeting(
+        avatar, player, missingProfile, options);
+    options.heightAdjustmentBalance = 1.0F;
+    const auto fallbackTorsoBalance = ComputeAvatarRetargeting(
+        avatar, player, missingProfile, options);
+    Check(!fallbackEven.armSpanBased &&
+              Near(fallbackLegBalance.uniformScale, fallbackTorsoBalance.uniformScale) &&
+              Near(fallbackLegBalance.finalEyeHeight, fallbackTorsoBalance.finalEyeHeight, 0.01F) &&
+              fallbackLegBalance.lowerBodyScale > fallbackEven.lowerBodyScale &&
+              fallbackLegBalance.torsoScale < fallbackEven.torsoScale &&
+              fallbackTorsoBalance.lowerBodyScale < fallbackEven.lowerBodyScale &&
+              fallbackTorsoBalance.torsoScale > fallbackEven.torsoScale,
+          "height balance remains a visible height-preserving proportion control when calibration falls back safely");
+
+    options.manualAvatarScaleEnabled = false;
+    options.heightAdjustmentBalance = 0.0F;
+    options.adjustBodyProportions = true;
+    options.autoShoulderWidth = true;
+    options.shoulderWidthScale = 1.22F;
+    profile.estimatedShoulderWidth = avatar.shoulderWidth * 0.90F * 1.35F;
+    profile.shoulderWidthConfidence = 0.82F;
+    fit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    const auto armChains = avatar.approximateArmSpan - avatar.shoulderWidth;
+    Check(fit.automaticShoulderWidthApplied &&
+              Near(fit.shoulderWidthScale * avatar.shoulderWidth * fit.baseUniformScale,
+                   profile.estimatedShoulderWidth, 0.001F) &&
+              Near(fit.baseUniformScale * armChains + profile.estimatedShoulderWidth,
+                   profile.playerArmSpan, 0.001F),
+          "automatic shoulder width contributes to effective arm span instead of extending reach on top of it");
+    profile.shoulderWidthConfidence = 0.59F;
+    fit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(!fit.automaticShoulderWidthApplied && Near(fit.shoulderWidthScale, 1.22F),
+          "low-confidence automatic shoulder fit falls back to the retained manual value");
+
+    options.autoShoulderWidth = false;
+    options.shoulderWidthScale = 1.75F;
+    const auto wideShoulderFit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(wideShoulderFit.baseUniformScale < fit.baseUniformScale &&
+              Near(wideShoulderFit.baseUniformScale * wideShoulderFit.avatarArmSpan,
+                   profile.playerArmSpan, 0.001F),
+          "manual shoulder widening increases natural reach and is included in arm-span fitting");
+
+    options.torsoWidthScale = 1.20F;
+    const auto wideTorsoFit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    Check(wideTorsoFit.baseUniformScale < wideShoulderFit.baseUniformScale &&
+              Near(wideTorsoFit.baseUniformScale * wideTorsoFit.avatarArmSpan,
+                   profile.playerArmSpan, 0.001F) &&
+              Near(wideTorsoFit.avatarArmSpan,
+                   armChains + avatar.shoulderWidth * 1.20F * 1.75F, 0.001F),
+          "base torso width is applied before shoulder width and contributes to effective arm span");
+
+    options.torsoHeightScale = 1.20F;
+    options.upperLegLengthScale = 1.15F;
+    options.lowerLegLengthScale = 0.90F;
+    options.lowerTorsoWidthScale = 1.25F;
+    options.neckBaseWidthScale = 1.30F;
+    options.legWidthScale = 1.40F;
+    const auto proportionFit = ComputeAvatarRetargeting(avatar, player, profile, options);
+    SolvedHumanoidPose proportionPose{};
+    SolvedHumanoidPose wideShoulderPose{};
+    Check(BuildRetargetedNeutralPose(avatar, player, proportionFit, proportionPose),
+          "manual torso and leg segment proportions rebuild the neutral skeleton");
+    Check(BuildRetargetedNeutralPose(avatar, player, wideTorsoFit, wideShoulderPose),
+          "baseline torso-and-shoulder neutral skeleton rebuilds for isolated length comparison");
+    const auto upperLeg = Length(
+        proportionPose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position -
+        proportionPose.bones[BoneIndex(HumanoidBone::LeftUpperLeg)].position);
+    const auto lowerLeg = Length(
+        proportionPose.bones[BoneIndex(HumanoidBone::LeftFoot)].position -
+        proportionPose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position);
+    const auto baselineUpperLeg = Length(
+        wideShoulderPose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position -
+        wideShoulderPose.bones[BoneIndex(HumanoidBone::LeftUpperLeg)].position);
+    const auto baselineLowerLeg = Length(
+        wideShoulderPose.bones[BoneIndex(HumanoidBone::LeftFoot)].position -
+        wideShoulderPose.bones[BoneIndex(HumanoidBone::LeftLowerLeg)].position);
+    Check(upperLeg > baselineUpperLeg * 1.10F &&
+              lowerLeg < baselineLowerLeg * 0.95F &&
+              proportionFit.finalEyeHeight > wideShoulderFit.finalEyeHeight,
+          "hip-knee, knee-ankle, and torso-height controls alter the intended segments and final height");
+
+    StaticTrackerlessAvatarSolver solver{};
+    SolverPersistentState baselineGripState{};
+    SolvedHumanoidPose baselineGripPose{};
+    SolverDiagnostics baselineGripDiagnostics{};
+    Check(solver.Solve(
+              tracking, avatar, player, profile, baselineGripState,
+              baselineGripPose, &baselineGripDiagnostics),
+          "unadjusted hand target solves before manual 6DOF placement");
+    const auto baselineGripElbow =
+        baselineGripPose.bones[BoneIndex(HumanoidBone::LeftLowerArm)].position;
+    options = {};
+    options.gripAdjustment[0].position = {0.012F, -0.018F, 0.025F};
+    options.autoFloorHeight = false;
+    options.floorOffsetMeters = 0.04F;
+    Check(solver.SetFitOptions(options), "grip and calibrated-floor settings update the solver fit");
+    profile.calibratedFloorHeight = -0.08F;
+    SolverPersistentState state{};
+    SolvedHumanoidPose pose{};
+    SolverDiagnostics diagnostics{};
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "manual calibrated-floor and grip-adjusted pose solves");
+    const auto recoveredAdjustment = RelativeTo(
+        diagnostics.handBaseTarget[0], diagnostics.handTarget[0]);
+    Check(Length(recoveredAdjustment.position - options.gripAdjustment[0].position) < 0.001F &&
+              SameRotation(recoveredAdjustment.rotation, options.gripAdjustment[0].rotation, 0.001F) &&
+              Length(pose.bones[BoneIndex(HumanoidBone::LeftLowerArm)].position - baselineGripElbow) > 0.0001F,
+          "per-avatar grip adjustment is one local rigid transform that drives the arm IK target");
+    const auto unrotatedHand = diagnostics.finalHand[0].rotation;
+    options.gripAdjustment[0].rotation = AxisAngle({0.0F, 0.0F, 1.0F}, 0.20F);
+    Check(solver.SetFitOptions(options), "manual grip rotation changes the active solver fit");
+    solver.Reset(state);
+    Check(solver.Solve(tracking, avatar, player, profile, state, pose, &diagnostics),
+          "manual grip rotation survives a full solver-state reseed");
+    const auto rotatedAdjustment = RelativeTo(
+        diagnostics.handBaseTarget[0], diagnostics.handTarget[0]);
+    Check(!SameRotation(diagnostics.finalHand[0].rotation, unrotatedHand, 0.002F) &&
+              Length(rotatedAdjustment.position - options.gripAdjustment[0].position) < 0.001F &&
+              SameRotation(rotatedAdjustment.rotation, options.gripAdjustment[0].rotation, 0.001F),
+          "manual target rotation drives the wrist while preserving the local target offset");
+    const Pose liveAdjustment{
+        {-0.021F, 0.014F, 0.033F},
+        AxisAngle({0.0F, 1.0F, 0.0F}, -0.31F)};
+    Check(solver.SetGripAdjustment(0, liveAdjustment),
+          "interactive hand-target update changes only the selected grip adjustment");
+    Check(!solver.SetGripAdjustment(-1, liveAdjustment) &&
+              !solver.SetGripAdjustment(2, liveAdjustment),
+          "interactive hand-target update rejects invalid hand indices");
+    const auto liveTracking = NextFrame(tracking, tracking.head.pose.position);
+    Check(solver.Solve(liveTracking, avatar, player, profile, state, pose, &diagnostics),
+          "interactive hand-target update solves without reseeding the full solver");
+    const auto recoveredLiveAdjustment = RelativeTo(
+        diagnostics.handBaseTarget[0], diagnostics.handTarget[0]);
+    Check(Length(recoveredLiveAdjustment.position - liveAdjustment.position) < 0.001F &&
+              SameRotation(recoveredLiveAdjustment.rotation, liveAdjustment.rotation, 0.001F),
+          "interactive hand-target update reaches the same local 6DOF transform used by saved settings");
+    const auto selectedFloor = profile.calibratedFloorHeight + options.floorOffsetMeters;
+    const auto footPivotAboveFloor =
+        (avatar.rest.bones[BoneIndex(HumanoidBone::LeftFoot)].world.position.y - avatar.floorHeight) *
+        diagnostics.retargeting.uniformScale;
+    Check(Near(state.footAnchor[0].y, selectedFloor + footPivotAboveFloor, 0.002F) &&
+              Near(state.footAnchor[1].y, selectedFloor + footPivotAboveFloor, 0.002F),
+          "manual floor mode applies the calibrated plane and then the signed user offset");
+
+    options.neutralKneeBendDegrees = 10.0F;
+    options.attackPoseDegrees = 12.0F;
+    Check(solver.SetFitOptions(options), "knee bend and attack-pose settings update the solver");
+    solver.Reset(state);
+    auto next = NextFrame(tracking, tracking.head.pose.position);
+    Check(solver.Solve(next, avatar, player, profile, state, pose, &diagnostics),
+          "combined knee bend and attack pose solve");
+    Check(diagnostics.eyeTargetError < 0.0001F &&
+              Near(state.footAnchor[0].y, selectedFloor + footPivotAboveFloor, 0.002F) &&
+              diagnostics.forwardHingeAmount > 0.0F,
+          "posture bias preserves exact eyes and planted floor while adding a forward hinge");
+}
+
 calibration::RuntimePlayerProfile BuildRuntimePlayerProfile() {
     calibration::RuntimePlayerProfile profile{};
     profile.valid = true;
@@ -681,7 +884,10 @@ void TestArmReachBendAndGripAuthority() {
           "controller-source reach sample solves before gameplay");
     tracking = NextFrame(tracking, tracking.head.pose.position);
     tracking.handIsSaberGrip[0] = true;
-    tracking.leftHand.pose.position = {-1.25F, 1.40F, 0.10F};
+    // Keep this well beyond the new 2.5x emergency reach extension. The
+    // default Keep Hands on Sabers mode must still preserve the tracked grip
+    // exactly while exposing the unresolved chain error diagnostically.
+    tracking.leftHand.pose.position = {-2.50F, 1.40F, 0.10F};
     Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics), "saber-handle target pose solves");
     Check(Length(diagnostics.handTarget[0].position - tracking.leftHand.pose.position) < 0.0001F,
           "authoritative saber handle bypasses controller-only position offsets");
@@ -702,7 +908,7 @@ void TestArmReachBendAndGripAuthority() {
     Check(!SameRotation(calibratedHandRotation, diagnostics.finalHand[0].rotation, 0.005F),
           "persistent grip-to-hand offset carries subsequent grip rotation into the wrist");
     Check(SameRotation(diagnostics.finalHand[0].rotation,
-              Multiply(diagnostics.handTarget[0].rotation, diagnostics.gripToHandRotation[0]), 0.001F),
+              diagnostics.handTarget[0].rotation, 0.001F),
           "tracked saber wrist orientation remains authoritative instead of being clamped away from the grip");
 
     tracking = NextFrame(tracking, tracking.head.pose.position);
@@ -714,9 +920,51 @@ void TestArmReachBendAndGripAuthority() {
           "wrist inversion protection never releases the tracked saber position");
     Check(!SameRotation(
               diagnostics.finalHand[0].rotation,
-              Multiply(diagnostics.handTarget[0].rotation, diagnostics.gripToHandRotation[0]),
+              diagnostics.handTarget[0].rotation,
               0.01F) && diagnostics.wristRotationErrorDegrees[0] > 1.0F,
           "an inverted tracked grip is rotation-limited instead of turning the hand inside-out");
+
+    AvatarFitOptions releasedReach{};
+    releasedReach.keepHandsOnSabers = false;
+    Check(solver.SetFitOptions(releasedReach),
+          "disabling Keep Hands on Sabers changes the active fit mode");
+    solver.Reset(state);
+    tracking = BuildTracking();
+    tracking.handIsSaberGrip[0] = true;
+    tracking.leftHand.pose.position = {-2.50F, 1.40F, 0.10F};
+    Check(solver.Solve(tracking, avatar, offsetPlayer, state, pose, &diagnostics),
+          "unreachable saber solves when emergency extension is disabled");
+    Check(!diagnostics.trackedGripHardAnchored[0] &&
+              diagnostics.handTargetError[0] > 0.05F &&
+              Near(diagnostics.upperArmLength[0],
+                   avatar.upperArmLength[0] * diagnostics.retargeting.uniformScale, 0.001F) &&
+              Near(diagnostics.lowerArmLength[0],
+                   avatar.lowerArmLength[0] * diagnostics.retargeting.uniformScale, 0.001F) &&
+              Length(diagnostics.finalHand[0].position - tracking.leftHand.pose.position) > 0.05F,
+          "disabling Keep Hands on Sabers preserves authored arm lengths and leaves an unreachable arm short");
+    releasedReach.keepHandsOnSabers = true;
+    Check(solver.SetFitOptions(releasedReach),
+          "re-enabling Keep Hands on Sabers restores the authoritative grip mode");
+
+    solver.Reset(state);
+    auto insideBodyTracking = BuildTracking();
+    insideBodyTracking.handIsSaberGrip[0] = true;
+    insideBodyTracking.leftHand.pose.position = {0.0F, 1.25F, 0.0F};
+    Check(solver.Solve(insideBodyTracking, avatar, player, state, pose, &diagnostics),
+          "inside-body saber target solves with collision disabled");
+    const auto uncorrectedInsideBodyHand = diagnostics.finalHand[0].position;
+    releasedReach.preventArmBodyClipping = true;
+    Check(solver.SetFitOptions(releasedReach),
+          "enabling arm-body clipping prevention changes the active fit mode");
+    solver.Reset(state);
+    Check(solver.Solve(insideBodyTracking, avatar, player, state, pose, &diagnostics),
+          "inside-body saber target solves with collision enabled");
+    Check(diagnostics.finalHand[0].position.z > uncorrectedInsideBodyHand.z + 0.05F &&
+              Length(diagnostics.handTarget[0].position - insideBodyTracking.leftHand.pose.position) < 0.0001F,
+          "collision prevention moves an impossible inside-body hand to the torso surface without hiding the tracked target");
+    releasedReach.preventArmBodyClipping = false;
+    Check(solver.SetFitOptions(releasedReach),
+          "disabling arm-body clipping prevention restores the ordinary arm path");
 
     solver.Reset(state);
     tracking = BuildTracking();
@@ -1312,6 +1560,7 @@ void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); 
 int main() {
     TestCalibration();
     TestArmSpanScalingAndHeightRetargeting();
+    TestExtendedAvatarFitOptions();
     TestTwoBone();
     TestFabrik();
     TestUpperBodyRegressionAndAllocations();

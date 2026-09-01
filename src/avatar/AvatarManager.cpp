@@ -26,6 +26,9 @@
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Vector3.hpp"
 #include "UnityEngine/Quaternion.hpp"
+#include "UnityEngine/Pose.hpp"
+#include "UnityEngine/SpatialTracking/PoseDataSource.hpp"
+#include "UnityEngine/XR/XRNode.hpp"
 #include "beatsaber-hook/shared/utils/byref.hpp"
 #include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
 
@@ -41,6 +44,8 @@
 namespace saberstage::avatar {
 namespace {
 
+Pose AvatarOffsetPose(const settings::AvatarControllerOffsetSettings& offset) noexcept;
+
 vrm::RuntimeOptions RuntimeOptionsFromSettings(const settings::AvatarSettings& settings) noexcept {
     vrm::RuntimeOptions options;
     options.maximumTextureDimension = static_cast<std::uint32_t>(std::clamp(settings.maximumTextureDimension, 256, 4096));
@@ -50,6 +55,8 @@ vrm::RuntimeOptions RuntimeOptionsFromSettings(const settings::AvatarSettings& s
     options.rimLighting = settings.rimLighting;
     options.matcap = settings.matcap;
     options.emission = settings.emission;
+    options.cutoutSmoothing = static_cast<std::int32_t>(settings.cutoutSmoothing);
+    options.alphaToMaskEnabled = settings.alphaToMaskEnabled;
     options.outlineMode = static_cast<std::int32_t>(settings.outlines);
     options.materialStage = static_cast<std::int32_t>(settings.materialStage);
     options.lightingMode = static_cast<std::int32_t>(settings.lightingMode);
@@ -61,6 +68,67 @@ vrm::RuntimeOptions RuntimeOptionsFromSettings(const settings::AvatarSettings& s
     options.maximumSpringChains = settings.maximumSpringChains;
     options.maximumSpringJoints = settings.maximumSpringJoints;
     return options;
+}
+
+bool SameRuntimeOptions(
+    const vrm::RuntimeOptions& left,
+    const vrm::RuntimeOptions& right) noexcept {
+    return left.maximumTextureDimension == right.maximumTextureDimension &&
+        left.avatarLayer == right.avatarLayer && left.visible == right.visible &&
+        left.toonLighting == right.toonLighting && left.normalMaps == right.normalMaps &&
+        left.rimLighting == right.rimLighting && left.matcap == right.matcap &&
+        left.emission == right.emission &&
+        left.cutoutSmoothing == right.cutoutSmoothing &&
+        left.alphaToMaskEnabled == right.alphaToMaskEnabled &&
+        left.outlineMode == right.outlineMode &&
+        left.materialStage == right.materialStage && left.lightingMode == right.lightingMode &&
+        left.springBones == right.springBones && left.springQuality == right.springQuality &&
+        left.springCollisionQuality == right.springCollisionQuality &&
+        left.springUpdateRateHz == right.springUpdateRateHz &&
+        left.springSubsteps == right.springSubsteps &&
+        left.maximumSpringChains == right.maximumSpringChains &&
+        left.maximumSpringJoints == right.maximumSpringJoints;
+}
+
+AvatarFitOptions FitOptionsFromSettings(const settings::AvatarRetargetingSettings& fit) noexcept {
+    AvatarFitOptions options{};
+    options.armSpanAvatarSizing = fit.armSpanAvatarSizing;
+    options.matchPlayerHeight = fit.matchPlayerHeight;
+    options.heightAdjustmentBalance = fit.heightAdjustmentBalance;
+    options.manualAvatarScaleEnabled = fit.manualAvatarScaleEnabled;
+    options.manualAvatarScale = fit.manualAvatarScalePercent / 100.0F;
+    options.keepHandsOnSabers = fit.keepHandsOnSabers;
+    options.gripAdjustment[0] = AvatarOffsetPose(fit.leftControllerToWrist);
+    options.gripAdjustment[1] = AvatarOffsetPose(fit.rightControllerToWrist);
+    options.adjustBodyProportions = fit.adjustBodyProportions;
+    options.torsoWidthScale = fit.torsoWidthPercent / 100.0F;
+    options.autoShoulderWidth = fit.autoShoulderWidth;
+    options.shoulderWidthScale = fit.shoulderWidthPercent / 100.0F;
+    options.waistHipWidthScale = fit.waistHipWidthPercent / 100.0F;
+    options.lowerTorsoWidthScale = fit.lowerTorsoWidthPercent / 100.0F;
+    options.neckBaseWidthScale = fit.neckBaseWidthPercent / 100.0F;
+    options.torsoHeightScale = fit.torsoHeightPercent / 100.0F;
+    options.upperLegLengthScale = fit.upperLegLengthPercent / 100.0F;
+    options.lowerLegLengthScale = fit.lowerLegLengthPercent / 100.0F;
+    options.legWidthScale = fit.legWidthPercent / 100.0F;
+    options.neutralKneeBendDegrees = fit.neutralKneeBendDegrees;
+    options.attackPoseDegrees = fit.attackPoseDegrees;
+    options.backStiffness = fit.backStiffnessPercent / 100.0F;
+    options.autoFloorHeight = fit.autoFloorHeight;
+    options.floorOffsetMeters = fit.floorOffsetMeters;
+    options.preventArmBodyClipping = fit.preventArmBodyClipping;
+    options.armSpringBoneInteraction = fit.armSpringBoneInteraction;
+    return options;
+}
+
+Pose AvatarOffsetPose(const settings::AvatarControllerOffsetSettings& offset) noexcept {
+    constexpr float degreesToRadians = 0.01745329251994329577F;
+    const auto pitch = AxisAngle({1.0F, 0.0F, 0.0F}, offset.rotationDegrees.x * degreesToRadians);
+    const auto yaw = AxisAngle({0.0F, 1.0F, 0.0F}, offset.rotationDegrees.y * degreesToRadians);
+    const auto roll = AxisAngle({0.0F, 0.0F, 1.0F}, offset.rotationDegrees.z * degreesToRadians);
+    return {
+        {offset.position.x, offset.position.y, offset.position.z},
+        Multiply(Multiply(yaw, pitch), roll)};
 }
 
 UnityEngine::Vector3 ToUnity(Vec3 value) noexcept { return {value.x, value.y, value.z}; }
@@ -292,6 +360,45 @@ TrackedPose SampleControllerPose(
     return result;
 }
 
+TrackedPose SampleXrNodePose(
+    UnityEngine::XR::XRNode node,
+    UnityEngine::Transform* trackingRoot,
+    const TrackedPose& previous,
+    double timestamp) {
+    TrackedPose result{};
+    if (!IsAlive(trackingRoot)) return result;
+
+    UnityEngine::Pose localPose = UnityEngine::Pose::get_identity();
+    const auto flags = UnityEngine::SpatialTracking::PoseDataSource::GetNodePoseData(
+        node, byref(localPose));
+    // PoseDataFlags is a bit field: a usable hand target needs both position
+    // and rotation. This source remains available even when Beat Saber disables
+    // the non-pointer VRController component in a menu, which previously froze
+    // the entire avatar in its binding T-pose.
+    if ((flags.value__ & 0x3) != 0x3) return result;
+
+    const auto rootRotation = FromUnity(trackingRoot->get_rotation());
+    result.pose = {
+        FromUnity(trackingRoot->TransformPoint(localPose.position)),
+        Multiply(rootRotation, FromUnity(localPose.rotation))};
+    result.timestampSeconds = timestamp;
+    result.valid = IsFinite(result.pose.position) && IsFinite(result.pose.rotation);
+    const auto delta = static_cast<float>(timestamp - previous.timestampSeconds);
+    if (!result.valid || !previous.valid || delta <= 0.0F || delta > 0.25F) return result;
+    result.linearVelocity = (result.pose.position - previous.pose.position) / delta;
+    auto rotationDelta = Multiply(result.pose.rotation, Inverse(previous.pose.rotation));
+    if (rotationDelta.w < 0.0F) {
+        rotationDelta = {-rotationDelta.x, -rotationDelta.y, -rotationDelta.z, -rotationDelta.w};
+    }
+    const auto halfAngle = std::acos(Clamp(rotationDelta.w, -1.0F, 1.0F));
+    const auto sine = std::sin(halfAngle);
+    if (sine > 1.0e-5F) {
+        const Vec3 axis{rotationDelta.x / sine, rotationDelta.y / sine, rotationDelta.z / sine};
+        result.angularVelocity = axis * (2.0F * halfAngle / delta);
+    }
+    return result;
+}
+
 std::optional<Pose> FirstPersonAnchor(const vrm::VrmUnityRuntime* runtime) noexcept {
     if (!runtime) return std::nullopt;
     const auto anchor = runtime->FirstPersonAnchorWorld();
@@ -400,17 +507,33 @@ public:
                 finger.localRotation = FromUnity(localRotation);
                 finger.valid = true;
             }
-            // Flexion axes from the VRM binding pose. The spec requires a
-            // T-pose with palms facing down, so for every finger joint the
-            // curl axis is the horizontal axis perpendicular to the finger
-            // segment: cross(segment, worldDown). Rotating a segment around
-            // it moves the fingertip toward the palm on BOTH hands, for every
-            // joint. (The previous construction projected the joint-to-wrist
-            // vector perpendicular to the segment; a finger points almost
-            // exactly away from the wrist, so that projection was numerical
-            // noise and each finger received an arbitrary bend axis — the
-            // visibly "broken fingers" grip. Distal joints additionally
-            // borrowed an axis expressed in a different bone's local frame.)
+            // Flexion axes come from the VRM binding pose. Ordinary fingers
+            // curl toward world-down from the required palms-down T-pose. A
+            // thumb cannot use that same plane: doing so leaves it beside the
+            // fingers instead of opposing them around a cylindrical grip.
+            // Derive one stable world-space thumb plane from the proximal
+            // thumb toward the middle-finger base, then express that same
+            // anatomical plane in each thumb joint's local coordinates.
+            Vec3 thumbAxisWorld[2]{};
+            bool thumbAxisValid[2]{};
+            for (std::size_t side = 0; side < 2; ++side) {
+                const auto thumb = side * 15;
+                const auto middle = thumb + 6;
+                if (!fingers_[thumb].valid || !fingers_[thumb + 1].valid ||
+                        !fingers_[middle].valid) {
+                    continue;
+                }
+                const auto segment = Normalize(
+                    fingers_[thumb + 1].worldPosition - fingers_[thumb].worldPosition);
+                auto towardOpposingFingers =
+                    fingers_[middle].worldPosition - fingers_[thumb].worldPosition;
+                towardOpposingFingers = towardOpposingFingers -
+                    segment * Dot(towardOpposingFingers, segment);
+                const auto axis = Cross(segment, towardOpposingFingers);
+                if (LengthSquared(axis) < 1.0e-6F) continue;
+                thumbAxisWorld[side] = Normalize(axis);
+                thumbAxisValid[side] = true;
+            }
             for (std::size_t index = 0; index < kFingerMap.size(); ++index) {
                 auto& finger = fingers_[index];
                 if (!finger.valid) continue;
@@ -427,8 +550,12 @@ public:
                 } else {
                     continue;
                 }
+                const auto side = static_cast<std::size_t>(kFingerMap[index].side);
+                const auto isThumb = index % 15 < 3;
                 const Vec3 kWorldDown{0.0F, -1.0F, 0.0F};
-                const auto axisWorld = Cross(segment, kWorldDown);
+                const auto axisWorld = isThumb && thumbAxisValid[side]
+                    ? thumbAxisWorld[side]
+                    : Normalize(Cross(segment, kWorldDown));
                 if (LengthSquared(axisWorld) < 1.0e-6F) continue;
                 // Expressed in this joint's own local frame so the axis stays
                 // correct however the hand is oriented at runtime.
@@ -499,6 +626,8 @@ public:
         handTransforms_[1] = nullptr;
         handControllers_[0] = nullptr;
         handControllers_[1] = nullptr;
+        directXrNodeTracking_ = false;
+        directXrTrackingRoot_ = nullptr;
         sabers_[0] = nullptr;
         sabers_[1] = nullptr;
         saberGripTransforms_[0] = nullptr;
@@ -658,12 +787,25 @@ public:
             const auto timestamp = static_cast<double>(UnityEngine::Time::get_unscaledTime());
             const auto previous = sample_;
             sample_.head = SamplePose(headTransform_, previous.head, timestamp);
-            sample_.controllerHand[0] = IsAlive(handControllers_[0])
-                ? SampleControllerPose(handControllers_[0], previous.controllerHand[0], timestamp)
-                : SamplePose(handTransforms_[0], previous.controllerHand[0], timestamp);
-            sample_.controllerHand[1] = IsAlive(handControllers_[1])
-                ? SampleControllerPose(handControllers_[1], previous.controllerHand[1], timestamp)
-                : SamplePose(handTransforms_[1], previous.controllerHand[1], timestamp);
+            if (directXrNodeTracking_) {
+                sample_.controllerHand[0] = SampleXrNodePose(
+                    UnityEngine::XR::XRNode::LeftHand,
+                    directXrTrackingRoot_,
+                    previous.controllerHand[0],
+                    timestamp);
+                sample_.controllerHand[1] = SampleXrNodePose(
+                    UnityEngine::XR::XRNode::RightHand,
+                    directXrTrackingRoot_,
+                    previous.controllerHand[1],
+                    timestamp);
+            } else {
+                sample_.controllerHand[0] = IsAlive(handControllers_[0])
+                    ? SampleControllerPose(handControllers_[0], previous.controllerHand[0], timestamp)
+                    : SamplePose(handTransforms_[0], previous.controllerHand[0], timestamp);
+                sample_.controllerHand[1] = IsAlive(handControllers_[1])
+                    ? SampleControllerPose(handControllers_[1], previous.controllerHand[1], timestamp)
+                    : SamplePose(handTransforms_[1], previous.controllerHand[1], timestamp);
+            }
             // Controller poses are sampled before saber discovery so the menu
             // can select the visible handle nearest each controller instead of
             // accidentally retaining a stale gameplay Saber from Resources.
@@ -745,6 +887,8 @@ public:
             handTransforms_[1] = nullptr;
             handControllers_[0] = nullptr;
             handControllers_[1] = nullptr;
+            directXrNodeTracking_ = false;
+            directXrTrackingRoot_ = nullptr;
             sabers_[0] = nullptr;
             sabers_[1] = nullptr;
             saberGripTransforms_[0] = nullptr;
@@ -812,6 +956,7 @@ public:
             }
 
             auto previous = std::move(vrmRuntime_);
+            const auto previousRuntimeOptions = lastRuntimeOptions_;
             auto* previousAnimator = previous ? previous->Animator() : nullptr;
             if (bindSolver && !BindAnimator(
                     candidate->Animator(),
@@ -820,6 +965,7 @@ public:
                     {0.0F, 0.0F, 1.0F},
                     FirstPersonAnchor(candidate.get()))) {
                 vrmRuntime_ = std::move(previous);
+                lastRuntimeOptions_ = previousRuntimeOptions;
                 if (vrmRuntime_ && IsAlive(previousAnimator)) {
                     BindAnimator(
                         previousAnimator,
@@ -833,6 +979,7 @@ public:
             }
             if (!bindSolver) UnbindAnimator();
             vrmRuntime_ = std::move(candidate);
+            lastRuntimeOptions_ = options;
             ResetAutomaticExpressionState();
             if (previous) previous->SetVisible(false);
             previous.reset();
@@ -934,6 +1081,7 @@ public:
         ClearAutomaticExpressions();
         UnbindAnimator();
         vrmRuntime_.reset();
+        lastRuntimeOptions_.reset();
         ResetAutomaticExpressionState();
         Logging::Logger.info("Unloaded SaberStage VRM avatar and released its Unity assets");
     }
@@ -957,19 +1105,38 @@ public:
         solver_.SetStanceWidthScale(settings.stanceWidthPercent / 100.0F);
         solver_.SetBackwardSpineCurveLimit(settings.backwardSpineCurveLimitPercent / 100.0F);
         const auto fit = settings::RetargetingForSelectedAvatar(settings);
-        if (solver_.SetRetargetingSettings(
-                fit.matchPlayerHeight,
-                fit.heightAdjustmentBalance)) {
+        armSpringBoneInteraction_ = fit.armSpringBoneInteraction;
+        gripClosureScale_[0] = std::clamp(fit.leftControllerToWrist.gripClosurePercent / 100.0F, 0.0F, 1.5F);
+        gripClosureScale_[1] = std::clamp(fit.rightControllerToWrist.gripClosurePercent / 100.0F, 0.0F, 1.5F);
+        thumbCurveScale_[0] = std::clamp(fit.leftControllerToWrist.thumbCurvePercent / 100.0F, 0.0F, 1.5F);
+        thumbCurveScale_[1] = std::clamp(fit.rightControllerToWrist.thumbCurvePercent / 100.0F, 0.0F, 1.5F);
+        if (vrmRuntime_) {
+            const auto proportionsEnabled = fit.adjustBodyProportions;
+            vrmRuntime_->SetBodyProportionScales(
+                proportionsEnabled ? fit.torsoWidthPercent / 100.0F : 1.0F,
+                proportionsEnabled ? fit.lowerTorsoWidthPercent / 100.0F : 1.0F,
+                proportionsEnabled ? fit.neckBaseWidthPercent / 100.0F : 1.0F,
+                proportionsEnabled ? fit.headSizePercent / 100.0F : 1.0F,
+                proportionsEnabled ? fit.legWidthPercent / 100.0F : 1.0F);
+        }
+        if (solver_.SetFitOptions(FitOptionsFromSettings(fit))) {
             // Neutral geometry, foot anchors, bend poles, and body history all
             // belong to the previous skeleton fit. Carrying them across a fit
             // change creates one-frame limb snaps and stale planted feet.
             solver_.Reset(persistent_);
             Logging::Logger.info(
-                "Avatar retargeting changed for '{}': matchHeight={} balance={:.2f}; solver state reseeded",
+                "Avatar retargeting changed for '{}': armSpan={} matchHeight={} balance={:.2f} manualScale={} {:.2f}x; solver state reseeded",
                 fit.avatarKey,
+                fit.armSpanAvatarSizing,
                 fit.matchPlayerHeight,
-                fit.heightAdjustmentBalance);
+                fit.heightAdjustmentBalance,
+                fit.manualAvatarScaleEnabled,
+                fit.manualAvatarScalePercent / 100.0F);
         }
+        lastWearAvatar_ = settings.wearAvatar;
+        lastWearHideFace_ = settings.wearHideFace;
+        lastWearHideHair_ = settings.wearHideHair;
+        lastWearHideNeckAccessories_ = settings.wearHideNeckAccessories;
         if (automaticExpressionsEnabled_ != settings.animatedExpressions) {
             automaticExpressionsEnabled_ = settings.animatedExpressions;
             if (!automaticExpressionsEnabled_) ClearAutomaticExpressions();
@@ -979,7 +1146,15 @@ public:
         standinShowSabers_ = settings.standinShowSabers;
         standinShowPointers_ = settings.standinShowPointers;
         if (vrmRuntime_) {
-            vrmRuntime_->ApplyOptions(RuntimeOptionsFromSettings(settings));
+            const auto runtimeOptions = RuntimeOptionsFromSettings(settings);
+            // Fit and posture sliders can update many times per second. Their
+            // callbacks must not re-walk every material/renderer when none of
+            // the rendering or SpringBone settings changed.
+            if (!lastRuntimeOptions_ || !SameRuntimeOptions(*lastRuntimeOptions_, runtimeOptions)) {
+                vrmRuntime_->ApplyOptions(runtimeOptions);
+                lastRuntimeOptions_ = runtimeOptions;
+            }
+            vrmRuntime_->SetDebugHairHidden(debugHairHidden_);
             // First-person wear view: body renderers become visible to the HMD
             // while the selected head geometry stays camera-only.
             vrmRuntime_->ApplyViewMode(
@@ -1010,6 +1185,26 @@ public:
         }
     }
 
+    void SetGripEditingPreview(int side, bool showArm) noexcept {
+        // A player already wearing the complete avatar does not need a second
+        // filtered arm. Otherwise the explicit editor switch controls one
+        // first-person-only arm and closing the editor always restores the
+        // persisted view mode.
+        gripEditingPreviewSide_ = showArm && !lastWearAvatar_ && side >= 0 && side <= 1
+            ? side : -1;
+        if (!vrmRuntime_) return;
+        if (!vrmRuntime_->SetGripEditingArm(gripEditingPreviewSide_, camera::kFirstPersonLayer) &&
+                gripEditingPreviewSide_ >= 0) {
+            Logging::Logger.warn(
+                "The selected arm could not be isolated for grip editing; the full avatar remains hidden from the headset");
+        }
+    }
+
+    void SetDebugHairHidden(bool hidden) noexcept {
+        debugHairHidden_ = hidden;
+        if (vrmRuntime_) vrmRuntime_->SetDebugHairHidden(hidden);
+    }
+
     void SetStandinWorldPose(std::size_t index, Vec3 position, float yawDegrees) noexcept {
         if (!vrmRuntime_ || !vrmRuntime_->StandinActive()) return;
         lastStandinScale_ = lastStandinScale_ > 0.0F ? lastStandinScale_ : 1.0F;
@@ -1023,6 +1218,37 @@ public:
     void UpdateSecondaryMotion(float deltaTime) noexcept {
         if (!vrmRuntime_) return;
         UpdateAutomaticExpressions(deltaTime);
+        std::array<vrm::Float3, 6> centers{};
+        std::array<float, 6> radii{};
+        std::size_t colliderCount = 0;
+        if (armSpringBoneInteraction_) {
+            constexpr HumanoidBone armBones[2][3]{
+                {HumanoidBone::LeftUpperArm, HumanoidBone::LeftLowerArm, HumanoidBone::LeftHand},
+                {HumanoidBone::RightUpperArm, HumanoidBone::RightLowerArm, HumanoidBone::RightHand}};
+            for (int side = 0; side < 2; ++side) {
+                const auto upper = BoneIndex(armBones[side][0]);
+                const auto elbow = BoneIndex(armBones[side][1]);
+                const auto hand = BoneIndex(armBones[side][2]);
+                if (!solved_.valid[upper] || !solved_.valid[elbow] || !solved_.valid[hand]) continue;
+                const auto append = [&](Vec3 position, float radius) {
+                    if (colliderCount >= centers.size()) return;
+                    centers[colliderCount] = {position.x, position.y, position.z};
+                    radii[colliderCount] = radius;
+                    ++colliderCount;
+                };
+                const auto solvedUpperLength = Length(
+                    solved_.bones[elbow].position - solved_.bones[upper].position);
+                const auto solvedLowerLength = Length(
+                    solved_.bones[hand].position - solved_.bones[elbow].position);
+                const auto armRadius = std::clamp(
+                    (solvedUpperLength + solvedLowerLength) * 0.075F,
+                    0.025F, 0.075F);
+                append((solved_.bones[upper].position + solved_.bones[elbow].position) * 0.5F, armRadius);
+                append(solved_.bones[elbow].position, armRadius);
+                append((solved_.bones[elbow].position + solved_.bones[hand].position) * 0.5F, armRadius * 0.9F);
+            }
+        }
+        vrmRuntime_->SetArmSpringColliders(centers, radii, colliderCount);
         vrmRuntime_->UpdateSecondaryMotion(deltaTime);
         // Hand-prop sources are chosen before the sync so a saber appearing or
         // a scene change swaps the clones' props on the same frame.
@@ -1111,6 +1337,17 @@ public:
         if (bound_) RecalibrateNeutral();
     }
 
+    void SetGripAdjustmentPreview(
+        int side,
+        Pose adjustment,
+        float closurePercent,
+        float thumbCurvePercent) noexcept {
+        if (side < 0 || side > 1) return;
+        (void)solver_.SetGripAdjustment(side, adjustment);
+        gripClosureScale_[side] = std::clamp(closurePercent / 100.0F, 0.0F, 1.5F);
+        thumbCurveScale_[side] = std::clamp(thumbCurvePercent / 100.0F, 0.0F, 1.5F);
+    }
+
     bool SetExpression(std::string_view preset, float weight, std::string* error) noexcept {
         if (!vrmRuntime_) {
             if (error) *error = "no VRM avatar is loaded";
@@ -1122,6 +1359,10 @@ public:
     bool IsBound() const noexcept { return bound_; }
     bool IsPlayerCalibrationReady() const noexcept { return bound_ && trackingWasReady_; }
     bool HasLoadedVrmAvatar() const noexcept { return vrmRuntime_ != nullptr; }
+
+    bool LoadedAvatarSupportsAlphaToMask() const noexcept {
+        return vrmRuntime_ && vrmRuntime_->SupportsAlphaToMask();
+    }
     const vrm::VrmAsset* LoadedVrmAsset() const noexcept { return vrmRuntime_ ? &vrmRuntime_->Asset() : nullptr; }
     const vrm::RuntimeStatistics* LoadedVrmStatistics() const noexcept { return vrmRuntime_ ? &vrmRuntime_->Statistics() : nullptr; }
     const AvatarCalibration& Calibration() const noexcept { return calibration_; }
@@ -1318,6 +1559,9 @@ private:
             // audio, so keep them audible during that pause and use a strong
             // 2D level that remains clear beside Beat Saber's preview music.
             calibrationAudioSource_->set_ignoreListenerPause(true);
+            calibrationAudioSource_->set_mute(false);
+            calibrationAudioSource_->set_pitch(1.0F);
+            calibrationAudioSource_->set_panStereo(0.0F);
             calibrationAudioSource_->set_volume(0.90F);
             calibrationAudioSource_->set_priority(32);
 
@@ -1362,6 +1606,44 @@ private:
         }
     }
 
+    void RefreshCalibrationAudioRoute() noexcept {
+        // A newly-created AudioSource normally reaches Unity's default output,
+        // but Beat Saber routes menu/music audio through an AudioMixerGroup.
+        // Mirror the active song-preview route when one exists so calibration
+        // cues obey the same known-audible mixer path instead of relying on a
+        // platform-specific default route. This is retried lazily because the
+        // menu AudioTimeSyncController is created after SaberStage starts.
+        if (!IsAlive(calibrationAudioSource_)) return;
+        try {
+            for (auto* candidate :
+                    UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::AudioTimeSyncController*>()) {
+                if (!IsAlive(candidate)) continue;
+                auto* reference = candidate->____audioSource.ptr();
+                if (!IsAlive(reference)) continue;
+                auto* group = reference->get_outputAudioMixerGroup().ptr();
+                if (!IsAlive(group)) continue;
+                if (calibrationAudioSource_->get_outputAudioMixerGroup().ptr() != group) {
+                    calibrationAudioSource_->set_outputAudioMixerGroup(group);
+                    Logging::Logger.info(
+                        "Player-calibration audio routed through Beat Saber's active audio mixer group");
+                }
+                calibrationAudioRouteResolved_ = true;
+                return;
+            }
+            if (!calibrationAudioRouteWarningLogged_) {
+                calibrationAudioRouteWarningLogged_ = true;
+                Logging::Logger.warn(
+                    "Player-calibration audio did not find an active Beat Saber mixer route; using Unity's default output");
+            }
+        } catch (...) {
+            if (!calibrationAudioRouteWarningLogged_) {
+                calibrationAudioRouteWarningLogged_ = true;
+                Logging::Logger.warn(
+                    "Player-calibration audio could not inspect Beat Saber's mixer route; using Unity's default output");
+            }
+        }
+    }
+
     void StopCalibrationTone() noexcept {
         try {
             if (!IsAlive(calibrationAudioSource_)) return;
@@ -1380,10 +1662,17 @@ private:
         // the measurement tone and has the same low-overhead result for these
         // short, mutually exclusive calibration cues.
         if (!IsAlive(calibrationAudioSource_) || !IsAlive(clip)) return;
+        RefreshCalibrationAudioRoute();
         calibrationAudioSource_->Stop(true);
         calibrationAudioSource_->set_loop(false);
         calibrationAudioSource_->set_clip(clip);
         calibrationAudioSource_->Play();
+        Logging::Logger.debug(
+            "Player-calibration audio clip '{}' requested; sourcePlaying={} volume={:.2f} routed={}",
+            static_cast<std::string>(clip->get_name()),
+            calibrationAudioSource_->get_isPlaying(),
+            calibrationAudioSource_->get_volume(),
+            calibrationAudioRouteResolved_);
     }
 
     void DestroyCalibrationAudio() noexcept {
@@ -1414,10 +1703,16 @@ private:
                     break;
                 case calibration::CalibrationCue::MeasurementStarted:
                     if (IsAlive(calibrationToneClip_)) {
+                        RefreshCalibrationAudioRoute();
                         calibrationAudioSource_->Stop(true);
                         calibrationAudioSource_->set_clip(calibrationToneClip_);
                         calibrationAudioSource_->set_loop(true);
                         calibrationAudioSource_->Play();
+                        Logging::Logger.debug(
+                            "Player-calibration measurement tone requested; sourcePlaying={} volume={:.2f} routed={}",
+                            calibrationAudioSource_->get_isPlaying(),
+                            calibrationAudioSource_->get_volume(),
+                            calibrationAudioRouteResolved_);
                     }
                     break;
                 case calibration::CalibrationCue::MeasurementCompleted:
@@ -1846,6 +2141,7 @@ private:
 
     bool TrackingSourcesReady() const noexcept {
         if (!IsAlive(headTransform_)) return false;
+        if (directXrNodeTracking_) return IsAlive(directXrTrackingRoot_);
         const auto transformHands = IsAlive(handTransforms_[0]) && IsAlive(handTransforms_[1]);
         const auto controllerHands = IsAlive(handControllers_[0]) && IsAlive(handControllers_[1]);
 
@@ -1878,6 +2174,8 @@ private:
         handTransforms_[1] = nullptr;
         handControllers_[0] = nullptr;
         handControllers_[1] = nullptr;
+        directXrNodeTracking_ = false;
+        directXrTrackingRoot_ = nullptr;
         sabers_[0] = nullptr;
         sabers_[1] = nullptr;
         saberGripTransforms_[0] = nullptr;
@@ -1914,14 +2212,22 @@ private:
         auto mainCamera = UnityEngine::Camera::get_main();
         if (mainCamera) headTransform_ = mainCamera->get_transform().ptr();
         std::size_t controllerCount = 0;
+        std::size_t totalControllerCount = 0;
         for (auto* controller : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::VRController*>()) {
-            if (!IsAlive(controller) || !controller->get_isActiveAndEnabled()) continue;
-            ++controllerCount;
+            if (!IsAlive(controller)) continue;
+            ++totalControllerCount;
             const auto node = controller->get_node();
-            if (node.value__ == UnityEngine::XR::XRNode::LeftHand.value__ && !IsAlive(handControllers_[0])) {
-                handControllers_[0] = controller;
-            } else if (node.value__ == UnityEngine::XR::XRNode::RightHand.value__ && !IsAlive(handControllers_[1])) {
-                handControllers_[1] = controller;
+            const auto side = node.value__ == UnityEngine::XR::XRNode::LeftHand.value__
+                ? 0
+                : node.value__ == UnityEngine::XR::XRNode::RightHand.value__ ? 1 : -1;
+            if (side < 0) continue;
+            if (controller->get_isActiveAndEnabled()) {
+                ++controllerCount;
+                // Prefer the active instance if Unity still retains an older,
+                // inactive controller object from a previous scene.
+                handControllers_[side] = controller;
+            } else if (!IsAlive(handControllers_[side])) {
+                handControllers_[side] = controller;
             }
         }
         if (TrackingSourcesReady()) {
@@ -1929,12 +2235,54 @@ private:
             Logging::Logger.info("Avatar tracking acquired from main HMD camera and Beat Saber VR controllers");
             return true;
         }
+
+        // Beat Saber can intentionally disable the non-pointer VRController in
+        // menu scenes. Unity's XR pose source still reports both physical
+        // controllers, so sample those nodes relative to the same XR rig root
+        // instead of requiring two active game UI components. Gameplay keeps
+        // using PlayerTransforms above, preserving the game's authoritative
+        // saber-space tracking and origin transitions.
+        UnityEngine::Transform* xrRoot = nullptr;
+        for (auto* controller : handControllers_) {
+            if (!IsAlive(controller)) continue;
+            auto* transform = controller->get_transform().ptr();
+            if (!IsAlive(transform)) continue;
+            auto parent = transform->get_parent();
+            if (parent) {
+                xrRoot = parent.ptr();
+                break;
+            }
+        }
+        if (!IsAlive(xrRoot) && IsAlive(headTransform_)) {
+            auto parent = headTransform_->get_parent();
+            if (parent) xrRoot = parent.ptr();
+        }
+        if (IsAlive(xrRoot)) {
+            UnityEngine::Pose leftPose = UnityEngine::Pose::get_identity();
+            UnityEngine::Pose rightPose = UnityEngine::Pose::get_identity();
+            const auto leftFlags = UnityEngine::SpatialTracking::PoseDataSource::GetNodePoseData(
+                UnityEngine::XR::XRNode::LeftHand, byref(leftPose));
+            const auto rightFlags = UnityEngine::SpatialTracking::PoseDataSource::GetNodePoseData(
+                UnityEngine::XR::XRNode::RightHand, byref(rightPose));
+            if ((leftFlags.value__ & 0x3) == 0x3 && (rightFlags.value__ & 0x3) == 0x3) {
+                directXrTrackingRoot_ = xrRoot;
+                directXrNodeTracking_ = true;
+                trackingFailureLogged_ = false;
+                Logging::Logger.info(
+                    "Avatar tracking acquired from main HMD camera and direct Unity XR hand poses "
+                    "(active VRControllers={}/{})",
+                    controllerCount,
+                    totalControllerCount);
+                return true;
+            }
+        }
         if (!trackingFailureLogged_) {
             trackingFailureLogged_ = true;
             Logging::Logger.warn(
-                "Avatar tracking unavailable: active PlayerTransforms={} active VRControllers={} HMD={} left={} right={}",
+                "Avatar tracking unavailable: active PlayerTransforms={} active VRControllers={}/{} HMD={} left={} right={}",
                 playerTransformCount,
                 controllerCount,
+                totalControllerCount,
                 IsAlive(headTransform_),
                 IsAlive(handControllers_[0]),
                 IsAlive(handControllers_[1]));
@@ -1968,9 +2316,10 @@ private:
             auto rotation = finger.localRotation;
             if (LengthSquared(finger.curlAxisLocal) > 1.0e-5F) {
                 const auto isThumb = index % 15 < 3;
-                const auto degrees = isThumb
-                    ? kThumbCurlDegrees[mapping.joint]
-                    : kCurlDegrees[mapping.joint];
+                const auto side = index / 15;
+                const auto degrees = (isThumb
+                    ? kThumbCurlDegrees[mapping.joint] * thumbCurveScale_[side]
+                    : kCurlDegrees[mapping.joint] * gripClosureScale_[side]);
                 rotation = Multiply(rotation, AxisAngle(
                     Normalize(finger.curlAxisLocal), degrees * 3.14159265358979323846F / 180.0F));
             }
@@ -2033,6 +2382,8 @@ private:
     UnityEngine::Transform* headTransform_ = nullptr;
     UnityEngine::Transform* handTransforms_[2]{};
     GlobalNamespace::VRController* handControllers_[2]{};
+    UnityEngine::Transform* directXrTrackingRoot_ = nullptr;
+    bool directXrNodeTracking_ = false;
     GlobalNamespace::Saber* sabers_[2]{};
     UnityEngine::Transform* saberGripTransforms_[2]{};
     GlobalNamespace::ComboController* comboController_ = nullptr;
@@ -2055,10 +2406,13 @@ private:
     calibration::CalibrationPhase lastCalibrationPhase_ = calibration::CalibrationPhase::Idle;
     std::size_t lastCalibrationStepIndex_ = std::numeric_limits<std::size_t>::max();
     UnityEngine::AudioSource* calibrationAudioSource_ = nullptr;
+    bool calibrationAudioRouteResolved_ = false;
+    bool calibrationAudioRouteWarningLogged_ = false;
     UnityEngine::AudioClip* calibrationTickClip_ = nullptr;
     UnityEngine::AudioClip* calibrationToneClip_ = nullptr;
     UnityEngine::AudioClip* calibrationShutterClip_ = nullptr;
     std::unique_ptr<vrm::VrmUnityRuntime> vrmRuntime_;
+    std::optional<vrm::RuntimeOptions> lastRuntimeOptions_;
     std::int32_t nextTrackingDiscoveryFrame_ = 0;
     std::int32_t nextSaberDiscoveryFrame_ = 0;
     std::int32_t nextExpressionSourceDiscoveryFrame_ = 0;
@@ -2083,6 +2437,21 @@ private:
     // rediscovery (the solver's own controller cache is main-menu only).
     bool standinShowSabers_ = true;
     bool standinShowPointers_ = true;
+    bool lastWearAvatar_ = false;
+    bool lastWearHideFace_ = true;
+    bool lastWearHideHair_ = false;
+    bool lastWearHideNeckAccessories_ = false;
+    // -1 means inactive; 0/1 identifies the sole arm temporarily rendered to
+    // the HMD by the grip editor. This never changes the persisted Wear Avatar
+    // state and never exposes the torso/head around the player's viewpoint.
+    int gripEditingPreviewSide_ = -1;
+    bool debugHairHidden_ = false;
+    bool armSpringBoneInteraction_ = false;
+    // Per-hand closure is deliberately runtime-owned rather than part of the
+    // IK solver: it modifies only the finger phalanges after the solved wrist
+    // has been written and therefore cannot perturb tracking or arm reach.
+    float gripClosureScale_[2]{1.0F, 1.0F};
+    float thumbCurveScale_[2]{1.0F, 1.0F};
     GlobalNamespace::VRController* propControllers_[2]{};
     std::int32_t propControllerDiscoveryCountdown_ = 0;
     bool wasInGameplay_ = false;
@@ -2169,6 +2538,17 @@ void AvatarManager::ApplyAvatarSettings(const settings::AvatarSettings& settings
 void AvatarManager::SetControllerToWristOffsets(Pose left, Pose right) noexcept {
     impl_->SetControllerToWristOffsets(left, right);
 }
+void AvatarManager::SetGripAdjustmentPreview(
+    int side,
+    Pose adjustment,
+    float closurePercent,
+    float thumbCurvePercent) noexcept {
+    impl_->SetGripAdjustmentPreview(side, adjustment, closurePercent, thumbCurvePercent);
+}
+void AvatarManager::SetGripEditingPreview(int side, bool showArm) noexcept {
+    impl_->SetGripEditingPreview(side, showArm);
+}
+void AvatarManager::SetDebugHairHidden(bool hidden) noexcept { impl_->SetDebugHairHidden(hidden); }
 bool AvatarManager::SetExpression(std::string_view preset, float weight, std::string* error) noexcept {
     return impl_->SetExpression(preset, weight, error);
 }
@@ -2187,6 +2567,9 @@ bool AvatarManager::IsPlayerCalibrationReady() const noexcept {
     return impl_->IsPlayerCalibrationReady();
 }
 bool AvatarManager::HasLoadedVrmAvatar() const noexcept { return impl_->HasLoadedVrmAvatar(); }
+bool AvatarManager::LoadedAvatarSupportsAlphaToMask() const noexcept {
+    return impl_->LoadedAvatarSupportsAlphaToMask();
+}
 const vrm::VrmAsset* AvatarManager::LoadedVrmAsset() const noexcept { return impl_->LoadedVrmAsset(); }
 const vrm::RuntimeStatistics* AvatarManager::LoadedVrmStatistics() const noexcept { return impl_->LoadedVrmStatistics(); }
 const AvatarCalibration& AvatarManager::Calibration() const noexcept { return impl_->Calibration(); }

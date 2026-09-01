@@ -106,11 +106,48 @@ struct PlayerCalibration {
     bool valid = false;
 };
 
+// Allocation-free input for one avatar's fitted geometry and posture. Keeping
+// this independent of the JSON settings layer lets host tests and the runtime
+// exercise exactly the same solver path.
+struct AvatarFitOptions {
+    bool armSpanAvatarSizing = true;
+    bool matchPlayerHeight = false;
+    float heightAdjustmentBalance = 0.0F;
+    bool manualAvatarScaleEnabled = false;
+    float manualAvatarScale = 1.0F;
+    bool keepHandsOnSabers = true;
+    // Per-avatar rigid hand-target alignment layered after the trusted
+    // calibration grip (or generic controller-to-wrist fallback). Position
+    // and rotation are one local transform relative to that unadjusted target.
+    // The full pose is supplied to arm IK, so the shoulder, elbow, forearm,
+    // wrist, and hand participate naturally. Identity preserves calibration.
+    Pose gripAdjustment[2]{};
+    bool adjustBodyProportions = false;
+    float torsoWidthScale = 1.0F;
+    bool autoShoulderWidth = false;
+    float shoulderWidthScale = 1.0F;
+    float waistHipWidthScale = 1.0F;
+    float lowerTorsoWidthScale = 1.0F;
+    float neckBaseWidthScale = 1.0F;
+    float torsoHeightScale = 1.0F;
+    float upperLegLengthScale = 1.0F;
+    float lowerLegLengthScale = 1.0F;
+    float legWidthScale = 1.0F;
+    float neutralKneeBendDegrees = 0.0F;
+    float attackPoseDegrees = 0.0F;
+    float backStiffness = 0.5F;
+    bool autoFloorHeight = true;
+    float floorOffsetMeters = 0.0F;
+    bool preventArmBodyClipping = false;
+    bool armSpringBoneInteraction = false;
+};
+
 // Allocation-free description of the neutral avatar fit used by the runtime
 // solver. The root always remains uniformly scaled. Optional height matching
 // changes only the vertical rest-pose spans of the lower-body and torso chains
 // so arm reach, shoulder width, hands, head, and feet retain the arm-span fit.
 struct AvatarRetargeting {
+    float baseUniformScale = 1.0F;
     float uniformScale = 1.0F;
     float playerArmSpan = 0.0F;
     float playerArmSpanConfidence = 0.0F;
@@ -126,12 +163,24 @@ struct AvatarRetargeting {
     float finalEyeHeight = 0.0F;
     float residualHeightError = 0.0F;
     float heightAdjustmentBalance = 0.0F;
+    float manualScale = 1.0F;
+    float torsoWidthScale = 1.0F;
+    float shoulderWidthScale = 1.0F;
+    float shoulderWidthConfidence = 0.0F;
+    float waistHipWidthScale = 1.0F;
+    float lowerTorsoWidthScale = 1.0F;
+    float neckBaseWidthScale = 1.0F;
+    float torsoHeightScale = 1.0F;
+    float upperLegLengthScale = 1.0F;
+    float lowerLegLengthScale = 1.0F;
+    float legWidthScale = 1.0F;
     bool armSpanBased = false;
     bool matchPlayerHeight = false;
     bool heightCorrectionApplied = false;
     bool scaleClamped = false;
     bool heightCorrectionClamped = false;
     bool geometryFallback = false;
+    bool automaticShoulderWidthApplied = false;
     bool valid = false;
 };
 
@@ -257,6 +306,10 @@ struct SolverDiagnostics {
     Pose hmdTarget{};
     Pose avatarEye{};
     Pose headTarget{};
+    // The controller/saber-derived wrist target before the per-avatar manual
+    // grip adjustment.  The world-space grip editor uses this as the stable
+    // parent pose for its one rigid 6DOF offset; it never writes bones.
+    Pose handBaseTarget[2]{};
     Pose handTarget[2]{};
     Pose finalHand[2]{};
     Pose pelvis{};
@@ -330,6 +383,7 @@ struct SolverDiagnostics {
 static_assert(std::is_trivially_copyable_v<TrackingSample>);
 static_assert(std::is_trivially_copyable_v<AvatarCalibration>);
 static_assert(std::is_trivially_copyable_v<PlayerCalibration>);
+static_assert(std::is_trivially_copyable_v<AvatarFitOptions>);
 static_assert(std::is_trivially_copyable_v<AvatarRetargeting>);
 static_assert(std::is_trivially_copyable_v<SolvedHumanoidPose>);
 static_assert(std::is_trivially_copyable_v<FootPersistentState>);

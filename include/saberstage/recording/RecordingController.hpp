@@ -111,6 +111,7 @@ private:
     void RestoreAudioListenerOwnership() noexcept;
     void HandleRuntimeCameraInvalidated() noexcept;
     void HandleRuntimeCameraReady() noexcept;
+    void HandleSpectatorRendered() noexcept;
     void HandleControllerShortcut() noexcept;
     bool TryTransition(
         std::initializer_list<RecordingState> expectedStates,
@@ -168,6 +169,12 @@ private:
     std::vector<std::int64_t> videoPresentationFrames_;
     std::int64_t videoSegmentFrameBase_ = 0;
     std::int64_t videoSegmentLastPresentationFrame_ = -1;
+    // Hollywood does not expose MediaCodec PTS values. Record the real
+    // spectator-camera render deadlines instead so missed Unity frames remain
+    // gaps in the MP4 timeline instead of shortening the video relative to
+    // continuously captured audio.
+    std::int64_t hollywoodLastPresentationFrame_ = -1;
+    std::uint64_t hollywoodSkippedPresentationFrames_ = 0;
     mutable std::mutex statusMutex_;
     std::string status_ = "Ready to record Primary camera.";
     StatusChangedHandler statusChangedHandler_;

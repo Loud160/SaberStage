@@ -26,6 +26,7 @@ public:
     using RuntimeCameraInvalidatedHandler = std::function<void()>;
     using RuntimeCameraReadyHandler = std::function<void()>;
     using BeforeRenderHandler = std::function<void()>;
+    using AfterRenderHandler = std::function<void()>;
 
     CameraManager(settings::SettingsService& settings, std::filesystem::path movementScriptDirectory);
     ~CameraManager();
@@ -47,7 +48,12 @@ public:
     void SetRuntimeCameraInvalidatedHandler(RuntimeCameraInvalidatedHandler handler);
     void SetRuntimeCameraReadyHandler(RuntimeCameraReadyHandler handler);
     void SetBeforeRenderHandler(BeforeRenderHandler handler);
+    void SetAfterRenderHandler(AfterRenderHandler handler);
     void PrepareForSpectatorRender() noexcept;
+    // Completes the camera pass before capture UI is restored. When the
+    // spectator is using MSAA this resolves its multisampled image into the
+    // encoder-owned single-sample texture, then notifies recording timing.
+    void FinishSpectatorRender() noexcept;
     void SetPreviewCaptureExcluded(bool excluded) noexcept;
 
     bool RecenterCameraToCurrentForward() noexcept;

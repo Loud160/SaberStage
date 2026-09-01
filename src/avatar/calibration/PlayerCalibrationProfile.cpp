@@ -11,6 +11,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -99,6 +100,88 @@ Vec3 EstimatedShoulder(int side, const StaticCaptureSummary& capture, float heig
         (side == 0 ? -1.0F : 1.0F) * height * 0.105F,
         -height * 0.17F,
         -height * 0.025F});
+}
+
+BodyFitModel FitShoulderWidth(
+    const PlayerCalibrationProfile& profile,
+    float height) noexcept {
+    BodyFitModel result{};
+    constexpr CalibrationStep fitSteps[]{
+        CalibrationStep::ArmsT,
+        CalibrationStep::ArmsForward,
+        CalibrationStep::ArmsOutward45,
+        CalibrationStep::ArmsY,
+        CalibrationStep::ArmsOverhead,
+    };
+
+    // For each plausible shoulder separation, compare the straight-arm length
+    // implied by every accepted pose. The physical upper/lower arm length is
+    // constant, so the best pivot separation is the one that minimizes
+    // within-side residual and left/right asymmetry. This is deliberately a
+    // bounded calibration-time search; none of it runs in the frame solver.
+    float bestScore = std::numeric_limits<float>::infinity();
+    float bestWidth = 0.0F;
+    float bestResidual = 0.0F;
+    std::uint32_t bestCount = 0;
+    float bestCaptureConfidence = 0.0F;
+    const auto minimumWidth = height * 0.16F;
+    const auto maximumWidth = height * 0.34F;
+    for (int candidateIndex = 0; candidateIndex <= 180; ++candidateIndex) {
+        const auto width = minimumWidth +
+            (maximumWidth - minimumWidth) * static_cast<float>(candidateIndex) / 180.0F;
+        float sideSum[2]{};
+        float sideWeight[2]{};
+        float sideSquared[2]{};
+        float confidenceSum = 0.0F;
+        std::uint32_t count = 0;
+        for (const auto step : fitSteps) {
+            const auto& capture = profile.staticCaptures[Index(step)];
+            if (!capture.valid || capture.confidence <= 0.0F) continue;
+            const auto yawOnly = AxisAngle({0.0F, 1.0F, 0.0F}, YawFromRotation(capture.head.rotation));
+            const auto weight = Clamp01(capture.confidence) *
+                (0.65F + Clamp01(capture.stableSampleFraction) * 0.35F);
+            for (int side = 0; side < 2; ++side) {
+                const auto shoulder = capture.head.position + Rotate(yawOnly, {
+                    (side == 0 ? -0.5F : 0.5F) * width,
+                    -height * 0.17F,
+                    -height * 0.025F});
+                const auto source = capture.usedSaberGrip[side]
+                    ? capture.grip[side] : capture.controller[side];
+                const auto length = Length(source.position - shoulder);
+                if (!std::isfinite(length) || length < height * 0.16F || length > height * 0.65F) continue;
+                sideSum[side] += length * weight;
+                sideSquared[side] += length * length * weight;
+                sideWeight[side] += weight;
+                confidenceSum += weight;
+                ++count;
+            }
+        }
+        if (sideWeight[0] <= 0.0F || sideWeight[1] <= 0.0F || count < 8) continue;
+        const auto leftMean = sideSum[0] / sideWeight[0];
+        const auto rightMean = sideSum[1] / sideWeight[1];
+        const auto leftVariance = std::max(0.0F, sideSquared[0] / sideWeight[0] - leftMean * leftMean);
+        const auto rightVariance = std::max(0.0F, sideSquared[1] / sideWeight[1] - rightMean * rightMean);
+        const auto residual = std::sqrt((leftVariance + rightVariance) * 0.5F);
+        const auto asymmetry = std::abs(leftMean - rightMean);
+        const auto score = residual + asymmetry * 0.75F;
+        if (score < bestScore) {
+            bestScore = score;
+            bestWidth = width;
+            bestResidual = residual;
+            bestCount = count;
+            bestCaptureConfidence = confidenceSum / static_cast<float>(count);
+        }
+    }
+
+    if (!std::isfinite(bestScore) || bestCount < 8) return result;
+    result.estimatedShoulderWidth = bestWidth;
+    result.shoulderWidthResidual = bestResidual;
+    result.shoulderObservationCount = bestCount;
+    const auto observationFactor = Clamp01(static_cast<float>(bestCount) / 10.0F);
+    const auto residualFactor = Clamp01(1.0F - bestScore / (height * 0.045F));
+    result.shoulderWidthConfidence = Clamp01(
+        bestCaptureConfidence * observationFactor * residualFactor);
+    return result;
 }
 
 std::string UtcNow() {
@@ -315,6 +398,10 @@ RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile
     }
     runtime.playerArmSpan = profile.reach.playerArmSpan;
     runtime.playerArmSpanConfidence = profile.reach.playerArmSpanConfidence;
+    runtime.estimatedShoulderWidth = profile.bodyFit.estimatedShoulderWidth;
+    runtime.shoulderWidthResidual = profile.bodyFit.shoulderWidthResidual;
+    runtime.shoulderWidthConfidence = profile.bodyFit.shoulderWidthConfidence;
+    runtime.shoulderObservationCount = profile.bodyFit.shoulderObservationCount;
     runtime.leanBoundaryNormalized[0] = profile.lean.leftNormalized;
     runtime.leanBoundaryNormalized[1] = profile.lean.rightNormalized;
     runtime.leanBoundaryNormalized[2] = profile.lean.forwardNormalized;
@@ -325,6 +412,7 @@ RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile
     }
     runtime.crouch = profile.crouch;
     runtime.turn = profile.turn;
+    runtime.calibratedFloorHeight = profile.calibratedFloorHeight;
     runtime.overallConfidence = profile.overallConfidence;
     runtime.valid = true;
     return runtime;
@@ -362,6 +450,8 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
             }
         }
         const auto height = StandingHeight(profile);
+        const auto& neutralCapture = profile.staticCaptures[Index(CalibrationStep::Neutral)];
+        profile.calibratedFloorHeight = neutralCapture.head.position.y - height;
         const auto& armsT = profile.staticCaptures[Index(CalibrationStep::ArmsT)];
         profile.reach.playerArmSpan = Length(
             armsT.grip[1].position - armsT.grip[0].position);
@@ -375,6 +465,7 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
             if (error) *error = "accepted T-pose arm span is not anatomically plausible";
             return false;
         }
+        profile.bodyFit = FitShoulderWidth(profile, height);
         for (int side = 0; side < 2; ++side) {
             std::vector<Pose> controllerToGrip;
             std::vector<Quaternion> controllerToCanonical;
@@ -527,6 +618,18 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
             profile.turn.bodyYawDegreesPerSecond = Clamp(
                 averageYawDegrees / averageTurnDuration * 2.6F, 75.0F, 165.0F);
         }
+        const auto& lookUp = profile.motionCaptures[Index(CalibrationStep::LookUp)];
+        const auto& lookDown = profile.motionCaptures[Index(CalibrationStep::LookDown)];
+        if (lookUp.valid) {
+            const auto measured = std::abs(lookUp.features.peakPitchRadians) * kRadiansToDegrees;
+            profile.turn.softNeckPitchUpDegrees = Clamp(measured * 0.85F, 18.0F, 42.0F);
+            profile.turn.hardNeckPitchUpDegrees = Clamp(measured * 1.15F, 35.0F, 65.0F);
+        }
+        if (lookDown.valid) {
+            const auto measured = std::abs(lookDown.features.peakPitchRadians) * kRadiansToDegrees;
+            profile.turn.softNeckPitchDownDegrees = Clamp(measured * 0.85F, 22.0F, 50.0F);
+            profile.turn.hardNeckPitchDownDegrees = Clamp(measured * 1.15F, 40.0F, 75.0F);
+        }
         float captureConfidenceSum = 0.0F;
         int captureConfidenceCount = 0;
         for (const auto& capture : profile.staticCaptures) {
@@ -677,6 +780,12 @@ bool SavePlayerCalibrationProfile(
             "playerArmSpanConfidence",
             profile.reach.playerArmSpanConfidence,
             allocator);
+        Value bodyFit(rapidjson::kObjectType);
+        bodyFit.AddMember("estimatedShoulderWidth", profile.bodyFit.estimatedShoulderWidth, allocator);
+        bodyFit.AddMember("shoulderWidthResidual", profile.bodyFit.shoulderWidthResidual, allocator);
+        bodyFit.AddMember("shoulderWidthConfidence", profile.bodyFit.shoulderWidthConfidence, allocator);
+        bodyFit.AddMember("shoulderObservationCount", profile.bodyFit.shoulderObservationCount, allocator);
+        derived.AddMember("bodyFit", bodyFit, allocator);
         Value lean(rapidjson::kObjectType);
         Value boundaries(rapidjson::kArrayType);
         boundaries.PushBack(profile.lean.leftNormalized, allocator)
@@ -704,12 +813,17 @@ bool SavePlayerCalibrationProfile(
         derived.AddMember("crouch", crouch, allocator);
         Value turn(rapidjson::kObjectType);
         turn.AddMember("softNeckConeDegrees", profile.turn.softNeckConeDegrees, allocator);
+        turn.AddMember("softNeckPitchUpDegrees", profile.turn.softNeckPitchUpDegrees, allocator);
+        turn.AddMember("softNeckPitchDownDegrees", profile.turn.softNeckPitchDownDegrees, allocator);
+        turn.AddMember("hardNeckPitchUpDegrees", profile.turn.hardNeckPitchUpDegrees, allocator);
+        turn.AddMember("hardNeckPitchDownDegrees", profile.turn.hardNeckPitchDownDegrees, allocator);
         turn.AddMember("turnDwellSeconds", profile.turn.turnDwellSeconds, allocator);
         turn.AddMember("settleHoldSeconds", profile.turn.settleHoldSeconds, allocator);
         turn.AddMember("bodyYawDegreesPerSecond", profile.turn.bodyYawDegreesPerSecond, allocator);
         turn.AddMember("leftConfidence", profile.turn.leftConfidence, allocator);
         turn.AddMember("rightConfidence", profile.turn.rightConfidence, allocator);
         derived.AddMember("turn", turn, allocator);
+        derived.AddMember("calibratedFloorHeight", profile.calibratedFloorHeight, allocator);
         document.AddMember("derived", derived, allocator);
 
         rapidjson::StringBuffer buffer;

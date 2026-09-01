@@ -58,9 +58,12 @@ int main() {
     invalid.rotationDegrees.y = 725.0F;
     invalid.farClipMeters = 0.01F;
     invalid.requestedWidth = 1279;
+    invalid.multisampleCount = 8;
     const auto repaired = ValidateAndRepair(invalid);
     Check(repaired.changed && repaired.repairedFields >= 4, "profile validation repairs unsafe fields individually");
     Check(invalid.profileId == kPrimaryCameraId, "Prompt 3 retains one stable camera identity");
+    Check(invalid.multisampleCount == 1,
+          "camera validation rejects unsupported multisample counts");
 
     auto legacyUiExclusion = DefaultCameraProfile();
     legacyUiExclusion.excludedLayersMask = 1 << 5;

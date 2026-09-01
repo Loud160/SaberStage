@@ -42,6 +42,7 @@ Shader "SaberStage/MToon"
         [Enum(UnityEngine.Rendering.BlendMode)] _DstBlend ("Destination Blend", Float) = 0
         [Toggle] _ZWrite ("Depth Write", Float) = 1
         [Toggle] _AlphaToMask ("Alpha To Coverage", Float) = 0
+        _CutoutSmoothing ("Cutout Smoothing", Range(0,3)) = 1
     }
 
     SubShader
@@ -78,6 +79,7 @@ Shader "SaberStage/MToon"
             float4 _Color, _ShadeColor, _EmissionColor, _RimColor;
             float _ShadeShift, _ShadeToony, _ShadingGradeRate, _BumpScale, _RimLightingMix;
             float _RimFresnelPower, _RimLift, _Cutoff;
+            float _AlphaToMask, _CutoutSmoothing;
             float _LightColorAttenuation, _IndirectLightIntensity;
             float _MaterialDebugStage, _AvatarLightingMode;
             float _MainTexCoord, _ShadeTextureCoord, _ShadingGradeTextureCoord;
@@ -143,9 +145,34 @@ Shader "SaberStage/MToon"
                 fixed4 rawMainSample = tex2D(_MainTex, mainUv);
                 fixed4 mainSample = rawMainSample * _Color;
                 #if defined(SABERSTAGE_ALPHA_TEST)
-                    float alphaWidth = max(fwidth(mainSample.a), 0.0001);
-                    mainSample.a = saturate((mainSample.a - _Cutoff) / alphaWidth + 0.5);
-                    clip(mainSample.a - 0.001);
+                    if (_CutoutSmoothing > 0.5)
+                    {
+                        // Convert the authored cutout into a bounded coverage
+                        // ramp. With AlphaToMask this feeds MSAA sample
+                        // coverage. On a single-sample target a stable
+                        // screen-space dither provides avatar-only smoothing
+                        // without changing Beat Saber's complete render path.
+                        float smoothingWidth = max(
+                            fwidth(mainSample.a) * (0.65 * _CutoutSmoothing), 0.0001);
+                        float coverage = saturate(
+                            (mainSample.a - _Cutoff) / smoothingWidth + 0.5);
+                        if (_AlphaToMask < 0.5)
+                        {
+                            float2 pixel = floor(input.position.xy);
+                            float threshold = frac(52.9829189 * frac(
+                                dot(pixel, float2(0.06711056, 0.00583715))));
+                            clip(coverage - threshold);
+                        }
+                        else
+                        {
+                            clip(coverage - 0.001);
+                        }
+                        mainSample.a = coverage;
+                    }
+                    else
+                    {
+                        clip(mainSample.a - _Cutoff);
+                    }
                 #endif
 
                 float3 normal = normalize(input.worldNormal);

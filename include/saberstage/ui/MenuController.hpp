@@ -28,6 +28,8 @@ class TextMeshProUGUI;
 
 namespace UnityEngine {
 class GameObject;
+class LineRenderer;
+class Material;
 class RectTransform;
 }
 
@@ -83,6 +85,22 @@ private:
     void RefreshAvatarStatus();
     void RefreshCalibrationStatus();
     void RefreshRetargetingControls();
+    void ShowAvatarFitWarning(int warningKind);
+    void ResolveAvatarFitWarning(bool accepted);
+    void OpenGripEditor(int side);
+    void EnsureGripEditor();
+    void EnsureGripTargetGizmo();
+    void DestroyGripEditor(bool restoreOriginal) noexcept;
+    void RecenterGripEditor();
+    void TickGripEditor() noexcept;
+    void SyncGripTargetGizmo() noexcept;
+    void ApplyGripEditorPreview();
+    void RefreshGripEditorControls();
+    void SetGripEditorComponent(int component, float value);
+    void SetGripEditorShowAvatarArm(bool visible);
+    void SaveGripEditor();
+    void MirrorGripEditorToOtherHand();
+    void ResetGripEditor();
     void RequestAvatarSettingsRebuild() noexcept;
     void RebuildAvatarSettingsPanel();
     void EnsureStandinProxy(int slot);
@@ -106,11 +124,11 @@ private:
     TMPro::TextMeshProUGUI* scriptStatusText_ = nullptr;
     UnityEngine::UI::RawImage* dockedPreviewImage_ = nullptr;
     HMUI::TextSegmentedControl* avatarTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 3> avatarTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 4> avatarTabViewRoots_{};
     // The scroll-view root controls visibility, while the content root owns
     // the actual settings layout. Keep both so a page that was hidden during
     // its first canvas pass can be rebuilt when selected.
-    std::array<UnityEngine::GameObject*, 3> avatarTabContentRoots_{};
+    std::array<UnityEngine::GameObject*, 4> avatarTabContentRoots_{};
     HMUI::TextSegmentedControl* settingsTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 4> tabViewRoots_{};
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
@@ -131,6 +149,79 @@ private:
     HMUI::ViewController* avatarSettingsView_ = nullptr;
     BSML::ToggleSetting* matchPlayerHeightToggle_ = nullptr;
     BSML::SliderSetting* heightAdjustmentBalanceSlider_ = nullptr;
+    BSML::ToggleSetting* armSpanSizingToggle_ = nullptr;
+    BSML::ToggleSetting* manualAvatarScaleToggle_ = nullptr;
+    BSML::SliderSetting* manualAvatarScaleSlider_ = nullptr;
+    BSML::ToggleSetting* bodyProportionToggle_ = nullptr;
+    BSML::SliderSetting* torsoWidthSlider_ = nullptr;
+    BSML::ToggleSetting* autoShoulderWidthToggle_ = nullptr;
+    BSML::SliderSetting* shoulderWidthSlider_ = nullptr;
+    BSML::SliderSetting* waistHipWidthSlider_ = nullptr;
+    BSML::SliderSetting* lowerTorsoWidthSlider_ = nullptr;
+    BSML::SliderSetting* neckBaseWidthSlider_ = nullptr;
+    BSML::SliderSetting* headSizeSlider_ = nullptr;
+    BSML::SliderSetting* torsoHeightSlider_ = nullptr;
+    BSML::SliderSetting* upperLegLengthSlider_ = nullptr;
+    BSML::SliderSetting* lowerLegLengthSlider_ = nullptr;
+    BSML::SliderSetting* legWidthSlider_ = nullptr;
+    BSML::SliderSetting* neutralKneeBendSlider_ = nullptr;
+    BSML::SliderSetting* attackPoseSlider_ = nullptr;
+    BSML::SliderSetting* backStiffnessSlider_ = nullptr;
+    BSML::SliderSetting* floorOffsetSlider_ = nullptr;
+    UnityEngine::UI::Button* heightAdjustmentBalanceResetButton_ = nullptr;
+    UnityEngine::UI::Button* manualAvatarScaleResetButton_ = nullptr;
+    UnityEngine::UI::Button* torsoWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* shoulderWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* waistHipWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* lowerTorsoWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* neckBaseWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* headSizeResetButton_ = nullptr;
+    UnityEngine::UI::Button* torsoHeightResetButton_ = nullptr;
+    UnityEngine::UI::Button* upperLegLengthResetButton_ = nullptr;
+    UnityEngine::UI::Button* lowerLegLengthResetButton_ = nullptr;
+    UnityEngine::UI::Button* legWidthResetButton_ = nullptr;
+    UnityEngine::UI::Button* neutralKneeBendResetButton_ = nullptr;
+    UnityEngine::UI::Button* attackPoseResetButton_ = nullptr;
+    UnityEngine::UI::Button* backStiffnessResetButton_ = nullptr;
+    UnityEngine::UI::Button* floorOffsetResetButton_ = nullptr;
+    BSML::ToggleSetting* keepHandsOnSabersToggle_ = nullptr;
+    BSML::ToggleSetting* armBodyCollisionToggle_ = nullptr;
+    BSML::ToggleSetting* armSpringCollisionToggle_ = nullptr;
+    BSML::ToggleSetting* alphaToMaskToggle_ = nullptr;
+    BSML::ModalView* avatarFitWarningModal_ = nullptr;
+    TMPro::TextMeshProUGUI* avatarFitWarningText_ = nullptr;
+    int pendingAvatarFitWarning_ = 0;
+    BSML::FloatingScreen* gripEditorScreen_ = nullptr;
+    // Three independent native BSML handles provide reliable Quest pointer
+    // input. Each handle represents one translation axis; the editor projects
+    // the opposite controller's motion onto only that axis while it is held.
+    std::array<BSML::FloatingScreen*, 3> gripAxisHandles_{};
+    std::array<UnityEngine::LineRenderer*, 3> gripAxisRings_{};
+    std::array<UnityEngine::Material*, 3> gripAxisMaterials_{};
+    std::array<UnityEngine::Material*, 3> gripAxisRingMaterials_{};
+    TMPro::TextMeshProUGUI* gripEditorTitleText_ = nullptr;
+    BSML::ToggleSetting* gripEditorShowArmToggle_ = nullptr;
+    std::array<BSML::SliderSetting*, 8> gripEditorSliders_{};
+    camera::Vec3 gripEditorOriginalPosition_{};
+    camera::Vec3 gripEditorOriginalRotation_{};
+    camera::Vec3 gripEditorWorkingPosition_{};
+    camera::Vec3 gripEditorWorkingRotation_{};
+    camera::Quaternion gripEditorWorkingRotationQuaternion_{};
+    float gripEditorOriginalClosurePercent_ = 100.0F;
+    float gripEditorWorkingClosurePercent_ = 100.0F;
+    float gripEditorOriginalThumbCurvePercent_ = 100.0F;
+    float gripEditorWorkingThumbCurvePercent_ = 100.0F;
+    camera::Quaternion gripEditorGizmoRotation_{};
+    camera::Vec3 gripAxisDragControllerStart_{};
+    camera::Quaternion gripAxisDragControllerRotationStart_{};
+    camera::Vec3 gripAxisDragOriginAdjustment_{};
+    camera::Quaternion gripAxisDragOriginAdjustmentRotation_{};
+    camera::Vec3 gripAxisDragWorldDirection_{};
+    int gripAxisDrag_ = -1;
+    int gripEditorSide_ = -1;
+    bool gripAxisDragRotating_ = false;
+    bool gripEditorShowAvatarArm_ = true;
+    bool refreshingGripEditor_ = false;
     TMPro::TextMeshProUGUI* calibrationPanelTitleText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelProgressText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationPanelInstructionText_ = nullptr;
@@ -199,6 +290,9 @@ private:
     bool livestreamKeyVisible_ = false;
     bool refreshingRetargetingControls_ = false;
     bool avatarSettingsRebuildPending_ = false;
+    // Deliberately session-only diagnostic used while tuning neck/spine
+    // behavior. It is never serialized into a player or avatar profile.
+    bool debugHideAvatarHair_ = false;
     int selectedAvatarTab_ = 0;
     int selectedTab_ = 0;
     int selectedRecordingTab_ = 0;

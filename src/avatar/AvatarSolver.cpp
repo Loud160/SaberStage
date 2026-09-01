@@ -131,8 +131,16 @@ RetargetedModelGeometry BuildRetargetedModelGeometry(
     const AvatarCalibration& avatar,
     float uniformScale,
     float lowerBodyScale,
-    float torsoScale) noexcept {
+    float torsoScale,
+    float torsoWidthScale = 1.0F,
+    float shoulderWidthScale = 1.0F,
+    float waistHipWidthScale = 1.0F,
+    float manualTorsoHeightScale = 1.0F,
+    float upperLegLengthScale = 1.0F,
+    float lowerLegLengthScale = 1.0F) noexcept {
     RetargetedModelGeometry geometry{};
+    const auto modelForward = Normalize(Horizontal(avatar.modelForward), {0.0F, 0.0F, 1.0F});
+    const auto modelRight = Normalize(Cross({0.0F, 1.0F, 0.0F}, modelForward), {1.0F, 0.0F, 0.0F});
     for (std::size_t pass = 0; pass < kHumanoidBoneCount; ++pass) {
         bool progressed = false;
         for (std::size_t index = 0; index < kHumanoidBoneCount; ++index) {
@@ -150,7 +158,32 @@ RetargetedModelGeometry BuildRetargetedModelGeometry(
                 uniformScale;
             const auto child = static_cast<HumanoidBone>(index);
             if (LowerBodyHeightEdge(child)) delta.y *= lowerBodyScale;
-            else if (TorsoHeightEdge(child)) delta.y *= torsoScale;
+            else if (TorsoHeightEdge(child)) delta.y *= torsoScale * manualTorsoHeightScale;
+            // Manual segment-length controls are deliberately layered after
+            // the automatic player-height distribution. They therefore
+            // remain visible even when Match Player Height is enabled.
+            if (child == HumanoidBone::LeftLowerLeg || child == HumanoidBone::RightLowerLeg) {
+                delta.y *= upperLegLengthScale;
+            } else if (child == HumanoidBone::LeftFoot || child == HumanoidBone::RightFoot) {
+                delta.y *= lowerLegLengthScale;
+            }
+            // Width retargeting is applied only to the lateral component of
+            // the relevant rest-pose edges. Deriving the right axis from the
+            // avatar's measured forward direction keeps this valid for models
+            // whose imported root is not aligned to Unity world X.
+            float widthScale = 1.0F;
+            if (child == HumanoidBone::LeftShoulder || child == HumanoidBone::RightShoulder) {
+                widthScale = torsoWidthScale * shoulderWidthScale;
+            } else if (child == HumanoidBone::LeftUpperArm || child == HumanoidBone::RightUpperArm) {
+                const auto parentBone = rest.parent;
+                if (parentBone != HumanoidBone::LeftShoulder && parentBone != HumanoidBone::RightShoulder) {
+                    widthScale = torsoWidthScale * shoulderWidthScale;
+                }
+            } else if (child == HumanoidBone::LeftUpperLeg || child == HumanoidBone::RightUpperLeg) {
+                widthScale = torsoWidthScale * waistHipWidthScale;
+            }
+            const auto lateral = Dot(delta, modelRight);
+            delta += modelRight * (lateral * (widthScale - 1.0F));
             geometry.positions[index] = geometry.positions[parentIndex] + delta;
             geometry.valid[index] = true;
             progressed = true;
@@ -253,7 +286,7 @@ void SeedBodyState(
         {1.0F, 0.0F, 0.0F});
     const auto halfStance = avatar.hipWidth * scale *
         kDefaultBodySolverTuning.stanceWidthHipMultiplier *
-        Clamp(stanceWidthScale, 0.75F, 2.0F) * 0.5F;
+        Clamp(stanceWidthScale, 0.75F, 4.0F) * 0.5F;
     for (int side = 0; side < 2; ++side) {
         const auto footBone = side == 0 ? HumanoidBone::LeftFoot : HumanoidBone::RightFoot;
         auto& foot = state.feet[side];
@@ -718,6 +751,8 @@ Vec3 StableElbowPole(
     Pose hand,
     float chainLength,
     Vec3 restPole,
+    Vec3 handLocalDirectionTowardElbow,
+    float handOrientationWeight,
     SolverPersistentState& state) noexcept {
     const auto axis = Normalize(hand.position - shoulder, {0.0F, 0.0F, 1.0F});
     const auto outward = Rotate(chest.rotation, {side == 0 ? -0.35F : 0.35F, -1.0F, -0.12F});
@@ -732,10 +767,18 @@ Vec3 StableElbowPole(
     const auto historyWeight = 0.25F + 0.7F * extension;
     auto pole = Normalize(Lerp(rest, history, historyWeight), rest);
 
-    // Controller orientation is intentionally secondary and confidence-gated.
-    auto controllerCue = ProjectOnPlane(Rotate(hand.rotation, {0.0F, 0.0F, 1.0F}), axis);
-    if (LengthSquared(controllerCue) > kEpsilon && Dot(controllerCue, pole) < 0.0F) controllerCue = -controllerCue;
-    pole = Normalize(Lerp(pole, Normalize(controllerCue, pole), bend * 0.1F), pole);
+    // A hand rotation is not an isolated wrist twist: it implies a preferred
+    // direction from the wrist back toward the elbow. Derive that direction
+    // from this avatar's own rest forearm rather than assuming that a fixed
+    // controller axis means the same thing for every VRM. It remains a bend-
+    // weighted cue (and is still bounded by the anatomical hemisphere below),
+    // so rapid saber wrist flicks cannot throw the elbow across the body.
+    auto handCue = ProjectOnPlane(
+        Rotate(hand.rotation, handLocalDirectionTowardElbow), axis);
+    if (LengthSquared(handCue) > kEpsilon && Dot(handCue, pole) < 0.0F) handCue = -handCue;
+    pole = Normalize(
+        Lerp(pole, Normalize(handCue, pole), bend * Saturate(handOrientationWeight)),
+        pole);
 
     // History removes jitter, but it must not preserve an elbow that has
     // crossed through the torso. Keep the bend goal inside a strict
@@ -781,8 +824,10 @@ void SolveArm(
     const calibration::RuntimePlayerProfile& profile,
     Pose chest,
     Pose handTarget,
-    Quaternion sourceToCanonicalHand,
     bool handFromSaberGrip,
+    bool manualGripAdjusted,
+    bool keepHandsOnSabers,
+    bool preventArmBodyClipping,
     const SolvedHumanoidPose& neutralPose,
     SolvedHumanoidPose& output,
     SolverPersistentState& state,
@@ -802,13 +847,58 @@ void SolveArm(
     const auto calibratedReach = useCalibratedReach
         ? profile.effectiveReachNormalized[side] * playerHeight
         : measuredArmLength;
-    const auto calibratedCompensation = useCalibratedReach
+    // Keep Hands on Sabers is the only option allowed to alter a gameplay
+    // arm's authored segment lengths. Previously the OFF path still inherited
+    // both calibration-derived extension and the tracked-grip stretch cap,
+    // which made the toggle appear ineffective.
+    const auto calibratedCompensation = useCalibratedReach && (!handFromSaberGrip || keepHandsOnSabers)
         ? Clamp(calibratedReach / std::max(measuredArmLength, kEpsilon), 1.0F, tuning.maximumArmStretchFraction)
         : 1.0F;
     const auto upperArmLength = avatar.upperArmLength[side] * scale * calibratedCompensation;
     const auto lowerArmLength = avatar.lowerArmLength[side] * scale * calibratedCompensation;
     const auto armLength = upperArmLength + lowerArmLength;
-    const auto initialReach = Length(handTarget.position - shoulder);
+    // handTarget is already the complete desired wrist pose. The caller has
+    // composed the live controller/saber pose, learned anatomical correction,
+    // and the user's rigid grip adjustment before reaching the arm solver.
+    // This is important: the IK chain must see the same rotation that the hand
+    // will receive, otherwise pitch/yaw/roll can only twist the wrist in place.
+    auto solveTarget = handTarget;
+    Vec3 bodyRight{};
+    Vec3 bodyForward{};
+    Vec3 torsoCenter{};
+    Vec3 torsoUp{};
+    float bodyRadius = 0.0F;
+    float bodyDepth = 0.0F;
+    float torsoHalfHeight = 0.0F;
+    if (preventArmBodyClipping) {
+        bodyRight = Normalize(Rotate(chest.rotation, {1.0F, 0.0F, 0.0F}), {1.0F, 0.0F, 0.0F});
+        bodyForward = Normalize(Rotate(chest.rotation, {0.0F, 0.0F, 1.0F}), {0.0F, 0.0F, 1.0F});
+        const auto hips = Has(avatar, HumanoidBone::Hips)
+            ? Solved(output, HumanoidBone::Hips).position
+            : chest.position - Vec3{0.0F, playerHeight * 0.28F, 0.0F};
+        torsoCenter = (hips + chest.position) * 0.5F;
+        torsoUp = Normalize(chest.position - hips, {0.0F, 1.0F, 0.0F});
+        torsoHalfHeight = std::max(Length(chest.position - hips) * 0.62F, 0.12F);
+        bodyRadius = std::max(avatar.shoulderWidth * scale * 0.40F, 0.10F);
+        bodyDepth = std::max(bodyRadius * 0.58F, 0.07F);
+        const auto relative = solveTarget.position - torsoCenter;
+        const auto lateral = Dot(relative, bodyRight);
+        const auto vertical = Dot(relative, torsoUp);
+        const auto forward = Dot(relative, bodyForward);
+        const auto lateralUnit = lateral / bodyRadius;
+        const auto depthUnit = forward / bodyDepth;
+        if (std::abs(vertical) <= torsoHalfHeight &&
+            lateralUnit * lateralUnit + depthUnit * depthUnit < 1.0F) {
+            // A tracked controller can physically be held against the chest,
+            // but the avatar hand cannot occupy the torso volume. Move only
+            // the collision-enabled solve target to the nearest front surface;
+            // the original tracked target remains in diagnostics.
+            const auto surfaceDepth = bodyDepth * std::sqrt(
+                std::max(0.0F, 1.0F - lateralUnit * lateralUnit)) + 0.012F;
+            solveTarget.position += bodyForward * (surfaceDepth - forward);
+        }
+    }
+    const auto initialReach = Length(solveTarget.position - shoulder);
     const auto shoulderAssistStart = armLength * (profile.valid
         ? std::max(0.84F, tuning.shoulderAssistStartReachRatio -
             std::max(0.0F, calibratedReach / std::max(measuredArmLength, kEpsilon) - 1.0F) * 0.25F)
@@ -817,16 +907,16 @@ void SolveArm(
     const auto shoulderAssist = std::min(
         std::max(0.0F, initialReach - shoulderAssistStart),
         maximumClavicle);
-    shoulder += Normalize(handTarget.position - shoulder) * shoulderAssist;
+    shoulder += Normalize(solveTarget.position - shoulder) * shoulderAssist;
 
     const auto originalShoulder = Has(avatar, shoulderBone)
         ? Solved(output, shoulderBone).position
         : Solved(output, upperBone).position;
     const auto upperRoot = Solved(output, upperBone).position + (shoulder - originalShoulder);
-    const auto shoulderToTargetDistance = Length(handTarget.position - upperRoot);
+    const auto shoulderToTargetDistance = Length(solveTarget.position - upperRoot);
     const auto reachRatio = shoulderToTargetDistance / std::max(armLength, kEpsilon);
     const auto stretchLimit = handFromSaberGrip
-        ? tuning.maximumTrackedGripStretchFraction
+        ? (keepHandsOnSabers ? 2.50F : 1.0F)
         : tuning.maximumArmStretchFraction;
     const auto stretch = Clamp(
         shoulderToTargetDistance / std::max(armLength, kEpsilon),
@@ -835,17 +925,103 @@ void SolveArm(
     const auto restPole = Rotate(
         PoseDelta(Rest(avatar, chestBone).world.rotation, chest.rotation),
         avatar.restElbowPole[side]);
-    const auto pole = StableElbowPole(side, chest, upperRoot, handTarget, armLength, restPole, state);
-    const auto result = SolveTwoBoneIK({
+    const auto neutralLower = Solved(neutralPose, lowerBone);
+    const auto neutralHand = Solved(neutralPose, handBone);
+    const auto handLocalDirectionTowardElbow = Rotate(
+        Inverse(neutralHand.rotation),
+        Normalize(neutralLower.position - neutralHand.position,
+            {side == 0 ? 1.0F : -1.0F, 0.0F, 0.0F}));
+    auto pole = StableElbowPole(
+        side,
+        chest,
+        upperRoot,
+        solveTarget,
+        armLength,
+        restPole,
+        handLocalDirectionTowardElbow,
+        // A grip edit changes only the rigid controller-to-hand transform. It
+        // must not abruptly switch elbow-pole weighting as soon as an offset
+        // moves away from identity; that old threshold made tiny slider edits
+        // visibly invert the arm. Keep the proven anatomical pole blend and
+        // let the continuously moving hand target drive shoulder/elbow/wrist.
+        0.12F,
+        state);
+    if (preventArmBodyClipping) {
+        // Start from an outward/front bend plane. A second bounded pass below
+        // evaluates complete upper-arm and forearm segments, because changing
+        // only the preferred pole was not enough to prevent cross-body poses
+        // from visibly passing through the torso.
+        const auto outward = bodyRight * (side == 0 ? -1.0F : 1.0F);
+        const auto targetFromChest = solveTarget.position - chest.position;
+        const auto lateral = Dot(targetFromChest, bodyRight) * (side == 0 ? -1.0F : 1.0F);
+        if (lateral < bodyRadius) {
+            const auto correction = Saturate((bodyRadius - lateral) / bodyRadius);
+            const auto outwardAndForward = Normalize(outward + bodyForward * 0.35F, outward);
+            pole = Normalize(Lerp(pole, ProjectOnPlane(outwardAndForward, solveTarget.position - upperRoot),
+                0.55F + correction * 0.40F), pole);
+        }
+    }
+    const TwoBoneIKInput armInput{
         .root = upperRoot,
         .currentMiddle = Solved(neutralPose, lowerBone).position,
         .currentEnd = Solved(neutralPose, handBone).position,
-        .target = handTarget.position,
+        .target = solveTarget.position,
         .poleVector = pole,
         .rootToMiddleLength = upperArmLength * stretch,
         .middleToEndLength = lowerArmLength * stretch,
         .soften = 1.0F,
-    });
+    };
+    auto result = SolveTwoBoneIK(armInput);
+    if (preventArmBodyClipping && result.valid) {
+        const auto torsoPenetration = [&](Vec3 point) noexcept {
+            const auto relative = point - torsoCenter;
+            const auto vertical = std::abs(Dot(relative, torsoUp));
+            if (vertical >= torsoHalfHeight) return 0.0F;
+            const auto lateral = Dot(relative, bodyRight) / bodyRadius;
+            const auto depth = Dot(relative, bodyForward) / bodyDepth;
+            const auto radial = std::sqrt(lateral * lateral + depth * depth);
+            const auto verticalWeight = 1.0F - vertical / torsoHalfHeight;
+            return std::max(0.0F, 1.0F - radial) * verticalWeight;
+        };
+        const auto pathPenetration = [&](const TwoBoneIKResult& candidate) noexcept {
+            // Sample the elbow and both half-segments. This catches the common
+            // failure where the elbow itself is outside but the forearm cuts
+            // through the chest. Fixed samples/candidates keep this allocation
+            // free and deterministic on Quest.
+            return torsoPenetration(candidate.middle) * 1.5F +
+                torsoPenetration((candidate.root + candidate.middle) * 0.5F) +
+                torsoPenetration((candidate.middle + candidate.end) * 0.5F);
+        };
+        auto bestResult = result;
+        auto bestPole = pole;
+        auto bestScore = pathPenetration(result);
+        if (bestScore > 1.0e-4F) {
+            const auto outward = bodyRight * (side == 0 ? -1.0F : 1.0F);
+            const std::array<Vec3, 5> candidates{
+                Normalize(outward + bodyForward * 0.35F, outward),
+                Normalize(outward + bodyForward, outward),
+                Normalize(bodyForward + outward * 0.55F, outward),
+                Normalize(outward + torsoUp * 0.30F + bodyForward * 0.25F, outward),
+                Normalize(outward - torsoUp * 0.30F + bodyForward * 0.25F, outward),
+            };
+            const auto armAxis = solveTarget.position - upperRoot;
+            for (const auto candidate : candidates) {
+                auto candidatePole = Normalize(ProjectOnPlane(candidate, armAxis), pole);
+                auto candidateInput = armInput;
+                candidateInput.poleVector = candidatePole;
+                const auto candidateResult = SolveTwoBoneIK(candidateInput);
+                if (!candidateResult.valid) continue;
+                const auto candidateScore = pathPenetration(candidateResult);
+                if (candidateScore + 1.0e-5F < bestScore) {
+                    bestResult = candidateResult;
+                    bestPole = candidatePole;
+                    bestScore = candidateScore;
+                }
+            }
+        }
+        result = bestResult;
+        pole = bestPole;
+    }
     if (!result.valid) return;
 
     if (Has(avatar, shoulderBone)) {
@@ -861,67 +1037,34 @@ void SolveArm(
     auto& lower = Solved(output, lowerBone);
     auto& hand = Solved(output, handBone);
     const auto neutralUpper = Solved(neutralPose, upperBone);
-    const auto neutralLower = Solved(neutralPose, lowerBone);
-    const auto neutralHand = Solved(neutralPose, handBone);
     upper.position = result.root;
     lower.position = result.middle;
-    const auto solvedTargetError = Length(result.end - handTarget.position);
-    // A live saber handle is a directly tracked end effector, not an inferred
-    // hand target.  Never let an arm-length estimate visibly detach the hand
-    // from the saber: shoulder assist and conservative stretch solve as much
-    // of the reach as possible, then the last forearm segment terminates at
-    // the authoritative tracked handle.  Controller-only/menu tracking keeps
-    // the ordinary anatomical clamp.
-    const auto finalEnd = handFromSaberGrip ? handTarget.position : result.end;
+    const auto solvedTargetError = Length(result.end - solveTarget.position);
+    // A live saber handle is normally the authoritative end effector. Keep
+    // Hands on Sabers may extend/anchor to it; collision prevention may first
+    // move an inside-body target to the torso surface. Controller-only/menu
+    // tracking keeps the ordinary anatomical clamp.
+    // A user-authored grip correction is intended to lock the visible pointer
+    // inside the calibrated palm in menus as well as lock sabers in gameplay.
+    // Honor that hard target while Keep Hands On Sabers is enabled; turning
+    // the option off still restores the ordinary reachable-limb result.
+    const auto finalEnd = (handFromSaberGrip || manualGripAdjusted) && keepHandsOnSabers
+        ? solveTarget.position
+        : result.end;
     hand.position = finalEnd;
     upper.rotation = AlignBone(neutralUpper, neutralLower, result.root, result.middle);
     lower.rotation = AlignBone(neutralLower, neutralHand, result.middle, finalEnd);
     const auto anatomicalHandRotation = Multiply(
         PoseDelta(neutralLower.rotation, lower.rotation),
         neutralHand.rotation);
-    const auto handSourceChanged =
-        state.gripToHandRotationValid[side] &&
-        state.previousHandWasSaberGrip[side] != handFromSaberGrip;
-    if (!state.gripToHandRotationValid[side] || handSourceChanged) {
-        const auto useGripFit =
-            profile.valid && profile.gripConfidence[side] >= tuning.minimumGripFitConfidence;
-        if (useGripFit) {
-            const auto canonicalRest = FromToRotation(
-                {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F},
-                Normalize(neutralHand.position - neutralLower.position,
-                    {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F}));
-            const auto canonicalToAvatar = Multiply(Inverse(canonicalRest), neutralHand.rotation);
-            state.gripToHandRotation[side] = Multiply(
-                sourceToCanonicalHand,
-                canonicalToAvatar);
-        } else {
-            state.gripToHandRotation[side] = Multiply(
-                Inverse(handTarget.rotation),
-                anatomicalHandRotation);
-        }
-        state.gripToHandRotationValid[side] = true;
-    }
-    if (handSourceChanged) {
-        // A saber-handle gameplay sample and a menu controller sample answer
-        // different reach questions. Start a fresh range when the authoritative
-        // source changes so the on-demand gameplay report is not polluted by
-        // earlier menu poses.
-        state.armReachRatioMinimum[side] = 0.0F;
-        state.armReachRatioMaximum[side] = 0.0F;
-        state.armReachRatioSum[side] = 0.0;
-        state.armReachSampleCount[side] = 0;
-    }
-    state.previousHandWasSaberGrip[side] = handFromSaberGrip;
-    const auto desiredHandRotation = Multiply(
-        handTarget.rotation,
-        state.gripToHandRotation[side]);
+    const auto desiredHandRotation = handTarget.rotation;
     const auto wristDeviation = QuaternionAngleDegrees(anatomicalHandRotation, desiredHandRotation);
     // Saber tracking remains authoritative for hand position. Rotation still
     // needs an anatomical hemisphere: an unconstrained 180-degree controller
     // orientation can turn the hand inside-out even though its grip point is
     // correct. Gameplay receives a wider cone than inferred menu tracking so
     // ordinary forearm pronation and backhand cuts remain available.
-    const auto wristLimit = handFromSaberGrip
+    const auto wristLimit = handFromSaberGrip || manualGripAdjusted
         ? tuning.maximumTrackedGripWristDeviationDegrees
         : tuning.maximumWristDeviationDegrees;
     hand.rotation = wristDeviation > wristLimit
@@ -959,9 +1102,9 @@ void SolveArm(
         const auto lowerDirection = Normalize(result.end - result.middle);
         diagnostics->elbowFlexionDegrees[side] = std::acos(
             Clamp(Dot(upperDirection, lowerDirection), -1.0F, 1.0F)) * kRadiansToDegrees;
-        diagnostics->handTargetError[side] = Length(hand.position - handTarget.position);
+        diagnostics->handTargetError[side] = Length(hand.position - solveTarget.position);
         diagnostics->preAnchorHandTargetError[side] = solvedTargetError;
-        diagnostics->trackedGripHardAnchored[side] = handFromSaberGrip;
+        diagnostics->trackedGripHardAnchored[side] = handFromSaberGrip && keepHandsOnSabers;
         diagnostics->wristRotationErrorDegrees[side] = QuaternionAngleDegrees(hand.rotation, desiredHandRotation);
         diagnostics->gripToHandRotation[side] = state.gripToHandRotation[side];
         diagnostics->handTargetFromSaberGrip[side] = handFromSaberGrip;
@@ -1079,7 +1222,7 @@ IdealStance CalculateIdealStance(
     const auto forward = Vec3{std::sin(predictedYaw), 0.0F, std::cos(predictedYaw)};
     const auto right = Vec3{std::cos(predictedYaw), 0.0F, -std::sin(predictedYaw)};
     const auto halfStance = avatar.hipWidth * scale * tuning.stanceWidthHipMultiplier *
-        Clamp(stanceWidthScale, 0.75F, 2.0F) * 0.5F;
+        Clamp(stanceWidthScale, 0.75F, 4.0F) * 0.5F;
     const auto neutralHips = Solved(neutralPose, HumanoidBone::Hips);
     const auto neutralFootCenter =
         (Solved(neutralPose, HumanoidBone::LeftFoot).position +
@@ -1570,52 +1713,147 @@ AvatarRetargeting ComputeAvatarRetargeting(
     const AvatarCalibration& avatar,
     const PlayerCalibration& player,
     const calibration::RuntimePlayerProfile& profile,
-    bool matchPlayerHeight,
-    float heightAdjustmentBalance) noexcept {
+    const AvatarFitOptions& options) noexcept {
     AvatarRetargeting result{};
-    result.avatarArmSpan = avatar.approximateArmSpan;
     result.playerArmSpan = profile.playerArmSpan;
     result.playerArmSpanConfidence = profile.playerArmSpanConfidence;
-    result.targetEyeHeight = player.standingHmdHeight;
-    result.matchPlayerHeight = matchPlayerHeight;
-    result.heightAdjustmentBalance = Clamp(heightAdjustmentBalance, -1.0F, 1.0F);
+    result.matchPlayerHeight = options.matchPlayerHeight;
+    result.heightAdjustmentBalance = Clamp(options.heightAdjustmentBalance, -1.0F, 1.0F);
+    result.manualScale = options.manualAvatarScaleEnabled
+        ? Clamp(options.manualAvatarScale, 0.50F, 2.0F)
+        : 1.0F;
+    result.torsoWidthScale = options.adjustBodyProportions
+        ? Clamp(options.torsoWidthScale, 0.50F, 2.0F) : 1.0F;
+    result.shoulderWidthScale = options.adjustBodyProportions
+        ? Clamp(options.shoulderWidthScale, 0.50F, 3.0F) : 1.0F;
+    result.shoulderWidthConfidence = profile.shoulderWidthConfidence;
+    result.waistHipWidthScale = options.adjustBodyProportions
+        ? Clamp(options.waistHipWidthScale, 0.50F, 2.0F) : 1.0F;
+    result.lowerTorsoWidthScale = options.adjustBodyProportions
+        ? Clamp(options.lowerTorsoWidthScale, 0.50F, 2.0F) : 1.0F;
+    result.neckBaseWidthScale = options.adjustBodyProportions
+        ? Clamp(options.neckBaseWidthScale, 0.50F, 2.0F) : 1.0F;
+    result.torsoHeightScale = options.adjustBodyProportions
+        ? Clamp(options.torsoHeightScale, 0.50F, 1.50F) : 1.0F;
+    result.upperLegLengthScale = options.adjustBodyProportions
+        ? Clamp(options.upperLegLengthScale, 0.50F, 1.50F) : 1.0F;
+    result.lowerLegLengthScale = options.adjustBodyProportions
+        ? Clamp(options.lowerLegLengthScale, 0.50F, 1.50F) : 1.0F;
+    result.legWidthScale = options.adjustBodyProportions
+        ? Clamp(options.legWidthScale, 0.50F, 2.0F) : 1.0F;
+    result.avatarArmSpan = avatar.approximateArmSpan;
     if (!avatar.valid || !player.valid || avatar.approximateArmSpan <= kEpsilon) return result;
 
     constexpr float kMinimumArmSpanConfidence = 0.55F;
     constexpr float kMinimumUniformScale = 0.55F;
-    constexpr float kMaximumUniformScale = 1.80F;
+    constexpr float kMaximumUniformScale = 2.50F;
     const auto armSpanAvailable = profile.valid &&
         profile.playerArmSpanConfidence >= kMinimumArmSpanConfidence &&
         std::isfinite(profile.playerArmSpan) && profile.playerArmSpan > 0.45F;
-    const auto requestedUniformScale = armSpanAvailable
-        ? profile.playerArmSpan / avatar.approximateArmSpan
-        : LegacyAvatarScale(avatar, player);
-    result.uniformScale = Clamp(
-        requestedUniformScale,
-        kMinimumUniformScale,
-        kMaximumUniformScale);
-    result.scaleClamped = std::abs(result.uniformScale - requestedUniformScale) > 1.0e-4F;
-    result.armSpanBased = armSpanAvailable;
+    constexpr float kMinimumShoulderWidthConfidence = 0.60F;
+    const auto automaticShoulderAvailable = options.adjustBodyProportions && options.autoShoulderWidth &&
+        profile.valid && profile.shoulderWidthConfidence >= kMinimumShoulderWidthConfidence &&
+        std::isfinite(profile.estimatedShoulderWidth) && profile.estimatedShoulderWidth > 0.15F &&
+        avatar.shoulderWidth > kEpsilon;
+    const auto armChains = std::max(
+        avatar.approximateArmSpan - avatar.shoulderWidth,
+        kEpsilon);
+    auto requestedUniformScale = LegacyAvatarScale(avatar, player);
+    if (options.armSpanAvatarSizing && armSpanAvailable) {
+        if (automaticShoulderAvailable && profile.playerArmSpan > profile.estimatedShoulderWidth + 0.10F) {
+            // The calibrated shoulder width is already a world-space value.
+            // Solve the remaining player reach against the two arm chains so
+            // changing shoulder width contributes to effective arm span
+            // instead of being added on top of the old uniform-scale result.
+            requestedUniformScale =
+                (profile.playerArmSpan - profile.estimatedShoulderWidth) / armChains;
+        } else {
+            const auto effectiveAvatarArmSpan =
+                armChains + avatar.shoulderWidth * result.torsoWidthScale * result.shoulderWidthScale;
+            requestedUniformScale = profile.playerArmSpan /
+                std::max(effectiveAvatarArmSpan, kEpsilon);
+        }
+    }
+    result.baseUniformScale = Clamp(requestedUniformScale, kMinimumUniformScale, kMaximumUniformScale);
+    if (automaticShoulderAvailable) {
+        result.shoulderWidthScale = Clamp(
+            profile.estimatedShoulderWidth /
+                (avatar.shoulderWidth * result.baseUniformScale * result.torsoWidthScale),
+            0.50F,
+            3.0F);
+        result.automaticShoulderWidthApplied = true;
+    }
+    result.avatarArmSpan = armChains +
+        avatar.shoulderWidth * result.torsoWidthScale * result.shoulderWidthScale;
+    result.uniformScale = result.baseUniformScale * result.manualScale;
+    // Final Avatar Size establishes the played root scale before vertical
+    // retargeting. Match Player Height's target is scaled by that same final
+    // multiplier, preserving the user's requested overall size. Height
+    // Balance can then redistribute the required vertical correction without
+    // changing either that final height or the arm-span-derived root scale.
+    result.targetEyeHeight = player.standingHmdHeight * result.manualScale;
+    result.scaleClamped = std::abs(result.baseUniformScale - requestedUniformScale) > 1.0e-4F;
+    result.armSpanBased = options.armSpanAvatarSizing && armSpanAvailable;
 
-    const auto natural = BuildRetargetedModelGeometry(avatar, result.uniformScale, 1.0F, 1.0F);
+    // Build the actual final-scale skeleton, including manual torso and leg
+    // proportions, before calculating automatic vertical correction. This
+    // keeps the balance slider as a pure post-scale distribution control.
+    const auto natural = BuildRetargetedModelGeometry(
+        avatar, result.uniformScale, 1.0F, 1.0F,
+        result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale,
+        result.torsoHeightScale, result.upperLegLengthScale, result.lowerLegLengthScale);
     if (!natural.complete) {
         result.geometryFallback = true;
         return result;
     }
     result.naturalEyeHeight = natural.eye.y - natural.floor;
-    result.finalEyeHeight = result.naturalEyeHeight;
-    result.requestedHeightDelta = player.standingHmdHeight - result.naturalEyeHeight;
-    result.residualHeightError = result.requestedHeightDelta;
+    const auto automaticBaseline = BuildRetargetedModelGeometry(
+        avatar, result.uniformScale, 1.0F, 1.0F,
+        result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale);
+    if (!automaticBaseline.complete) {
+        result.geometryFallback = true;
+        return result;
+    }
+    // Explicit torso/leg length controls are authored proportion changes, not
+    // part of automatic height matching. Preserve the height they add/remove,
+    // then distribute only the automatic match correction after final scale.
+    // Consequently Height Balance cannot erase those controls or alter the
+    // avatar's already-established final height.
+    result.targetEyeHeight += result.naturalEyeHeight -
+        (automaticBaseline.eye.y - automaticBaseline.floor);
+    result.requestedHeightDelta = result.targetEyeHeight - result.naturalEyeHeight;
     result.valid = true;
-    if (!matchPlayerHeight || !armSpanAvailable) return result;
+    const auto finishGeometry = [&]() {
+        const auto finalGeometry = BuildRetargetedModelGeometry(
+            avatar, result.uniformScale, result.lowerBodyScale, result.torsoScale,
+            result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale,
+            result.torsoHeightScale, result.upperLegLengthScale, result.lowerLegLengthScale);
+        if (!finalGeometry.complete) {
+            result.geometryFallback = true;
+            result.finalEyeHeight = result.naturalEyeHeight;
+        } else {
+            result.finalEyeHeight = finalGeometry.eye.y - finalGeometry.floor;
+        }
+        result.residualHeightError = result.targetEyeHeight - result.finalEyeHeight;
+    };
+    if (!options.matchPlayerHeight || !options.armSpanAvatarSizing) {
+        // With height matching disabled, targetEyeHeight is diagnostic only;
+        // report the final natural skeleton exactly as it will be rendered.
+        finishGeometry();
+        return result;
+    }
 
     // Measuring each region by rebuilding it at 2x accounts for authored
     // slanted bones without assuming that summed segment magnitudes equal the
     // vertical height they contribute.
     const auto doubledLower = BuildRetargetedModelGeometry(
-        avatar, result.uniformScale, 2.0F, 1.0F);
+        avatar, result.uniformScale, 2.0F, 1.0F,
+        result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale,
+        result.torsoHeightScale, result.upperLegLengthScale, result.lowerLegLengthScale);
     const auto doubledTorso = BuildRetargetedModelGeometry(
-        avatar, result.uniformScale, 1.0F, 2.0F);
+        avatar, result.uniformScale, 1.0F, 2.0F,
+        result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale,
+        result.torsoHeightScale, result.upperLegLengthScale, result.lowerLegLengthScale);
     if (!doubledLower.complete || !doubledTorso.complete) {
         result.geometryFallback = true;
         return result;
@@ -1629,9 +1867,9 @@ AvatarRetargeting ComputeAvatarRetargeting(
         return result;
     }
 
-    constexpr float kMinimumRegionScale = 0.70F;
-    constexpr float kMaximumRegionScale = 1.30F;
-    const auto maximumTotalCorrection = std::min(0.45F, result.naturalEyeHeight * 0.28F);
+    constexpr float kMinimumRegionScale = 0.50F;
+    constexpr float kMaximumRegionScale = 1.50F;
+    const auto maximumTotalCorrection = std::min(0.75F, result.naturalEyeHeight * 0.45F);
     const auto boundedHeightDelta = Clamp(
         result.requestedHeightDelta,
         -maximumTotalCorrection,
@@ -1639,55 +1877,83 @@ AvatarRetargeting ComputeAvatarRetargeting(
     result.heightCorrectionClamped =
         std::abs(boundedHeightDelta - result.requestedHeightDelta) > 1.0e-4F;
 
+    const auto lowerMinimumDelta =
+        result.lowerBodyVerticalLength * (kMinimumRegionScale - 1.0F);
+    const auto lowerMaximumDelta =
+        result.lowerBodyVerticalLength * (kMaximumRegionScale - 1.0F);
+    const auto torsoMinimumDelta =
+        result.torsoVerticalLength * (kMinimumRegionScale - 1.0F);
+    const auto torsoMaximumDelta =
+        result.torsoVerticalLength * (kMaximumRegionScale - 1.0F);
     const auto totalAdjustable = result.lowerBodyVerticalLength + result.torsoVerticalLength;
     const auto centerLegWeight = Clamp(
         result.lowerBodyVerticalLength / totalAdjustable,
-        0.15F,
-        0.85F);
-    const auto legWeight = result.heightAdjustmentBalance < 0.0F
-        ? centerLegWeight + (0.85F - centerLegWeight) * -result.heightAdjustmentBalance
-        : centerLegWeight + (0.15F - centerLegWeight) * result.heightAdjustmentBalance;
+        0.02F,
+        0.98F);
     auto lowerDelta = Clamp(
-        boundedHeightDelta * legWeight,
-        result.lowerBodyVerticalLength * (kMinimumRegionScale - 1.0F),
-        result.lowerBodyVerticalLength * (kMaximumRegionScale - 1.0F));
+        boundedHeightDelta * centerLegWeight,
+        lowerMinimumDelta,
+        lowerMaximumDelta);
     auto torsoDelta = Clamp(
         boundedHeightDelta - lowerDelta,
-        result.torsoVerticalLength * (kMinimumRegionScale - 1.0F),
-        result.torsoVerticalLength * (kMaximumRegionScale - 1.0F));
+        torsoMinimumDelta,
+        torsoMaximumDelta);
     auto residual = boundedHeightDelta - lowerDelta - torsoDelta;
     if (std::abs(residual) > 1.0e-5F) {
         const auto prior = lowerDelta;
         lowerDelta = Clamp(
             lowerDelta + residual,
-            result.lowerBodyVerticalLength * (kMinimumRegionScale - 1.0F),
-            result.lowerBodyVerticalLength * (kMaximumRegionScale - 1.0F));
+            lowerMinimumDelta,
+            lowerMaximumDelta);
         residual -= lowerDelta - prior;
     }
     if (std::abs(residual) > 1.0e-5F) {
         const auto prior = torsoDelta;
         torsoDelta = Clamp(
             torsoDelta + residual,
-            result.torsoVerticalLength * (kMinimumRegionScale - 1.0F),
-            result.torsoVerticalLength * (kMaximumRegionScale - 1.0F));
+            torsoMinimumDelta,
+            torsoMaximumDelta);
         residual -= torsoDelta - prior;
     }
     if (std::abs(residual) > 1.0e-4F) result.heightCorrectionClamped = true;
+
+    // Height Balance is a post-scale proportion control, not merely a choice
+    // of where to place a nonzero automatic correction. The old weighted-
+    // delta implementation became an exact no-op whenever the arm-span fit
+    // already matched player height (and throughout the safe legacy-height
+    // fallback), because there was no correction to divide. Transfer equal
+    // and opposite vertical length between the two regions after the centered
+    // height correction instead. This keeps total height and root/arm scale
+    // invariant while making every nonzero balance value observable.
+    const auto transferMinimum = std::max(
+        lowerMinimumDelta - lowerDelta,
+        torsoDelta - torsoMaximumDelta);
+    const auto transferMaximum = std::min(
+        lowerMaximumDelta - lowerDelta,
+        torsoDelta - torsoMinimumDelta);
+    const auto desiredTransfer = result.heightAdjustmentBalance < 0.0F
+        ? transferMaximum * -result.heightAdjustmentBalance
+        : transferMinimum * result.heightAdjustmentBalance;
+    const auto transfer = Clamp(desiredTransfer, transferMinimum, transferMaximum);
+    lowerDelta += transfer;
+    torsoDelta -= transfer;
+
     result.lowerBodyScale = 1.0F + lowerDelta / result.lowerBodyVerticalLength;
     result.torsoScale = 1.0F + torsoDelta / result.torsoVerticalLength;
 
     const auto corrected = BuildRetargetedModelGeometry(
-        avatar, result.uniformScale, result.lowerBodyScale, result.torsoScale);
+        avatar, result.uniformScale, result.lowerBodyScale, result.torsoScale,
+        result.torsoWidthScale, result.shoulderWidthScale, result.waistHipWidthScale,
+        result.torsoHeightScale, result.upperLegLengthScale, result.lowerLegLengthScale);
     if (!corrected.complete) {
         result.lowerBodyScale = 1.0F;
         result.torsoScale = 1.0F;
         result.geometryFallback = true;
         return result;
     }
-    result.finalEyeHeight = corrected.eye.y - corrected.floor;
-    result.appliedHeightDelta = result.finalEyeHeight - result.naturalEyeHeight;
-    result.residualHeightError = player.standingHmdHeight - result.finalEyeHeight;
+    result.appliedHeightDelta = (corrected.eye.y - corrected.floor) - result.naturalEyeHeight;
     result.heightCorrectionApplied = std::abs(result.appliedHeightDelta) > 1.0e-4F;
+    finishGeometry();
     return result;
 }
 
@@ -1702,7 +1968,13 @@ bool BuildRetargetedNeutralPose(
         avatar,
         retargeting.uniformScale,
         retargeting.lowerBodyScale,
-        retargeting.torsoScale);
+        retargeting.torsoScale,
+        retargeting.torsoWidthScale,
+        retargeting.shoulderWidthScale,
+        retargeting.waistHipWidthScale,
+        retargeting.torsoHeightScale,
+        retargeting.upperLegLengthScale,
+        retargeting.lowerLegLengthScale);
     if (!geometry.complete) return false;
     const auto facing = FacingRotation(avatar, player);
     const Vec3 modelFloorAnchor{geometry.eye.x, geometry.floor, geometry.eye.z};
@@ -1735,22 +2007,98 @@ void StaticTrackerlessAvatarSolver::SetPlantedLegLeanLimit(float fraction) noexc
 }
 
 void StaticTrackerlessAvatarSolver::SetStanceWidthScale(float scale) noexcept {
-    stanceWidthScale_ = Clamp(scale, 0.75F, 2.0F);
+    stanceWidthScale_ = Clamp(scale, 0.75F, 4.0F);
 }
 
 void StaticTrackerlessAvatarSolver::SetBackwardSpineCurveLimit(float fraction) noexcept {
     backwardSpineCurveLimit_ = Clamp(fraction, 0.0F, 1.0F);
 }
 
-bool StaticTrackerlessAvatarSolver::SetRetargetingSettings(
-    bool matchPlayerHeight,
-    float heightAdjustmentBalance) noexcept {
-    const auto boundedBalance = Clamp(heightAdjustmentBalance, -1.0F, 1.0F);
-    const auto changed = matchPlayerHeight_ != matchPlayerHeight ||
-        std::abs(heightAdjustmentBalance_ - boundedBalance) > 1.0e-4F;
-    matchPlayerHeight_ = matchPlayerHeight;
-    heightAdjustmentBalance_ = boundedBalance;
+bool StaticTrackerlessAvatarSolver::SetFitOptions(const AvatarFitOptions& options) noexcept {
+    auto bounded = options;
+    bounded.heightAdjustmentBalance = Clamp(bounded.heightAdjustmentBalance, -1.0F, 1.0F);
+    bounded.manualAvatarScale = Clamp(bounded.manualAvatarScale, 0.50F, 2.0F);
+    bounded.torsoWidthScale = Clamp(bounded.torsoWidthScale, 0.50F, 2.0F);
+    bounded.shoulderWidthScale = Clamp(bounded.shoulderWidthScale, 0.50F, 3.0F);
+    bounded.waistHipWidthScale = Clamp(bounded.waistHipWidthScale, 0.50F, 2.0F);
+    bounded.lowerTorsoWidthScale = Clamp(bounded.lowerTorsoWidthScale, 0.50F, 2.0F);
+    bounded.neckBaseWidthScale = Clamp(bounded.neckBaseWidthScale, 0.50F, 2.0F);
+    bounded.torsoHeightScale = Clamp(bounded.torsoHeightScale, 0.50F, 1.50F);
+    bounded.upperLegLengthScale = Clamp(bounded.upperLegLengthScale, 0.50F, 1.50F);
+    bounded.lowerLegLengthScale = Clamp(bounded.lowerLegLengthScale, 0.50F, 1.50F);
+    bounded.legWidthScale = Clamp(bounded.legWidthScale, 0.50F, 2.0F);
+    bounded.neutralKneeBendDegrees = Clamp(bounded.neutralKneeBendDegrees, 0.0F, 20.0F);
+    bounded.attackPoseDegrees = Clamp(bounded.attackPoseDegrees, -20.0F, 20.0F);
+    bounded.backStiffness = Clamp(bounded.backStiffness, 0.0F, 1.0F);
+    bounded.floorOffsetMeters = Clamp(bounded.floorOffsetMeters, -0.25F, 0.25F);
+    for (auto& adjustment : bounded.gripAdjustment) {
+        if (!IsFinite(adjustment.position)) adjustment.position = {};
+        if (!IsFinite(adjustment.rotation)) adjustment.rotation = {};
+        adjustment.position.x = Clamp(adjustment.position.x, -0.25F, 0.25F);
+        adjustment.position.y = Clamp(adjustment.position.y, -0.25F, 0.25F);
+        adjustment.position.z = Clamp(adjustment.position.z, -0.25F, 0.25F);
+        adjustment.rotation = Normalize(adjustment.rotation);
+    }
+    const auto different = [](float left, float right) {
+        return std::abs(left - right) > 1.0e-4F;
+    };
+    const auto poseDifferent = [](const Pose& left, const Pose& right) {
+        const auto rotationDot = std::abs(left.rotation.x * right.rotation.x +
+            left.rotation.y * right.rotation.y + left.rotation.z * right.rotation.z +
+            left.rotation.w * right.rotation.w);
+        return LengthSquared(left.position - right.position) > 1.0e-10F ||
+            rotationDot < 0.999999F;
+    };
+    const auto changed =
+        fitOptions_.armSpanAvatarSizing != bounded.armSpanAvatarSizing ||
+        fitOptions_.matchPlayerHeight != bounded.matchPlayerHeight ||
+        different(fitOptions_.heightAdjustmentBalance, bounded.heightAdjustmentBalance) ||
+        fitOptions_.manualAvatarScaleEnabled != bounded.manualAvatarScaleEnabled ||
+        different(fitOptions_.manualAvatarScale, bounded.manualAvatarScale) ||
+        fitOptions_.keepHandsOnSabers != bounded.keepHandsOnSabers ||
+        poseDifferent(fitOptions_.gripAdjustment[0], bounded.gripAdjustment[0]) ||
+        poseDifferent(fitOptions_.gripAdjustment[1], bounded.gripAdjustment[1]) ||
+        fitOptions_.adjustBodyProportions != bounded.adjustBodyProportions ||
+        different(fitOptions_.torsoWidthScale, bounded.torsoWidthScale) ||
+        fitOptions_.autoShoulderWidth != bounded.autoShoulderWidth ||
+        different(fitOptions_.shoulderWidthScale, bounded.shoulderWidthScale) ||
+        different(fitOptions_.waistHipWidthScale, bounded.waistHipWidthScale) ||
+        different(fitOptions_.lowerTorsoWidthScale, bounded.lowerTorsoWidthScale) ||
+        different(fitOptions_.neckBaseWidthScale, bounded.neckBaseWidthScale) ||
+        different(fitOptions_.torsoHeightScale, bounded.torsoHeightScale) ||
+        different(fitOptions_.upperLegLengthScale, bounded.upperLegLengthScale) ||
+        different(fitOptions_.lowerLegLengthScale, bounded.lowerLegLengthScale) ||
+        different(fitOptions_.legWidthScale, bounded.legWidthScale) ||
+        different(fitOptions_.neutralKneeBendDegrees, bounded.neutralKneeBendDegrees) ||
+        different(fitOptions_.attackPoseDegrees, bounded.attackPoseDegrees) ||
+        different(fitOptions_.backStiffness, bounded.backStiffness) ||
+        fitOptions_.autoFloorHeight != bounded.autoFloorHeight ||
+        different(fitOptions_.floorOffsetMeters, bounded.floorOffsetMeters) ||
+        fitOptions_.preventArmBodyClipping != bounded.preventArmBodyClipping ||
+        fitOptions_.armSpringBoneInteraction != bounded.armSpringBoneInteraction;
+    fitOptions_ = bounded;
     return changed;
+}
+
+bool StaticTrackerlessAvatarSolver::SetGripAdjustment(int side, Pose adjustment) noexcept {
+    if (side < 0 || side > 1 || !IsFinite(adjustment.position) || !IsFinite(adjustment.rotation)) {
+        return false;
+    }
+    adjustment.position.x = Clamp(adjustment.position.x, -0.25F, 0.25F);
+    adjustment.position.y = Clamp(adjustment.position.y, -0.25F, 0.25F);
+    adjustment.position.z = Clamp(adjustment.position.z, -0.25F, 0.25F);
+    adjustment.rotation = Normalize(adjustment.rotation);
+    const auto& current = fitOptions_.gripAdjustment[side];
+    const auto rotationDot = std::abs(current.rotation.x * adjustment.rotation.x +
+        current.rotation.y * adjustment.rotation.y +
+        current.rotation.z * adjustment.rotation.z +
+        current.rotation.w * adjustment.rotation.w);
+    if (LengthSquared(current.position - adjustment.position) <= 1.0e-10F &&
+        rotationDot >= 0.999999F) {
+        return false;
+    }
+    fitOptions_.gripAdjustment[side] = adjustment;
+    return true;
 }
 
 bool StaticTrackerlessAvatarSolver::Solve(
@@ -1775,6 +2123,15 @@ bool StaticTrackerlessAvatarSolver::Solve(
         return false;
     }
 
+    auto fittedPlayer = player;
+    // Auto follows the current tracking-origin floor already maintained by
+    // AvatarManager. Manual mode locks to the floor captured by the selected
+    // calibration profile. The user offset is always the final operation.
+    if (!fitOptions_.autoFloorHeight && profile.valid) {
+        fittedPlayer.floorHeight = profile.calibratedFloorHeight;
+    }
+    fittedPlayer.floorHeight += fitOptions_.floorOffsetMeters;
+
     const auto newRenderFrame = tracking.renderFrame != state.lastSolvedRenderFrame;
     if (newRenderFrame) {
         state.lastSolvedRenderFrame = tracking.renderFrame;
@@ -1784,18 +2141,17 @@ bool StaticTrackerlessAvatarSolver::Solve(
 
     const auto retargeting = ComputeAvatarRetargeting(
         avatar,
-        player,
+        fittedPlayer,
         profile,
-        matchPlayerHeight_,
-        heightAdjustmentBalance_);
-    if (!BuildRetargetedNeutralPose(avatar, player, retargeting, output)) return false;
+        fitOptions_);
+    if (!BuildRetargetedNeutralPose(avatar, fittedPlayer, retargeting, output)) return false;
     const auto neutralPose = output;
     const auto scale = retargeting.uniformScale;
     const auto legReach = MinimumLegReach(neutralPose);
     const auto totalSpineLength = PoseSpineLength(avatar, neutralPose);
     if (legReach <= kEpsilon || totalSpineLength <= kEpsilon) return false;
     if (!state.bodyStateValid || !state.footAnchorsValid || !PersistentStateFinite(state)) {
-        SeedBodyState(tracking, avatar, player, neutralPose, scale, stanceWidthScale_, state);
+        SeedBodyState(tracking, avatar, fittedPlayer, neutralPose, scale, stanceWidthScale_, state);
     }
     const auto deltaSeconds = StateDeltaSeconds(tracking, state, newRenderFrame);
 
@@ -1804,14 +2160,16 @@ bool StaticTrackerlessAvatarSolver::Solve(
         avatar.headToEye.position * scale,
         avatar.headToEye.rotation};
     const auto headRotationDelta = PoseDelta(
-        player.neutralHead.rotation,
+        fittedPlayer.neutralHead.rotation,
         tracking.head.pose.rotation);
     const Pose headTarget{
         neutralHeadBone.position +
-            (tracking.head.pose.position - player.neutralHead.position),
+            (tracking.head.pose.position - fittedPlayer.neutralHead.position),
         Multiply(headRotationDelta, neutralHeadBone.rotation)};
     Pose handTarget[2]{};
+    Pose handBaseTarget[2]{};
     Quaternion sourceToCanonicalHand[2]{};
+    bool manualGripAdjusted[2]{};
     for (int side = 0; side < 2; ++side) {
         const auto& authoritative = side == 0 ? tracking.leftHand : tracking.rightHand;
         const auto& controller = tracking.controllerHand[side].valid
@@ -1829,7 +2187,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
         } else {
             const auto controllerToTarget = gripFitTrusted && profile.controllerToGripObserved[side]
                 ? profile.controllerToGrip[side]
-                : player.controllerToWrist[side];
+                : fittedPlayer.controllerToWrist[side];
             handTarget[side] = Compose(authoritative.pose, controllerToTarget);
             sourceToCanonicalHand[side] = gripFitTrusted && profile.gripFitUsesSaber[side]
                 ? profile.gripToCanonicalHand[side]
@@ -1837,12 +2195,70 @@ bool StaticTrackerlessAvatarSolver::Solve(
                     ? Multiply(Inverse(controllerToTarget.rotation), profile.gripToCanonicalHand[side])
                     : Quaternion{};
         }
+        const auto lowerBone = side == 0 ? HumanoidBone::LeftLowerArm : HumanoidBone::RightLowerArm;
+        const auto handBone = side == 0 ? HumanoidBone::LeftHand : HumanoidBone::RightHand;
+        const auto neutralLower = Solved(neutralPose, lowerBone);
+        const auto neutralHand = Solved(neutralPose, handBone);
+        const auto handSourceChanged =
+            state.gripToHandRotationValid[side] &&
+            state.previousHandWasSaberGrip[side] != tracking.handIsSaberGrip[side];
+        if (!state.gripToHandRotationValid[side] || handSourceChanged) {
+            if (gripFitTrusted) {
+                const auto canonicalRest = FromToRotation(
+                    {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F},
+                    Normalize(neutralHand.position - neutralLower.position,
+                        {side == 0 ? -1.0F : 1.0F, 0.0F, 0.0F}));
+                const auto canonicalToAvatar = Multiply(
+                    Inverse(canonicalRest), neutralHand.rotation);
+                state.gripToHandRotation[side] = Multiply(
+                    sourceToCanonicalHand[side], canonicalToAvatar);
+            } else {
+                // No trustworthy multi-pose grip fit is available. Preserve
+                // the neutral controller-to-avatar relationship instead of
+                // deriving a correction from an already-solved wrist. This
+                // gives the arm IK a stable desired hand rotation before it
+                // chooses an elbow and avoids the old circular dependency.
+                const auto neutralSourceRotation = fittedPlayer.neutralHand[side].rotation;
+                auto currentSourceRotation = handTarget[side].rotation;
+                if (tracking.handIsSaberGrip[side] && controller.valid) {
+                    currentSourceRotation = Compose(
+                        controller.pose, fittedPlayer.controllerToWrist[side]).rotation;
+                }
+                state.gripToHandRotation[side] = Multiply(
+                    Multiply(Inverse(handTarget[side].rotation), currentSourceRotation),
+                    Multiply(Inverse(neutralSourceRotation), neutralHand.rotation));
+            }
+            state.gripToHandRotationValid[side] = true;
+        }
+        if (handSourceChanged) {
+            // A saber-handle gameplay sample and a menu controller sample answer
+            // different reach questions. Start a fresh range when the source
+            // changes so diagnostics are not polluted by the previous scene.
+            state.armReachRatioMinimum[side] = 0.0F;
+            state.armReachRatioMaximum[side] = 0.0F;
+            state.armReachRatioSum[side] = 0.0;
+            state.armReachSampleCount[side] = 0;
+        }
+        state.previousHandWasSaberGrip[side] = tracking.handIsSaberGrip[side];
+
+        // Establish the ordinary controller/saber-derived wrist pose first.
+        // Manual calibration is then one conventional local rigid transform
+        // relative to this base target.  This is the same target model used by
+        // the world-space hand gizmo and prevents translation from changing
+        // coordinate frames whenever the rotation sliders move.
+        handTarget[side].rotation = Multiply(
+            handTarget[side].rotation, state.gripToHandRotation[side]);
+        handBaseTarget[side] = handTarget[side];
+        const auto& adjustment = fitOptions_.gripAdjustment[side];
+        handTarget[side] = Compose(handBaseTarget[side], adjustment);
+        manualGripAdjusted[side] = LengthSquared(adjustment.position) > 1.0e-8F ||
+            QuaternionAngleDegrees({}, adjustment.rotation) > 0.05F;
     }
-    const auto yawError = UpdateBodyYaw(tracking, player, profile, deltaSeconds, state);
+    const auto yawError = UpdateBodyYaw(tracking, fittedPlayer, profile, deltaSeconds, state);
     auto pelvis = EstimatePelvis(
         tracking,
         avatar,
-        player,
+        fittedPlayer,
         profile,
         headTarget,
         Solved(neutralPose, HumanoidBone::Hips),
@@ -1853,6 +2269,22 @@ bool StaticTrackerlessAvatarSolver::Solve(
         plantedLegLeanLimit_,
         deltaSeconds,
         state);
+
+    const auto bodyForwardForPose = Vec3{
+        std::sin(state.torsoYawRadians), 0.0F, std::cos(state.torsoYawRadians)};
+    const auto attackRadians = fitOptions_.attackPoseDegrees * kDegreesToRadians;
+    const auto configuredKneeRadians = fitOptions_.neutralKneeBendDegrees * kDegreesToRadians;
+    // Knee bend lowers the pelvis while keeping both planted feet fixed. The
+    // attack bias then moves the hip behind/ahead of the exact tracked head so
+    // the spine starts from the requested forward/rearward stance rather than
+    // changing the HMD endpoint itself.
+    pelvis.position.y -= legReach * (1.0F - std::cos(configuredKneeRadians * 0.5F));
+    pelvis.position = pelvis.position -
+        bodyForwardForPose * (std::tan(attackRadians) * totalSpineLength * 0.38F);
+    state.forwardHingeAmount = Clamp(
+        state.forwardHingeAmount + attackRadians / (20.0F * kDegreesToRadians),
+        -1.0F,
+        1.0F);
 
     constexpr std::array<HumanoidBone, kMaximumSpineJoints> candidates = {
         HumanoidBone::Hips,
@@ -1886,10 +2318,11 @@ bool StaticTrackerlessAvatarSolver::Solve(
     auto rootToHead = Horizontal(headTarget.position - pelvis.position);
     const auto rootToHeadForward = Dot(rootToHead, bodyForward);
     const auto rootToHeadLateral = Dot(rootToHead, bodyRight);
+    const auto stiffnessResponse = 1.0F - Clamp(fitOptions_.backStiffness, 0.0F, 1.0F) * 0.85F;
     const auto constrainedForward = Clamp(
         rootToHeadForward,
         -totalSpineLength * kDefaultBodySolverTuning.maximumBackwardSpineBowFraction *
-            backwardSpineCurveLimit_,
+            backwardSpineCurveLimit_ * stiffnessResponse,
         totalSpineLength * kDefaultBodySolverTuning.maximumForwardSpineBowFraction);
     const auto constrainedLateral = Clamp(
         rootToHeadLateral,
@@ -1935,7 +2368,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
     state.pelvisPosition = pelvis.position;
     state.pelvisSupportOffset = Length(Horizontal(pelvis.position - plantedSupportCenter));
     float accumulatedSpineLength = 0.0F;
-    const auto neutralBodyYaw = YawFromDirection(player.neutralForward);
+    const auto neutralBodyYaw = YawFromDirection(fittedPlayer.neutralForward);
     const auto bodyYawDelta = AngleDelta(neutralBodyYaw, state.torsoYawRadians);
     const auto bodyDeltaRotation = AxisAngle({0.0F, 1.0F, 0.0F}, bodyYawDelta);
     // Do not distribute HMD pitch/roll through the torso. A player can keep
@@ -1991,13 +2424,13 @@ bool StaticTrackerlessAvatarSolver::Solve(
     // The proven head/hand targets and analytic arm path remain direct. Lower
     // body inference is solved around these targets, never by filtering them.
     SolveArm(
-        0, avatar, scale, player.standingHmdHeight, profile, Solved(output, chestBone), handTarget[0],
-        sourceToCanonicalHand[0],
-        tracking.handIsSaberGrip[0], neutralPose, output, state, diagnostics);
+        0, avatar, scale, fittedPlayer.standingHmdHeight, profile, Solved(output, chestBone), handTarget[0],
+        tracking.handIsSaberGrip[0], manualGripAdjusted[0], fitOptions_.keepHandsOnSabers,
+        fitOptions_.preventArmBodyClipping, neutralPose, output, state, diagnostics);
     SolveArm(
-        1, avatar, scale, player.standingHmdHeight, profile, Solved(output, chestBone), handTarget[1],
-        sourceToCanonicalHand[1],
-        tracking.handIsSaberGrip[1], neutralPose, output, state, diagnostics);
+        1, avatar, scale, fittedPlayer.standingHmdHeight, profile, Solved(output, chestBone), handTarget[1],
+        tracking.handIsSaberGrip[1], manualGripAdjusted[1], fitOptions_.keepHandsOnSabers,
+        fitOptions_.preventArmBodyClipping, neutralPose, output, state, diagnostics);
 
     const auto neutralHips = Solved(neutralPose, HumanoidBone::Hips);
     const auto solvedHips = Solved(output, HumanoidBone::Hips);
@@ -2012,7 +2445,7 @@ bool StaticTrackerlessAvatarSolver::Solve(
     UpdateFeet(
         tracking,
         avatar,
-        player,
+        fittedPlayer,
         neutralPose,
         output,
         solvedHips,
@@ -2050,6 +2483,8 @@ bool StaticTrackerlessAvatarSolver::Solve(
         diagnostics->avatarEye = Compose(headTarget, headToEye);
         diagnostics->retargeting = retargeting;
         diagnostics->headTarget = headTarget;
+        diagnostics->handBaseTarget[0] = handBaseTarget[0];
+        diagnostics->handBaseTarget[1] = handBaseTarget[1];
         diagnostics->handTarget[0] = handTarget[0];
         diagnostics->handTarget[1] = handTarget[1];
         diagnostics->pelvis = Solved(output, HumanoidBone::Hips);

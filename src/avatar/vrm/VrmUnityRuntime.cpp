@@ -190,6 +190,10 @@ struct AvatarShaderResources {
     // surfaces render in the headset. Missing from older bundles; its absence
     // never blocks avatar loading.
     SafePtrUnity<UnityEngine::Shader> videoPreview;
+    // Optional transparent hand-placement target shader. Like VideoPreview,
+    // this is retained from the embedded Android bundle so both Quest eyes
+    // receive a guaranteed multiview variant.
+    SafePtrUnity<UnityEngine::Shader> gripTarget;
     bool attempted = false;
 };
 
@@ -238,6 +242,14 @@ bool LoadAvatarShaders() {
             Logging::Logger.warn(
                 "Embedded bundle has no saberstage-video-preview shader; previews use the stock fallback");
         }
+        auto* gripTarget = static_cast<UnityEngine::Shader*>(
+            bundle->LoadAsset<UnityEngine::Shader*>("saberstage-grip-target"));
+        if (RetainShader(gripTarget)) {
+            resources.gripTarget = gripTarget;
+        } else {
+            Logging::Logger.warn(
+                "Embedded bundle has no saberstage-grip-target shader; hand target uses the stock fallback");
+        }
         resources.bundle = bundle;
         resources.mtoon = mtoon;
         resources.outline = outline;
@@ -256,6 +268,11 @@ bool LoadAvatarShaders() {
 
 class VrmUnityRuntime::Impl final {
 public:
+    struct GripArmRenderer {
+        UnityEngine::Renderer* source = nullptr;
+        UnityEngine::Renderer* filtered = nullptr;
+    };
+
     ~Impl() { Destroy(); }
 
     bool Build(VrmAsset parsed, const RuntimeOptions& options, std::string* error) {
@@ -297,6 +314,7 @@ public:
             renderers_.clear();
             rendererMeshIndices_.clear();
             allRenderers_.clear();
+            for (auto& arm : gripArmRenderers_) arm.clear();
             rendererMaterialIndices_.clear();
             rendererOutlineEnabled_.clear();
             nodeObjects_.clear();
@@ -325,8 +343,14 @@ public:
         rendererHeadFraction_.clear();
         rendererNeckFraction_.clear();
         rendererIsHair_.clear();
+        gripEditingArmSide_ = -1;
         wearAvatar_ = false;
         rootUniformScale_ = 1.0F;
+        bodyTorsoWidthScale_ = 1.0F;
+        bodyLowerTorsoWidthScale_ = 1.0F;
+        bodyNeckBaseWidthScale_ = 1.0F;
+        bodyHeadSizeScale_ = 1.0F;
+        bodyLegWidthScale_ = 1.0F;
     }
 
     void BuildNodes() {
@@ -558,18 +582,21 @@ public:
                     i, source.name, source.shader, customShadersAvailable);
             }
             if (blend < 1.0F) ++stats_.opaqueMaterialCount;
-            else if (blend < 2.0F) ++stats_.cutoutMaterialCount;
+            else if (blend < 2.0F) {
+                ++stats_.cutoutMaterialCount;
+                if (useMtoon) ++stats_.mtoonCutoutMaterialCount;
+            }
             else if (blend < 3.0F) ++stats_.transparentMaterialCount;
             else ++stats_.transparentZWriteMaterialCount;
             if (source.floatProperties.contains("_CullMode") && source.floatProperties.at("_CullMode") == 0.0F) {
                 ++stats_.doubleSidedMaterialCount;
             }
             if (useMtoon) {
-                static constexpr std::array<const char*, 19> requiredProperties{
+                static constexpr std::array<const char*, 21> requiredProperties{
                     "_MainTex", "_Color", "_ShadeTexture", "_ShadeColor", "_ShadeShift", "_ShadeToony",
                     "_BumpMap", "_BumpScale", "_RimTexture", "_RimColor", "_SphereAdd",
                     "_EmissionMap", "_EmissionColor", "_Cutoff", "_Cull", "_SrcBlend", "_DstBlend",
-                    "_MaterialDebugStage", "_AvatarLightingMode"};
+                    "_AlphaToMask", "_CutoutSmoothing", "_MaterialDebugStage", "_AvatarLightingMode"};
                 for (const auto* property : requiredProperties) {
                     if (!material->HasProperty(property)) {
                         Logging::Logger.error(
@@ -587,7 +614,13 @@ public:
                 material->SetFloat("_ZWrite", valueOr("_ZWrite", blend == 2.0F ? 0.0F : 1.0F));
                 material->SetFloat("_Cull", source.floatProperties.contains("_CullMode")
                     ? source.floatProperties.at("_CullMode") : 2.0F);
-                material->SetFloat("_AlphaToMask", valueOr("_AlphaToMask", blend == 1.0F ? 1.0F : 0.0F));
+                const auto cutout = blend == 1.0F;
+                material->SetFloat(
+                    "_AlphaToMask", cutout && options_.alphaToMaskEnabled ? 1.0F : 0.0F);
+                material->SetFloat(
+                    "_CutoutSmoothing", cutout
+                        ? static_cast<float>(std::clamp(options_.cutoutSmoothing, 0, 3))
+                        : 0.0F);
                 material->SetFloat("_MaterialDebugStage", static_cast<float>(options_.materialStage));
                 material->SetFloat("_AvatarLightingMode", static_cast<float>(options_.lightingMode));
             }
@@ -705,9 +738,14 @@ public:
                 // against pathological authored widths.
                 outline->SetFloat("_OutlineWidth", std::clamp(width * 0.01F, 0.0F, 0.02F));
                 outline->SetFloat("_Cutoff", source.floatProperties.contains("_Cutoff") ? source.floatProperties.at("_Cutoff") : 0.5F);
-                outline->SetFloat("_AlphaToMask", source.floatProperties.contains("_AlphaToMask")
-                    ? source.floatProperties.at("_AlphaToMask")
-                    : (source.floatProperties.contains("_BlendMode") && source.floatProperties.at("_BlendMode") == 1.0F ? 1.0F : 0.0F));
+                const auto cutout = source.floatProperties.contains("_BlendMode") &&
+                    source.floatProperties.at("_BlendMode") == 1.0F;
+                outline->SetFloat(
+                    "_AlphaToMask", cutout && options_.alphaToMaskEnabled ? 1.0F : 0.0F);
+                outline->SetFloat(
+                    "_CutoutSmoothing", cutout
+                        ? static_cast<float>(std::clamp(options_.cutoutSmoothing, 0, 3))
+                        : 0.0F);
                 if (const auto color = source.vectorProperties.find("_OutlineColor"); color != source.vectorProperties.end()) {
                     outline->SetColor("_OutlineColor", {color->second.x, color->second.y, color->second.z, color->second.w});
                 }
@@ -754,13 +792,14 @@ public:
         Logging::Logger.info(
             "VRM material summary: materials={} MToon={} fallback={} mainTextures={}/{} shadeTextures={} "
             "normalMaps={} rim={} matcaps={} emission={} opaque={} cutout={} transparent={} "
-            "transparentZWrite={} doubleSided={} lightingMode={} materialStage={}",
+            "transparentZWrite={} doubleSided={} MToonCutout={} lightingMode={} materialStage={}",
             asset_.materials.size(), stats_.mtoonMaterialCount, stats_.fallbackMaterialCount,
             stats_.mainTextureMaterialCount, asset_.materials.size(), stats_.shadeTextureMaterialCount,
             stats_.normalMapMaterialCount, stats_.rimMaterialCount, stats_.matcapMaterialCount,
             stats_.emissionMaterialCount, stats_.opaqueMaterialCount, stats_.cutoutMaterialCount,
             stats_.transparentMaterialCount, stats_.transparentZWriteMaterialCount,
-            stats_.doubleSidedMaterialCount, options_.lightingMode, options_.materialStage);
+            stats_.doubleSidedMaterialCount, stats_.mtoonCutoutMaterialCount,
+            options_.lightingMode, options_.materialStage);
     }
 
     UnityEngine::Material* FallbackMaterial() {
@@ -884,6 +923,99 @@ public:
         return static_cast<float>(inside) / static_cast<float>(vertexCount);
     }
 
+    static float VertexSubtreeWeight(
+        const Primitive& primitive,
+        const Skin& skin,
+        std::size_t vertex,
+        const std::unordered_set<std::size_t>& subtreeNodes) {
+        if (vertex >= primitive.joints0.size() || vertex >= primitive.weights0.size()) return 0.0F;
+        const auto& joints = primitive.joints0[vertex];
+        const auto& weights = primitive.weights0[vertex];
+        const std::array<std::pair<float, std::uint16_t>, 4> candidates{{
+            {weights.x, joints.x}, {weights.y, joints.y},
+            {weights.z, joints.z}, {weights.w, joints.w}}};
+        float inside = 0.0F;
+        for (const auto& [weight, joint] : candidates) {
+            if (joint < skin.joints.size() && subtreeNodes.contains(skin.joints[joint])) inside += weight;
+        }
+        return std::clamp(inside, 0.0F, 1.0F);
+    }
+
+    // Produces a compact copy containing only triangles influenced by the
+    // selected arm. A renderer-level visibility toggle is insufficient for
+    // VRoid models because the torso, limbs, and skin commonly share one
+    // SkinnedMeshRenderer. Filtering once while the parsed skin weights are
+    // available prevents the grip editor from putting the player's head
+    // inside a visible full-body mesh without retaining the large import-time
+    // CPU payload for the lifetime of the mod.
+    static std::optional<Primitive> BuildGripArmPrimitive(
+        const Primitive& primitive,
+        const Skin* skin,
+        std::size_t nodeIndex,
+        const std::unordered_set<std::size_t>& armNodes) {
+        if (primitive.positions.empty() || primitive.indices.size() < 3 || armNodes.empty()) return std::nullopt;
+
+        std::vector<std::uint32_t> keptIndices;
+        keptIndices.reserve(primitive.indices.size() / 4);
+        if (!skin || primitive.joints0.empty() || primitive.weights0.empty()) {
+            if (!armNodes.contains(nodeIndex)) return std::nullopt;
+            keptIndices = primitive.indices;
+        } else {
+            for (std::size_t triangle = 0; triangle + 2 < primitive.indices.size(); triangle += 3) {
+                const auto a = primitive.indices[triangle];
+                const auto b = primitive.indices[triangle + 1];
+                const auto c = primitive.indices[triangle + 2];
+                if (a >= primitive.positions.size() || b >= primitive.positions.size() ||
+                        c >= primitive.positions.size()) continue;
+                const auto wa = VertexSubtreeWeight(primitive, *skin, a, armNodes);
+                const auto wb = VertexSubtreeWeight(primitive, *skin, b, armNodes);
+                const auto wc = VertexSubtreeWeight(primitive, *skin, c, armNodes);
+                // Keep a small blended seam at the shoulder while excluding
+                // torso triangles that only have incidental arm influence.
+                if (std::max({wa, wb, wc}) < 0.20F || wa + wb + wc < 0.24F) continue;
+                keptIndices.insert(keptIndices.end(), {a, b, c});
+            }
+        }
+        if (keptIndices.empty()) return std::nullopt;
+
+        Primitive compact{};
+        compact.material = primitive.material;
+        compact.mode = primitive.mode;
+        const auto missing = primitive.positions.size();
+        std::vector<std::size_t> remap(primitive.positions.size(), missing);
+        std::vector<std::size_t> sourceVertices;
+        sourceVertices.reserve(keptIndices.size());
+        compact.indices.reserve(keptIndices.size());
+        for (const auto sourceIndex : keptIndices) {
+            auto& mapped = remap[sourceIndex];
+            if (mapped == missing) {
+                mapped = sourceVertices.size();
+                sourceVertices.push_back(sourceIndex);
+            }
+            compact.indices.push_back(static_cast<std::uint32_t>(mapped));
+        }
+
+        const auto copyAttribute = [&](const auto& source, auto& destination) {
+            if (source.size() != primitive.positions.size()) return;
+            destination.reserve(sourceVertices.size());
+            for (const auto sourceIndex : sourceVertices) destination.push_back(source[sourceIndex]);
+        };
+        copyAttribute(primitive.positions, compact.positions);
+        copyAttribute(primitive.normals, compact.normals);
+        copyAttribute(primitive.tangents, compact.tangents);
+        copyAttribute(primitive.texcoords0, compact.texcoords0);
+        copyAttribute(primitive.texcoords1, compact.texcoords1);
+        copyAttribute(primitive.joints0, compact.joints0);
+        copyAttribute(primitive.weights0, compact.weights0);
+        compact.morphTargets.resize(primitive.morphTargets.size());
+        for (std::size_t target = 0; target < primitive.morphTargets.size(); ++target) {
+            copyAttribute(primitive.morphTargets[target].positionDeltas, compact.morphTargets[target].positionDeltas);
+            copyAttribute(primitive.morphTargets[target].normalDeltas, compact.morphTargets[target].normalDeltas);
+            copyAttribute(primitive.morphTargets[target].tangentDeltas, compact.morphTargets[target].tangentDeltas);
+        }
+        return compact;
+    }
+
     [[nodiscard]] std::unordered_set<std::size_t> HumanoidSubtree(const char* boneName) const {
         std::unordered_set<std::size_t> nodes;
         const auto found = asset_.humanoidBones.find(boneName);
@@ -903,6 +1035,12 @@ public:
         const auto headNodes = HumanoidSubtree("head");
         auto neckNodes = HumanoidSubtree("neck");
         neckNodes.insert(headNodes.begin(), headNodes.end());
+        std::array<std::unordered_set<std::size_t>, 2> gripArmNodes{
+            HumanoidSubtree("leftShoulder"), HumanoidSubtree("rightShoulder")};
+        // Shoulder bones are optional in Unity humanoid rigs. Upper-arm
+        // subtrees still include the forearm, hand, and finger chains.
+        if (gripArmNodes[0].empty()) gripArmNodes[0] = HumanoidSubtree("leftUpperArm");
+        if (gripArmNodes[1].empty()) gripArmNodes[1] = HumanoidSubtree("rightUpperArm");
         for (std::size_t nodeIndex = 0; nodeIndex < asset_.nodes.size(); ++nodeIndex) {
             const auto& node = asset_.nodes[nodeIndex];
             if (!node.mesh) continue;
@@ -952,6 +1090,37 @@ public:
                 allRenderers_.push_back(renderer);
                 rendererMaterialIndices_.push_back(materialIndex);
                 rendererOutlineEnabled_.push_back(false);
+
+                for (std::size_t side = 0; side < gripArmNodes.size(); ++side) {
+                    auto armPrimitive = BuildGripArmPrimitive(
+                        primitive, skin, nodeIndex, gripArmNodes[side]);
+                    if (!armPrimitive) continue;
+                    auto* armObject = UnityEngine::GameObject::New_ctor(
+                        sourceMesh.name + (side == 0 ? "__grip_left_" : "__grip_right_") +
+                        std::to_string(primitiveIndex));
+                    if (!IsAlive(armObject)) throw std::runtime_error("Unity could not create grip-editor arm renderer");
+                    armObject->set_layer(options_.avatarLayer);
+                    armObject->get_transform()->SetParent(nodeTransforms_[nodeIndex], false);
+                    auto* armMesh = BuildPrimitiveMesh(sourceMesh, *armPrimitive, skin);
+                    UnityEngine::Renderer* armRenderer = nullptr;
+                    if (skin) {
+                        auto* skinned = armObject->AddComponent<UnityEngine::SkinnedMeshRenderer*>();
+                        skinned->set_sharedMesh(armMesh);
+                        skinned->set_bones(ConvertArray<UnityEngine::Transform*>(skin->joints.size(), [&](std::size_t i) {
+                            return nodeTransforms_[skin->joints[i]];
+                        }));
+                        skinned->set_rootBone(nodeTransforms_[skin->skeleton.value_or(skin->joints.front())]);
+                        skinned->set_updateWhenOffscreen(false);
+                        armRenderer = skinned;
+                    } else {
+                        auto* filter = armObject->AddComponent<UnityEngine::MeshFilter*>();
+                        filter->set_sharedMesh(armMesh);
+                        armRenderer = armObject->AddComponent<UnityEngine::MeshRenderer*>();
+                    }
+                    armRenderer->set_sharedMaterial(renderer->get_sharedMaterial());
+                    armRenderer->set_enabled(false);
+                    gripArmRenderers_[side].push_back({renderer, armRenderer});
+                }
                 ++stats_.rendererCount;
             }
         }
@@ -1034,10 +1203,15 @@ public:
     void SetVisible(bool visible) noexcept {
         try {
             options_.visible = visible;
-            for (auto* renderer : renderers_) if (IsAlive(renderer)) renderer->set_enabled(visible);
-            // Rigid renderers are children of the avatar root and follow this
-            // visibility state through the root while skinned renderers are
-            // explicitly toggled for expression/runtime ownership.
+            for (std::size_t i = 0; i < allRenderers_.size(); ++i) {
+                auto* renderer = allRenderers_[i];
+                if (!IsAlive(renderer)) continue;
+                const bool hair = i < rendererIsHair_.size() && rendererIsHair_[i];
+                renderer->set_enabled(visible && !(debugHairHidden_ && hair));
+            }
+            // Explicitly update both skinned and rigid renderers. Hair can be
+            // authored as either kind, so relying only on root activation for
+            // rigid meshes would leave the session diagnostic incomplete.
             if (IsAlive(root_)) root_->SetActive(visible);
         } catch (...) {
         }
@@ -1059,6 +1233,82 @@ public:
             Logging::Logger.info("VRM root uniform scale changed to {:.3f}", bounded);
         } catch (...) {
             Logging::Logger.error("Could not apply the VRM root uniform scale");
+        }
+    }
+
+    void SetBodyProportionScales(
+        float torsoWidthScale,
+        float lowerTorsoWidthScale,
+        float neckBaseWidthScale,
+        float headSizeScale,
+        float legWidthScale) noexcept {
+        try {
+            const auto torso = std::clamp(torsoWidthScale, 0.50F, 2.0F);
+            const auto lowerTorso = std::clamp(lowerTorsoWidthScale, 0.50F, 2.0F);
+            const auto neck = std::clamp(neckBaseWidthScale, 0.50F, 2.0F);
+            const auto head = std::clamp(headSizeScale, 0.50F, 2.0F);
+            const auto legs = std::clamp(legWidthScale, 0.50F, 2.0F);
+            if (std::abs(bodyTorsoWidthScale_ - torso) <= 1.0e-4F &&
+                std::abs(bodyLowerTorsoWidthScale_ - lowerTorso) <= 1.0e-4F &&
+                std::abs(bodyNeckBaseWidthScale_ - neck) <= 1.0e-4F &&
+                std::abs(bodyHeadSizeScale_ - head) <= 1.0e-4F &&
+                std::abs(bodyLegWidthScale_ - legs) <= 1.0e-4F) return;
+
+            bodyTorsoWidthScale_ = torso;
+            bodyLowerTorsoWidthScale_ = lowerTorso;
+            bodyNeckBaseWidthScale_ = neck;
+            bodyHeadSizeScale_ = head;
+            bodyLegWidthScale_ = legs;
+            const auto apply = [&](std::string_view boneName, float xzMultiplier) {
+                const auto found = asset_.humanoidBones.find(std::string(boneName));
+                if (found == asset_.humanoidBones.end() || found->second >= nodeTransforms_.size() ||
+                    found->second >= asset_.nodes.size()) return false;
+                auto* transform = nodeTransforms_[found->second];
+                if (!IsAlive(transform)) return false;
+                const auto authored = ToUnityScale(asset_.nodes[found->second].scale);
+                const UnityEngine::Vector3 scale{
+                    authored.x * xzMultiplier,
+                    authored.y,
+                    authored.z * xzMultiplier};
+                transform->set_localScale(scale);
+                // Existing display clones are independent hierarchies. Apply
+                // the same local scale immediately; newly created clones copy
+                // the already-adjusted source hierarchy through Instantiate.
+                for (auto& instance : standins_) {
+                    for (const auto& [source, clone] : instance.pairs) {
+                        if (source == transform && IsAlive(clone)) {
+                            clone->set_localScale(scale);
+                            break;
+                        }
+                    }
+                }
+                return true;
+            };
+
+            // Torso Width is the base multiplier. The more specific lower
+            // torso and skeleton-width adjustments are layered after it.
+            // Cancel torso inheritance at limb and neck roots so arm/leg
+            // thickness, neck width, and head size remain independent.
+            apply("hips", torso * lowerTorso);
+            apply("spine", 1.0F / lowerTorso);
+            apply("leftUpperArm", 1.0F / torso);
+            apply("rightUpperArm", 1.0F / torso);
+            apply("leftUpperLeg", legs / (torso * lowerTorso));
+            apply("rightUpperLeg", legs / (torso * lowerTorso));
+            apply("leftFoot", 1.0F / legs);
+            apply("rightFoot", 1.0F / legs);
+
+            // A centerline neck bone has no lateral offset to retarget. Scale
+            // its weighted skin directly, cancel inherited torso width, then
+            // make Head Size the final cumulative scale. Mixed neck/head skin
+            // weights provide a natural upper-neck transition.
+            apply("neck", neck / torso);
+            apply("head", head / neck);
+            Logging::Logger.info(
+                "Applied avatar mesh proportions: torso={:.2f} lowerTorso={:.2f} neckBase={:.2f} head={:.2f} legWidth={:.2f}",
+                torso, lowerTorso, neck, head, legs);
+        } catch (...) {
+            Logging::Logger.error("Could not apply localized avatar mesh proportions");
         }
     }
 
@@ -1177,9 +1427,11 @@ public:
         ApplyMaterialOptions();
         UpdateActiveSpringStatistics();
         Logging::Logger.info(
-            "Avatar material controls applied: stage={} lighting={} toon={} normal={} rim={} matcap={} emission={} outlines={}",
+            "Avatar material controls applied: stage={} lighting={} toon={} normal={} rim={} matcap={} emission={} outlines={} cutoutSmoothing={} alphaToMask={} supported={}",
             options_.materialStage, options_.lightingMode, options_.toonLighting, options_.normalMaps,
-            options_.rimLighting, options_.matcap, options_.emission, options_.outlineMode);
+            options_.rimLighting, options_.matcap, options_.emission, options_.outlineMode,
+            options_.cutoutSmoothing, options_.alphaToMaskEnabled,
+            stats_.mtoonCutoutMaterialCount > 0);
     }
 
     void SetKeyword(UnityEngine::Material* material, const char* keyword, bool enabled) noexcept {
@@ -1219,6 +1471,22 @@ public:
                     (source.textureProperties.contains("_EmissionMap") || source.vectorProperties.contains("_EmissionColor")));
                 SetKeyword(material, "SABERSTAGE_ALPHA_TEST", source.floatProperties.contains("_BlendMode") &&
                     source.floatProperties.at("_BlendMode") == 1.0F);
+                const auto cutout = source.floatProperties.contains("_BlendMode") &&
+                    source.floatProperties.at("_BlendMode") == 1.0F;
+                material->SetFloat(
+                    "_AlphaToMask", cutout && options_.alphaToMaskEnabled ? 1.0F : 0.0F);
+                material->SetFloat(
+                    "_CutoutSmoothing", cutout
+                        ? static_cast<float>(std::clamp(options_.cutoutSmoothing, 0, 3))
+                        : 0.0F);
+                if (index < outlineMaterials_.size() && IsAlive(outlineMaterials_[index])) {
+                    outlineMaterials_[index]->SetFloat(
+                        "_AlphaToMask", cutout && options_.alphaToMaskEnabled ? 1.0F : 0.0F);
+                    outlineMaterials_[index]->SetFloat(
+                        "_CutoutSmoothing", cutout
+                            ? static_cast<float>(std::clamp(options_.cutoutSmoothing, 0, 3))
+                            : 0.0F);
+                }
             }
             for (std::size_t rendererIndex = 0; rendererIndex < allRenderers_.size(); ++rendererIndex) {
                 auto* renderer = allRenderers_[rendererIndex];
@@ -1293,6 +1561,42 @@ public:
         springAccumulator_ = 0.0F;
     }
 
+    void SetArmSpringColliders(
+        const std::array<Float3, 6>& centers,
+        const std::array<float, 6>& radii,
+        std::size_t count) noexcept {
+        generatedArmColliderCount_ = std::min(count, generatedArmColliderCenters_.size());
+        for (std::size_t i = 0; i < generatedArmColliderCount_; ++i) {
+            generatedArmColliderCenters_[i] = ToUnityPosition(centers[i]);
+            generatedArmColliderRadii_[i] = std::max(0.0F, radii[i]);
+        }
+        stats_.activeGeneratedArmColliderCount = generatedArmColliderCount_;
+    }
+
+    void SetDebugHairHidden(bool hidden) noexcept {
+        if (debugHairHidden_ == hidden) return;
+        debugHairHidden_ = hidden;
+        try {
+            for (std::size_t i = 0; i < allRenderers_.size(); ++i) {
+                auto* renderer = allRenderers_[i];
+                if (!IsAlive(renderer)) continue;
+                const bool hair = i < rendererIsHair_.size() && rendererIsHair_[i];
+                if (hair) renderer->set_enabled(options_.visible && !debugHairHidden_);
+            }
+            // Clone renderer pairs mirror the source visibility so the
+            // diagnostic exposes the spine on every displayed avatar too.
+            for (auto& standin : standins_) {
+                for (const auto& pair : standin.rendererPairs) {
+                    if (IsAlive(pair.first) && IsAlive(pair.second)) {
+                        pair.second->set_enabled(pair.first->get_enabled());
+                    }
+                }
+            }
+            Logging::Logger.info("Session hair diagnostic hidden={}", hidden);
+        } catch (...) {
+        }
+    }
+
     void SimulateSpringStep(float deltaTime) {
         const auto maximumChains = static_cast<std::size_t>(std::max(0, options_.maximumSpringChains));
         const auto maximumJoints = static_cast<std::size_t>(std::max(0, options_.maximumSpringJoints));
@@ -1326,6 +1630,18 @@ public:
                     if (fromCenter.get_sqrMagnitude() < radius * radius) {
                         next = Add(center, Scale(SafeDirection(fromCenter, restDirection), radius));
                         next = Add(origin, Scale(SafeDirection(Subtract(next, origin), restDirection), joint.length));
+                    }
+                }
+                for (std::size_t colliderIndex = 0;
+                        colliderIndex < generatedArmColliderCount_; ++colliderIndex) {
+                    const auto center = generatedArmColliderCenters_[colliderIndex];
+                    const auto radius = std::max(
+                        0.0F, generatedArmColliderRadii_[colliderIndex] + group.hitRadius);
+                    auto fromCenter = Subtract(next, center);
+                    if (fromCenter.get_sqrMagnitude() < radius * radius) {
+                        next = Add(center, Scale(SafeDirection(fromCenter, restDirection), radius));
+                        next = Add(origin, Scale(
+                            SafeDirection(Subtract(next, origin), restDirection), joint.length));
                     }
                 }
                 if (!Finite(next)) {
@@ -1389,6 +1705,13 @@ public:
         return FindExpression(presetName) != nullptr;
     }
 
+    bool SupportsAlphaToMask() const noexcept {
+        // Fallback Unity cutout shaders do not expose SaberStage's controlled
+        // alpha-to-coverage path. Require at least one actual MToon cutout so
+        // the menu cannot enable a setting that would affect no material.
+        return stats_.mtoonCutoutMaterialCount > 0;
+    }
+
     bool ApplyExpression(
         std::string_view presetName,
         float weight,
@@ -1438,6 +1761,37 @@ public:
         return ApplyExpression(presetName, weight, nullptr, false);
     }
 
+    std::size_t ApplyStoredViewLayers() {
+        std::size_t hiddenFromFirstPerson = 0;
+        for (std::size_t i = 0; i < allRenderers_.size(); ++i) {
+            auto* renderer = allRenderers_[i];
+            if (!IsAlive(renderer)) continue;
+            bool headGeometry = false;
+            if (wearAvatar_) {
+                const auto head = i < rendererHeadFraction_.size() ? rendererHeadFraction_[i] : 0.0F;
+                const auto neck = i < rendererNeckFraction_.size() ? rendererNeckFraction_[i] : 0.0F;
+                const bool hair = i < rendererIsHair_.size() && rendererIsHair_[i];
+                // Thresholds: a renderer mostly skinned to the head (60%+)
+                // is face/hair/head-accessory even when a few vertices
+                // blend into the neck; a quarter of vertices at neck level
+                // marks collars, scarves, and chokers. The three switches
+                // are independent so players can, e.g., hide only hair.
+                const bool faceGeometry = head >= 0.6F && !hair;
+                headGeometry = (wearHideFace_ && faceGeometry) ||
+                    (wearHideHair_ && hair) ||
+                    (wearHideNeckAccessories_ && neck >= 0.25F);
+            }
+            // Worn body parts go to the both-views layer so the player and
+            // the camera see them; hidden head geometry (and everything,
+            // when wear is off) stays on the spectator-only avatar layer,
+            // so recordings always contain the complete avatar.
+            const auto layer = (wearAvatar_ && !headGeometry) ? wearBothLayer_ : options_.avatarLayer;
+            renderer->get_gameObject()->set_layer(layer);
+            if (wearAvatar_ && headGeometry) ++hiddenFromFirstPerson;
+        }
+        return hiddenFromFirstPerson;
+    }
+
     void ApplyViewMode(
         bool wearAvatar,
         bool hideFace,
@@ -1451,38 +1805,17 @@ public:
             const bool changed = wearAvatar_ != wearAvatar || wearHideFace_ != hideFace ||
                 wearHideHair_ != hideHair || wearHideNeckAccessories_ != hideNeckAccessories ||
                 wearBothLayer_ != bothViewsLayer;
+            if (!changed) return;
             wearAvatar_ = wearAvatar;
             wearHideFace_ = hideFace;
             wearHideHair_ = hideHair;
             wearHideNeckAccessories_ = hideNeckAccessories;
             wearBothLayer_ = bothViewsLayer;
-            std::size_t hiddenFromFirstPerson = 0;
-            for (std::size_t i = 0; i < allRenderers_.size(); ++i) {
-                auto* renderer = allRenderers_[i];
-                if (!IsAlive(renderer)) continue;
-                bool headGeometry = false;
-                if (wearAvatar_) {
-                    const auto head = i < rendererHeadFraction_.size() ? rendererHeadFraction_[i] : 0.0F;
-                    const auto neck = i < rendererNeckFraction_.size() ? rendererNeckFraction_[i] : 0.0F;
-                    const bool hair = i < rendererIsHair_.size() && rendererIsHair_[i];
-                    // Thresholds: a renderer mostly skinned to the head (60%+)
-                    // is face/hair/head-accessory even when a few vertices
-                    // blend into the neck; a quarter of vertices at neck level
-                    // marks collars, scarves, and chokers. The three switches
-                    // are independent so players can, e.g., hide only hair.
-                    const bool faceGeometry = head >= 0.6F && !hair;
-                    headGeometry = (hideFace && faceGeometry) ||
-                        (hideHair && hair) ||
-                        (hideNeckAccessories && neck >= 0.25F);
-                }
-                // Worn body parts go to the both-views layer so the player and
-                // the camera see them; hidden head geometry (and everything,
-                // when wear is off) stays on the spectator-only avatar layer,
-                // so recordings always contain the complete avatar.
-                const auto layer = (wearAvatar_ && !headGeometry) ? wearBothLayer_ : options_.avatarLayer;
-                renderer->get_gameObject()->set_layer(layer);
-                if (wearAvatar_ && headGeometry) ++hiddenFromFirstPerson;
-            }
+            // While grip calibration owns the HMD view, settings changes only
+            // update the saved view state. Re-layering the source avatar here
+            // would put the torso back around the player's head mid-edit.
+            const auto hiddenFromFirstPerson = gripEditingArmSide_ >= 0
+                ? std::size_t{0} : ApplyStoredViewLayers();
             if (changed) {
                 Logging::Logger.info(
                     "Avatar view mode: wear={} hideFace={} hideHair={} hideNeck={} headRenderersHiddenFromHmd={}/{}",
@@ -1491,6 +1824,56 @@ public:
             }
         } catch (...) {
             Logging::Logger.warn("Could not apply the avatar first-person view mode");
+        }
+    }
+
+    bool SetGripEditingArm(std::int32_t side, std::int32_t firstPersonLayer) noexcept {
+        try {
+            for (auto& armSide : gripArmRenderers_) {
+                for (auto& arm : armSide) {
+                    if (IsAlive(arm.filtered)) arm.filtered->set_enabled(false);
+                }
+            }
+
+            if (side < 0 || side > 1) {
+                const auto previous = gripEditingArmSide_;
+                gripEditingArmSide_ = -1;
+                ApplyStoredViewLayers();
+                if (previous >= 0) Logging::Logger.info("Closed the temporary arm-only grip view");
+                return true;
+            }
+
+            gripEditingArmSide_ = side;
+            // The complete source avatar remains visible to the spectator
+            // camera but is excluded from the HMD. Only compact selected-arm
+            // meshes are assigned to the first-person-only layer, preventing
+            // both the inside-torso view and double rendering in recordings.
+            for (auto* renderer : allRenderers_) {
+                if (IsAlive(renderer)) renderer->get_gameObject()->set_layer(options_.avatarLayer);
+            }
+            std::size_t shown = 0;
+            for (auto& arm : gripArmRenderers_[static_cast<std::size_t>(side)]) {
+                if (!IsAlive(arm.source) || !IsAlive(arm.filtered)) continue;
+                arm.filtered->get_gameObject()->set_layer(firstPersonLayer);
+                // Renderer::get_sharedMaterials uses UnityW entries while the
+                // generated setter accepts raw Material pointers. Preserve
+                // every slot (including the optional outline material) while
+                // crossing that generated-wrapper boundary explicitly.
+                auto sourceMaterials = arm.source->get_sharedMaterials();
+                arm.filtered->set_sharedMaterials(
+                    ConvertArray<UnityEngine::Material*>(sourceMaterials.size(), [&](std::size_t materialIndex) {
+                        return sourceMaterials[materialIndex].ptr();
+                    }));
+                arm.filtered->set_enabled(true);
+                ++shown;
+            }
+            Logging::Logger.info(
+                "Opened {} arm-only grip view with {} filtered renderers",
+                side == 0 ? "left" : "right", shown);
+            return shown > 0;
+        } catch (...) {
+            Logging::Logger.warn("Could not apply the temporary arm-only grip view");
+            return false;
         }
     }
 
@@ -1885,10 +2268,14 @@ public:
     std::vector<UnityEngine::SkinnedMeshRenderer*> renderers_;
     std::vector<std::size_t> rendererMeshIndices_;
     std::vector<UnityEngine::Renderer*> allRenderers_;
+    std::array<std::vector<GripArmRenderer>, 2> gripArmRenderers_;
     std::vector<std::size_t> rendererMaterialIndices_;
     std::vector<bool> rendererOutlineEnabled_;
     std::vector<SpringChainRuntime> springChains_;
     std::vector<SpringColliderRuntime> springColliders_;
+    std::array<UnityEngine::Vector3, 6> generatedArmColliderCenters_{};
+    std::array<float, 6> generatedArmColliderRadii_{};
+    std::size_t generatedArmColliderCount_ = 0;
     float springAccumulator_ = 0.0F;
     double springWindowSeconds_ = 0.0;
     std::size_t springWindowUpdates_ = 0;
@@ -1901,10 +2288,17 @@ public:
     bool wearHideFace_ = true;
     bool wearHideHair_ = false;
     bool wearHideNeckAccessories_ = false;
+    std::int32_t gripEditingArmSide_ = -1;
+    bool debugHairHidden_ = false;
     std::int32_t wearBothLayer_ = 0;
     // The live hierarchy and every display clone use the same player-fit
     // scale. Stand-in scale remains a separate user-selected multiplier.
     float rootUniformScale_ = 1.0F;
+    float bodyTorsoWidthScale_ = 1.0F;
+    float bodyLowerTorsoWidthScale_ = 1.0F;
+    float bodyNeckBaseWidthScale_ = 1.0F;
+    float bodyHeadSizeScale_ = 1.0F;
+    float bodyLegWidthScale_ = 1.0F;
     // Free-standing display clone state (up to three instances, one shared
     // layer and blend-shape dirty flag).
     std::vector<StandinInstance> standins_;
@@ -1921,6 +2315,16 @@ UnityEngine::Shader* EmbeddedVideoPreviewShader() noexcept {
         LoadAvatarShaders();
         auto& resources = AvatarShaders();
         return resources.videoPreview ? resources.videoPreview.ptr() : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+UnityEngine::Shader* EmbeddedGripTargetShader() noexcept {
+    try {
+        LoadAvatarShaders();
+        auto& resources = AvatarShaders();
+        return resources.gripTarget ? resources.gripTarget.ptr() : nullptr;
     } catch (...) {
         return nullptr;
     }
@@ -1955,9 +2359,30 @@ std::unique_ptr<VrmUnityRuntime> VrmUnityRuntime::Load(
 void VrmUnityRuntime::Destroy() noexcept { if (impl_) impl_->Destroy(); }
 void VrmUnityRuntime::SetVisible(bool visible) noexcept { if (impl_) impl_->SetVisible(visible); }
 void VrmUnityRuntime::SetUniformScale(float scale) noexcept { if (impl_) impl_->SetUniformScale(scale); }
+void VrmUnityRuntime::SetBodyProportionScales(
+    float torsoWidthScale,
+    float lowerTorsoWidthScale,
+    float neckBaseWidthScale,
+    float headSizeScale,
+    float legWidthScale) noexcept {
+    if (impl_) impl_->SetBodyProportionScales(
+        torsoWidthScale, lowerTorsoWidthScale, neckBaseWidthScale, headSizeScale, legWidthScale);
+}
 void VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { if (impl_) impl_->ApplyOptions(options); }
 void VrmUnityRuntime::UpdateSecondaryMotion(float deltaTime) noexcept { if (impl_) impl_->UpdateSecondaryMotion(deltaTime); }
 void VrmUnityRuntime::ResetSecondaryMotion() noexcept { if (impl_) impl_->ResetSecondaryMotion(); }
+void VrmUnityRuntime::SetArmSpringColliders(
+    const std::array<Float3, 6>& centers,
+    const std::array<float, 6>& radii,
+    std::size_t count) noexcept {
+    if (impl_) impl_->SetArmSpringColliders(centers, radii, count);
+}
+void VrmUnityRuntime::SetDebugHairHidden(bool hidden) noexcept {
+    if (impl_) impl_->SetDebugHairHidden(hidden);
+}
+bool VrmUnityRuntime::SupportsAlphaToMask() const noexcept {
+    return impl_ && impl_->SupportsAlphaToMask();
+}
 bool VrmUnityRuntime::HasExpression(std::string_view preset) const noexcept {
     return impl_ && impl_->HasExpression(preset);
 }
@@ -1974,6 +2399,9 @@ void VrmUnityRuntime::ApplyViewMode(
     bool hideNeckAccessories,
     std::int32_t bothViewsLayer) noexcept {
     if (impl_) impl_->ApplyViewMode(wearAvatar, hideFace, hideHair, hideNeckAccessories, bothViewsLayer);
+}
+bool VrmUnityRuntime::SetGripEditingArm(std::int32_t side, std::int32_t firstPersonLayer) noexcept {
+    return impl_ && impl_->SetGripEditingArm(side, firstPersonLayer);
 }
 bool VrmUnityRuntime::SetStandinCount(std::size_t count) noexcept {
     return impl_ && impl_->SetStandinCount(count);

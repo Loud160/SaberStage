@@ -3,6 +3,7 @@
 #include "saberstage/avatar/vrm/VrmAsset.hpp"
 
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -27,6 +28,8 @@ struct RuntimeOptions {
     bool rimLighting = true;
     bool matcap = false;
     bool emission = true;
+    std::int32_t cutoutSmoothing = 1;
+    bool alphaToMaskEnabled = false;
     std::int32_t outlineMode = 0;
     std::int32_t materialStage = 0;
     std::int32_t lightingMode = 1;
@@ -49,6 +52,7 @@ struct RuntimeStatistics {
     std::size_t skippedUnusedTextureCount = 0;
     std::size_t runtimeMaterialCount = 0;
     std::size_t mtoonMaterialCount = 0;
+    std::size_t mtoonCutoutMaterialCount = 0;
     std::size_t fallbackMaterialCount = 0;
     std::size_t mainTextureMaterialCount = 0;
     std::size_t shadeTextureMaterialCount = 0;
@@ -71,6 +75,7 @@ struct RuntimeStatistics {
     std::size_t activeSpringJointCount = 0;
     std::size_t springColliderCount = 0;
     std::size_t activeSpringColliderCount = 0;
+    std::size_t activeGeneratedArmColliderCount = 0;
     double springSolverMilliseconds = 0.0;
     double springUpdatesPerSecond = 0.0;
 };
@@ -86,6 +91,11 @@ struct RuntimeAnchor {
 // stock shaders located with Shader.Find can silently lack them on Quest and
 // then rasterize nothing in the headset. Used by the camera preview surfaces.
 UnityEngine::Shader* EmbeddedVideoPreviewShader() noexcept;
+
+// Transparent multiview-safe world-space shader used by the hand-placement
+// axis arrows and their hover rings. It is packaged beside the avatar shaders because
+// the same Unity Android build guarantees the stereo variants Quest needs.
+UnityEngine::Shader* EmbeddedGripTargetShader() noexcept;
 
 // Owns every Unity object created for one VRM. Destruction is centralized so
 // AvatarManager can unbind the humanoid first and then unload without leaving
@@ -109,9 +119,29 @@ public:
     // rigid attachments, spring chains, and unmapped nodes must share the
     // same root scale or moving the solved joints merely stretches the skin.
     void SetUniformScale(float scale) noexcept;
+    // Applies localized mesh-width adjustments from immutable authored node
+    // scales. Child counter-scales keep the change confined to the requested
+    // body region instead of widening the head, feet, or upper torso too.
+    void SetBodyProportionScales(
+        float torsoWidthScale,
+        float lowerTorsoWidthScale,
+        float neckBaseWidthScale,
+        float headSizeScale,
+        float legWidthScale) noexcept;
     void ApplyOptions(const RuntimeOptions& options) noexcept;
     void UpdateSecondaryMotion(float deltaTime) noexcept;
     void ResetSecondaryMotion() noexcept;
+    // Optional fixed-size world-space arm colliders are supplied from the
+    // already solved humanoid pose. They participate only in SaberStage's
+    // SpringBone pass and never create Unity physics objects.
+    void SetArmSpringColliders(
+        const std::array<Float3, 6>& centers,
+        const std::array<float, 6>& radii,
+        std::size_t count) noexcept;
+    // Session-only solver diagnostic. This is intentionally separate from
+    // persisted wear-view settings and affects the live avatar and clones.
+    void SetDebugHairHidden(bool hidden) noexcept;
+    [[nodiscard]] bool SupportsAlphaToMask() const noexcept;
     [[nodiscard]] bool HasExpression(std::string_view presetName) const noexcept;
     bool SetExpression(std::string_view presetName, float weight, std::string* error = nullptr) noexcept;
     // Runtime animation uses the same validated blend-shape path without
@@ -130,6 +160,11 @@ public:
         bool hideHair,
         bool hideNeckAccessories,
         std::int32_t bothViewsLayer) noexcept;
+    // Grip calibration uses compact skin-weight-filtered arm renderers so the
+    // headset sees only the selected arm. The complete source avatar remains
+    // on its spectator layer and therefore remains correct for recordings.
+    // Pass 0 for left, 1 for right, or -1 to disable the temporary view.
+    bool SetGripEditingArm(std::int32_t side, std::int32_t firstPersonLayer) noexcept;
 
     // Free-standing display clones mirroring the live pose (up to three).
     // Each clone is an Instantiate of the avatar hierarchy, so meshes,

@@ -9,8 +9,21 @@ namespace saberstage::avatar {
     const AvatarCalibration& avatar,
     const PlayerCalibration& player,
     const calibration::RuntimePlayerProfile& profile,
+    const AvatarFitOptions& options) noexcept;
+
+// Compatibility overload retained for focused tests and callers that only
+// care about the original two height-fit controls.
+[[nodiscard]] inline AvatarRetargeting ComputeAvatarRetargeting(
+    const AvatarCalibration& avatar,
+    const PlayerCalibration& player,
+    const calibration::RuntimePlayerProfile& profile,
     bool matchPlayerHeight,
-    float heightAdjustmentBalance) noexcept;
+    float heightAdjustmentBalance) noexcept {
+    AvatarFitOptions options{};
+    options.matchPlayerHeight = matchPlayerHeight;
+    options.heightAdjustmentBalance = heightAdjustmentBalance;
+    return ComputeAvatarRetargeting(avatar, player, profile, options);
+}
 
 [[nodiscard]] bool BuildRetargetedNeutralPose(
     const AvatarCalibration& avatar,
@@ -25,9 +38,19 @@ public:
     void SetPlantedLegLeanLimit(float fraction) noexcept;
     void SetStanceWidthScale(float scale) noexcept;
     void SetBackwardSpineCurveLimit(float fraction) noexcept;
+    [[nodiscard]] bool SetFitOptions(const AvatarFitOptions& options) noexcept;
+    // Updates only one manual hand target during interactive placement. Unlike
+    // SetFitOptions, this deliberately preserves body, foot, and bend history
+    // so a 90 Hz controller drag cannot reseed the whole avatar every frame.
+    [[nodiscard]] bool SetGripAdjustment(int side, Pose adjustment) noexcept;
     [[nodiscard]] bool SetRetargetingSettings(
         bool matchPlayerHeight,
-        float heightAdjustmentBalance) noexcept;
+        float heightAdjustmentBalance) noexcept {
+        auto options = fitOptions_;
+        options.matchPlayerHeight = matchPlayerHeight;
+        options.heightAdjustmentBalance = heightAdjustmentBalance;
+        return SetFitOptions(options);
+    }
 
     bool Solve(
         const TrackingSample& tracking,
@@ -51,8 +74,7 @@ private:
     float plantedLegLeanLimit_ = 1.0F;
     float stanceWidthScale_ = 1.0F;
     float backwardSpineCurveLimit_ = 1.0F;
-    bool matchPlayerHeight_ = false;
-    float heightAdjustmentBalance_ = 0.0F;
+    AvatarFitOptions fitOptions_{};
 };
 
 } // namespace saberstage::avatar

@@ -12,6 +12,7 @@ Shader "SaberStage/MToonOutline"
         _MainTexRotation ("Main UV Rotation", Float) = 0
         _Cutoff ("Alpha Cutoff", Range(0,1)) = 0.5
         [Toggle] _AlphaToMask ("Alpha To Coverage", Float) = 0
+        _CutoutSmoothing ("Cutout Smoothing", Range(0,3)) = 1
     }
     SubShader
     {
@@ -33,6 +34,7 @@ Shader "SaberStage/MToonOutline"
             float4 _MainTex_ST, _OutlineColor;
             float _OutlineWidth, _OutlineColorMode, _OutlineLightingMix;
             float _Cutoff, _MainTexCoord, _MainTexRotation;
+            float _AlphaToMask, _CutoutSmoothing;
             struct appdata { float4 vertex:POSITION; float3 normal:NORMAL; float2 uv0:TEXCOORD0; float2 uv1:TEXCOORD1; UNITY_VERTEX_INPUT_INSTANCE_ID };
             struct v2f { float4 position:SV_POSITION; float2 uv0:TEXCOORD0; float2 uv1:TEXCOORD1; UNITY_VERTEX_INPUT_INSTANCE_ID UNITY_VERTEX_OUTPUT_STEREO };
             float2 transformedUv(float2 uv0, float2 uv1) {
@@ -61,18 +63,38 @@ Shader "SaberStage/MToonOutline"
                 UNITY_SETUP_INSTANCE_ID(input);
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
                 fixed4 mainSample = tex2D(_MainTex, transformedUv(input.uv0, input.uv1));
+                float cutoutCoverage = 1.0;
                 #if defined(SABERSTAGE_ALPHA_TEST)
                     float alpha = mainSample.a;
-                    float alphaWidth = max(fwidth(alpha), 0.0001);
-                    alpha = saturate((alpha - _Cutoff) / alphaWidth + 0.5);
-                    clip(alpha - 0.001);
+                    if (_CutoutSmoothing > 0.5)
+                    {
+                        float smoothingWidth = max(
+                            fwidth(alpha) * (0.65 * _CutoutSmoothing), 0.0001);
+                        alpha = saturate((alpha - _Cutoff) / smoothingWidth + 0.5);
+                        if (_AlphaToMask < 0.5)
+                        {
+                            float2 pixel = floor(input.position.xy);
+                            float threshold = frac(52.9829189 * frac(
+                                dot(pixel, float2(0.06711056, 0.00583715))));
+                            clip(alpha - threshold);
+                        }
+                        else
+                        {
+                            clip(alpha - 0.001);
+                        }
+                        cutoutCoverage = alpha;
+                    }
+                    else
+                    {
+                        clip(alpha - _Cutoff);
+                    }
                 #endif
                 // Fixed mode paints the authored color; mixed mode (hair and
                 // similar) tints the outline with the surface texture, faded
                 // by the authored lighting mix.
                 float3 mixedTint = lerp(float3(1, 1, 1), mainSample.rgb, saturate(_OutlineLightingMix));
                 float3 tint = lerp(float3(1, 1, 1), mixedTint, step(0.5, _OutlineColorMode));
-                return fixed4(_OutlineColor.rgb * tint, _OutlineColor.a);
+                return fixed4(_OutlineColor.rgb * tint, _OutlineColor.a * cutoutCoverage);
             }
             ENDCG
         }

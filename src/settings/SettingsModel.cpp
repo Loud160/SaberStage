@@ -13,7 +13,7 @@ namespace {
 constexpr std::array<std::string_view, 5> kAvatarPlayerProfileIds{
     "default", "player-2", "player-3", "player-4", "player-5"};
 constexpr std::array<std::string_view, 5> kAvatarPlayerProfileNames{
-    "Player 1", "Player 2", "Player 3", "Player 4", "Player 5"};
+    "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"};
 
 template <typename T>
 void RepairEnum(T& value, T first, T last, T fallback, ValidationResult& result) {
@@ -73,6 +73,9 @@ AvatarRetargetingSettings RetargetingForSelectedAvatar(const AvatarSettings& set
     }
     AvatarRetargetingSettings result{};
     result.avatarKey = key;
+    result.gripOffsetsInitialized = true;
+    result.leftControllerToWrist = settings.leftControllerToWrist;
+    result.rightControllerToWrist = settings.rightControllerToWrist;
     return result;
 }
 
@@ -81,7 +84,12 @@ AvatarRetargetingSettings& EditRetargetingForSelectedAvatar(AvatarSettings& sett
     for (auto& profile : settings.retargetingProfiles) {
         if (profile.avatarKey == key) return profile;
     }
-    settings.retargetingProfiles.push_back({.avatarKey = key});
+    AvatarRetargetingSettings created{};
+    created.avatarKey = key;
+    created.gripOffsetsInitialized = true;
+    created.leftControllerToWrist = settings.leftControllerToWrist;
+    created.rightControllerToWrist = settings.rightControllerToWrist;
+    settings.retargetingProfiles.push_back(std::move(created));
     return settings.retargetingProfiles.back();
 }
 
@@ -323,6 +331,8 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                AvatarQualityPreset::Custom, defaults.avatar.qualityPreset, result);
     RepairEnum(settings.avatar.outlines, AvatarOutlineMode::Off,
                AvatarOutlineMode::Full, defaults.avatar.outlines, result);
+    RepairEnum(settings.avatar.cutoutSmoothing, AvatarCutoutSmoothing::Off,
+               AvatarCutoutSmoothing::High, defaults.avatar.cutoutSmoothing, result);
     RepairEnum(settings.avatar.materialStage, AvatarMaterialStage::Configured,
                AvatarMaterialStage::Outlines, defaults.avatar.materialStage, result);
     RepairEnum(settings.avatar.lightingMode, AvatarLightingMode::Environment,
@@ -349,7 +359,7 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                 defaults.avatar.sideStepLeanLimitPercent, result);
     RepairFloat(settings.avatar.plantedLegLeanLimitPercent, 20.0F, 100.0F,
                 defaults.avatar.plantedLegLeanLimitPercent, result);
-    RepairFloat(settings.avatar.stanceWidthPercent, 75.0F, 200.0F,
+    RepairFloat(settings.avatar.stanceWidthPercent, 75.0F, 400.0F,
                 defaults.avatar.stanceWidthPercent, result);
     RepairFloat(settings.avatar.backwardSpineCurveLimitPercent, 0.0F, 100.0F,
                 defaults.avatar.backwardSpineCurveLimitPercent, result);
@@ -374,6 +384,39 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
             result.changed = true;
             ++result.repairedFields;
         }
+        RepairFloat(profile.manualAvatarScalePercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.torsoWidthPercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.shoulderWidthPercent, 50.0F, 300.0F, 100.0F, result);
+        RepairFloat(profile.waistHipWidthPercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.lowerTorsoWidthPercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.neckBaseWidthPercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.headSizePercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.torsoHeightPercent, 50.0F, 150.0F, 100.0F, result);
+        RepairFloat(profile.upperLegLengthPercent, 50.0F, 150.0F, 100.0F, result);
+        RepairFloat(profile.lowerLegLengthPercent, 50.0F, 150.0F, 100.0F, result);
+        RepairFloat(profile.legWidthPercent, 50.0F, 200.0F, 100.0F, result);
+        RepairFloat(profile.neutralKneeBendDegrees, 0.0F, 20.0F, 0.0F, result);
+        RepairFloat(profile.attackPoseDegrees, -20.0F, 20.0F, 0.0F, result);
+        RepairFloat(profile.backStiffnessPercent, 0.0F, 100.0F, 50.0F, result);
+        RepairFloat(profile.floorOffsetMeters, -0.25F, 0.25F, 0.0F, result);
+        RepairVector(profile.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
+        RepairVector(profile.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
+        RepairFloat(profile.leftControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
+        RepairFloat(profile.leftControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
+        RepairVector(profile.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
+        RepairVector(profile.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
+        RepairFloat(profile.rightControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
+        RepairFloat(profile.rightControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
+        if (!profile.gripOffsetsInitialized) {
+            // Schema 14 stored one offset pair directly on AvatarSettings.
+            // Copy it into every existing avatar fit once so an upgrade cannot
+            // move the visible hands relative to the user's controllers.
+            profile.leftControllerToWrist = settings.avatar.leftControllerToWrist;
+            profile.rightControllerToWrist = settings.avatar.rightControllerToWrist;
+            profile.gripOffsetsInitialized = true;
+            result.changed = true;
+            ++result.repairedFields;
+        }
         const auto duplicate = std::find_if(
             repairedRetargeting.begin(), repairedRetargeting.end(),
             [&](const auto& prior) { return prior.avatarKey == profile.avatarKey; });
@@ -388,8 +431,12 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
     settings.avatar.retargetingProfiles = std::move(repairedRetargeting);
     RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
     RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
+    RepairFloat(settings.avatar.leftControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
+    RepairFloat(settings.avatar.leftControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
     RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
     RepairVector(settings.avatar.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
+    RepairFloat(settings.avatar.rightControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
+    RepairFloat(settings.avatar.rightControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
     // The active AvatarSettings object is the editable working copy. Preserve
     // it in its current slot before normalizing older dynamic-profile files to
     // the five fixed slots exposed by the dropdown.
@@ -411,7 +458,7 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         }
         if (profile.displayName.empty() || profile.displayName.size() > 32 ||
             profile.displayName.find('\0') != std::string::npos) {
-            profile.displayName = profile.id == "default" ? "Player 1" : "Player";
+            profile.displayName = profile.id == "default" ? "Profile 1" : "Profile";
             result.changed = true;
             ++result.repairedFields;
         }
@@ -604,6 +651,16 @@ std::string_view ToString(AvatarOutlineMode value) noexcept {
     return "off";
 }
 
+std::string_view ToString(AvatarCutoutSmoothing value) noexcept {
+    switch (value) {
+        case AvatarCutoutSmoothing::Off: return "off";
+        case AvatarCutoutSmoothing::Low: return "low";
+        case AvatarCutoutSmoothing::Medium: return "medium";
+        case AvatarCutoutSmoothing::High: return "high";
+    }
+    return "low";
+}
+
 std::string_view ToString(AvatarMaterialStage value) noexcept {
     switch (value) {
         case AvatarMaterialStage::Configured: return "configured";
@@ -719,6 +776,13 @@ bool TryParse(std::string_view value, AvatarOutlineMode& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("off", AvatarOutlineMode::Off)
     SABERSTAGE_PARSE_ENUM_CASE("reduced", AvatarOutlineMode::Reduced)
     SABERSTAGE_PARSE_ENUM_CASE("full", AvatarOutlineMode::Full)
+    return false;
+}
+bool TryParse(std::string_view value, AvatarCutoutSmoothing& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("off", AvatarCutoutSmoothing::Off)
+    SABERSTAGE_PARSE_ENUM_CASE("low", AvatarCutoutSmoothing::Low)
+    SABERSTAGE_PARSE_ENUM_CASE("medium", AvatarCutoutSmoothing::Medium)
+    SABERSTAGE_PARSE_ENUM_CASE("high", AvatarCutoutSmoothing::High)
     return false;
 }
 bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept {

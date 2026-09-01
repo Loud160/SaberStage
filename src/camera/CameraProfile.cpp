@@ -73,6 +73,12 @@ ProfileValidationResult ValidateAndRepair(CameraProfile& profile) {
     RepairRange(profile.requestedWidth, 320, 4096, defaults.requestedWidth, result);
     RepairRange(profile.requestedHeight, 240, 4096, defaults.requestedHeight, result);
     RepairRange(profile.requestedFramesPerSecond, 15, 60, defaults.requestedFramesPerSecond, result);
+    if (profile.multisampleCount != 1 && profile.multisampleCount != 2 &&
+        profile.multisampleCount != 4) {
+        profile.multisampleCount = defaults.multisampleCount;
+        result.changed = true;
+        ++result.repairedFields;
+    }
     if ((profile.requestedWidth & 1) != 0) {
         --profile.requestedWidth;
         result.changed = true;
