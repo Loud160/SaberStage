@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Provides small deterministic math primitives shared by the surrounding subsystem.
+// - Functions avoid Unity types so algorithms can be covered by host tests.
+
 #include "saberstage/avatar/Math.hpp"
 
 #include <algorithm>
@@ -27,6 +39,8 @@ Vec3 operator-(Vec3 value) noexcept { return {-value.x, -value.y, -value.z}; }
 Vec3 operator*(Vec3 value, float scalar) noexcept { return {value.x * scalar, value.y * scalar, value.z * scalar}; }
 Vec3 operator*(float scalar, Vec3 value) noexcept { return value * scalar; }
 Vec3 operator/(Vec3 value, float scalar) noexcept {
+    // Returning zero for a degenerate divisor keeps recovery deterministic and
+    // prevents infinities from contaminating a complete solved skeleton.
     if (std::abs(scalar) <= kEpsilon) return {};
     return value * (1.0F / scalar);
 }
@@ -90,6 +104,8 @@ Quaternion FromToRotation(Vec3 from, Vec3 to) noexcept {
     const auto dot = Clamp(Dot(a, b), -1.0F, 1.0F);
     if (dot > 1.0F - kEpsilon) return {};
     if (dot < -1.0F + kEpsilon) {
+        // Antiparallel vectors have infinitely many valid rotation axes. Choose
+        // a deterministic perpendicular axis so the result cannot flip per frame.
         auto axis = Cross(a, {1.0F, 0.0F, 0.0F});
         if (LengthSquared(axis) <= kEpsilon) axis = Cross(a, {0.0F, 1.0F, 0.0F});
         return AxisAngle(axis, 3.14159265358979323846F);
@@ -123,6 +139,8 @@ Quaternion LookRotation(Vec3 forward, Vec3 up) noexcept {
 Quaternion Nlerp(Quaternion from, Quaternion to, float amount) noexcept {
     auto a = Normalize(from);
     auto b = Normalize(to);
+    // q and -q represent the same orientation. Flipping one endpoint selects the
+    // shortest interpolation arc and avoids an unnecessary full rotation.
     if (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0.0F) {
         b = {-b.x, -b.y, -b.z, -b.w};
     }

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Coordinates camera demand, recording and streaming backends, audio, pause/AFK, and finalization.
+// - All state transitions and worker results converge here before the UI is notified.
+
 #include "saberstage/recording/RecordingController.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -18,6 +30,7 @@
 #include "GlobalNamespace/OVRInput.hpp"
 #include "UnityEngine/AudioListener.hpp"
 #include "UnityEngine/AudioSettings.hpp"
+#include "UnityEngine/AndroidJNI.hpp"
 #include "UnityEngine/Android/Permission.hpp"
 #include "UnityEngine/Behaviour.hpp"
 #include "UnityEngine/Camera.hpp"
@@ -29,6 +42,7 @@
 #include "UnityEngine/SceneManagement/SceneManager.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Time.hpp"
+#include "UnityEngine/jvalue.hpp"
 #include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
 #include "hollywood/shared/hollywood.hpp"
 
@@ -36,6 +50,7 @@
 #include <array>
 #include <ctime>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <system_error>
 #include <utility>
@@ -44,6 +59,102 @@ namespace saberstage::recording {
 namespace {
 
 constexpr std::string_view kRecordingDemandId = "recording";
+constexpr std::string_view kMicrophonePermission = "android.permission.RECORD_AUDIO";
+
+using Jni = UnityEngine::AndroidJNI;
+using JHandle = System::IntPtr;
+using JValue = UnityEngine::jvalue;
+
+bool IsNull(JHandle handle) noexcept { return handle.m_value == nullptr; }
+
+JValue JniObject(JHandle object) {
+    JValue value{};
+    value.__cordl_internal_set_l(object);
+    return value;
+}
+
+JValue JniInteger(std::int32_t integer) {
+    JValue value{};
+    value.__cordl_internal_set_i(integer);
+    return value;
+}
+
+bool ClearJniException() noexcept {
+    const auto exception = Jni::ExceptionOccurred();
+    if (IsNull(exception)) return false;
+    Jni::ExceptionClear();
+    Jni::DeleteLocalRef(exception);
+    return true;
+}
+
+class JniLocalFrame final {
+public:
+    JniLocalFrame() : active_(Jni::PushLocalFrame(48) == 0) {}
+    ~JniLocalFrame() {
+        if (active_) Jni::PopLocalFrame({});
+    }
+    [[nodiscard]] bool Active() const noexcept { return active_; }
+
+private:
+    bool active_ = false;
+};
+
+std::optional<bool> ApplicationDeclaresMicrophonePermission() noexcept {
+    try {
+        JniLocalFrame frame;
+        if (!frame.Active()) return std::nullopt;
+        const auto unityPlayerClass = Jni::FindClass("com/unity3d/player/UnityPlayer");
+        if (IsNull(unityPlayerClass) || ClearJniException()) return std::nullopt;
+        const auto activityField = Jni::GetStaticFieldID(
+            unityPlayerClass, "currentActivity", "Landroid/app/Activity;");
+        const auto activity = Jni::GetStaticObjectField(unityPlayerClass, activityField);
+        if (IsNull(activity) || ClearJniException()) return std::nullopt;
+
+        const auto activityClass = Jni::GetObjectClass(activity);
+        const auto getPackageManager = Jni::GetMethodID(
+            activityClass, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+        const auto getPackageName = Jni::GetMethodID(
+            activityClass, "getPackageName", "()Ljava/lang/String;");
+        const auto packageManager = Jni::CallObjectMethod(activity, getPackageManager, nullptr);
+        const auto packageName = Jni::CallObjectMethod(activity, getPackageName, nullptr);
+        if (IsNull(packageManager) || IsNull(packageName) || ClearJniException()) {
+            return std::nullopt;
+        }
+
+        const auto packageManagerClass = Jni::GetObjectClass(packageManager);
+        const auto getPackageInfo = Jni::GetMethodID(
+            packageManagerClass,
+            "getPackageInfo",
+            "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
+        const auto packageInfo = Jni::CallObjectMethod(
+            packageManager,
+            getPackageInfo,
+            {JniObject(packageName), JniInteger(0x00001000)}); // GET_PERMISSIONS
+        if (IsNull(packageInfo) || ClearJniException()) return std::nullopt;
+
+        const auto packageInfoClass = Jni::GetObjectClass(packageInfo);
+        const auto permissionsField = Jni::GetFieldID(
+            packageInfoClass, "requestedPermissions", "[Ljava/lang/String;");
+        const auto requestedPermissions = Jni::GetObjectField(packageInfo, permissionsField);
+        if (ClearJniException()) return std::nullopt;
+        if (IsNull(requestedPermissions)) return false;
+
+        const auto count = Jni::GetArrayLength(requestedPermissions);
+        if (ClearJniException()) return std::nullopt;
+        for (std::int32_t index = 0; index < count; ++index) {
+            const auto permission = Jni::GetObjectArrayElement(requestedPermissions, index);
+            if (IsNull(permission) || ClearJniException()) continue;
+            if (static_cast<std::string>(Jni::GetStringUTFChars(permission)) ==
+                    kMicrophonePermission) {
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        ClearJniException();
+        return std::nullopt;
+    }
+}
 
 bool IsUnityObjectAlive(UnityEngine::Object* object) {
     return object != nullptr && UnityEngine::Object::op_Inequality(object, nullptr);
@@ -766,6 +877,8 @@ RecordingSnapshot RecordingController::Snapshot() const {
         snapshot.elapsedSeconds = ElapsedSeconds(std::chrono::steady_clock::now());
     }
     snapshot.encodedFrameCount = encodedFrameCount_.load(std::memory_order_relaxed);
+    snapshot.gameAudioMuted = localRecordingGameAudioMuted_.load(
+        std::memory_order_acquire);
     snapshot.droppedFrameCount = hollywoodSkippedPresentationFrames_;
     if (IsUnityObjectAlive(directVideoCapture_)) {
         const auto diagnostics = directVideoCapture_->Diagnostics();
@@ -851,6 +964,22 @@ std::string RecordingController::StreamKey(settings::LivestreamProvider provider
     return settings::DestinationForProvider(settings_.Get().broadcast, provider).streamKey;
 }
 
+MicrophonePermissionStatus RecordingController::QueryMicrophonePermission() noexcept {
+    try {
+        if (UnityEngine::Android::Permission::HasUserAuthorizedPermission(
+                kMicrophonePermission)) {
+            return MicrophonePermissionStatus::Granted;
+        }
+        const auto declared = ApplicationDeclaresMicrophonePermission();
+        if (!declared.has_value()) return MicrophonePermissionStatus::Unknown;
+        return *declared
+            ? MicrophonePermissionStatus::RequestRequired
+            : MicrophonePermissionStatus::MissingFromApplication;
+    } catch (...) {
+        return MicrophonePermissionStatus::Unknown;
+    }
+}
+
 bool RecordingController::StartLivestream(std::string* error) {
     // Streaming owns its session backend. A user can keep Hollywood selected
     // for ordinary local recording; Go Live starts a Direct FFmpeg stream-only
@@ -864,15 +993,16 @@ bool RecordingController::StartLivestream(std::string* error) {
     }
     const auto requestedBroadcastSettings = settings_.Get().broadcast;
     if (requestedBroadcastSettings.microphoneEnabled) {
-        constexpr std::string_view permission = "android.permission.RECORD_AUDIO";
-        if (!UnityEngine::Android::Permission::HasUserAuthorizedPermission(permission)) {
-            // Requesting is still useful when the permission is declared but
-            // has not been accepted. If the APK lacks the declaration, Unity
-            // cannot grant it and the same plain-language start error directs
-            // the user to MBF's patch option.
-            UnityEngine::Android::Permission::RequestUserPermission(permission, nullptr);
+        const auto permissionStatus = QueryMicrophonePermission();
+        if (permissionStatus != MicrophonePermissionStatus::Granted) {
+            if (permissionStatus != MicrophonePermissionStatus::MissingFromApplication) {
+                UnityEngine::Android::Permission::RequestUserPermission(
+                    kMicrophonePermission, nullptr);
+            }
             if (error) {
-                *error = "Quest microphone access is not available. Accept the system microphone prompt, then try again. If no prompt appears, enable Microphone Access in MBF and repatch Beat Saber.";
+                *error = permissionStatus == MicrophonePermissionStatus::MissingFromApplication
+                    ? "Beat Saber was patched without Microphone Access. Enable Microphone Access in MBF, repatch Beat Saber, and then try the stream again."
+                    : "Quest microphone access is waiting for approval. Accept the Android microphone prompt, then try the stream again.";
             }
             return false;
         }
@@ -1157,12 +1287,57 @@ bool RecordingController::ResumeLivestream(std::string* error) {
 void RecordingController::SetLivestreamGameAudioVolumePercent(float value) {
     std::lock_guard lock(livestreamMutex_);
     livestreamGameAudioGain_ = std::clamp(value / 100.0F, 0.0F, 2.0F);
+    statusVersion_.fetch_add(1);
 }
 
 void RecordingController::SetLivestreamMicrophoneVolumePercent(float value) {
     std::lock_guard lock(livestreamMutex_);
     livestreamMicrophoneGain_ = std::clamp(value / 100.0F, 0.0F, 2.0F);
     statusVersion_.fetch_add(1);
+}
+
+void RecordingController::SetLocalRecordingGameAudioMuted(bool muted) noexcept {
+    localRecordingGameAudioMuted_.store(muted, std::memory_order_release);
+    // RealtimeAudioCapture owns the audio-thread boundary. Its setter is an
+    // atomic flag update, so this remains safe while the background writer is
+    // draining a local recording and does not disturb a simultaneous stream.
+    if (IsUnityObjectAlive(audioCapture_) && !streamOnlySession_) {
+        audioCapture_->SetFileMuted(muted);
+    }
+    statusVersion_.fetch_add(1);
+    Logging::Logger.info(
+        "Local recording game sound {} from movable controls",
+        muted ? "muted" : "unmuted");
+}
+
+bool RecordingController::SetLivestreamGameAudioMuted(
+    bool muted,
+    std::string* error) {
+    std::lock_guard lock(livestreamMutex_);
+    const bool streamActive = livestreamSink_ &&
+        broadcast::CanStop(livestreamSink_->Snapshot().state);
+    if (streamActive && livestreamAfk_.load(std::memory_order_acquire)) {
+        if (error) *error = "Game sound is locked while the AFK screen is active.";
+        return false;
+    }
+    const auto& configured = settings_.Get().broadcast;
+    const bool gameAudioAvailable = streamActive
+        ? livestreamGameAudioEnabled_ && livestreamGameAudioGain_ > 0.0001F
+        : configured.gameAudioEnabled && configured.gameAudioVolumePercent > 0.0001F;
+    if (!gameAudioAvailable) {
+        if (error) {
+            *error = "Enable Game Sound and set its volume above 0% before using game-sound mute.";
+        }
+        return false;
+    }
+    if (livestreamGameAudioMuted_ == muted) return true;
+    livestreamGameAudioMuted_ = muted;
+    statusVersion_.fetch_add(1);
+    Logging::Logger.info(
+        "Livestream game sound {} from movable controls ({})",
+        muted ? "muted" : "unmuted",
+        streamActive ? "applied live" : "queued for next stream");
+    return true;
 }
 
 bool RecordingController::SetLivestreamMicrophoneMuted(
@@ -1252,6 +1427,10 @@ broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
         snapshot.streamKeyConfigured =
             !streamKeyOverrides_[providerIndex].empty() || !saved.streamKey.empty();
         snapshot.afk = livestreamAfk_.load(std::memory_order_acquire);
+        snapshot.gameAudioAvailable = livestreamGameAudioEnabled_ &&
+            livestreamGameAudioGain_ > 0.0001F;
+        snapshot.gameAudioMuted = snapshot.afk ||
+            !snapshot.gameAudioAvailable || livestreamGameAudioMuted_;
         snapshot.microphoneAvailable = livestreamMicrophoneEnabled_ &&
             livestreamMicrophone_ && livestreamMicrophoneGain_ > 0.0001F;
         snapshot.microphoneMuted = snapshot.afk ||
@@ -1266,6 +1445,10 @@ broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
     snapshot.streamKeyConfigured =
         !streamKeyOverrides_[providerIndex].empty() || !saved.streamKey.empty();
     snapshot.afk = livestreamAfk_.load(std::memory_order_acquire);
+    snapshot.gameAudioAvailable = broadcastSettings.gameAudioEnabled &&
+        broadcastSettings.gameAudioVolumePercent > 0.0001F;
+    snapshot.gameAudioMuted = !snapshot.gameAudioAvailable ||
+        livestreamGameAudioMuted_;
     snapshot.microphoneAvailable = broadcastSettings.microphoneEnabled &&
         broadcastSettings.microphoneVolumePercent > 0.0001F;
     snapshot.microphoneMuted = !snapshot.microphoneAvailable;
@@ -1347,6 +1530,8 @@ void RecordingController::CreatePersistentAudioCapture() {
         audioCapture_->OpenConsumerOnly(std::move(networkConsumer));
     } else {
         audioCapture_->OpenFile(rawAudioPath_, std::move(networkConsumer));
+        audioCapture_->SetFileMuted(localRecordingGameAudioMuted_.load(
+            std::memory_order_acquire));
     }
     audioObject_->SetActive(true);
     RefreshAudioListenerOwnership();
@@ -1365,7 +1550,7 @@ void RecordingController::SubmitLivestreamAudioLocked(
     // Preserve the zero-cost legacy path when the stream uses unmodified game
     // audio and no microphone. Local WAV output always receives the original
     // samples before this consumer is called, so no stream mix can alter it.
-    if (livestreamGameAudioEnabled_ &&
+    if (livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_ &&
             (!livestreamMicrophoneEnabled_ || livestreamMicrophoneMuted_ ||
              livestreamMicrophoneGain_ <= 0.0001F) &&
             std::abs(livestreamGameAudioGain_ - 1.0F) <= 0.0001F) {
@@ -1398,7 +1583,7 @@ void RecordingController::SubmitLivestreamAudioLocked(
             : 0.0F;
         for (std::size_t channel = 0; channel < channelCount; ++channel) {
             const auto index = frame * channelCount + channel;
-            const auto gameSample = livestreamGameAudioEnabled_
+            const auto gameSample = livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_
                 ? samples[index] * livestreamGameAudioGain_
                 : 0.0F;
             livestreamMixScratch_[index] = std::clamp(

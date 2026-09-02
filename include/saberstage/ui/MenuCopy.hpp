@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Contains user-facing menu labels and reusable explanatory text.
+// - Centralized copy keeps error and guidance wording consistent across panels.
+
 #pragma once
 
 #include <cstddef>
@@ -5,6 +17,8 @@
 
 namespace saberstage::ui::copy {
 
+// This legacy scaffold copy remains compile-time bounded because it may be used
+// by a narrow recovery UI when the full menu cannot be constructed.
 inline constexpr std::string_view kScaffoldDescription =
     "SaberStage 0.1.0\n"
     "by Loud160 (AKA Whisp)\n"
@@ -17,6 +31,8 @@ inline constexpr std::string_view kScaffoldDescription =
 inline constexpr std::string_view kResetButton = "Reset general settings";
 inline constexpr std::string_view kFactoryResetButton = "Factory reset SaberStage";
 
+// Compile-time layout guards catch copy edits that would overflow the recovery
+// panel without requiring an on-device visual test to discover them.
 constexpr std::size_t LongestLine(std::string_view text) {
     std::size_t longest = 0;
     std::size_t current = 0;

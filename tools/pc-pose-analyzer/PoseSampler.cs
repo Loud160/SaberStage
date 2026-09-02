@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Samples controller/HMD inputs and resulting avatar bones at a bounded cadence.
+// - The sampler observes the PC avatar implementation without reading its internal solver code.
+
 using System;
 using UnityEngine;
 

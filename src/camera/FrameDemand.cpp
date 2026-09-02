@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Combines preview, recording, and streaming requests into one camera render demand.
+// - The fractional scheduler avoids duplicate renders while preserving requested output cadence.
+
 #include "saberstage/camera/FrameDemand.hpp"
 
 #include <algorithm>
@@ -6,9 +18,13 @@
 namespace saberstage::camera {
 
 bool FrameDemandRegistry::Set(std::string consumerId, RenderDemand demand) {
+    // The current runtime exposes one spectator camera. Reject unknown camera
+    // identifiers now rather than accepting demand the renderer cannot satisfy.
     if (consumerId.empty() || consumerId.size() > 64 || demand.cameraId != "primary" ||
         demand.width < 320 || demand.width > 4096 || demand.height < 240 || demand.height > 4096 ||
         demand.framesPerSecond < 15 || demand.framesPerSecond > 60) return false;
+    // YUV encoders require even dimensions. Rounding down stays within the
+    // requested maximum and avoids a later per-frame resize.
     demand.width &= ~1;
     demand.height &= ~1;
     demands_.insert_or_assign(std::move(consumerId), std::move(demand));
@@ -25,6 +41,8 @@ CombinedRenderDemand FrameDemandRegistry::Combined(std::string_view cameraId) co
         (void)consumer;
         if (demand.cameraId != cameraId) continue;
         result.active = true;
+        // Use one render large and fast enough for every consumer. Lower-demand
+        // outputs can downsample or skip frames without triggering another render.
         result.width = std::max(result.width, demand.width);
         result.height = std::max(result.height, demand.height);
         result.framesPerSecond = std::max(result.framesPerSecond, demand.framesPerSecond);
@@ -35,6 +53,8 @@ CombinedRenderDemand FrameDemandRegistry::Combined(std::string_view cameraId) co
 bool FrameScheduler::Advance(float deltaSeconds, std::int32_t framesPerSecond) noexcept {
     if (!std::isfinite(deltaSeconds) || deltaSeconds < 0.0F || framesPerSecond <= 0) return false;
     const auto interval = 1.0F / static_cast<float>(framesPerSecond);
+    // Cap accumulated debt. Rendering a burst of every missed frame after a hitch
+    // would worsen the hitch; the scheduler resumes cadence from current time.
     accumulatorSeconds_ = std::min(accumulatorSeconds_ + deltaSeconds, interval * 2.0F);
     if (accumulatorSeconds_ + 0.000001F < interval) return false;
     accumulatorSeconds_ = std::fmod(accumulatorSeconds_, interval);

@@ -12,8 +12,9 @@ other mods.
 
 Native Logger Quest is distributed under GPL-3.0-only with its preserved
 GPLv3 section 7 terms. Its complete license, additional terms, and notice are
-available in the upstream repository at the pinned revision. This notice does
-not select a final license for SaberStage's remaining first-party source.
+available in the upstream repository at the pinned revision. SaberStage's own
+first-party source is separately distributed under the project license linked
+from the repository root.
 
 ## Camera2
 

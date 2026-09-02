@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Coordinates camera demand, recording and streaming backends, audio, pause/AFK, and finalization.
+// - All state transitions and worker results converge here before the UI is notified.
+
 #pragma once
 
 #include "saberstage/recording/ControllerShortcut.hpp"
@@ -39,6 +51,13 @@ class SettingsService;
 
 namespace saberstage::recording {
 
+enum class MicrophonePermissionStatus {
+    Granted,
+    RequestRequired,
+    MissingFromApplication,
+    Unknown
+};
+
 class AsyncVideoWriter;
 class DirectFfmpegCapture;
 class RealtimeAudioCapture;
@@ -70,6 +89,9 @@ struct RecordingSnapshot {
     // powers both the five-second rolling and total counters in the movable
     // controls.
     std::uint64_t droppedFrameCount = 0;
+    // Session-level local-recording choice. It is available before capture
+    // starts and remains adjustable while the WAV writer is active.
+    bool gameAudioMuted = false;
 
     [[nodiscard]] bool CanStart() const noexcept {
         return recording::CanStart(state);
@@ -103,6 +125,10 @@ public:
     bool Resume(std::string* error = nullptr);
     bool Stop(std::string_view reason = "Stopped by user");
     bool StartLivestream(std::string* error = nullptr);
+    // Android can display a runtime microphone prompt only when RECORD_AUDIO
+    // was included while Beat Saber was patched. Exposing that distinction
+    // lets the menu explain an MBF patch-permission omission accurately.
+    [[nodiscard]] static MicrophonePermissionStatus QueryMicrophonePermission() noexcept;
     bool PauseLivestream(std::string* error = nullptr);
     bool ResumeLivestream(std::string* error = nullptr);
     // Gain changes are deliberately safe while live: the audio worker reads
@@ -110,6 +136,10 @@ public:
     // changes still require a new stream because they own capture resources.
     void SetLivestreamGameAudioVolumePercent(float value);
     void SetLivestreamMicrophoneVolumePercent(float value);
+    void SetLocalRecordingGameAudioMuted(bool muted) noexcept;
+    bool SetLivestreamGameAudioMuted(
+        bool muted,
+        std::string* error = nullptr);
     bool SetLivestreamMicrophoneMuted(
         bool muted,
         std::string* error = nullptr);
@@ -213,6 +243,9 @@ private:
     // Incremented from encoder callback threads; read by Snapshot() on the
     // main thread. Relaxed ordering is sufficient for a display counter.
     std::atomic<std::uint64_t> encodedFrameCount_{0};
+    // The movable panel can choose local audio before recording starts. The
+    // realtime writer receives this value atomically when capture is active.
+    std::atomic<bool> localRecordingGameAudioMuted_{false};
     std::atomic<bool> captureWriteFailed_{false};
     std::string captureFailureDetail_;
     std::chrono::steady_clock::time_point recordingStarted_{};
@@ -262,6 +295,7 @@ private:
     std::vector<float> livestreamMicrophoneScratch_;
     bool livestreamGameAudioEnabled_ = true;
     float livestreamGameAudioGain_ = 1.0F;
+    bool livestreamGameAudioMuted_ = false;
     bool livestreamMicrophoneEnabled_ = false;
     float livestreamMicrophoneGain_ = 1.0F;
     bool livestreamMicrophoneMuted_ = false;

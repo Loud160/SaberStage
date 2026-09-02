@@ -1,3 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Installs the development Camera2 preset used for repeatable pose screenshots.
+# - Existing user presets are preserved unless the explicit target name is selected.
+
 [CmdletBinding()]
 param(
     [string]$BeatSaberDir = "C:\Users\Owner\BSManager\BSInstances\1.37.1"

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Owns the third-person camera, render targets, motion pipeline, and capture demand.
+// - Only one camera render is scheduled for the highest active consumer demand each frame.
+
 #include "saberstage/camera/CameraManager.hpp"
 
 #include "saberstage/Logging.hpp"

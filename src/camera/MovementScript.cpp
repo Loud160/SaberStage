@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Loads, validates, and evaluates bounded camera movement scripts.
+// - File-name confinement and strict limits prevent scripts from escaping their directory or exhausting resources.
+
 #include "saberstage/camera/MovementScript.hpp"
 
 #include <rapidjson/document.h>
@@ -78,6 +90,9 @@ float Ease(float value, ScriptTransition transition) noexcept {
 }
 
 bool ValidFileName(std::string_view name) {
+    // Only leaf JSON names are accepted. Rejecting separators, drive prefixes,
+    // and traversal before joining is clearer and safer than canonicalizing an
+    // attacker-controlled path after the fact.
     if (name.empty() || name.size() > 128 || name == "." || name == "..") return false;
     if (name.find('/') != std::string_view::npos || name.find('\\') != std::string_view::npos ||
         name.find(':') != std::string_view::npos || name.find("..") != std::string_view::npos) return false;
@@ -110,6 +125,8 @@ ScriptLoadResult ParseMovementScript(std::string_view json, const ScriptLimits& 
     rapidjson::Document document;
     document.Parse(json.data(), json.size());
     if (document.HasParseError() || !document.IsObject()) return Failure("movement script JSON is malformed");
+    // Unknown keys are treated as errors so misspelled motion controls cannot be
+    // silently ignored and produce a camera path different from what was authored.
     for (auto iterator = document.MemberBegin(); iterator != document.MemberEnd(); ++iterator) {
         const std::string_view name(iterator->name.GetString(), iterator->name.GetStringLength());
         if (!IsAllowedRootMember(name)) return Failure("unsupported root property: " + std::string(name));
@@ -171,6 +188,8 @@ ScriptLoadResult ParseMovementScript(std::string_view json, const ScriptLimits& 
             !ReadSeconds(source, "holdTime", limits.maxSegmentSeconds, frame.holdSeconds, error)) {
             return Failure("frame " + std::to_string(index) + ": " + error);
         }
+        // Precompute absolute segment boundaries once. Runtime evaluation stays
+        // allocation-free and does not rescan durations to reconstruct a timeline.
         frame.startSeconds = cursor;
         cursor += frame.durationSeconds;
         frame.transitionEndSeconds = cursor;
@@ -219,6 +238,8 @@ ScriptSample EvaluateMovementScript(
         sample.complete = !script.loop;
     }
 
+    // Frames are ordered and carry absolute end times, permitting logarithmic
+    // lookup even for the maximum supported script size.
     const auto iterator = std::lower_bound(
         script.frames.begin(), script.frames.end(), time,
         [](const ScriptFrame& frame, float value) { return frame.endSeconds < value; });
@@ -243,6 +264,8 @@ ScriptSample EvaluateMovementScript(
     const Pose target{frame.position, FromEulerDegrees(frame.rotationDegrees)};
     const auto targetFov = frame.fovDegrees.value_or(previousFov);
     if (frame.durationSeconds > 0.0F && time < frame.transitionEndSeconds) {
+        // Holds deliberately keep the target pose. Only the transition interval
+        // interpolates from the previous authored pose/FOV.
         const auto amount = Ease((time - frame.startSeconds) / frame.durationSeconds, frame.transition);
         sample.pose = Lerp(previous, target, amount, amount);
         sample.fovDegrees = previousFov + (targetFov - previousFov) * amount;

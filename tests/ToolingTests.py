@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Validates repository scripts, manifests, licensing, and packaging contracts.
+# - Tests prevent build-path drift that ordinary C++ unit tests cannot observe.
+
 """Host-only safety and repository invariant tests for the Prompt 2 scaffold."""
 
 from __future__ import annotations
@@ -186,6 +198,7 @@ class RepositoryInvariantTests(unittest.TestCase):
 
     def test_error_ui_is_main_thread_owned_and_frontmost(self):
         manager = (ROOT / "src/ErrorManager.cpp").read_text(encoding="utf-8")
+        manager_header = (ROOT / "include/saberstage/ErrorManager.hpp").read_text(encoding="utf-8")
         driver = (ROOT / "src/ErrorRuntimeDriver.cpp").read_text(encoding="utf-8")
         main = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
 
@@ -196,6 +209,21 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("SafePtrUnity<HMUI::FlowCoordinator>", manager)
         self.assertIn("ErrorManager::Instance().TickMainThread()", driver)
         self.assertIn("DontDestroyOnLoad", driver)
+        self.assertIn("NotifyMainFlowActivated", manager_header)
+        self.assertIn("uiDiscoveryReady_", manager_header)
+        self.assertIn("MainFlowCoordinator_DidActivate", main)
+        self.assertLess(
+            manager.index("if (!shouldResolveTarget) return;"),
+            manager.index("auto target = ResolveTarget();"),
+        )
+        self.assertLess(
+            main.index("MainFlowCoordinator_DidActivate(\n        self"),
+            main.index("NotifyMainFlowActivated();"),
+        )
+        self.assertLess(
+            main.index("INSTALL_HOOK(saberstage::Logging::Logger, MainFlowCoordinator_DidActivate)"),
+            main.index("g_application = std::make_unique"),
+        )
         self.assertLess(
             main.index("Logging::Logger.Initialize(VERSION)"),
             main.index("il2cpp_functions::Init()"),
@@ -253,7 +281,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn('recordingView_, {52.0F, 22.0F}', menu)
         self.assertNotIn("client_secret", service.lower())
         self.assertNotIn("Twitch App Client ID", menu)
-        self.assertIn("No Client ID or client secret entry is required.", menu)
+        self.assertIn("no Client ID or secret entry is required", menu)
         self.assertIn("pendingLiveTwitchTitleUpdate_", menu)
         self.assertIn("update the active stream without ending it", menu)
 
@@ -320,6 +348,17 @@ class RepositoryInvariantTests(unittest.TestCase):
             menu,
         )
         self.assertIn("if (!IsAlive(button)) graphic->set_raycastTarget(false)", menu)
+        self.assertIn("chatWorldPanelScrollView_->____isHoveredByPointer", menu)
+        self.assertNotIn("UpdateChatWorldPanelScrollIndicator", menu)
+        self.assertNotIn("chatWorldPanelScrollTrack_", menu)
+        self.assertNotIn("chatWorldPanelScrollHandle_", menu)
+        self.assertIn("pointer->get_pointingOver()", menu)
+        self.assertIn(
+            "pointerOverPanel && !bodyGrabbed && chatWorldPanelContentOverflows_",
+            menu,
+        )
+        self.assertNotIn("kChatJoystickDeadZone", menu)
+        self.assertNotIn("____verticalScrollIndicator->get_gameObject()->SetActive(false)", menu)
         self.assertIn(
             "row->set_horizontalAlignment(TMPro::HorizontalAlignmentOptions::Left)",
             menu,
@@ -346,8 +385,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("void MenuController::ReflowChatWorldPanelText()", menu)
         self.assertIn("GetPreferredValues(", menu)
         self.assertIn("void MenuController::RefreshVirtualizedChatRows()", menu)
-        self.assertIn("rect->set_anchorMin({0.0F, 1.0F})", menu)
-        self.assertIn("rect->set_anchorMax({1.0F, 1.0F})", menu)
+        self.assertIn("rect->set_anchorMin({0.5F, 1.0F})", menu)
+        self.assertIn("rect->set_anchorMax({0.5F, 1.0F})", menu)
+        self.assertIn("rect->set_sizeDelta({textWidth, entry.height})", menu)
         self.assertIn("chatWorldPanelRowsDirty_", menu)
         self.assertIn("chatWorldPanelRenderedScrollPosition_", menu)
         self.assertIn("kChatDataRefreshIntervalSeconds = 0.10F", menu)
@@ -620,10 +660,20 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("recordingWorldPanelModeBackground_", menu)
         self.assertIn('streamMode ? "Stream Control" : "Recording Control"', menu)
         self.assertIn('"SaberStage Movable Livestream Microphone Mute"', menu)
-        self.assertIn('"Microphone Muted Slash"', menu)
-        self.assertIn('"Microphone Unavailable X"', menu)
+        self.assertIn('"SaberStage Movable Livestream Game Sound Mute"', menu)
+        self.assertIn("EmbeddedRecordingPanelIcons()", menu)
+        self.assertIn("controlIcons.microphoneUnavailable", menu)
+        self.assertIn("controlIcons.microphoneMuted", menu)
+        self.assertIn("controlIcons.microphoneActive", menu)
+        self.assertIn("controlIcons.gameAudioMuted", menu)
+        self.assertIn("controlIcons.gameAudioActive", menu)
+        self.assertNotIn('"Microphone Capsule"', menu)
+        self.assertNotIn('"Microphone Unavailable X"', menu)
         self.assertIn("RecordingWorldPanelMicrophoneAction", menu)
-        self.assertIn("!livestream.afk && livestream.microphoneAvailable", menu)
+        self.assertIn("RecordingWorldPanelGameAudioAction", menu)
+        self.assertGreaterEqual(menu.count("->get_gameObject()->SetActive(true)"), 2)
+        self.assertIn("recordingWorldPanelGameAudioButton_->set_interactable(true)", menu)
+        self.assertIn("recordingWorldPanelMicrophoneButton_->set_interactable(true)", menu)
 
     def test_avatar_is_mandatory_in_primary_camera_and_preview_uses_primary_output(self):
         profile = (ROOT / "src/camera/CameraProfile.cpp").read_text(encoding="utf-8")
@@ -864,8 +914,11 @@ class RepositoryInvariantTests(unittest.TestCase):
 
     def test_recording_side_panel_overrides_center_panel_prefab_widths(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        self.assertIn("layout->set_preferredWidth(48.0F)", menu)
-        self.assertIn("ConfigureRightPanelInput(active_->livestreamKeyInput_, 512, 38.0F)", menu)
+        self.assertIn("layout->set_preferredWidth(kRightPanelRowWidth)", menu)
+        self.assertIn(
+            "active_->livestreamKeyInput_, 512, kRightPanelRowWidth - 10.0F",
+            menu,
+        )
         self.assertIn('CreateUIButton(\n        streamKeyInputRow, "Set"', menu)
         self.assertIn('CreateUIButton(\n        serverInputRow, "Set"', menu)
         self.assertIn('CreateUIButton(actions, "Use Once"', menu)
@@ -884,8 +937,86 @@ class RepositoryInvariantTests(unittest.TestCase):
             menu,
         )
         self.assertIn("rows->set_childForceExpandWidth(false)", menu)
-        self.assertIn("scroll->set_sizeDelta({-6.0F, -22.0F})", menu)
+        self.assertIn("scroll->set_sizeDelta({0.0F, -13.0F})", menu)
+        self.assertIn("BSML::SliderSetting* ConstrainRightPanelRow", menu)
+        self.assertIn("kRightPanelLabelFraction", menu)
+        self.assertIn("constexpr float kRightPanelRowWidth = 54.0F", menu)
+        # Preserve the page's native centered placement. Live Stream now sizes
+        # its other rows from Service's actual outer row on tab activation;
+        # changing the page to UpperLeft would move that fixed reference too.
+        self.assertIn("rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter)", menu)
+        self.assertNotIn("LeftAlignLivestreamSettingRows", menu)
+        self.assertIn("FitRectToParentRegion(", menu)
+        self.assertIn('livestreamTransport, "Start Stream", "PlayButton"', menu)
+        self.assertIn('livestreamTransport, "Stop Stream", "PlayButton"', menu)
         self.assertIn("ConfigureRightPanelButton(active_->startRecordingButton_)", menu)
+
+    def test_livestream_layout_uses_untouched_service_outer_row(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        reference_start = menu.index("    auto* provider = WithHint")
+        reference_end = menu.index(
+            "    active_->livestreamProviderFeatureText_ = BSML::Lite::CreateText",
+            reference_start,
+        )
+        # The user explicitly froze this reference widget. Catch accidental
+        # changes to its creation, constraints or event setup in later fixes.
+        self.assertEqual(
+            hashlib.sha256(menu[reference_start:reference_end].encode()).hexdigest(),
+            "f3e165787f6c4a348777db640b7af82caf881216b6ebce44d22e0cbd6e02947b",
+        )
+        apply = menu.split("void MenuController::ApplyLivestreamReferenceLayout()", 1)[1]
+        apply = apply.split("void MenuController::ShowRecordingTab", 1)[0]
+        self.assertIn("reference->get_parent() != content", apply)
+        self.assertIn('reference->Find("Label")', apply)
+        self.assertIn("referenceBounds.get_width()", apply)
+        self.assertIn("label->get_margin().x", apply)
+        self.assertIn("selectorBounds.get_xMax()", apply)
+        self.assertEqual(apply.count("if (child == reference) continue;"), 2)
+        self.assertLess(
+            apply.index("SetLivestreamRowWidth(child->get_gameObject(), rowWidth)"),
+            apply.index("FitLivestreamActionRow(group, rowWidth, leftInset, rightInset)"),
+        )
+        self.assertNotIn("kRightPanelRowWidth", apply)
+        self.assertNotIn("referenceRect->set_", apply)
+        self.assertNotIn("labelRect->set_", apply)
+        self.assertNotIn("selectorRect->set_", apply)
+        self.assertIn("margin.x = leftInset", apply)
+        self.assertIn("margin.z = rightInset", apply)
+        self.assertIn("slider->slider->UpdateVisuals()", apply)
+        horizontal = menu.split("void FitLivestreamHorizontalSpan(", 1)[1]
+        horizontal = horizontal.split("void FitLivestreamToggle", 1)[0]
+        self.assertIn("anchorMin.x = 0.0F", horizontal)
+        self.assertIn("offsetMax.x = -rightInset", horizontal)
+        self.assertNotIn(".y =", horizontal)
+        # This is a one-time tab-entry layout, not work repeated by every UI
+        # tick, chat message, audio slider callback or stream-status refresh.
+        self.assertEqual(menu.count("ApplyLivestreamReferenceLayout();"), 1)
+        show = menu.split("void MenuController::ShowRecordingTab(int index)", 1)[1]
+        self.assertIn("if (selectedRecordingTab_ == 1) ApplyLivestreamReferenceLayout();", show)
+        self.assertLess(show.index("SetActive("), show.index("ApplyLivestreamReferenceLayout();"))
+
+    def test_livestream_action_groups_fit_inside_service_content_edges(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        fit = menu.split("void FitLivestreamActionRow(", 1)[1]
+        fit = fit.split("void ConfigureCalibrationPanelText", 1)[0]
+        self.assertIn("std::lround(leftInset)", fit)
+        self.assertIn("std::lround(rightInset)", fit)
+        self.assertIn("rowWidth - leftPadding - rightPadding", fit)
+        self.assertIn("SetLivestreamRowWidth(object, width)", fit)
+        self.assertIn("FitLivestreamToggle(toggle, 0.0F, 0.0F)", fit)
+        # Single-action rows also need a Service-width outer group; widening
+        # the button itself to that group width would cover the native insets.
+        for name, caption in (
+            ("titleActions", "Set Stream Title"),
+            ("chooseAfkActions", "Choose AFK Picture or GIF"),
+            ("builtInAfkActions", "Use Built-in AFK Screen"),
+            ("clearKeyActions", "Clear Stream Key"),
+        ):
+            self.assertIn(
+                f"auto* {name} = CreateRightPanelInputActionRow(livestreamPage->get_transform());",
+                menu,
+            )
+            self.assertIn(f'{name}, "{caption}"', menu)
 
     def test_livestream_uses_ffmpeg_native_annex_b_to_flv_conversion(self):
         sink = (ROOT / "src/broadcast/DirectLivestreamSink.cpp").read_text(encoding="utf-8")
@@ -933,6 +1064,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_livestream_audio_mix_is_stream_only_bounded_and_permission_aware(self):
         header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8")
         microphone = (ROOT / "src/recording/MicrophoneCapture.cpp").read_text(encoding="utf-8")
+        audio_capture = (ROOT / "src/recording/RealtimeAudioCapture.cpp").read_text(encoding="utf-8")
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
@@ -951,7 +1083,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn('"Game Sound Volume"', menu)
         self.assertIn('"Quest Microphone"', menu)
         self.assertIn('"Microphone Volume"', menu)
-        self.assertIn("enable Microphone Access in MBF", menu)
+        self.assertIn("without Microphone Access", menu)
+        self.assertIn("repatch Beat Saber", menu)
         self.assertIn("The microphone is never added to local recordings", menu)
         self.assertIn("SetLivestreamGameAudioVolumePercent(value)", menu)
         self.assertIn("SetLivestreamMicrophoneVolumePercent(value)", menu)
@@ -966,6 +1099,25 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("SetLivestreamMicrophoneMuted", controller)
         self.assertIn("snapshot.microphoneAvailable", controller)
         self.assertIn("snapshot.microphoneMuted", controller)
+        self.assertIn("SetLivestreamGameAudioMuted", controller)
+        self.assertIn("SetLocalRecordingGameAudioMuted", controller)
+        self.assertIn("localRecordingGameAudioMuted_", header)
+        self.assertIn("SetFileMuted", controller)
+        self.assertIn("SetFileMuted", audio_capture)
+        self.assertIn("fileMuted_", audio_capture)
+        self.assertIn("muteFileBatch", audio_capture)
+        self.assertIn("snapshot.gameAudioAvailable", controller)
+        self.assertIn("snapshot.gameAudioMuted", controller)
+        self.assertIn("!livestreamGameAudioMuted_", controller)
+        for icon in (
+            "saberstage_mic_active.png",
+            "saberstage_mic_muted.png",
+            "saberstage_mic_unavailable.png",
+            "saberstage_game_audio_active.png",
+            "saberstage_game_audio_muted.png",
+        ):
+            self.assertTrue((ROOT / "assets" / icon).is_file())
+            self.assertIn(icon.removesuffix(".png"), cmake)
 
     def test_twitch_is_the_only_supported_service_preset_for_now(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -994,9 +1146,62 @@ class RepositoryInvariantTests(unittest.TestCase):
         linux_build = (ROOT / "Build-And-Deploy-Linux.sh").read_text(encoding="utf-8")
         self.assertIn("trap cleanup EXIT", linux_build)
 
-    def test_no_final_project_license_was_chosen(self):
-        self.assertFalse((ROOT / "LICENSE").exists())
-        self.assertFalse((ROOT / "LICENSE.md").exists())
+    def test_project_license_and_first_party_headers_are_complete(self):
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        additional_terms = (ROOT / "LICENSE-ADDITIONAL-TERMS.md").read_text(
+            encoding="utf-8")
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 29 June 2007", license_text)
+        self.assertIn("SaberStage GPLv3 section 7 terms", additional_terms)
+        self.assertIn("https://github.com/Loud160/SaberStage", additional_terms)
+        self.assertTrue((ROOT / "INBOUND_LICENSE.md").is_file())
+        self.assertTrue((ROOT / "DCO.txt").is_file())
+
+        # Match Big Screen's license boundary: require the full project header
+        # on comment-capable first-party source and build files, while leaving
+        # JSON, Markdown, generated Unity metadata, and third-party material in
+        # their native formats and under their own notices.
+        first_party_patterns = {
+            ROOT / "include": ("*.c", "*.cpp", "*.h", "*.hpp"),
+            ROOT / "src": ("*.c", "*.cpp", "*.h", "*.hpp"),
+            ROOT / "scripts": ("*.ps1", "*.sh", "*.py"),
+            ROOT / "tests": ("*.c", "*.cpp", "*.h", "*.hpp", "*.py"),
+            # Unity writes third-party packages under tools/avatar-shader/Library
+            # during a shader build. Restrict tooling checks to the two authored
+            # source trees so a local build cache can never become license input.
+            ROOT / "tools" / "avatar-shader" / "Assets": ("*.cs", "*.shader"),
+            ROOT / "tools" / "pc-pose-analyzer": ("*.cs", "*.ps1"),
+        }
+        generated_directory_names = {
+            "Library", "Temp", "Logs", "obj", "bin", "build", "build-host",
+        }
+        first_party_files = {
+            ROOT / "CMakeLists.txt",
+            ROOT / "Build-And-Deploy.bat",
+            ROOT / "Build-And-Deploy-Linux.sh",
+            ROOT / "Collect-SaberStage-Logs.bat",
+            ROOT / "Collect-SaberStage-Logs-Linux.sh",
+            ROOT / "Remove-SaberStage.bat",
+            ROOT / "Remove-SaberStage-Linux.sh",
+        }
+        for directory, patterns in first_party_patterns.items():
+            for pattern in patterns:
+                first_party_files.update(
+                    path for path in directory.rglob(pattern)
+                    if not generated_directory_names.intersection(
+                        path.relative_to(ROOT).parts)
+                )
+
+        self.assertTrue(first_party_files)
+        for source_file in sorted(first_party_files):
+            preamble = "\n".join(
+                source_file.read_text(encoding="utf-8").splitlines()[:12])
+            self.assertEqual(
+                preamble.count("SPDX-License-Identifier: GPL-3.0-only"),
+                1,
+                source_file,
+            )
+            self.assertIn("LICENSE-ADDITIONAL-TERMS.md", preamble, source_file)
 
 
 if __name__ == "__main__":

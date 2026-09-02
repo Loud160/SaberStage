@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Defines recording states and validates every legal state transition.
+// - Keeping transition policy centralized prevents UI and encoder paths from disagreeing.
+
 #pragma once
 
 #include <cstdint>
@@ -33,6 +45,8 @@ enum class RecordingState : std::uint8_t {
     Failed,
 };
 
+// All callers use this table before publishing state. Encoding and menu code
+// must not invent their own transition rules or skip asynchronous phases.
 [[nodiscard]] constexpr bool CanTransition(
     RecordingState from,
     RecordingState to) noexcept {

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Stores and retrieves sensitive account tokens through Android Keystore-backed encryption.
+// - Plaintext credentials are kept out of repository defaults and ordinary settings serialization.
+
 #include "saberstage/security/AndroidKeystore.hpp"
 
 #include "UnityEngine/AndroidJNI.hpp"

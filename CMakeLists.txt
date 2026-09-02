@@ -1,3 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Defines host-test and Quest ARM64 build graphs for SaberStage.
+# - Pinned generated assets and native dependencies are linked through one reproducible target.
+
 cmake_minimum_required(VERSION 3.21)
 
 option(SABERSTAGE_HOST_TESTS "Build only platform-neutral SaberStage tests" OFF)
@@ -211,6 +223,42 @@ set_source_files_properties("${SABERSTAGE_AFK_IMAGE_OBJECT}" PROPERTIES
     GENERATED TRUE
     EXTERNAL_OBJECT TRUE)
 target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AFK_IMAGE_OBJECT}")
+
+# The movable recording panel uses authored PNG glyphs rather than assembling
+# approximate microphones and speakers from UI rectangles. Embed every state
+# in the native library so direct source deployment and QMOD installation
+# always receive the same controls without relying on sidecar asset paths.
+set(SABERSTAGE_CONTROL_ICON_ASSETS
+    saberstage_mic_active
+    saberstage_mic_muted
+    saberstage_mic_unavailable
+    saberstage_game_audio_active
+    saberstage_game_audio_muted)
+foreach(SABERSTAGE_CONTROL_ICON IN LISTS SABERSTAGE_CONTROL_ICON_ASSETS)
+    set(SABERSTAGE_CONTROL_ICON_ASSET
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets/${SABERSTAGE_CONTROL_ICON}.png")
+    if(NOT EXISTS "${SABERSTAGE_CONTROL_ICON_ASSET}")
+        message(FATAL_ERROR
+            "Missing embedded recording-panel icon: assets/${SABERSTAGE_CONTROL_ICON}.png")
+    endif()
+    set(SABERSTAGE_CONTROL_ICON_OBJECT
+        "${CMAKE_CURRENT_BINARY_DIR}/${SABERSTAGE_CONTROL_ICON}.o")
+    add_custom_command(
+        OUTPUT "${SABERSTAGE_CONTROL_ICON_OBJECT}"
+        COMMAND ${CMAKE_OBJCOPY}
+            "${SABERSTAGE_CONTROL_ICON}.png"
+            "${SABERSTAGE_CONTROL_ICON_OBJECT}"
+            --input-target binary
+            --output-target elf64-aarch64
+            --set-section-flags binary=alloc,load,readonly,data,contents
+        DEPENDS "${SABERSTAGE_CONTROL_ICON_ASSET}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+        COMMENT "Embedding ${SABERSTAGE_CONTROL_ICON} recording-panel icon")
+    set_source_files_properties("${SABERSTAGE_CONTROL_ICON_OBJECT}" PROPERTIES
+        GENERATED TRUE
+        EXTERNAL_OBJECT TRUE)
+    target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_CONTROL_ICON_OBJECT}")
+endforeach()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set_property(TARGET ${COMPILE_ID} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)

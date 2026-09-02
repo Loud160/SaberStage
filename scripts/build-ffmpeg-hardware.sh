@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Builds the pinned Quest FFmpeg hardware-enabled runtime on Linux.
+# - Only the codec, muxer, transport, and Android interfaces required by SaberStage are enabled.
+
 # Build SaberStage's private, hardware-only Android FFmpeg runtime.
 #
 # This recipe intentionally enables no software video encoder. H.264 encoding

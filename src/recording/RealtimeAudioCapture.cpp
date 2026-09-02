@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Captures game audio on the realtime audio callback and exposes timestamped PCM blocks.
+// - The callback path stays bounded and avoids disk or network I/O to protect gameplay audio.
+
 #include "saberstage/recording/RealtimeAudioCapture.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -21,6 +33,8 @@ DEFINE_TYPE(saberstage::recording, RealtimeAudioCapture);
 namespace saberstage::recording {
 namespace {
 
+// Four seconds of 48 kHz stereo float samples absorb short storage/network
+// stalls without permitting unbounded growth on a memory-constrained headset.
 constexpr std::size_t kRingCapacity = 48'000U * 2U * 4U;
 constexpr std::size_t kDrainBatch = 8192U;
 
@@ -81,6 +95,9 @@ public:
 
     void Push(ArrayW<float> data, std::int32_t channels) noexcept {
         if (!accepting_.load(std::memory_order_acquire) || channels <= 0 || data.size() == 0) return;
+        // Capture the first callback's monotonic time exactly once. Recording
+        // finalization uses this shared clock to align audio with the first video
+        // frame instead of assuming both Unity callbacks began simultaneously.
         std::int64_t unset = 0;
         firstSampleMonotonicNanos_.compare_exchange_strong(
             unset,
@@ -94,6 +111,9 @@ public:
             return;
         }
 
+        // Single producer (Unity audio thread) and single consumer (writer) make
+        // this ring lock-free. Acquire/release ordering publishes complete sample
+        // writes without taking a mutex inside OnAudioFilterRead.
         const auto write = writeIndex_.load(std::memory_order_relaxed);
         const auto read = readIndex_.load(std::memory_order_acquire);
         if (data.size() > ring_.size() - static_cast<std::size_t>(write - read)) {
@@ -123,8 +143,14 @@ public:
         return firstSampleMonotonicNanos_.load(std::memory_order_acquire);
     }
 
+    void SetFileMuted(bool muted) noexcept {
+        fileMuted_.store(muted, std::memory_order_release);
+    }
+
 private:
     void WriterLoop() noexcept {
+        // Conversion, callbacks, and file I/O belong here. Doing any of them from
+        // OnAudioFilterRead can cause the audible stutter this class prevents.
         std::array<float, kDrainBatch> floats{};
         std::array<std::int16_t, kDrainBatch> pcm{};
         try {
@@ -138,10 +164,17 @@ private:
                     continue;
                 }
                 const auto count = std::min(available, floats.size());
+                // Sample the local-file mute once per writer batch. Muting must
+                // write timed silence instead of dropping samples, otherwise
+                // the final audio track would become shorter than the video.
+                const bool muteFileBatch = writeWaveFile_ &&
+                    fileMuted_.load(std::memory_order_acquire);
                 for (std::size_t i = 0; i < count; ++i) {
                     floats[i] = ring_[(static_cast<std::size_t>(read) + i) % ring_.size()];
                     if (writeWaveFile_) {
-                        const auto value = std::clamp(floats[i], -1.0F, 1.0F);
+                        const auto value = muteFileBatch
+                            ? 0.0F
+                            : std::clamp(floats[i], -1.0F, 1.0F);
                         pcm[i] = static_cast<std::int16_t>(
                             std::lrint(value * static_cast<float>(std::numeric_limits<std::int16_t>::max())));
                     }
@@ -165,6 +198,8 @@ private:
             }
 
             if (writeWaveFile_) {
+                // The final data size is unknown at open time. Patch the RIFF
+                // header only after admission stops and the ring is fully drained.
                 const auto channels = std::max(1, channels_.load(std::memory_order_relaxed));
                 const auto sampleRate = std::max(1, sampleRate_.load(std::memory_order_relaxed));
                 WriteWaveHeader(output_, channels, sampleRate, dataBytes_);
@@ -196,6 +231,7 @@ private:
     std::atomic<std::uint64_t> writeIndex_{0};
     std::atomic<std::uint64_t> droppedSamples_{0};
     std::atomic<std::int64_t> firstSampleMonotonicNanos_{0};
+    std::atomic<bool> fileMuted_{false};
     std::uint32_t dataBytes_ = 0;
     bool writeWaveFile_ = true;
 };
@@ -216,9 +252,15 @@ void RealtimeAudioCapture::OpenConsumerOnly(PcmConsumer consumer) {
     impl_ = new RealtimeAudioCaptureImpl({}, std::move(consumer), false);
 }
 
+void RealtimeAudioCapture::SetFileMuted(bool muted) noexcept {
+    if (impl_) impl_->SetFileMuted(muted);
+}
+
 void RealtimeAudioCapture::Save() noexcept {
     if (!impl_) return;
     impl_->Close();
+    // Preserve terminal diagnostics after deleting the implementation so the
+    // recording summary can still report the just-finished audio session.
     lastDroppedSampleCount_ = impl_->DroppedSampleCount();
     lastFirstSampleMonotonicNanos_ = impl_->FirstSampleMonotonicNanos();
     lastFailed_ = impl_->Failed();

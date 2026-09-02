@@ -49,4 +49,7 @@ The local BigScreen repository is actively being changed in another task. SaberS
 | mbedTLS/BoringSSL wrapper or platform TLS | Stage 2/3 selection deferred | Must be maintained, ARM64-capable, license-compatible, and expose bounded nonblocking I/O; networking only |
 | Avalonia/.NET | Required companion stack in Stage 2 | MIT and cross-platform; desktop-only; consumes protocol packets and must not import Meta runtime |
 
-No final SaberStage license has been selected.
+SaberStage first-party source is distributed under GPL-3.0-only with the
+additional GPLv3 section 7 terms in the repository root. Dependency and
+adapted-source notices remain governed by their respective entries above and
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

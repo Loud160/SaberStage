@@ -1,3 +1,15 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Builds and runs platform-neutral C++ tests plus Python tooling tests.
+# - This is the fast validation gate before an ARM64 Quest build.
+
 [CmdletBinding()]
 param()
 

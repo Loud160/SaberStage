@@ -1,7 +1,21 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Defines and normalizes the tracking and solved-pose data exchanged by avatar components.
+// - The types form the boundary between sampled hardware poses and Unity bone application.
+
 #include "saberstage/avatar/PoseTypes.hpp"
 
 namespace saberstage::avatar {
 
+// Stable lowercase bone names are used in diagnostics and serialized tooling;
+// keep these independent of Unity/VRM display names.
 const char* BoneName(HumanoidBone bone) noexcept {
     switch (bone) {
         case HumanoidBone::Hips: return "hips";
@@ -34,6 +48,7 @@ const char* BoneName(HumanoidBone bone) noexcept {
 }
 
 const char* BodyYawStateName(BodyYawState state) noexcept {
+    // These uppercase state labels are intended for concise live diagnostics.
     switch (state) {
         case BodyYawState::Locked: return "LOCKED";
         case BodyYawState::Turning: return "TURNING";

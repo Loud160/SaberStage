@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Renders spectator-camera preview textures in the headset.
+// - The embedded multiview variant avoids silent rasterization failure from stripped stock shaders.
+
 // Camera-preview surface shader for SaberStage's world-space monitors.
 //
 // Why this exists (two lessons imported from the author's Big Screen mod):

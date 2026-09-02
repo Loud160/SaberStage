@@ -1,6 +1,6 @@
 # Development tooling provenance
 
-The root Windows/Linux launchers and `scripts/quest_tool.py` are adapted from the user-owned Big Screen repository's source-deployment, receipt-ownership, log-collection, removal, and ADB-session workflow. They intentionally retain per-file `GPL-3.0-only` notices. This does not select a final license for the SaberStage mod source as a whole.
+The root Windows/Linux launchers and `scripts/quest_tool.py` are adapted from the user-owned Big Screen repository's source-deployment, receipt-ownership, log-collection, removal, and ADB-session workflow. They retain their provenance comments and are distributed under SaberStage's GPL-3.0-only project license and additional section 7 terms.
 
 The SaberStage variant is smaller because Prompt 2 deploys one late-mod library and has no embedded runtime/media payload. It preserves the important safety behavior:
 

@@ -25,7 +25,9 @@ Use current verified Quest Beat Saber tooling and dependency versions.
 - host-test target for platform-neutral logic;
 - no camera/preview/encoder/network/chat/Discord/avatar implementation yet.
 
-Do not choose a final license unless explicitly instructed.
+At this scaffold stage the license decision was intentionally deferred. The
+owner later selected GPL-3.0-only with the repository's additional GPLv3
+section 7 terms.
 
 Do not put future functionality into one giant `main.cpp`.
 

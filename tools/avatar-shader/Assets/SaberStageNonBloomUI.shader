@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Renders world-space SaberStage panels without inheriting gameplay bloom.
+// - Opaque UI remains readable while retaining Quest stereo multiview support.
+
 // Multiview-safe UI accent shader for SaberStage's world-space panels.
 //
 // Beat Saber uses the rendered alpha channel as a bloom weight. Ordinary UI

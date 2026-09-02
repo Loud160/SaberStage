@@ -99,7 +99,10 @@ Use:
 
 Do not insert a legal/real-world name into project attribution.
 
-The approved product and repository name is **SaberStage**. Do not choose a final license unless explicitly instructed.
+The approved product and repository name is **SaberStage**. This original
+planning restriction deferred the license decision to the owner; the owner
+subsequently selected GPL-3.0-only with the repository's additional GPLv3
+section 7 terms.
 
 ---
 

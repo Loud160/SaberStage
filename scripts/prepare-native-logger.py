@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Restores and verifies the pinned Native Logger source dependency.
+# - Hash validation prevents an unexpected dependency revision entering release builds.
+
 """Prepare SaberStage's pinned Native Logger Quest source dependency safely."""
 
 from __future__ import annotations

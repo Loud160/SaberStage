@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Loads, validates, migrates, and atomically persists per-player calibration profiles.
+// - Invalid or partial files fall back safely instead of entering the live solver.
+
 #include "saberstage/avatar/calibration/PlayerCalibrationProfile.hpp"
 
 #include "saberstage/avatar/Math.hpp"
@@ -383,6 +395,8 @@ bool IsStaticCalibrationStep(CalibrationStep step) noexcept {
 }
 
 RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile) noexcept {
+    // RuntimeProfile contains only solver-ready values. Version and validity
+    // gates keep an incomplete persisted file out of the per-frame solver.
     RuntimePlayerProfile runtime{};
     if (!profile.valid || !profile.complete || profile.profileVersion != kPlayerProfileVersion ||
         profile.algorithmVersion != kCalibrationAlgorithmVersion) return runtime;
@@ -420,6 +434,8 @@ RuntimePlayerProfile BuildRuntimeProfile(const PlayerCalibrationProfile& profile
 
 bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string* error) noexcept {
     try {
+        // Fitting is all-or-nothing. Validate the capture set before deriving
+        // measurements that could later be marked complete and persisted.
         constexpr CalibrationStep basicStatic[] = {
             CalibrationStep::Neutral,
             CalibrationStep::ArmsDown,
@@ -449,6 +465,8 @@ bool FitPlayerCalibrationProfile(PlayerCalibrationProfile& profile, std::string*
                 }
             }
         }
+        // Retain absolute reach for model fitting while normalizing movement
+        // envelopes where player scale would otherwise skew the thresholds.
         const auto height = StandingHeight(profile);
         const auto& neutralCapture = profile.staticCaptures[Index(CalibrationStep::Neutral)];
         profile.calibratedFloorHeight = neutralCapture.head.position.y - height;
@@ -835,6 +853,8 @@ bool SavePlayerCalibrationProfile(
             if (error) *error = "cannot create calibration directory: " + ec.message();
             return false;
         }
+        // Write, flush, and promote through a backup so a power loss cannot leave
+        // the only accepted calibration as a truncated JSON document.
         const auto temporary = std::filesystem::path(path.string() + ".tmp");
         const auto backup = std::filesystem::path(path.string() + ".bak");
         {
@@ -907,6 +927,8 @@ ProfileLoadResult LoadPlayerCalibrationProfile(
             result.message = "saved player calibration version is incompatible; recalibration required";
             return result;
         }
+        // Decode into a temporary profile. Assigning the caller's output only
+        // after validation prevents partially parsed data entering the solver.
         PlayerCalibrationProfile decoded{};
         decoded.profileVersion = version->value.GetUint();
         // Version 3 adds an arm-span-derived fit computed entirely from the

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Builds and manages Unity avatar objects from validated VrmAsset data.
+// - Material conversion, visibility, bone binding, and destruction are kept behind one runtime boundary.
+
 #pragma once
 
 #include "saberstage/avatar/vrm/VrmAsset.hpp"

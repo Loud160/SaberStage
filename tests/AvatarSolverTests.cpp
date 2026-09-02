@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Exercises AvatarSolver behavior on the host without starting Beat Saber.
+// - Regression coverage focuses on deterministic state, validation, and boundary conditions.
+
 #include "saberstage/avatar/AvatarSolver.hpp"
 #include "saberstage/avatar/Calibration.hpp"
 #include "saberstage/avatar/FabrikSpine.hpp"

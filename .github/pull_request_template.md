@@ -3,6 +3,14 @@
 Describe what changed, why it is needed, and the intended behavior that remains
 unchanged.
 
+## Contribution certification
+
+- [ ] Every commit is signed off with `Signed-off-by:` under DCO 1.1.
+- [ ] I have read `CONTRIBUTING.md` and intentionally submit this contribution
+      under its separate inbound MIT grant.
+- [ ] I understand that SaberStage is distributed outbound under
+      GPL-3.0-only with the additional GPLv3 section 7 terms.
+
 ## Validation
 
 - [ ] Host C++ tests passed.

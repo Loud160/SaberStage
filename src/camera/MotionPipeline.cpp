@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Composes base camera pose, movement scripts, smoothing, and floating-camera motion.
+// - Reset boundaries prevent temporal state from carrying across seeks, profile changes, or scene transitions.
+
 #include "saberstage/camera/MotionPipeline.hpp"
 
 #include <algorithm>
@@ -15,6 +27,8 @@ float ExponentialAmount(float responseSeconds, float deltaSeconds) noexcept {
 } // namespace
 
 MotionOutput MotionPipeline::Evaluate(const CameraProfile& profile, const MotionInput& input) noexcept {
+    // Authored motion replaces the saved local pose only while its sample is
+    // active; the world anchor remains authoritative in both modes.
     auto targetLocal = input.baseLocal;
     auto targetFov = profile.fovDegrees;
     if (input.script && input.script->active) {
@@ -23,6 +37,8 @@ MotionOutput MotionPipeline::Evaluate(const CameraProfile& profile, const Motion
     }
 
     if (!initialized_) {
+        // Snap on the first sample. Interpolating from an identity pose would
+        // sweep a newly created or reset camera through the scene.
         smoothedLocal_ = targetLocal;
         initialized_ = true;
     } else {
@@ -32,6 +48,8 @@ MotionOutput MotionPipeline::Evaluate(const CameraProfile& profile, const Motion
             ExponentialAmount(profile.rotationSmoothingSeconds, input.deltaSeconds));
     }
 
+    // Anchored float introduces a small local horizontal response after a yaw
+    // dead zone. It intentionally moves in camera-local space, not world X.
     float floatTarget = 0.0F;
     if (profile.anchoredFloatEnabled) {
         const auto yaw = NormalizeDegrees(input.headYawRelativeDegrees);
@@ -53,6 +71,8 @@ float MotionPipeline::SmoothAnchoredFloat(float target, float responseSeconds, f
     const auto smoothTime = std::max(0.02F, responseSeconds);
     const auto omega = 2.0F / smoothTime;
     const auto x = omega * deltaSeconds;
+    // Critically damped integration avoids overshoot while remaining stable with
+    // the variable frame intervals seen on Quest menus and gameplay scenes.
     const auto decay = 1.0F / (1.0F + x + 0.48F * x * x + 0.235F * x * x * x);
     const auto change = floatPosition_ - target;
     const auto temporary = (floatVelocity_ + omega * change) * deltaSeconds;

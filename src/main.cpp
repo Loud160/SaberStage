@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Defines the Quest mod entry points and binds SaberStage to Beat Saber lifecycle events.
+// - Startup is fail-contained so dependency or initialization errors are logged before optional UI appears.
+
 #include "saberstage/Logging.hpp"
 #include "saberstage/ErrorManager.hpp"
 #include "saberstage/ErrorRuntimeDriver.hpp"
@@ -15,6 +27,7 @@
 #include "GlobalNamespace/FileDifficultyBeatmap.hpp"
 #include "GlobalNamespace/FileSystemBeatmapLevelData.hpp"
 #include "GlobalNamespace/GameplayCoreSceneSetupData.hpp"
+#include "GlobalNamespace/MainFlowCoordinator.hpp"
 #include "GlobalNamespace/OverrideEnvironmentSettings.hpp"
 #include "GlobalNamespace/PauseMenuManager.hpp"
 #include "GlobalNamespace/StandardLevelScenesTransitionSetupDataSO.hpp"
@@ -63,6 +76,23 @@ std::string JoinManagedStrings(::ArrayW<::StringW, ::Array<::StringW>*> values) 
         first = false;
     }
     return joined.str();
+}
+
+MAKE_HOOK_MATCH(
+    MainFlowCoordinator_DidActivate,
+    &GlobalNamespace::MainFlowCoordinator::DidActivate,
+    void,
+    GlobalNamespace::MainFlowCoordinator* self,
+    bool firstActivation,
+    bool addedToHierarchy,
+    bool screenSystemEnabling) {
+    MainFlowCoordinator_DidActivate(
+        self, firstActivation, addedToHierarchy, screenSystemEnabling);
+    // Signal readiness after the original activation has finished. The error
+    // runtime may exist from late_load onward so startup failures can be
+    // queued, but it must not ask BSML for this coordinator while GameLoader
+    // is still constructing IL2CPP and menu-flow metadata.
+    saberstage::ErrorManager::Instance().NotifyMainFlowActivated();
 }
 
 MAKE_HOOK_MATCH(
@@ -227,6 +257,10 @@ extern "C" void late_load() noexcept {
         saberstage::ErrorManager::Instance().Guard(
             "starting the main-thread error dialog runtime",
             [] { saberstage::StartErrorRuntimeDriver(); });
+        // Install the readiness hook before starting SaberStage subsystems so
+        // an error raised during partial startup can remain queued and appear
+        // once Beat Saber's main menu is genuinely ready.
+        INSTALL_HOOK(saberstage::Logging::Logger, MainFlowCoordinator_DidActivate);
         const auto gameVersion = std::string(UnityEngine::Application::get_version());
         const auto unityVersion = std::string(UnityEngine::Application::get_unityVersion());
         saberstage::Logging::Logger.info("Runtime game version={}, Unity={}", gameVersion, unityVersion);

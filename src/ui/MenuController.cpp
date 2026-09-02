@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Builds SaberStage menus and floating panels and translates user actions into subsystem calls.
+// - Worker results are marshalled back to Unity before any UI object is touched.
+
 #include "saberstage/ui/MenuController.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -31,11 +43,14 @@
 #include "UnityEngine/Canvas.hpp"
 #include "UnityEngine/Application.hpp"
 #include "UnityEngine/Android/Permission.hpp"
+#include "UnityEngine/EventSystems/EventSystem.hpp"
 #include "UnityEngine/Camera.hpp"
 #include "UnityEngine/Color.hpp"
 #include "UnityEngine/Collider.hpp"
 #include "UnityEngine/Component.hpp"
+#include "UnityEngine/FilterMode.hpp"
 #include "UnityEngine/GameObject.hpp"
+#include "UnityEngine/ImageConversion.hpp"
 #include "UnityEngine/LineRenderer.hpp"
 #include "UnityEngine/Material.hpp"
 #include "UnityEngine/MeshRenderer.hpp"
@@ -49,6 +64,9 @@
 #include "UnityEngine/SceneManagement/SceneManager.hpp"
 #include "UnityEngine/TextAnchor.hpp"
 #include "UnityEngine/Time.hpp"
+#include "UnityEngine/Texture2D.hpp"
+#include "UnityEngine/TextureFormat.hpp"
+#include "UnityEngine/TextureWrapMode.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Vector3.hpp"
 #include "UnityEngine/Shader.hpp"
@@ -77,6 +95,8 @@
 #include "HMUI/ImageView.hpp"
 #include "UnityEngine/UI/RawImage.hpp"
 #include "UnityEngine/UI/Selectable.hpp"
+#include "VRUIControls/VRInputModule.hpp"
+#include "VRUIControls/VRPointer.hpp"
 
 #include <array>
 #include <algorithm>
@@ -86,6 +106,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <limits>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -93,6 +114,17 @@
 #ifndef SABERSTAGE_BUILD_NUMBER
 #define SABERSTAGE_BUILD_NUMBER "local"
 #endif
+
+extern "C" std::uint8_t _binary_saberstage_mic_active_png_start[];
+extern "C" std::uint8_t _binary_saberstage_mic_active_png_end[];
+extern "C" std::uint8_t _binary_saberstage_mic_muted_png_start[];
+extern "C" std::uint8_t _binary_saberstage_mic_muted_png_end[];
+extern "C" std::uint8_t _binary_saberstage_mic_unavailable_png_start[];
+extern "C" std::uint8_t _binary_saberstage_mic_unavailable_png_end[];
+extern "C" std::uint8_t _binary_saberstage_game_audio_active_png_start[];
+extern "C" std::uint8_t _binary_saberstage_game_audio_active_png_end[];
+extern "C" std::uint8_t _binary_saberstage_game_audio_muted_png_start[];
+extern "C" std::uint8_t _binary_saberstage_game_audio_muted_png_end[];
 
 namespace saberstage::ui {
 namespace {
@@ -136,6 +168,10 @@ constexpr float kRecordingPanelHeaderHeight = 7.0F;
 constexpr float kRecordingPanelFpsRowHeight = 5.5F;
 constexpr float kRecordingPanelDropRowHeight = 5.0F;
 constexpr float kRecordingPanelScale = 0.0125F;
+// Audio buttons remain present in both panel modes so switching Record/Stream
+// never changes the control row's shape. They are deliberately a little larger
+// than the original compact buttons because these are icon-only VR targets.
+constexpr UnityEngine::Vector2 kRecordingPanelAudioButtonSize{7.7F, 6.875F};
 const UnityEngine::Vector2 kChatPanelSize{70.0F, 58.0F};
 constexpr float kChatPanelScale = 0.011F;
 constexpr float kChatPanelMinimumWidth = 45.0F;
@@ -624,6 +660,97 @@ public:
     }
 };
 
+struct RecordingPanelIconTextures {
+    UnityEngine::Texture2D* microphoneActive = nullptr;
+    UnityEngine::Texture2D* microphoneMuted = nullptr;
+    UnityEngine::Texture2D* microphoneUnavailable = nullptr;
+    UnityEngine::Texture2D* gameAudioActive = nullptr;
+    UnityEngine::Texture2D* gameAudioMuted = nullptr;
+};
+
+UnityEngine::Texture2D* DecodeEmbeddedControlIcon(
+    const std::uint8_t* begin,
+    const std::uint8_t* end,
+    std::string_view name) {
+    if (!begin || !end || end <= begin) {
+        Logging::Logger.error("Embedded recording-panel icon '{}' is empty", name);
+        return nullptr;
+    }
+    auto* texture = UnityEngine::Texture2D::New_ctor(
+        2, 2, UnityEngine::TextureFormat::RGBA32, false, false);
+    if (!IsAlive(texture)) {
+        Logging::Logger.error("Could not allocate recording-panel icon '{}'", name);
+        return nullptr;
+    }
+    ArrayW<std::uint8_t> encoded(std::span<const std::uint8_t>(
+        begin, static_cast<std::size_t>(end - begin)));
+    if (!UnityEngine::ImageConversion::LoadImage(texture, encoded, false)) {
+        Logging::Logger.error("Could not decode embedded recording-panel icon '{}'", name);
+        UnityEngine::Object::Destroy(texture);
+        return nullptr;
+    }
+    texture->set_name(name);
+    texture->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
+    texture->set_filterMode(UnityEngine::FilterMode::Bilinear);
+    texture->Apply(false, true);
+    UnityEngine::Object::DontDestroyOnLoad(texture);
+    return texture;
+}
+
+const RecordingPanelIconTextures& EmbeddedRecordingPanelIcons() {
+    // These five tiny textures are decoded once per game process. Keeping
+    // them outside the floating panel's lifetime prevents repeated PNG work
+    // when the user hides/reopens the panel or toggles its FPS row.
+    static const RecordingPanelIconTextures textures{
+        DecodeEmbeddedControlIcon(
+            _binary_saberstage_mic_active_png_start,
+            _binary_saberstage_mic_active_png_end,
+            "SaberStage Microphone Active"),
+        DecodeEmbeddedControlIcon(
+            _binary_saberstage_mic_muted_png_start,
+            _binary_saberstage_mic_muted_png_end,
+            "SaberStage Microphone Muted"),
+        DecodeEmbeddedControlIcon(
+            _binary_saberstage_mic_unavailable_png_start,
+            _binary_saberstage_mic_unavailable_png_end,
+            "SaberStage Microphone Unavailable"),
+        DecodeEmbeddedControlIcon(
+            _binary_saberstage_game_audio_active_png_start,
+            _binary_saberstage_game_audio_active_png_end,
+            "SaberStage Game Audio Active"),
+        DecodeEmbeddedControlIcon(
+            _binary_saberstage_game_audio_muted_png_start,
+            _binary_saberstage_game_audio_muted_png_end,
+            "SaberStage Game Audio Muted")};
+    return textures;
+}
+
+UnityEngine::UI::RawImage* CreateRecordingPanelButtonIcon(
+    UnityEngine::UI::Button* button,
+    UnityEngine::Texture2D* texture,
+    std::string_view name) {
+    if (!IsAlive(button) || !IsAlive(texture)) return nullptr;
+    auto* object = PublicRawImageTag{}.Create(button->get_transform().ptr());
+    if (!IsAlive(object)) return nullptr;
+    object->set_name(name);
+    object->set_layer(5);
+    auto* image = object->GetComponent<UnityEngine::UI::RawImage*>();
+    if (!IsAlive(image)) {
+        UnityEngine::Object::Destroy(object);
+        return nullptr;
+    }
+    image->set_texture(texture);
+    image->set_color(UnityEngine::Color::get_white());
+    image->set_raycastTarget(false);
+    auto rect = image->get_rectTransform();
+    rect->set_anchorMin({0.5F, 0.5F});
+    rect->set_anchorMax({0.5F, 0.5F});
+    rect->set_pivot({0.5F, 0.5F});
+    rect->set_anchoredPosition({0.0F, 0.0F});
+    rect->set_sizeDelta({3.8F, 3.8F});
+    return image;
+}
+
 void ConfigureLayout(
     UnityEngine::Component* component,
     float preferredWidth,
@@ -663,6 +790,13 @@ void FlattenFlatPanelDepth(UnityEngine::Transform* transform) {
     }
 }
 
+// The right side screen has a 60-unit canvas. Retain a small mask margin, but
+// use the same 54-unit span already proven by the tab strip instead of
+// needlessly squeezing settings into 48 units. Long slider captions then own
+// enough width to remain separate from their tracks.
+constexpr float kRightPanelRowWidth = 54.0F;
+constexpr float kRightPanelLabelFraction = 0.48F;
+
 template <typename T>
 T* ConstrainRightPanelRow(T* control) {
     if (!control) return nullptr;
@@ -675,7 +809,7 @@ T* ConstrainRightPanelRow(T* control) {
         // SaberStage's right screen is a side panel, so every setting row must
         // override that prefab width instead of overflowing both mask edges.
         layout->set_minWidth(0.0F);
-        layout->set_preferredWidth(48.0F);
+        layout->set_preferredWidth(kRightPanelRowWidth);
         layout->set_flexibleWidth(0.0F);
     }
     // Every SaberStage menu surface is flat. Some stock BSML setting prefabs
@@ -735,6 +869,90 @@ void FitRectToParentRegion(
     rect->set_offsetMax({-rightInset, 0.0F});
     const auto position = rect->get_localPosition();
     rect->set_localPosition({position.x, position.y, 0.0F});
+}
+
+BSML::SliderSetting* ConstrainRightPanelRow(BSML::SliderSetting* control) {
+    if (!control) return nullptr;
+    auto* object = control->get_gameObject().ptr();
+    if (!object) return control;
+
+    ConfigureLayout(control, kRightPanelRowWidth, 8.0F, 0.0F, 0.0F);
+    if (auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(kRightPanelRowWidth);
+    }
+    FlattenFlatPanelDepth(object->get_transform().ptr());
+
+    // SliderSetting's stock prefab is designed for a roughly 90-unit center
+    // screen. Merely narrowing its LayoutElement leaves the title sitting on
+    // top of the track. Give the title and native slider explicit, disjoint
+    // regions inside SaberStage's side-panel row.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    if (auto titleTransform = root->Find("Title")) {
+        FitRectToParentRegion(
+            titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+            0.0F,
+            kRightPanelLabelFraction,
+            0.5F,
+            0.5F);
+        if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+            title->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            title->set_enableWordWrapping(false);
+            title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+            title->set_fontSize(3.0F);
+        }
+    }
+    if (control->slider) {
+        FitRectToParentRegion(
+            control->slider->get_transform().cast<UnityEngine::RectTransform>(),
+            kRightPanelLabelFraction,
+            1.0F,
+            0.5F,
+            0.25F);
+    }
+    return control;
+}
+
+BSML::ToggleSetting* ConstrainRightPanelRow(BSML::ToggleSetting* control) {
+    if (!control) return nullptr;
+    auto* object = control->get_gameObject().ptr();
+    if (!object) return control;
+
+    ConfigureLayout(control, kRightPanelRowWidth, 8.0F, 0.0F, 0.0F);
+    if (auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(kRightPanelRowWidth);
+    }
+    FlattenFlatPanelDepth(object->get_transform().ptr());
+
+    // Keep the switch at the visible right edge and reserve the rest of the
+    // row for its caption. This prevents long Stream labels from colliding
+    // with the switch while preserving the stock BSML interaction behavior.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    auto switchTransform = root->Find("SwitchView");
+    auto* switchRect = switchTransform
+        ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
+        : nullptr;
+    const auto switchWidth = switchRect ? switchRect->get_sizeDelta().x : 12.0F;
+    if (auto nameTransform = root->Find("NameText")) {
+        auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
+        nameRect->set_anchorMin({0.0F, 0.0F});
+        nameRect->set_anchorMax({1.0F, 1.0F});
+        nameRect->set_pivot({0.5F, 0.5F});
+        nameRect->set_offsetMin({0.5F, 0.0F});
+        nameRect->set_offsetMax({-(switchWidth + 1.25F), 0.0F});
+        if (control->text) {
+            control->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            control->text->set_enableWordWrapping(false);
+            control->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+            control->text->set_fontSize(3.0F);
+        }
+    }
+    if (switchRect) {
+        switchRect->set_anchorMin({1.0F, 0.5F});
+        switchRect->set_anchorMax({1.0F, 0.5F});
+        switchRect->set_pivot({1.0F, 0.5F});
+        switchRect->set_anchoredPosition({-0.5F, 0.0F});
+    }
+    return control;
 }
 
 BSML::DropdownListSetting* ConstrainCenterPanelRow(BSML::DropdownListSetting* control) {
@@ -985,11 +1203,22 @@ UnityEngine::UI::Button* ConfigureCenterRowButton(
 void ConfigureRightPanelButton(UnityEngine::UI::Button* button) {
     if (!IsAlive(button)) return;
     NeutralizeContentSizeFitter(button);
-    ConfigureLayout(button, 46.0F, 8.0F, 0.0F, 0.0F);
+    ConfigureLayout(button, kRightPanelRowWidth - 2.0F, 8.0F, 0.0F, 0.0F);
     if (auto* layout = button->GetComponent<UnityEngine::UI::LayoutElement*>()) {
         layout->set_minWidth(0.0F);
     }
     BSML::Lite::SetButtonTextSize(button, 3.2F);
+}
+
+void ConfigureRightPanelHalfButton(UnityEngine::UI::Button* button) {
+    if (!IsAlive(button)) return;
+    NeutralizeContentSizeFitter(button);
+    constexpr float halfWidth = (kRightPanelRowWidth - 1.0F) * 0.5F;
+    ConfigureLayout(button, halfWidth, 7.0F, 0.0F, 0.0F);
+    if (auto* layout = button->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(halfWidth);
+    }
+    BSML::Lite::SetButtonTextSize(button, 3.0F);
 }
 
 TMPro::TextMeshProUGUI* CreateRightPanelSubheader(
@@ -1001,10 +1230,10 @@ TMPro::TextMeshProUGUI* CreateRightPanelSubheader(
     text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
     text->set_enableWordWrapping(false);
     text->set_raycastTarget(false);
-    // 48 units matches ConstrainRightPanelRow's row width so the label's left
+    // Match ConstrainRightPanelRow's row width so the label's left
     // edge lines up with the setting rows beneath it. The extra height above
     // a plain row provides the visual section break.
-    ConfigureLayout(text, 48.0F, 4.5F, 0.0F, 0.0F);
+    ConfigureLayout(text, kRightPanelRowWidth, 4.5F, 0.0F, 0.0F);
     text->set_color({0.55F, 0.78F, 0.95F, 1.0F});
     return text;
 }
@@ -1031,7 +1260,7 @@ TMPro::TextMeshProUGUI* CreateCenterPanelSubheader(
 void ConfigureRightPanelInput(
     HMUI::InputFieldView* input,
     int textLengthLimit,
-    float preferredWidth = 48.0F) {
+    float preferredWidth = kRightPanelRowWidth) {
     if (!IsAlive(input)) return;
     ConstrainRightPanelRow(input);
     if (auto* layout = input->GetComponent<UnityEngine::UI::LayoutElement*>()) {
@@ -1052,8 +1281,8 @@ UnityEngine::UI::HorizontalLayoutGroup* CreateRightPanelInputActionRow(
     row->set_childControlHeight(true);
     row->set_childForceExpandWidth(false);
     row->set_childForceExpandHeight(false);
-    row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
-    ConfigureLayout(row, 48.0F, 8.0F, 0.0F, 0.0F);
+    row->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
+    ConfigureLayout(row, kRightPanelRowWidth, 8.0F, 0.0F, 0.0F);
     return row;
 }
 
@@ -1065,6 +1294,98 @@ void ConfigureRightPanelInlineButton(UnityEngine::UI::Button* button) {
         layout->set_minWidth(9.0F);
     }
     BSML::Lite::SetButtonTextSize(button, 3.0F);
+}
+
+// Live Stream deliberately uses the existing Service row as its ruler. BSML
+// returns an inner selector for dropdowns but an outer row for sliders/toggles;
+// applying one width to those returned components does NOT align their rows.
+// These helpers run only on Live Stream's other rows, after the reference has
+// real canvas geometry. They never traverse into the Service widget or change
+// shared Camera/Record layout rules.
+void SetLivestreamRowWidth(UnityEngine::GameObject* object, float width) {
+    auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>();
+    if (!layout) layout = object->AddComponent<UnityEngine::UI::LayoutElement*>();
+    // Override native text/group minimum widths too: otherwise a long caption
+    // can expand a nested row beyond the correctly sized outer group.
+    layout->set_minWidth(0.0F);
+    layout->set_preferredWidth(width);
+    layout->set_flexibleWidth(0.0F);
+    if (auto* fitter = object->GetComponent<UnityEngine::UI::ContentSizeFitter*>()) {
+        fitter->set_horizontalFit(UnityEngine::UI::ContentSizeFitter::FitMode::Unconstrained);
+    }
+}
+
+void FitLivestreamHorizontalSpan(UnityEngine::RectTransform* rect, float leftInset, float rightInset) {
+    if (!rect) return;
+    // Align X only. In particular, a dropdown's native height and vertical
+    // anchors must not change just because its caption is being aligned.
+    auto anchorMin = rect->get_anchorMin();
+    auto anchorMax = rect->get_anchorMax();
+    anchorMin.x = 0.0F;
+    anchorMax.x = 1.0F;
+    rect->set_anchorMin(anchorMin);
+    rect->set_anchorMax(anchorMax);
+    auto offsetMin = rect->get_offsetMin();
+    auto offsetMax = rect->get_offsetMax();
+    offsetMin.x = leftInset;
+    offsetMax.x = -rightInset;
+    rect->set_offsetMin(offsetMin);
+    rect->set_offsetMax(offsetMax);
+}
+
+void FitLivestreamToggle(BSML::ToggleSetting* toggle, float leftInset, float rightInset) {
+    auto root = toggle->get_transform();
+    auto switchTransform = root->Find("SwitchView");
+    if (!switchTransform) return;
+    auto* switchRect = switchTransform->GetComponent<UnityEngine::RectTransform*>();
+    if (!switchRect) return;
+    const float switchWidth = switchRect->get_sizeDelta().x;
+    switchRect->set_anchorMin({1.0F, 0.5F});
+    switchRect->set_anchorMax({1.0F, 0.5F});
+    switchRect->set_pivot({1.0F, 0.5F});
+    switchRect->set_anchoredPosition({-rightInset, 0.0F});
+    if (IsAlive(toggle->text)) {
+        FitLivestreamHorizontalSpan(toggle->text->get_rectTransform(),
+            leftInset, rightInset + switchWidth + 1.25F);
+        toggle->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+        toggle->text->set_enableWordWrapping(false);
+        toggle->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        toggle->text->set_fontSize(3.0F);
+    }
+}
+
+void FitLivestreamActionRow(
+    UnityEngine::UI::HorizontalLayoutGroup* group,
+    float rowWidth,
+    float leftInset,
+    float rightInset) {
+    // This is the same outer row width as Service, NOT a smaller group shifted
+    // toward the viewport edge. Native layout padding restricts its children
+    // to Service's visible label-to-selector span. RectOffset uses whole units.
+    const int leftPadding = static_cast<int>(std::lround(leftInset));
+    const int rightPadding = static_cast<int>(std::lround(rightInset));
+    group->set_padding(UnityEngine::RectOffset::New_ctor(leftPadding, rightPadding, 0, 0));
+    group->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
+    group->set_childControlWidth(true);
+    group->set_childForceExpandWidth(false);
+    const float gap = group->get_spacing();
+    auto transform = group->get_transform();
+    const int count = transform->get_childCount();
+    if (count == 0) return;
+    const float available = rowWidth - leftPadding - rightPadding - gap * (count - 1);
+    // Input/Set and Chat/Reset retain a compact action at the right edge.
+    // Start/Stop and Connect/Disconnect split the same available span evenly.
+    auto* first = transform->GetChild(0)->get_gameObject().ptr();
+    const bool inlineAction = count == 2 &&
+        (first->GetComponent<HMUI::InputFieldView*>() || first->GetComponent<BSML::ToggleSetting*>());
+    for (int child = 0; child < count; ++child) {
+        auto* object = transform->GetChild(child)->get_gameObject().ptr();
+        const float width = inlineAction ? (child == 0 ? available - 9.0F : 9.0F) : available / count;
+        SetLivestreamRowWidth(object, width);
+        if (auto* toggle = object->GetComponent<BSML::ToggleSetting*>()) {
+            FitLivestreamToggle(toggle, 0.0F, 0.0F);
+        }
+    }
 }
 
 void ConfigureCalibrationPanelText(
@@ -3486,11 +3807,14 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     active_->livestreamProviderFeatureText_ = nullptr;
     static std::array<std::string_view, 3> tabNames{"Record", "Live Stream", "Files"};
     active_->recordingTabViewRoots_.fill(nullptr);
+    active_->livestreamContentRoot_ = nullptr;
+    active_->livestreamServiceReference_ = nullptr;
     active_->recordingEncodingControls_.clear();
     active_->directRecordingEncodingControls_.clear();
     active_->livestreamConfigurationControls_.clear();
     active_->livestreamGameAudioVolumeSlider_ = nullptr;
     active_->livestreamMicrophoneVolumeSlider_ = nullptr;
+    active_->connectTwitchButton_ = nullptr;
     active_->livestreamKeyVisible_ = false;
     active_->selectedRecordingTab_ = 0;
 
@@ -3508,10 +3832,10 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         tabsRect->set_anchorMin({0.0F, 1.0F});
         tabsRect->set_anchorMax({1.0F, 1.0F});
         tabsRect->set_pivot({0.5F, 1.0F});
-        // Match Big Screen's proven full-height side-panel insets. The old
-        // near-zero inset placed this bar and its pages under the screen's top
-        // clipping region on the right-side HMUI screen.
-        tabsRect->set_anchoredPosition({0.0F, -10.0F});
+        // Match the left camera screen exactly. Using a larger top inset here
+        // made the right screen look physically shorter even though both HMUI
+        // screens have the same actual bounds.
+        tabsRect->set_anchoredPosition({0.0F, -1.5F});
         tabsRect->set_sizeDelta({-4.0F, 7.0F});
     }
 
@@ -3520,8 +3844,8 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         if (!container) return nullptr;
         if (auto* external = container->GetComponent<BSML::ExternalComponents*>()) {
             if (auto* scroll = external->Get<UnityEngine::RectTransform*>()) {
-                scroll->set_anchoredPosition({0.0F, -8.0F});
-                scroll->set_sizeDelta({-6.0F, -22.0F});
+                scroll->set_anchoredPosition({2.0F, -3.5F});
+                scroll->set_sizeDelta({0.0F, -13.0F});
                 active_->recordingTabViewRoots_[index] = scroll->get_gameObject();
             }
         }
@@ -3544,7 +3868,6 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         Logging::Logger.error("Could not create native SaberStage recording side-menu pages");
         return;
     }
-
     // ---- Record tab -------------------------------------------------------
     // Page order is deliberate: current status first, the transport buttons
     // directly under it in chronological order (Start -> Pause -> Resume ->
@@ -3871,25 +4194,29 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     // directly under it, then the one-time service setup, then reliability.
     // Mid-session the user only needs the top of this page.
     auto* liveHeading = BSML::Lite::CreateText(
-        livestreamPage->get_transform(), "Direct Live Stream", 4.0F, {0.0F, 0.0F}, {48.0F, 6.5F});
-    liveHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
+        livestreamPage->get_transform(), "Direct Live Stream", 4.0F,
+        {0.0F, 0.0F}, {kRightPanelRowWidth, 6.5F});
+    liveHeading->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
     active_->livestreamStatusText_ = BSML::Lite::CreateText(
-        livestreamPage->get_transform(), "", 3.0F, {0.0F, 0.0F}, {48.0F, 13.0F});
+        livestreamPage->get_transform(), "", 3.0F,
+        {0.0F, 0.0F}, {kRightPanelRowWidth, 13.0F});
     active_->livestreamStatusText_->set_enableWordWrapping(true);
-    active_->livestreamStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    active_->livestreamStatusText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
 
+    auto* livestreamTransport = CreateRightPanelInputActionRow(
+        livestreamPage->get_transform());
     active_->startLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Go Live", [] {
+        livestreamTransport, "Start Stream", "PlayButton", [] {
             if (active_) active_->TryStartLivestreamWithTitle();
         }), "Starts broadcasting the Primary camera and game audio with Direct FFmpeg. Going live does not start or save a local recording. While live, SaberStage keeps the Quest awake so removing the headset does not normally interrupt the stream. If you explicitly started a compatible local recording first, the stream can share that existing hardware encode.");
-    ConfigureRightPanelButton(active_->startLivestreamButton_);
+    ConfigureRightPanelHalfButton(active_->startLivestreamButton_);
     active_->stopLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Stop Stream", [] {
+        livestreamTransport, "Stop Stream", "PlayButton", [] {
             if (!active_) return;
             active_->root_.Recording().StopLivestream();
             active_->RefreshRecordingStatus();
         }), "Ends the broadcast. A stream-only capture stops completely; an explicitly started local recording keeps running until you use Stop & Save.");
-    ConfigureRightPanelButton(active_->stopLivestreamButton_);
+    ConfigureRightPanelHalfButton(active_->stopLivestreamButton_);
 
     auto* keepHeadsetAwake = WithHint(BSML::Lite::CreateToggle(
         livestreamPage,
@@ -3951,11 +4278,15 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             active_->root_.Settings().Edit().broadcast.microphoneEnabled = enabled;
             active_->root_.Settings().Save(nullptr);
             if (enabled) {
-                constexpr const char* permission = "android.permission.RECORD_AUDIO";
-                if (!UnityEngine::Android::Permission::HasUserAuthorizedPermission(permission)) {
-                    UnityEngine::Android::Permission::RequestUserPermission(permission, nullptr);
+                const auto permission = recording::RecordingController::QueryMicrophonePermission();
+                if (permission == recording::MicrophonePermissionStatus::MissingFromApplication) {
                     active_->ShowLivestreamActionError(
-                        "Quest microphone access was requested. Accept the system prompt, then start the stream. If no prompt appears, enable Microphone Access in MBF and repatch Beat Saber.");
+                        "Beat Saber was patched without Microphone Access, so Android cannot show a permission prompt. Enable Microphone Access in MBF and repatch Beat Saber before using the Quest microphone.");
+                } else if (permission != recording::MicrophonePermissionStatus::Granted) {
+                    UnityEngine::Android::Permission::RequestUserPermission(
+                        "android.permission.RECORD_AUDIO", nullptr);
+                    active_->ShowLivestreamActionError(
+                        "Android microphone access was requested. Accept the system prompt, then start the stream.");
                 }
             }
             active_->RefreshRecordingStatus();
@@ -4017,38 +4348,41 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
 
     active_->livestreamProviderFeatureText_ = BSML::Lite::CreateText(
         livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {48.0F, 11.0F});
+        {0.0F, 0.0F}, {kRightPanelRowWidth, 11.0F});
     active_->livestreamProviderFeatureText_->set_enableWordWrapping(true);
-    active_->livestreamProviderFeatureText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    active_->livestreamProviderFeatureText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
 
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Twitch Channel Controls");
     active_->twitchAccountStatusText_ = BSML::Lite::CreateText(
         livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {48.0F, 11.0F});
+        {0.0F, 0.0F}, {kRightPanelRowWidth, 11.0F});
     active_->twitchAccountStatusText_->set_enableWordWrapping(true);
-    active_->twitchAccountStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    active_->twitchAccountStatusText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
 
     auto* twitchAppText = BSML::Lite::CreateText(
         livestreamPage->get_transform(),
-        "Uses SaberStage's registered public Twitch application. No Client ID or client secret entry is required.",
-        2.8F, {0.0F, 0.0F}, {48.0F, 10.0F});
+        "Secure device sign-in; no Client ID or secret entry is required.",
+        2.8F, {0.0F, 0.0F}, {kRightPanelRowWidth, 7.0F});
     twitchAppText->set_enableWordWrapping(true);
-    twitchAppText->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* connectTwitch = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Connect Twitch Account", [] {
+    twitchAppText->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+    auto* twitchAccountActions = CreateRightPanelInputActionRow(
+        livestreamPage->get_transform());
+    active_->connectTwitchButton_ = WithHint(BSML::Lite::CreateUIButton(
+        twitchAccountActions, "Connect", "PlayButton", [] {
             if (active_) active_->BeginTwitchAuthorization();
         }), "Links Twitch through its device authorization page so SaberStage can set the channel title, read live chat, and optionally post map information. Accounts connected before map announcements were added must reconnect once. The RTMP stream key remains separate.");
-    ConfigureRightPanelButton(connectTwitch);
+    ConfigureRightPanelHalfButton(active_->connectTwitchButton_);
     auto* disconnectTwitch = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Disconnect Twitch Account", [] {
+        twitchAccountActions, "Disconnect", "PlayButton", [] {
             if (!active_) return;
             active_->root_.Twitch().DisconnectAccount();
             active_->SetChatWorldPanelVisible(false);
             active_->RefreshTwitchControls();
         }), "Removes SaberStage's saved Twitch authorization. This does not erase the separately configured RTMP stream key.");
-    ConfigureRightPanelButton(disconnectTwitch);
+    ConfigureRightPanelHalfButton(disconnectTwitch);
+    auto* titleActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
     auto* titleButton = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Set Stream Title", [] {
+        titleActions, "Set Stream Title", [] {
             if (active_) active_->ShowStreamTitleEditor();
         }), "Saves the Twitch title for the next stream, or updates it immediately when a Twitch stream is already live. YouTube and Kick title control are not supported yet.");
     ConfigureRightPanelButton(titleButton);
@@ -4067,8 +4401,10 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
                     "Could not save Twitch map-announcement preference: {}", saveError);
             }
             if (enabled && !settings.broadcast.twitchAccount.chatWriteAuthorized) {
-                active_->ShowLivestreamActionError(
-                    "Connect Twitch Account to post map information. If this account was already connected, reconnect it once to grant the new chat permission.");
+                // Older account links do not contain user:write:chat. Start the
+                // one-time Twitch device flow from the option that needs it
+                // instead of leaving an enabled-but-inoperative setting.
+                active_->BeginTwitchAuthorization();
             }
             active_->RefreshTwitchControls();
         }),
@@ -4083,7 +4419,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         [](bool visible) {
             if (active_) active_->SetChatWorldPanelVisible(visible);
         }), "Shows a movable, HMD-only Twitch chat panel. Twitch account linking is required; YouTube and Kick chat are not supported yet.");
-    ConfigureLayout(showChat, 38.0F, 7.0F, 1.0F);
+    ConfigureLayout(showChat, kRightPanelRowWidth - 10.0F, 7.0F, 1.0F);
     auto* resetChat = WithHint(BSML::Lite::CreateUIButton(
         chatRow, "↻", [] {
             if (active_) active_->ResetChatWorldPanelPose();
@@ -4093,16 +4429,18 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Paused Stream Screen");
     active_->afkSelectionText_ = BSML::Lite::CreateText(
         livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {48.0F, 8.0F});
+        {0.0F, 0.0F}, {kRightPanelRowWidth, 8.0F});
     active_->afkSelectionText_->set_enableWordWrapping(true);
-    active_->afkSelectionText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    active_->afkSelectionText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+    auto* chooseAfkActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
     auto* chooseAfk = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Choose AFK Picture or GIF", [] {
+        chooseAfkActions, "Choose AFK Picture or GIF", [] {
             if (active_) active_->OpenAfkFilePicker();
         }), "Selects a PNG, JPEG, or animated GIF shown instead of the camera while a Twitch stream is paused.");
     ConfigureRightPanelButton(chooseAfk);
+    auto* builtInAfkActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
     auto* builtInAfk = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Use Built-in AFK Screen", [] {
+        builtInAfkActions, "Use Built-in AFK Screen", [] {
             if (!active_) return;
             std::string error;
             if (!active_->root_.Recording().PrepareAfkMedia({}, &error)) {
@@ -4125,7 +4463,8 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         active_->root_.Recording().StreamServerUrl(stream.provider)),
         "The selected service's RTMP or RTMPS ingest address. Editing does not apply it until Set is pressed, where you can use it once or save it for later sessions.");
     RememberSelectables(active_->livestreamServerInput_, active_->livestreamConfigurationControls_);
-    ConfigureRightPanelInput(active_->livestreamServerInput_, 2048, 38.0F);
+    ConfigureRightPanelInput(
+        active_->livestreamServerInput_, 2048, kRightPanelRowWidth - 10.0F);
     active_->setLivestreamServerButton_ = WithHint(BSML::Lite::CreateUIButton(
         serverInputRow, "Set", [] {
             if (active_) active_->ShowLivestreamValueConfirmation(1);
@@ -4142,7 +4481,8 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         [](StringW) {
             if (active_) active_->RefreshLivestreamKeyDisplay();
         }), "Paste the selected service's private stream key. Set lets you keep it for this session only or explicitly save it in local SaberStage settings. It is never logged and is redacted from support archives.");
-    ConfigureRightPanelInput(active_->livestreamKeyInput_, 512, 38.0F);
+    ConfigureRightPanelInput(
+        active_->livestreamKeyInput_, 512, kRightPanelRowWidth - 10.0F);
     RememberSelectables(active_->livestreamKeyInput_, active_->livestreamConfigurationControls_);
     active_->setLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
         streamKeyInputRow, "Set", [] {
@@ -4161,8 +4501,9 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         }), "Shows the private stream key in this field. Leave this off to display password-style masking whether the key is session-only or saved locally.");
     ConstrainRightPanelRow(livestreamKeyVisibility);
 
+    auto* clearKeyActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
     active_->clearLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
-        livestreamPage, "Clear Stream Key", [] {
+        clearKeyActions, "Clear Stream Key", [] {
             if (!active_) return;
             auto& broadcastSettings = active_->root_.Settings().Edit().broadcast;
             const auto provider = broadcastSettings.provider;
@@ -4211,9 +4552,14 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     auto* liveNote = BSML::Lite::CreateText(
         livestreamPage->get_transform(),
         "Use CBR and a 2-second keyframe interval for Twitch and Kick. Recommended starting points: Twitch 1080p60 at 6 Mbps; Kick up to 1080p60 at 8 Mbps; YouTube 1080p60 at 12 Mbps or 1440p60 at 24 Mbps.",
-        3.0F, {0.0F, 0.0F}, {48.0F, 23.0F});
+        3.0F, {0.0F, 0.0F}, {kRightPanelRowWidth, 23.0F});
     liveNote->set_enableWordWrapping(true);
-    liveNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+    liveNote->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+
+    // Store the reference without altering it. ShowRecordingTab applies the
+    // other rows' geometry after this initially hidden page becomes visible.
+    active_->livestreamContentRoot_ = livestreamPage;
+    active_->livestreamServiceReference_ = provider;
 
     auto* filesHeading = BSML::Lite::CreateText(
         filesPage->get_transform(), "Saved Recordings", 4.0F, {0.0F, 0.0F}, {48.0F, 6.5F});
@@ -4884,6 +5230,15 @@ void MenuController::RefreshTwitchControls() {
                         " cannot start a stream yet. Twitch is the first supported service.");
     }
     const auto twitch = root_.Twitch().Snapshot();
+    if (connectTwitchButton_) {
+        const bool needsChatPermission =
+            twitch.authorizationState == broadcast::TwitchAuthorizationState::Connected &&
+            root_.Settings().Get().broadcast.postMapInfoToChat &&
+            !root_.Settings().Get().broadcast.twitchAccount.chatWriteAuthorized;
+        BSML::Lite::SetButtonText(
+            connectTwitchButton_,
+            needsChatPermission ? "Authorize Map Chat" : "Connect");
+    }
     if (twitchAccountStatusText_) {
         auto status = twitch.status;
         const auto& title = settings::DestinationForProvider(
@@ -5316,7 +5671,7 @@ void MenuController::EnsureRecordingWorldPanel() {
         rect->set_sizeDelta(size);
     };
     const float buttonsY = -half + 4.5F;
-    const float streamControlY = -half + 12.2F;
+    const float streamControlY = -half + 12.8F;
     recordingWorldPanelStopButton_ = BSML::Lite::CreateUIButton(
         parent,
         "STOP",
@@ -5348,18 +5703,27 @@ void MenuController::EnsureRecordingWorldPanel() {
         parent,
         "Stream Control",
         "PlayButton",
-        {-7.0F, streamControlY},
-        {38.0F, 6.0F},
+        {-10.0F, streamControlY},
+        {30.0F, 5.5F},
         [] {
             // Reserved for the provider-specific popout added in the next
             // streaming-control phase. It remains visibly disabled for now.
+        });
+    recordingWorldPanelGameAudioButton_ = BSML::Lite::CreateUIButton(
+        parent,
+        "",
+        "PlayButton",
+        {12.0F, streamControlY},
+        kRecordingPanelAudioButtonSize,
+        [] {
+            if (active_) active_->RecordingWorldPanelGameAudioAction();
         });
     recordingWorldPanelMicrophoneButton_ = BSML::Lite::CreateUIButton(
         parent,
         "",
         "PlayButton",
-        {20.0F, streamControlY},
-        {10.0F, 6.0F},
+        {23.0F, streamControlY},
+        kRecordingPanelAudioButtonSize,
         [] {
             if (active_) active_->RecordingWorldPanelMicrophoneAction();
         });
@@ -5388,65 +5752,48 @@ void MenuController::EnsureRecordingWorldPanel() {
             "SaberStage Movable Stream Control Placeholder");
         BSML::Lite::SetButtonTextSize(recordingWorldPanelStreamControlButton_, 2.8F);
         pinWorldPanelButton(
-            recordingWorldPanelStreamControlButton_, {-7.0F, streamControlY}, {38.0F, 6.0F});
+            recordingWorldPanelStreamControlButton_, {-10.0F, streamControlY}, {30.0F, 5.5F});
         recordingWorldPanelStreamControlButton_->set_interactable(false);
+    }
+    const auto keepBlueWhenUnavailable = [](UnityEngine::UI::Button* button) {
+        if (!IsAlive(button)) return;
+        auto colors = button->get_colors();
+        colors.set_disabledColor(colors.get_normalColor());
+        button->set_colors(colors);
+    };
+    const auto& controlIcons = EmbeddedRecordingPanelIcons();
+    if (IsAlive(recordingWorldPanelGameAudioButton_)) {
+        recordingWorldPanelGameAudioButton_->get_gameObject()->set_name(
+            "SaberStage Movable Livestream Game Sound Mute");
+        pinWorldPanelButton(
+            recordingWorldPanelGameAudioButton_, {12.0F, streamControlY},
+            kRecordingPanelAudioButtonSize);
+        keepBlueWhenUnavailable(recordingWorldPanelGameAudioButton_);
+        recordingWorldPanelGameAudioIcon_ = CreateRecordingPanelButtonIcon(
+            recordingWorldPanelGameAudioButton_,
+            controlIcons.gameAudioActive,
+            "SaberStage Movable Game Sound Icon");
     }
     if (IsAlive(recordingWorldPanelMicrophoneButton_)) {
         recordingWorldPanelMicrophoneButton_->get_gameObject()->set_name(
             "SaberStage Movable Livestream Microphone Mute");
         pinWorldPanelButton(
-            recordingWorldPanelMicrophoneButton_, {20.0F, streamControlY}, {10.0F, 6.0F});
-
-        // Draw the microphone from the same zero-bloom UI primitives as the
-        // panel rather than relying on an optional icon font. The five white
-        // pieces form the microphone/stem, one red diagonal is the ordinary
-        // mute mark, and the second diagonal turns it into an X when the
-        // microphone source is disabled or its gain is 0%.
-        const auto addMicrophonePart = [&](std::size_t index,
-                                           std::string_view name,
-                                           UnityEngine::Vector2 position,
-                                           UnityEngine::Vector2 size) {
-            auto* image = BSML::Lite::CreateImage(
-                recordingWorldPanelMicrophoneButton_->get_transform(), whitePixel);
-            ConfigureWorldPanelImage(
-                image, position, size, UnityEngine::Color{0.92F, 0.96F, 1.0F, 1.0F});
-            ApplyWorldPanelMaterial(image, recordingWorldPanelBorderMaterial_);
-            if (IsAlive(image)) {
-                image->get_gameObject()->set_name(name);
-                image->set_raycastTarget(false);
-            }
-            recordingWorldPanelMicrophoneGlyph_[index] = image;
-        };
-        addMicrophonePart(0, "Microphone Capsule", {0.0F, 0.65F}, {1.8F, 2.8F});
-        addMicrophonePart(1, "Microphone Stem", {0.0F, -1.05F}, {0.45F, 1.25F});
-        addMicrophonePart(2, "Microphone Base", {0.0F, -1.70F}, {2.5F, 0.45F});
-        addMicrophonePart(3, "Microphone Left Cradle", {-1.25F, -0.35F}, {0.35F, 1.65F});
-        addMicrophonePart(4, "Microphone Right Cradle", {1.25F, -0.35F}, {0.35F, 1.65F});
-
-        const auto addMicrophoneSlash = [&](std::string_view name, float rotation) {
-            auto* image = BSML::Lite::CreateImage(
-                recordingWorldPanelMicrophoneButton_->get_transform(), whitePixel);
-            ConfigureWorldPanelImage(
-                image, {0.0F, 0.0F}, {0.55F, 5.1F},
-                UnityEngine::Color{1.0F, 0.18F, 0.15F, 1.0F});
-            ApplyWorldPanelMaterial(image, recordingWorldPanelBorderMaterial_);
-            if (IsAlive(image)) {
-                image->get_gameObject()->set_name(name);
-                image->set_raycastTarget(false);
-                image->get_rectTransform()->set_localEulerAngles({0.0F, 0.0F, rotation});
-            }
-            return image;
-        };
-        recordingWorldPanelMicrophoneMuteSlash_ =
-            addMicrophoneSlash("Microphone Muted Slash", -38.0F);
-        recordingWorldPanelMicrophoneUnavailableSlash_ =
-            addMicrophoneSlash("Microphone Unavailable X", 38.0F);
+            recordingWorldPanelMicrophoneButton_, {23.0F, streamControlY},
+            kRecordingPanelAudioButtonSize);
+        keepBlueWhenUnavailable(recordingWorldPanelMicrophoneButton_);
+        recordingWorldPanelMicrophoneIcon_ = CreateRecordingPanelButtonIcon(
+            recordingWorldPanelMicrophoneButton_,
+            controlIcons.microphoneActive,
+            "SaberStage Movable Microphone Icon");
     }
     if (!IsAlive(recordingWorldPanelTypeText_) || !IsAlive(recordingWorldPanelTimeText_) ||
             !IsAlive(recordingWorldPanelPrimaryButton_) ||
             !IsAlive(recordingWorldPanelPauseButton_) ||
             !IsAlive(recordingWorldPanelStopButton_) ||
+            !IsAlive(recordingWorldPanelGameAudioButton_) ||
             !IsAlive(recordingWorldPanelMicrophoneButton_) ||
+            !IsAlive(recordingWorldPanelGameAudioIcon_) ||
+            !IsAlive(recordingWorldPanelMicrophoneIcon_) ||
             !IsAlive(recordingWorldPanelDropText_) ||
             !recordingWorldPanelModeToggle_) {
         Logging::Logger.error("Movable recording controls were incomplete");
@@ -5462,6 +5809,7 @@ void MenuController::EnsureRecordingWorldPanel() {
     recordingWorldPanelDisplayedState_ = -1;
     recordingWorldPanelDropSamples_.clear();
     recordingWorldPanelSessionStartDrops_ = root_.Recording().Snapshot().droppedFrameCount;
+    recordingWorldPanelDropWarmupComplete_ = false;
     RefreshRecordingWorldPanel();
     Logging::Logger.info("Created movable HMD-only recording controls");
 }
@@ -5483,9 +5831,9 @@ void MenuController::DestroyRecordingWorldPanel() noexcept {
     recordingWorldPanelStopButton_ = nullptr;
     recordingWorldPanelStreamControlButton_ = nullptr;
     recordingWorldPanelMicrophoneButton_ = nullptr;
-    recordingWorldPanelMicrophoneGlyph_.fill(nullptr);
-    recordingWorldPanelMicrophoneMuteSlash_ = nullptr;
-    recordingWorldPanelMicrophoneUnavailableSlash_ = nullptr;
+    recordingWorldPanelMicrophoneIcon_ = nullptr;
+    recordingWorldPanelGameAudioButton_ = nullptr;
+    recordingWorldPanelGameAudioIcon_ = nullptr;
     if (IsAlive(recordingWorldPanelBorderMaterial_)) {
         UnityEngine::Object::Destroy(recordingWorldPanelBorderMaterial_);
     }
@@ -5501,6 +5849,7 @@ void MenuController::DestroyRecordingWorldPanel() noexcept {
     recordingWorldPanelHmdSessionActive_ = false;
     recordingWorldPanelDropSamples_.clear();
     recordingWorldPanelSessionStartDrops_ = 0;
+    recordingWorldPanelDropWarmupComplete_ = false;
     recordingWorldPanelLastFrames_ = 0;
 }
 
@@ -5515,8 +5864,10 @@ void MenuController::RefreshRecordingWorldPanel() {
     recordingWorldPanelDisplayedState_ = streamMode
         ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
             (livestream.microphoneAvailable ? 40 : 0) +
-            (livestream.microphoneMuted ? 80 : 0)
-        : static_cast<int>(snapshot.state);
+            (livestream.microphoneMuted ? 80 : 0) +
+            (livestream.gameAudioAvailable ? 160 : 0) +
+            (livestream.gameAudioMuted ? 320 : 0)
+        : static_cast<int>(snapshot.state) + (snapshot.gameAudioMuted ? 1000 : 0);
     if (IsAlive(recordingWorldPanelTypeText_)) {
         recordingWorldPanelTypeText_->set_text(streamMode
             ? (livestream.afk ? "AFK" : "STREAM")
@@ -5545,25 +5896,45 @@ void MenuController::RefreshRecordingWorldPanel() {
         BSML::Lite::SetButtonText(
             recordingWorldPanelStreamControlButton_,
             streamMode ? "Stream Control" : "Recording Control");
+        // Do not expand this button in Record mode. The two persistent audio
+        // buttons own the right side of this row in both modes.
+        auto rect = recordingWorldPanelStreamControlButton_->get_transform()
+            .cast<UnityEngine::RectTransform>();
+        rect->set_anchoredPosition({
+            -10.0F,
+            -RecordingPanelSize(recordingWorldPanelShowsFps_).y * 0.5F + 12.8F});
+        rect->set_sizeDelta({30.0F, 5.5F});
+    }
+    const auto& controlIcons = EmbeddedRecordingPanelIcons();
+    if (IsAlive(recordingWorldPanelGameAudioButton_)) {
+        recordingWorldPanelGameAudioButton_->get_gameObject()->SetActive(true);
+        // Keep this blue icon button present in Record mode, before either
+        // capture mode starts, and while a stream is active. In Record mode it
+        // controls timed silence in the local WAV; in Stream mode it changes
+        // the live mix or queues that choice for the next stream. Disabling the
+        // underlying Beat Saber button caused its visual hierarchy to vanish.
+        recordingWorldPanelGameAudioButton_->set_interactable(true);
+        if (IsAlive(recordingWorldPanelGameAudioIcon_)) {
+            const bool gameAudioMuted = streamMode
+                ? livestream.gameAudioMuted
+                : snapshot.gameAudioMuted;
+            recordingWorldPanelGameAudioIcon_->set_texture(gameAudioMuted
+                ? controlIcons.gameAudioMuted
+                : controlIcons.gameAudioActive);
+        }
     }
     if (IsAlive(recordingWorldPanelMicrophoneButton_)) {
-        recordingWorldPanelMicrophoneButton_->get_gameObject()->SetActive(streamMode);
-        recordingWorldPanelMicrophoneButton_->set_interactable(
-            streamMode && broadcast::CanStop(livestream.state) &&
-            !livestream.afk && livestream.microphoneAvailable);
-        const auto microphoneColor = livestream.microphoneAvailable
-            ? UnityEngine::Color{0.92F, 0.96F, 1.0F, 1.0F}
-            : UnityEngine::Color{0.52F, 0.57F, 0.64F, 1.0F};
-        for (auto* image : recordingWorldPanelMicrophoneGlyph_) {
-            if (IsAlive(image)) image->set_color(microphoneColor);
-        }
-        if (IsAlive(recordingWorldPanelMicrophoneMuteSlash_)) {
-            recordingWorldPanelMicrophoneMuteSlash_->get_gameObject()->SetActive(
-                livestream.microphoneMuted);
-        }
-        if (IsAlive(recordingWorldPanelMicrophoneUnavailableSlash_)) {
-            recordingWorldPanelMicrophoneUnavailableSlash_->get_gameObject()->SetActive(
-                !livestream.microphoneAvailable);
+        recordingWorldPanelMicrophoneButton_->get_gameObject()->SetActive(true);
+        // Match the adjacent speaker: always render the button, while the
+        // guarded action below decides whether the current stream can change.
+        recordingWorldPanelMicrophoneButton_->set_interactable(true);
+        if (IsAlive(recordingWorldPanelMicrophoneIcon_)) {
+            recordingWorldPanelMicrophoneIcon_->set_texture(
+                !livestream.microphoneAvailable
+                    ? controlIcons.microphoneUnavailable
+                    : livestream.microphoneMuted
+                        ? controlIcons.microphoneMuted
+                        : controlIcons.microphoneActive);
         }
     }
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
@@ -5653,6 +6024,30 @@ void MenuController::RecordingWorldPanelMicrophoneAction() {
     RefreshRecordingStatus();
 }
 
+void MenuController::RecordingWorldPanelGameAudioAction() {
+    if (!root_.Settings().Get().recording.worldControlsStreamMode) {
+        const auto snapshot = root_.Recording().Snapshot();
+        root_.Recording().SetLocalRecordingGameAudioMuted(
+            !snapshot.gameAudioMuted);
+        RefreshRecordingStatus();
+        return;
+    }
+
+    const auto livestream = root_.Recording().LivestreamSnapshot();
+    if (livestream.afk || !livestream.gameAudioAvailable) {
+        RefreshRecordingWorldPanel();
+        return;
+    }
+
+    std::string error;
+    if (!root_.Recording().SetLivestreamGameAudioMuted(
+            !livestream.gameAudioMuted, &error)) {
+        Logging::Logger.error("Movable game-sound control failed: {}", error);
+        if (!error.empty()) ShowLivestreamActionError(error, true);
+    }
+    RefreshRecordingStatus();
+}
+
 void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode) {
     auto& settings = root_.Settings().Edit().recording;
     settings.worldControlsStreamMode = streamMode;
@@ -5729,33 +6124,46 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         const auto selectedState = streamMode
             ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
                 (livestream.microphoneAvailable ? 40 : 0) +
-                (livestream.microphoneMuted ? 80 : 0)
-            : static_cast<int>(snapshot.state);
+                (livestream.microphoneMuted ? 80 : 0) +
+                (livestream.gameAudioAvailable ? 160 : 0) +
+                (livestream.gameAudioMuted ? 320 : 0)
+            : static_cast<int>(snapshot.state) + (snapshot.gameAudioMuted ? 1000 : 0);
         if (recordingWorldPanelDisplayedSecond_ != elapsedSecond ||
                 recordingWorldPanelDisplayedState_ != selectedState) {
             RefreshRecordingWorldPanel();
         }
 
         // Both local and live Direct FFmpeg sessions feed this capture-level
-        // count. Sampling it against the active timeline produces the recent
-        // five-second delta requested by the movable controls without resetting
-        // or mutating the encoder's lifetime diagnostics.
+        // count. The first second is a connection/encoder warm-up period: keep
+        // the underlying diagnostics intact for support logs, but establish
+        // the panel baseline after that second so transient startup pressure is
+        // not presented to the user as sustained recording frame loss.
         const auto dropped = snapshot.droppedFrameCount;
-        if (selectedElapsed <= 0.0 ||
-                (!recording::HasRecordingTimeline(snapshot.state) &&
-                 !broadcast::CanStop(livestream.state))) {
+        const bool outputActive = recording::HasRecordingTimeline(snapshot.state) ||
+            broadcast::CanStop(livestream.state);
+        if (!outputActive || selectedElapsed <= 0.0) {
             recordingWorldPanelDropSamples_.clear();
             recordingWorldPanelSessionStartDrops_ = dropped;
+            recordingWorldPanelDropWarmupComplete_ = false;
+        } else if (selectedElapsed < 1.0) {
+            recordingWorldPanelDropSamples_.clear();
+            recordingWorldPanelSessionStartDrops_ = dropped;
+        } else if (!recordingWorldPanelDropWarmupComplete_) {
+            recordingWorldPanelDropSamples_.clear();
+            recordingWorldPanelSessionStartDrops_ = dropped;
+            recordingWorldPanelDropWarmupComplete_ = true;
         }
         recordingWorldPanelDropSamples_.push_back({selectedElapsed, dropped});
         while (recordingWorldPanelDropSamples_.size() > 1 &&
                 recordingWorldPanelDropSamples_.front().first < selectedElapsed - 5.0) {
             recordingWorldPanelDropSamples_.pop_front();
         }
-        const auto recentDrops = dropped >= recordingWorldPanelDropSamples_.front().second
+        const auto recentDrops = recordingWorldPanelDropWarmupComplete_ &&
+                dropped >= recordingWorldPanelDropSamples_.front().second
             ? dropped - recordingWorldPanelDropSamples_.front().second : 0;
-        const auto totalDrops = dropped >= recordingWorldPanelSessionStartDrops_
-            ? dropped - recordingWorldPanelSessionStartDrops_ : dropped;
+        const auto totalDrops = recordingWorldPanelDropWarmupComplete_ &&
+                dropped >= recordingWorldPanelSessionStartDrops_
+            ? dropped - recordingWorldPanelSessionStartDrops_ : 0;
         if (IsAlive(recordingWorldPanelDropText_)) {
             recordingWorldPanelDropText_->set_text(
                 "Current Frame Loss: " + std::to_string(recentDrops) +
@@ -5877,7 +6285,12 @@ void MenuController::EnsureChatWorldPanel() {
     screenObject->set_layer(5);
     UnityEngine::Object::DontDestroyOnLoad(screenObject);
     chatWorldPanelScreen_->set_HandleSide(BSML::Side::Top);
-    chatWorldPanelScreen_->set_HighlightHandle(false);
+    // Keep highlight-state tracking enabled even though the primitive renderer
+    // is hidden below. FloatingScreenHandle only changes its material alpha on
+    // pointer enter/exit when this flag is true; TickChatWorldPanel reads that
+    // state to give the native HMUI ScrollView joystick focus without taking
+    // away the same full-panel trigger-to-grab behavior.
+    chatWorldPanelScreen_->set_HighlightHandle(true);
     chatWorldPanelScreen_->get_transform()->set_localScale({
         kChatPanelScale, kChatPanelScale, kChatPanelScale});
     HideAndFitWorldPanelHandleBehindContent(chatWorldPanelScreen_, panelSize);
@@ -6117,18 +6530,25 @@ void MenuController::UpdateChatWorldPanelLayout() {
             {0.0F, (bodyTop + bodyBottom) * 0.5F},
             {width - 5.0F, bodyHeight});
         if (auto* content = chatWorldPanelScrollView_->get_contentTransform().ptr()) {
-            // Stretch the content canvas across the complete viewport. The
-            // recycled TMP rows use the same horizontal stretch, so even a
-            // one-word message owns the full available width and begins at the
-            // left margin instead of being centered at its preferred width.
+            // BSML's ScrollView content is normally width-driven by a layout
+            // fitter. Chat deliberately disables that fitter for virtualization,
+            // so horizontal stretch can collapse to roughly one glyph on Quest.
+            // Give the content a deterministic width matching the text viewport.
+            const float textWidth = std::max(25.0F, width - 14.0F);
             auto anchorMin = content->get_anchorMin();
             auto anchorMax = content->get_anchorMax();
-            anchorMin.x = 0.0F;
-            anchorMax.x = 1.0F;
+            anchorMin.x = 0.5F;
+            anchorMax.x = 0.5F;
             content->set_anchorMin(anchorMin);
             content->set_anchorMax(anchorMax);
+            auto pivot = content->get_pivot();
+            pivot.x = 0.5F;
+            content->set_pivot(pivot);
+            auto position = content->get_anchoredPosition();
+            position.x = 0.0F;
+            content->set_anchoredPosition(position);
             auto size = content->get_sizeDelta();
-            size.x = 0.0F;
+            size.x = textWidth;
             content->set_sizeDelta(size);
         }
     }
@@ -6179,6 +6599,7 @@ void MenuController::ReflowChatWorldPanelText() {
     const bool contentOverflows = offset > pageHeight + 0.5F;
     chatWorldPanelScrollView_->SetContentSize(contentHeight);
     chatWorldPanelContentOverflows_ = contentOverflows;
+    chatWorldPanelScrollView_->RefreshButtons();
     if (!contentOverflows) {
         // A status line or a small number of wrapped messages fits on the
         // page. Keep it top-aligned; ScrollToEnd on BSML's cloned scroll view
@@ -6250,11 +6671,14 @@ void MenuController::RefreshVirtualizedChatRows() {
             }
         }
         auto rect = row->get_rectTransform();
-        rect->set_anchorMin({0.0F, 1.0F});
-        rect->set_anchorMax({1.0F, 1.0F});
+        // Fixed-width pooled rows match the fixed-width virtualized content.
+        // Stretch anchors here depend on a parent layout component that chat
+        // intentionally disables and caused the one-character-wide regression.
+        rect->set_anchorMin({0.5F, 1.0F});
+        rect->set_anchorMax({0.5F, 1.0F});
         rect->set_pivot({0.5F, 1.0F});
         rect->set_anchoredPosition({0.0F, -entry.offset});
-        rect->set_sizeDelta({-(std::max(0.0F, chat.width - textWidth)), entry.height});
+        rect->set_sizeDelta({textWidth, entry.height});
         ++poolIndex;
     }
 
@@ -6467,6 +6891,49 @@ void MenuController::TickChatWorldPanel() noexcept {
         UpdateWorldPanelHandleRotation(chatWorldPanelScreen_);
         TickChatWorldPanelResize();
         UpdateChatWorldPanelPersistence();
+
+        if (IsAlive(chatWorldPanelScrollView_) &&
+                IsAlive(chatWorldPanelScreen_->handle)) {
+            auto* handle = chatWorldPanelScreen_->handle->GetComponent<
+                BSML::FloatingScreenHandle*>();
+            const bool bodyGrabbed = IsAlive(handle) &&
+                static_cast<bool>(handle->__get__grabbingController());
+
+            // HMUI normally scrolls only after its viewport receives a UI
+            // pointer-enter event. The chat viewport deliberately does not
+            // consume pointer raycasts because the black panel body must also
+            // remain grabbable. Read the VR pointer's actual hit object instead
+            // and feed that hover state back to the native ScrollView. This
+            // keeps both interactions: trigger-drag moves the panel, while the
+            // stock HMUI joystick path scrolls and updates its native bar.
+            bool pointerOverPanel = false;
+            auto eventSystem = UnityEngine::EventSystems::EventSystem::get_current();
+            if (IsAlive(eventSystem.ptr())) {
+                auto inputModule = eventSystem->get_currentInputModule()
+                    .try_cast<VRUIControls::VRInputModule>()
+                    .value_or(nullptr);
+                if (IsAlive(inputModule.ptr()) && IsAlive(inputModule->_vrPointer.ptr())) {
+                    auto* pointer = inputModule->_vrPointer.ptr();
+                    auto* pointedObject = pointer->get_pointingOver().ptr();
+                    if (IsAlive(pointedObject)) {
+                        auto* pointedTransform = pointedObject->get_transform().ptr();
+                        auto* panelTransform = chatWorldPanelScreen_->get_transform().ptr();
+                        pointerOverPanel = IsAlive(pointedTransform) &&
+                            IsAlive(panelTransform) &&
+                            (pointedTransform == panelTransform ||
+                             pointedTransform->IsChildOf(panelTransform));
+                    }
+                }
+            }
+            // Route joystick input through HMUI's own scroll implementation.
+            // The panel body intentionally passes trigger raycasts through to
+            // FloatingScreen's movement handle, so the stock pointer-enter
+            // callback cannot own this flag. The actual VR pointer hit still
+            // tells us when the controller is over this panel; HMUI then keeps
+            // its proven dead-zone, quick-snap, bounds, and scroll indicator.
+            chatWorldPanelScrollView_->____isHoveredByPointer =
+                pointerOverPanel && !bodyGrabbed && chatWorldPanelContentOverflows_;
+        }
 
         // The stock BSML scroll control supplies page-up/page-down buttons and
         // a visible position bar. Auto-follow remains active only while the
@@ -7772,6 +8239,116 @@ void MenuController::RefreshCalibrationStatus() {
     if (IsAlive(calibrationPanelScreen_)) RefreshCalibrationPanel();
 }
 
+void MenuController::ApplyLivestreamReferenceLayout() {
+    if (!IsAlive(livestreamContentRoot_) || !IsAlive(livestreamServiceReference_)) return;
+    auto content = livestreamContentRoot_->get_transform();
+    auto* contentRect = livestreamContentRoot_->GetComponent<UnityEngine::RectTransform*>();
+    if (!contentRect) return;
+
+    // DropdownListSetting lives on the selector child. Walk to the immediate
+    // page child to find Service's real group, rather than resizing the inner
+    // selector and accidentally leaving the rest of the page at another width.
+    auto reference = livestreamServiceReference_->get_transform();
+    while (reference && reference->get_parent() != content) reference = reference->get_parent();
+    if (!reference) return;
+    auto labelTransform = reference->Find("Label");
+    auto* referenceRect = reference->GetComponent<UnityEngine::RectTransform*>();
+    auto* labelRect = labelTransform ? labelTransform->GetComponent<UnityEngine::RectTransform*>() : nullptr;
+    auto* selectorRect = livestreamServiceReference_->GetComponent<UnityEngine::RectTransform*>();
+    if (!referenceRect || !labelRect || !selectorRect) {
+        Logging::Logger.error("Live Stream layout: Service reference row/label/selector missing; no layout applied");
+        return;
+    }
+
+    UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(contentRect);
+    UnityEngine::Canvas::ForceUpdateCanvases();
+    auto referenceBounds = referenceRect->get_rect();
+    auto labelBounds = labelRect->get_rect();
+    auto selectorBounds = selectorRect->get_rect();
+    const float rowWidth = referenceBounds.get_width();
+    auto* label = labelRect->GetComponent<TMPro::TextMeshProUGUI*>();
+    const float labelMargin = label ? label->get_margin().x : 0.0F;
+    const auto relativeX = [&](UnityEngine::RectTransform* rect, float x) {
+        // Work in Service-row units, not world/panel offsets. The two side
+        // panels can be rotated in the room without changing this alignment.
+        return referenceRect->InverseTransformPoint(rect->TransformPoint({x, 0.0F, 0.0F})).x
+            - referenceBounds.get_xMin();
+    };
+    const float leftInset = relativeX(labelRect, labelBounds.get_xMin() + labelMargin);
+    const float selectorLeft = relativeX(selectorRect, selectorBounds.get_xMin());
+    const float rightInset = rowWidth - relativeX(selectorRect, selectorBounds.get_xMax());
+    if (!std::isfinite(rowWidth) || !std::isfinite(leftInset) || !std::isfinite(rightInset) ||
+        !std::isfinite(selectorLeft) || rowWidth <= 0.0F || selectorLeft <= leftInset ||
+        rowWidth - rightInset <= selectorLeft) {
+        Logging::Logger.warn("Live Stream layout: Service geometry not ready; no guessed width applied");
+        return;
+    }
+
+    // Pass 1: size every peer's OUTER row/group first. Keep the existing
+    // centered page layout; moving that parent left shifts the reference too.
+    // Service (including all of its descendants) is deliberately excluded.
+    const int rowCount = content->get_childCount();
+    for (int row = 0; row < rowCount; ++row) {
+        auto child = content->GetChild(row);
+        if (child == reference) continue;
+        SetLivestreamRowWidth(child->get_gameObject(), rowWidth);
+    }
+
+    // Pass 2: fit each row's own contents inside the SAME visible span. Native
+    // buttons/sliders keep their visual hierarchy and input handling; only
+    // layout bounds change. No descendant-wide repositioning or raycast edits.
+    int actionRows = 0;
+    for (int row = 0; row < rowCount; ++row) {
+        auto child = content->GetChild(row);
+        if (child == reference) continue;
+        auto* object = child->get_gameObject().ptr();
+        if (auto* slider = object->GetComponent<BSML::SliderSetting*>()) {
+            if (auto title = child->Find("Title")) {
+                FitLivestreamHorizontalSpan(title->GetComponent<UnityEngine::RectTransform*>(),
+                    leftInset, rowWidth - selectorLeft + 1.0F);
+            }
+            if (slider->slider) {
+                FitLivestreamHorizontalSpan(slider->slider->GetComponent<UnityEngine::RectTransform*>(),
+                    selectorLeft, rightInset);
+            }
+        } else if (auto* toggle = object->GetComponent<BSML::ToggleSetting*>()) {
+            FitLivestreamToggle(toggle, leftInset, rightInset);
+        } else if (auto* text = object->GetComponent<TMPro::TextMeshProUGUI*>()) {
+            // Text is itself the outer row; margins provide the same content
+            // inset without adding another container or changing its height.
+            auto margin = text->get_margin();
+            margin.x = leftInset;
+            margin.z = rightInset;
+            text->set_margin(margin);
+        } else if (auto* dropdown = object->GetComponentInChildren<BSML::DropdownListSetting*>(true)) {
+            if (auto caption = child->Find("Label")) {
+                FitLivestreamHorizontalSpan(caption->GetComponent<UnityEngine::RectTransform*>(),
+                    leftInset, rowWidth - selectorLeft + 1.0F);
+                if (auto* text = caption->GetComponent<TMPro::TextMeshProUGUI*>()) {
+                    text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+                    text->set_enableWordWrapping(false);
+                    text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+                }
+            }
+            FitLivestreamHorizontalSpan(dropdown->GetComponent<UnityEngine::RectTransform*>(),
+                selectorLeft, rightInset);
+        } else if (auto* group = object->GetComponent<UnityEngine::UI::HorizontalLayoutGroup*>()) {
+            FitLivestreamActionRow(group, rowWidth, leftInset, rightInset);
+            ++actionRows;
+        }
+    }
+    UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(contentRect);
+    UnityEngine::Canvas::ForceUpdateCanvases();
+    for (auto* slider : {livestreamGameAudioVolumeSlider_, livestreamMicrophoneVolumeSlider_}) {
+        if (IsAlive(slider) && slider->slider) slider->slider->UpdateVisuals();
+    }
+    // Geometry only: never include input-field contents, stream keys or tokens.
+    Logging::Logger.info(
+        "Live Stream layout matched Service: outerWidth={:.2f}, leftInset={:.2f}, "
+        "selectorLeft={:.2f}, rightInset={:.2f}, peerRows={}, actionGroups={}",
+        rowWidth, leftInset, selectorLeft, rightInset, rowCount - 1, actionRows);
+}
+
 void MenuController::ShowRecordingTab(int index) {
     index = std::clamp(index, 0, 2);
     selectedRecordingTab_ = index;
@@ -7779,6 +8356,9 @@ void MenuController::ShowRecordingTab(int index) {
         if (recordingTabViewRoots_[page]) recordingTabViewRoots_[page]->SetActive(page == selectedRecordingTab_);
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
+    // Hidden native prefabs have stale rectangles. Resolve the ruler only on
+    // tab activation, not in Update or in streaming/status refresh callbacks.
+    if (selectedRecordingTab_ == 1) ApplyLivestreamReferenceLayout();
 }
 
 } // namespace saberstage::ui

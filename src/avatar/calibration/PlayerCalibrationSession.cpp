@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Runs the guided calibration state machine and captures accepted samples.
+// - Calibration is transactional: cancellation restores the prior profile and only completion persists changes.
+
 #include "saberstage/avatar/calibration/PlayerCalibrationSession.hpp"
 
 #include "saberstage/avatar/Math.hpp"
@@ -67,6 +79,8 @@ std::vector<CalibrationStep> BasicPlan() {
 }
 
 std::vector<CalibrationStep> AdvancedPlan() {
+    // Enum order is the authored workflow order and is covered by host tests;
+    // deriving the list prevents a newly added step from being silently omitted.
     std::vector<CalibrationStep> result;
     result.reserve(kCalibrationStepCount);
     for (std::size_t index = 0; index < kCalibrationStepCount; ++index) {
@@ -98,6 +112,9 @@ CalibrationFrame ToFrame(const TrackingSample& sample, float time) noexcept {
 }
 
 float Median(std::vector<float> values) {
+    // Calibration happens in ordinary play space where an individual tracking
+    // sample may spike. Median positions reject those outliers without tuning a
+    // filter window to one headset or room.
     if (values.empty()) return 0.0F;
     const auto middle = values.begin() + values.size() / 2;
     std::nth_element(values.begin(), middle, values.end());
@@ -192,6 +209,8 @@ float DirectionalAmount(CalibrationStep step, Vec3 value) noexcept {
 MotionFeatures MeasureMotion(const std::vector<CalibrationFrame>& frames) noexcept {
     MotionFeatures features{};
     if (frames.size() < 2) return features;
+    // Normalize displacement and speed by player height so validation thresholds
+    // remain meaningful across different-sized players.
     const auto height = HeightFrom(frames);
     const auto startHead = frames.front().head.pose;
     const auto startMidpoint = ControllerMidpoint(frames.front());
@@ -290,6 +309,8 @@ float MultiPoseConsistency(
             if (!prior.valid || !prior.usedSaberGrip[side]) continue;
             priorControllerToGrip.push_back(RelativeTo(prior.controller[side], prior.grip[side]));
         }
+        // One prior pose cannot establish a stable controller-to-grip offset.
+        // Require independent observations before penalizing the candidate.
         if (!candidate.usedSaberGrip[side] || priorControllerToGrip.size() < 2) continue;
 
         Vec3 averagePosition{};
@@ -327,6 +348,8 @@ bool SummarizeStatic(
     std::vector<Pose> head;
     std::vector<Pose> controllers[2];
     std::vector<Pose> grips[2];
+    // Remove motion-contaminated samples before calculating the robust pose. Too
+    // little stable time retries the step instead of saving unreliable alignment.
     for (const auto& frame : frames) {
         const auto stable = Length(frame.head.linearVelocity) < 0.22F &&
             Length(frame.head.angularVelocity) < 1.5F &&
@@ -600,6 +623,8 @@ bool PlayerCalibrationSession::BeginSession(
         if (error) *error = "the selected calibration has no capture steps";
         return false;
     }
+    // Snapshot before clearing working data. Restart and Cancel both depend on
+    // this being the last accepted profile rather than a partially fitted one.
     profileBeforeSession_ = profile_;
     runtimeBeforeSession_ = runtime_;
     profile_ = {};
@@ -708,6 +733,8 @@ bool PlayerCalibrationSession::Complete(std::string* error) noexcept {
         if (error) *error = "calibration results are not ready to save";
         return false;
     }
+    // Persistence is the commit point. Until it succeeds, Cancel can still
+    // restore the last accepted runtime profile without leaking partial results.
     std::string saveError;
     if (!SavePlayerCalibrationProfile(profilePath_, profile_, &saveError)) {
         status_.phase = CalibrationPhase::Failed;
@@ -781,6 +808,8 @@ void PlayerCalibrationSession::BeginCurrentStep(double timestamp) noexcept {
 }
 
 void PlayerCalibrationSession::FinishCapture() noexcept {
+    // Static and movement steps use different evidence. Both paths must produce
+    // an accepted confidence result before the workflow can advance.
     const auto step = status_.step;
     float confidence = 0.0F;
     bool accepted = false;
@@ -892,6 +921,8 @@ void PlayerCalibrationSession::SetValidation(bool accepted, std::string details)
 }
 
 void PlayerCalibrationSession::Update(const TrackingSample& sample) noexcept {
+    // Tracking timestamps drive the state machine so a rendering stall cannot
+    // shorten the countdown or change the capture duration.
     if (!Active() || !sample.head.valid || !sample.leftHand.valid || !sample.rightHand.valid) return;
     const auto timestamp = sample.head.timestampSeconds;
     if (status_.phase == CalibrationPhase::Preparing) {

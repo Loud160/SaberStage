@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Centralizes recoverable error reporting, deduplication, and the user-visible error queue.
+// - Keeps logging independent from Unity UI so failures can be recorded before a menu exists.
+
 #pragma once
 
 #include <exception>
@@ -24,6 +36,11 @@ public:
     void ReportUserVisible(
         std::string title,
         std::string detail) noexcept;
+    // Called only after Beat Saber's MainFlowCoordinator has completed its
+    // activation callback. Until that point BSML's main-flow lookup can touch
+    // incomplete IL2CPP metadata and must not be queried, even from Unity's
+    // main thread.
+    void NotifyMainFlowActivated() noexcept;
     void TickMainThread() noexcept;
 
     template <typename Function>
@@ -63,6 +80,7 @@ private:
     std::optional<std::pair<std::string, std::string>> pendingDialog_;
     std::optional<std::pair<std::string, std::string>> activeDialog_;
     std::uint64_t dialogGeneration_ = 0;
+    bool uiDiscoveryReady_ = false;
     bool dialogVisible_ = false;
     bool dialogAcknowledged_ = false;
     bool dialogFailureLogged_ = false;

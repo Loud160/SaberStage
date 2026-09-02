@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Defines the validated mesh, skin, material, expression, and spring-bone data produced by the parser.
+// - Ownership is explicit so the Unity runtime never retains views into temporary GLB buffers.
+
 #pragma once
 
 #include <array>
@@ -10,6 +22,8 @@
 
 namespace saberstage::avatar::vrm {
 
+// Plain value types mirror glTF numeric storage without exposing RapidJSON or
+// Unity types to the validated asset model.
 struct Float2 { float x = 0.0F; float y = 0.0F; };
 struct Float3 { float x = 0.0F; float y = 0.0F; float z = 0.0F; };
 struct Float4 { float x = 0.0F; float y = 0.0F; float z = 0.0F; float w = 0.0F; };
@@ -25,6 +39,8 @@ struct Matrix4 {
 };
 
 struct AssetLimits {
+    // Limits are enforced before allocation or decode. They are deliberately
+    // conservative for Quest memory while still covering normal VRM avatars.
     std::size_t maximumFileBytes = 256U * 1024U * 1024U;
     std::size_t maximumJsonBytes = 32U * 1024U * 1024U;
     std::size_t maximumBinaryBytes = 224U * 1024U * 1024U;
@@ -92,6 +108,8 @@ struct TextureTransform {
 };
 
 struct MToonMaterial {
+    // VRM 0.x MToon extensions are property bags. Preserving authored names here
+    // lets the Unity runtime map supported properties and log unsupported ones.
     std::string name;
     std::string shader;
     std::unordered_map<std::string, float> floatProperties;
@@ -110,6 +128,8 @@ struct MorphTarget {
 };
 
 struct Primitive {
+    // Every vector owns its decoded data. No span into the source GLB survives
+    // parsing, which makes VrmAsset safe to move into the Unity runtime.
     std::vector<Float3> positions;
     std::vector<Float3> normals;
     std::vector<Float4> tangents;
@@ -217,6 +237,8 @@ struct AssetStatistics {
 };
 
 struct VrmAsset {
+    // Indices in nodes/meshes/skins/textures are fully cross-validated before a
+    // successful ParseResult exposes this object.
     std::string sourceLabel;
     std::string generator;
     std::string vrmExporterVersion;
@@ -240,6 +262,8 @@ struct VrmAsset {
 };
 
 struct ParseResult {
+    // Malformed user files are ordinary result data, not exceptions crossing the
+    // public parser boundary. Warnings describe safely ignored optional content.
     std::optional<VrmAsset> asset;
     std::string error;
     std::vector<std::string> warnings;

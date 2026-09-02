@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Renders the hand-placement calibration gizmo on Quest.
+// - Its multiview variants keep the target visible in both headset eyes.
+
 // Transparent world-space shader for the LIV-style hand-placement target.
 //
 // The target must remain readable in both Quest eyes while still allowing the

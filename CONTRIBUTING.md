@@ -1,9 +1,49 @@
 # Contributing to SaberStage
 
-SaberStage is still in early development and no final project license or
-inbound contribution terms have been selected. Discuss a proposed contribution
-with the maintainer before submitting code; opening a pull request does not by
-itself create a license grant beyond rights you already hold.
+SaberStage is distributed outbound under **GPL-3.0-only**, with additional
+terms and an interoperability permission under GPLv3 section 7. See
+[LICENSE](LICENSE) and
+[LICENSE-ADDITIONAL-TERMS.md](LICENSE-ADDITIONAL-TERMS.md).
+
+## Inbound MIT license grant
+
+By intentionally submitting a contribution to SaberStage, you license that
+contribution to **Loud160 (AKA Whisp)**, the SaberStage project, and its
+maintainer under the [MIT License for inbound contributions](INBOUND_LICENSE.md)
+in addition to any license applicable to the distributed SaberStage project.
+
+This separate inbound MIT grant permits the maintainer to use, copy, modify,
+merge, publish, distribute, sublicense, relicense, dual-license, sell, grant
+exceptions for, and otherwise exercise the rights granted by the MIT License
+over the submitted contribution. SaberStage's outbound GPL-3.0-only plus
+section 7 licensing does not restrict the maintainer's separate rights received
+from contributors under this inbound MIT grant. When exercising that separate
+inbound MIT license, the maintainer is not required to apply SaberStage's GPLv3
+section 7 attribution requirements to the maintainer's independent use of the
+contributor material.
+
+This is a license grant, not a copyright assignment. Contributors retain any
+copyright ownership they otherwise hold. By opening or submitting a pull
+request, the contributor acknowledges these inbound contribution terms.
+
+## Developer Certificate of Origin 1.1
+
+Every contribution must also be certified under the
+[Developer Certificate of Origin 1.1](DCO.txt). Sign each commit with:
+
+```text
+git commit -s
+```
+
+which adds:
+
+```text
+Signed-off-by: Contributor Name <email@example.com>
+```
+
+The DCO sign-off certifies provenance and the contributor's right to submit the
+change. It does **not** create or grant the inbound MIT license. The inbound MIT
+grant above is a separate condition of intentional submission.
 
 ## Engineering expectations
 

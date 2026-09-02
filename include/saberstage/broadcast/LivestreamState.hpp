@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Defines livestream states and the validated transitions between them.
+// - Central transition rules keep menu actions and backend callbacks from creating impossible states.
+
 #pragma once
 
 #include <cstdint>
@@ -29,6 +41,11 @@ struct LivestreamSnapshot {
     // controls without stopping capture or changing the saved preference.
     bool microphoneAvailable = false;
     bool microphoneMuted = true;
+    // Game audio follows the same session-mute contract as the microphone:
+    // muting from the movable panel never overwrites the saved source toggle
+    // or volume, so unmute restores the user's configured live mix.
+    bool gameAudioAvailable = false;
+    bool gameAudioMuted = true;
 };
 
 inline bool CanStart(LivestreamState state) noexcept {

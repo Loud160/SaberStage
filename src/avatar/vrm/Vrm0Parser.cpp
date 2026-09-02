@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Parses bounded GLB and VRM 0.x data into a Unity-independent asset description.
+// - Every offset, stride, count, and reference is validated before binary data is read.
+
 #include "saberstage/avatar/vrm/Vrm0Parser.hpp"
 
 #include <rapidjson/document.h>
@@ -231,6 +243,9 @@ public:
         : file_(bytes), limits_(limits) { asset_.sourceLabel = std::move(label); }
 
     ParseResult Run() {
+        // Parsing is deliberately phased: establish byte-safe views first,
+        // construct typed objects second, then validate references that can only
+        // be checked after every collection exists.
         ParseGlb();
         ParseRoot();
         ValidateCrossReferences();
@@ -246,12 +261,16 @@ public:
 
 private:
     void ParseGlb() {
+        // GLB-declared sizes are untrusted. Every subtraction is ordered to avoid
+        // unsigned wraparound before subspan or RapidJSON sees the bytes.
         if (file_.size() > limits_.maximumFileBytes) throw ParseFailure("file exceeds configured byte limit");
         if (file_.size() < 20) throw ParseFailure("file is too small to be a GLB");
         if (ReadU32(file_, 0) != kGlbMagic) throw ParseFailure("file is not a binary glTF (GLB)");
         if (ReadU32(file_, 4) != 2) throw ParseFailure("only GLB version 2 is supported");
         if (ReadU32(file_, 8) != file_.size()) throw ParseFailure("GLB declared length does not match file size");
 
+        // VRM 0.x is self-contained here: exactly one JSON chunk and one BIN
+        // chunk. Unknown optional chunks are skipped only after bounds validation.
         std::size_t offset = 12;
         bool foundJson = false;
         while (offset < file_.size()) {
@@ -292,6 +311,8 @@ private:
         const auto* vrm = extensions ? Member(*extensions, "VRM") : nullptr;
         if (!vrm || !vrm->IsObject()) throw ParseFailure("VRM 0.x extension is missing");
 
+        // Unknown optional extensions can be ignored with a warning; an unknown
+        // required extension means the asset cannot be rendered faithfully.
         static const std::unordered_set<std::string> supportedExtensions{
             "VRM", "KHR_materials_unlit", "KHR_texture_transform"};
         if (const auto* used = Member(document_, "extensionsUsed")) {
@@ -311,6 +332,8 @@ private:
             }
         }
 
+        // Preserve dependency order: later objects refer by numeric index to the
+        // collections parsed before them.
         ParseBufferViews();
         ParseAccessors();
         ParseSamplers();
@@ -360,6 +383,9 @@ private:
             accessor.type = StringValue(&RequireMember(value, "type", "accessor"));
             accessor.normalized = BoolValue(Member(value, "normalized"));
             if (accessor.bufferView >= bufferViews_.size()) throw ParseFailure("accessor references an invalid bufferView");
+            // Validate the final addressed element with overflow-safe arithmetic.
+            // Passing only the first element check would permit a hostile count or
+            // stride to read beyond the BIN chunk during Decode.
             const auto elementBytes = ComponentBytes(accessor.componentType) * ComponentCount(accessor.type);
             const auto stride = bufferViews_[accessor.bufferView].stride == 0 ? elementBytes : bufferViews_[accessor.bufferView].stride;
             if (stride < elementBytes) throw ParseFailure("accessor byteStride is smaller than its element");
@@ -384,6 +410,8 @@ private:
         const auto& accessor = GetAccessor(index, expectedType);
         const auto components = ComponentCount(accessor.type);
         if (accessor.count > std::numeric_limits<std::size_t>::max() / components) throw ParseFailure("accessor decoded size overflows");
+        // Normalize all glTF scalar representations through double once. Typed
+        // conversion below then stays uniform for positions, weights, and indices.
         std::vector<double> result(accessor.count * components);
         const auto& view = bufferViews_[accessor.bufferView];
         const auto componentBytes = ComponentBytes(accessor.componentType);
@@ -484,6 +512,8 @@ private:
         asset_.images.reserve(values->Size());
         for (const auto& value : values->GetArray()) {
             if (!value.IsObject()) throw ParseFailure("image must be an object");
+            // External paths and data URIs would add filesystem/network ambiguity.
+            // SaberStage accepts only images embedded in the already bounded BIN.
             if (Member(value, "uri")) throw ParseFailure("external/data-URI images are not supported; VRM must be self-contained");
             const auto viewIndex = CheckedIndex(RequireMember(value, "bufferView", "image"), "image.bufferView");
             if (viewIndex >= bufferViews_.size()) throw ParseFailure("image references an invalid bufferView");
@@ -497,6 +527,8 @@ private:
             }
             image.encoded.assign(binary_.begin() + static_cast<std::ptrdiff_t>(view.offset),
                                  binary_.begin() + static_cast<std::ptrdiff_t>(view.offset + view.length));
+            // Read dimensions from the encoded header before Unity allocation so
+            // compressed-image bombs are rejected at the parser boundary.
             std::tie(image.encodedWidth, image.encodedHeight) = ImageDimensions(image.encoded, image.mimeType);
             if (image.encodedWidth == 0 || image.encodedHeight == 0) throw ParseFailure("could not validate encoded image dimensions");
             if (image.encodedWidth > limits_.maximumImageDimension || image.encodedHeight > limits_.maximumImageDimension) {
@@ -527,6 +559,9 @@ private:
     }
 
     void ParseMaterials(const rapidjson::Value& vrm) {
+        // VRM 0.x stores rendering intent across base glTF materials and the VRM
+        // materialProperties extension. Merge by material index into one MToon
+        // description for the Unity runtime.
         const auto parseTextureInfo = [&](const rapidjson::Value* textureInfo,
                                           MToonMaterial& material,
                                           const char* property,
@@ -851,6 +886,8 @@ private:
                 for (const auto& child : children->GetArray()) node.children.push_back(CheckedIndex(child, "node child"));
             }
         }
+        // Build reverse parent links only after all child arrays exist, rejecting
+        // multiple parents because Unity Transform hierarchies require one owner.
         for (std::size_t parent = 0; parent < asset_.nodes.size(); ++parent) {
             std::unordered_set<std::size_t> unique;
             for (const auto child : asset_.nodes[parent].children) {
@@ -861,6 +898,8 @@ private:
                 asset_.nodes[child].parent = parent;
             }
         }
+        // A three-color DFS detects cycles before runtime Transform creation;
+        // allowing a cycle here would make hierarchy traversal non-terminating.
         std::vector<std::uint8_t> color(asset_.nodes.size());
         const auto visit = [&](auto&& self, std::size_t node) -> void {
             if (color[node] == 1) throw ParseFailure("node hierarchy contains a cycle");
@@ -924,6 +963,8 @@ private:
             if (*node >= asset_.nodes.size()) throw ParseFailure("VRM humanoid bone '" + name + "' has an invalid node");
             if (!asset_.humanoidBones.emplace(name, *node).second) throw ParseFailure("VRM humanoid maps bone '" + name + "' more than once");
         }
+        // These bones are the minimum chain needed by SaberStage's solver. Extra
+        // humanoid bones remain optional and are used when an avatar supplies them.
         static constexpr std::array<std::string_view, 17> required{
             "hips", "leftUpperLeg", "leftLowerLeg", "leftFoot", "rightUpperLeg", "rightLowerLeg", "rightFoot",
             "spine", "chest", "neck", "head", "leftUpperArm", "leftLowerArm", "leftHand",
@@ -1040,6 +1081,8 @@ private:
     }
 
     void ValidateCrossReferences() const {
+        // Node, skin, and primitive relationships span separate glTF arrays and
+        // therefore cannot be proven valid during each collection's local parse.
         for (std::size_t nodeIndex = 0; nodeIndex < asset_.nodes.size(); ++nodeIndex) {
             const auto& node = asset_.nodes[nodeIndex];
             if (node.mesh && *node.mesh >= asset_.meshes.size()) throw ParseFailure("node mesh reference is out of range");
@@ -1074,6 +1117,8 @@ private:
 } // namespace
 
 ParseResult ParseVrm0Bytes(std::span<const std::uint8_t> bytes, std::string sourceLabel, const AssetLimits& limits) {
+    // Convert parser exceptions into data so malformed user avatars remain a
+    // recoverable load error rather than escaping into the Beat Saber lifecycle.
     try {
         return Parser(bytes, std::move(sourceLabel), limits).Run();
     } catch (const ParseFailure& failure) {
@@ -1087,6 +1132,8 @@ ParseResult ParseVrm0Bytes(std::span<const std::uint8_t> bytes, std::string sour
 
 ParseResult ParseVrm0File(const std::filesystem::path& path, const AssetLimits& limits) {
     try {
+        // Check the file size before allocating the backing vector. The byte parser
+        // repeats limits because callers may invoke ParseVrm0Bytes directly.
         std::ifstream stream(path, std::ios::binary | std::ios::ate);
         if (!stream) return {std::nullopt, "could not open VRM file: " + path.string(), {}};
         const auto end = stream.tellg();

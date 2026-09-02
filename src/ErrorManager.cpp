@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Centralizes recoverable error reporting, deduplication, and the user-visible error queue.
+// - Keeps logging independent from Unity UI so failures can be recorded before a menu exists.
+
 #include "saberstage/ErrorManager.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -169,6 +181,19 @@ void ErrorManager::ReportUserVisible(std::string title, std::string detail) noex
     }
 }
 
+void ErrorManager::NotifyMainFlowActivated() noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        // This flag is deliberately process-lifetime state. MainFlowCoordinator
+        // may deactivate during gameplay and reactivate later, but after its
+        // first completed activation BSML's cached flow metadata is initialized
+        // and safe to inspect when a queued dialog needs a host.
+        uiDiscoveryReady_ = true;
+    } catch (...) {
+        RecordDialogFailure("could not record main-menu UI readiness");
+    }
+}
+
 void ErrorManager::RecordDialogFailure(std::string_view detail) noexcept {
     bool shouldLog = false;
     try {
@@ -234,6 +259,18 @@ void ErrorManager::TickMainThread() noexcept {
 }
 
 void ErrorManager::TickMainThreadImpl() {
+    bool shouldResolveTarget = false;
+    {
+        std::scoped_lock lock(mutex_);
+        shouldResolveTarget = uiDiscoveryReady_ &&
+            (dialogVisible_ || pendingDialog_.has_value());
+    }
+    if (!shouldResolveTarget) return;
+
+    // GetMainFlowCoordinator is a BSML/IL2CPP metadata lookup, not a harmless
+    // availability probe. The readiness and work checks above must remain
+    // ahead of this call: invoking it during GameLoader caused an uncatchable
+    // SIGSEGV in il2cpp_class_is_valuetype on Quest.
     auto target = ResolveTarget();
     bool visible = false;
     bool acknowledged = false;

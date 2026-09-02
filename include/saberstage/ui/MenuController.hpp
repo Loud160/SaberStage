@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Builds SaberStage menus and floating panels and translates user actions into subsystem calls.
+// - Worker results are marshalled back to Unity before any UI object is touched.
+
 #pragma once
 
 #include "saberstage/camera/Math.hpp"
@@ -20,6 +32,7 @@ class ViewController;
 }
 
 namespace BSML {
+class DropdownListSetting;
 class SliderSetting;
 class ToggleSetting;
 class ModalView;
@@ -104,6 +117,7 @@ private:
     void RecordingWorldPanelPauseAction();
     void RecordingWorldPanelStopAction();
     void RecordingWorldPanelMicrophoneAction();
+    void RecordingWorldPanelGameAudioAction();
     void SetRecordingWorldPanelStreamMode(bool streamMode);
     void ResetRecordingWorldPanelPose();
     void SetChatWorldPanelVisible(bool visible);
@@ -163,6 +177,7 @@ private:
     void ShowAvatarTab(int index);
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
+    void ApplyLivestreamReferenceLayout();
     static MenuController* active_;
     app::ApplicationRoot& root_;
     TMPro::TextMeshProUGUI* scriptStatusText_ = nullptr;
@@ -178,6 +193,11 @@ private:
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
     HMUI::TextSegmentedControl* recordingTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 3> recordingTabViewRoots_{};
+    // Service is the user's fixed visual reference. Measure its native outer
+    // row only after the Live tab is visible; the dropdown component itself
+    // belongs to the inner selector, not to that row.
+    UnityEngine::GameObject* livestreamContentRoot_ = nullptr;
+    BSML::DropdownListSetting* livestreamServiceReference_ = nullptr;
     TMPro::TextMeshProUGUI* recordingStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingOutputText_ = nullptr;
     TMPro::TextMeshProUGUI* livestreamStatusText_ = nullptr;
@@ -317,6 +337,7 @@ private:
     UnityEngine::UI::Button* stopRecordingButton_ = nullptr;
     UnityEngine::UI::Button* startLivestreamButton_ = nullptr;
     UnityEngine::UI::Button* stopLivestreamButton_ = nullptr;
+    UnityEngine::UI::Button* connectTwitchButton_ = nullptr;
     UnityEngine::UI::Button* setLivestreamServerButton_ = nullptr;
     UnityEngine::UI::Button* setLivestreamKeyButton_ = nullptr;
     UnityEngine::UI::Button* clearLivestreamKeyButton_ = nullptr;
@@ -331,9 +352,9 @@ private:
     UnityEngine::UI::Button* recordingWorldPanelStopButton_ = nullptr;
     UnityEngine::UI::Button* recordingWorldPanelStreamControlButton_ = nullptr;
     UnityEngine::UI::Button* recordingWorldPanelMicrophoneButton_ = nullptr;
-    std::array<HMUI::ImageView*, 5> recordingWorldPanelMicrophoneGlyph_{};
-    HMUI::ImageView* recordingWorldPanelMicrophoneMuteSlash_ = nullptr;
-    HMUI::ImageView* recordingWorldPanelMicrophoneUnavailableSlash_ = nullptr;
+    UnityEngine::UI::RawImage* recordingWorldPanelMicrophoneIcon_ = nullptr;
+    UnityEngine::UI::Button* recordingWorldPanelGameAudioButton_ = nullptr;
+    UnityEngine::UI::RawImage* recordingWorldPanelGameAudioIcon_ = nullptr;
     // Per-panel material instances use the embedded zero-bloom alpha shader.
     // They are not shared with avatar or preview surfaces, so destroying or
     // rebuilding one floating panel cannot mutate another panel's UI state.
@@ -383,6 +404,9 @@ private:
     bool recordingWorldPanelHmdSessionActive_ = false;
     std::deque<std::pair<double, std::uint64_t>> recordingWorldPanelDropSamples_;
     std::uint64_t recordingWorldPanelSessionStartDrops_ = 0;
+    // The panel uses a post-start baseline so encoder/network startup pressure
+    // during the first second does not inflate the user-facing loss counters.
+    bool recordingWorldPanelDropWarmupComplete_ = false;
     std::uint64_t recordingWorldPanelLastFrames_ = 0;
     camera::Pose chatWorldPanelLastPose_{};
     float chatWorldPanelStableSeconds_ = 0.0F;

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Forwards Unity frame and lifecycle events to the active AvatarManager.
+// - Binding is explicitly cleared during teardown so stale Unity callbacks become harmless no-ops.
+
 #include "saberstage/avatar/AvatarRuntimeDriver.hpp"
 
 #include "saberstage/avatar/AvatarManager.hpp"

@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Moves encoded packet file writes off the capture callback through a bounded queue.
+// - Backpressure drops and reports packets instead of blocking Unity or growing memory without limit.
+
 #include "saberstage/recording/AsyncVideoWriter.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -31,6 +43,9 @@ public:
         if (!data || length == 0 || failed_.load(std::memory_order_acquire)) return false;
         try {
             std::unique_lock lock(mutex_);
+            // Never wait for storage from an encoder callback. The byte budget
+            // is the hard memory ceiling; crossing it is reported as a dropped
+            // packet so the caller can stop or surface degraded output.
             if (!accepting_ || queuedBytes_ + length > maximumQueuedBytes_) {
                 droppedPackets_.fetch_add(1, std::memory_order_relaxed);
                 return false;
@@ -53,6 +68,8 @@ public:
             accepting_ = false;
         }
         ready_.notify_one();
+        // Joining here guarantees every packet accepted before accepting_=false
+        // is written before finalization observes the file.
         if (worker_.joinable()) worker_.join();
     }
 
@@ -69,6 +86,8 @@ private:
                 {
                     std::unique_lock lock(mutex_);
                     ready_.wait(lock, [this] { return !queue_.empty() || !accepting_; });
+                    // Closing does not discard the queue: exit only after the
+                    // producer is closed and all previously accepted data drains.
                     if (queue_.empty() && !accepting_) break;
                     packet = std::move(queue_.front());
                     queue_.pop_front();

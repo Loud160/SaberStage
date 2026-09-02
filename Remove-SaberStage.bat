@@ -1,5 +1,15 @@
 @echo off
 @REM SPDX-License-Identifier: GPL-3.0-only
+@REM SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+@REM
+@REM Part of SaberStage. Distributed under GPL-3.0-only with additional terms
+@REM under GPLv3 section 7(b)/(c) and an interoperability permission under
+@REM section 7; see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+@REM File responsibility:
+@REM - Provides the Windows entry point for ownership-aware SaberStage removal.
+@REM - Removal remains available while preserving explicit choices for settings and recordings.
+
 @REM Development launcher adapted from the Big Screen source workflow.
 setlocal
 pushd "%~dp0"

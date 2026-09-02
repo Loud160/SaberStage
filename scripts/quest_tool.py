@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+#
+# Part of SaberStage.
+# Distributed under GPL-3.0-only with additional terms under GPLv3
+# section 7(b)/(c) and an interoperability permission under section 7;
+# see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+# File responsibility:
+# - Implements shared Quest discovery, deployment, removal, and log collection.
+# - Device and install ownership checks remain identical across Windows and Linux wrappers.
+
 """Receipt-owned SaberStage source deploy, removal, and support logs.
 
 The workflow is adapted from Big Screen's source-install safety model: exact

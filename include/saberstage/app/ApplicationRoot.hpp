@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Constructs, wires, and tears down SaberStage subsystems in dependency order.
+// - Central ownership prevents Unity lifecycle callbacks from outliving the services they call.
+
 #pragma once
 
 #include "saberstage/settings/SettingsService.hpp"
@@ -33,6 +45,8 @@ class TwitchService;
 
 namespace saberstage::app {
 
+// Process-lifetime composition root. ApplicationRoot is the only object that owns
+// the major managers; the managers may reference one another but never own peers.
 class ApplicationRoot final {
 public:
     explicit ApplicationRoot(std::filesystem::path settingsPath);
@@ -41,6 +55,8 @@ public:
     ApplicationRoot(const ApplicationRoot&) = delete;
     ApplicationRoot& operator=(const ApplicationRoot&) = delete;
 
+    // Start is idempotent. A failed partial start is unwound by Stop so a later
+    // lifecycle callback cannot observe only part of the service graph.
     bool Start();
     void Stop() noexcept;
     settings::SettingsService& Settings() noexcept;
@@ -54,6 +70,8 @@ public:
     bool DeleteActiveAvatarPlayerProfile(std::string* error = nullptr);
 
 private:
+    // Profile calibration lives beside settings but uses a separate file per
+    // player profile so switching profiles never rewrites unrelated preferences.
     [[nodiscard]] std::filesystem::path AvatarCalibrationPath(std::string_view profileId) const;
     bool ApplyConfiguredAvatar(std::string* error = nullptr);
     bool started_ = false;

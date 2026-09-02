@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-FileCopyrightText: © 2026 Loud160 (AKA Whisp) and the SaberStage contributors
+//
+// Part of SaberStage.
+// Distributed under GPL-3.0-only with additional terms under GPLv3
+// section 7(b)/(c) and an interoperability permission under section 7;
+// see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
+
+// File responsibility:
+// - Constructs, wires, and tears down SaberStage subsystems in dependency order.
+// - Central ownership prevents Unity lifecycle callbacks from outliving the services they call.
+
 #include "saberstage/app/ApplicationRoot.hpp"
 
 #include "saberstage/Logging.hpp"
