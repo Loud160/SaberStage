@@ -334,13 +334,15 @@ void ChatPanelDiagnostics::Tick(const ChatPanelDiagnosticContext& context, float
         Logging::Logger.info(
             "ChatPanelDiag snapshot reason={} panel={} flags={} entries={} pool={} logicalOverflow={} resizing={} "
             "requestedHeight={:.3f} immediateReadback={:.3f} observedHeight={:.3f} writeAge={:.3f}s writes={} "
-            "pageHeight={:.3f} position={:.3f} hovered={} indicator={}",
+            "pageHeight={:.3f} position={:.3f} hovered={} scrollEnabled={} scrollActive={} indicator={}",
             report == ChatPanelDiagnosticSchedule::Report::Detail ? "settled-or-state-change" : "heartbeat",
             Id(context.panel), flags, context.entries, context.pooledRows, context.contentOverflows, context.resizing,
             requestedHeight_, appliedHeight_, Alive(context.scroll) ? context.scroll->get_contentSize() : -1.0F,
             secondsSinceWrite_, writes_, Alive(context.scroll) ? context.scroll->get_scrollPageSize() : -1.0F,
             Alive(context.scroll) ? context.scroll->get_position() : -1.0F,
-            Alive(context.scroll) && context.scroll->____isHoveredByPointer, indicatorId);
+            Alive(context.scroll) && context.scroll->____isHoveredByPointer,
+            Alive(context.scroll) && context.scroll->get_enabled(),
+            Alive(context.scroll) && context.scroll->get_isActiveAndEnabled(), indicatorId);
         Logging::Logger.info(
             "ChatPanelDiag visibility missingScroll={} missingIndicator={} inactiveIndicator={} "
             "missingHandle={} emptyHandleRect={} inactiveHandle={} culledHandle={} transparentHandle={}",

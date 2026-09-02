@@ -14,8 +14,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 namespace saberstage::ui {
+
+// Budget rows for the largest allowed panel, not the amount of retained chat.
+// Using the whole panel height is conservative (the viewport is smaller).
+// Three extra slots cover rounding and partially visible rows at either edge.
+// Arguments are finite positive configuration constants, not user input.
+constexpr std::size_t ChatPanelRowPoolCapacity(float maximumPanelHeight, float minimumRowHeight) noexcept {
+    return static_cast<std::size_t>(maximumPanelHeight / minimumRowHeight) + 3;
+}
 
 struct ChatPanelScrollGeometry {
     float textWidth = 0.0F;

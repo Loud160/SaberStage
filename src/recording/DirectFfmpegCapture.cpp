@@ -1023,20 +1023,45 @@ void DirectFfmpegCapture::Update() {
         timeline.presentationFrame, framesPerSecond_));
 }
 
-void DirectFfmpegCapture::SetOverrideTexture(UnityEngine::Texture* overrideTexture) noexcept {
-    overrideTextureActive_ = overrideTexture &&
-        UnityEngine::Object::op_Inequality(overrideTexture, nullptr);
-    GLuint nativeTexture = 0;
-    if (overrideTextureActive_) {
-        const auto native = overrideTexture->GetNativeTexturePtr().m_value.convert();
-        nativeTexture = static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(native));
-        if (nativeTexture == 0) overrideTextureActive_ = false;
+bool DirectFfmpegCapture::SetOverrideTexture(
+    UnityEngine::Texture* overrideTexture, std::string* error) noexcept {
+    const auto reject = [error](std::string_view reason) {
+        Logging::Logger.error("Direct FFmpeg source override rejected: {}", reason);
+        if (error) *error = reason;
+        return false;
+    };
+    try {
+        GLuint nativeTexture = 0;
+        if (overrideTexture) {
+            if (!UnityEngine::Object::op_Inequality(overrideTexture, nullptr)) {
+                return reject("The AFK Unity texture was destroyed before binding.");
+            }
+            if (!impl_) return reject("The live encoder render bridge is unavailable.");
+            const auto native = overrideTexture->GetNativeTexturePtr().m_value.convert();
+            nativeTexture = static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(native));
+            if (nativeTexture == 0) {
+                Logging::Logger.error("AFK texture id={} has no native GPU handle",
+                    overrideTexture->GetInstanceID());
+                return reject("The AFK image has no usable Quest graphics texture handle.");
+            }
+        }
+
+        // Validate before publishing a new source. A rejected AFK request must
+        // leave the camera and audio running, not partially enter pause mode.
+        if (!overrideTexture && camera_ && UnityEngine::Object::op_Inequality(camera_, nullptr)) {
+            camera_->set_enabled(false);
+        }
+        if (impl_) impl_->SetOverrideTexture(nativeTexture);
+        overrideTextureActive_ = overrideTexture != nullptr;
+        Logging::Logger.info("Direct FFmpeg source override {} (texture={})",
+            overrideTextureActive_ ? "enabled" : "disabled", nativeTexture);
+        return true;
+    } catch (const std::exception& exception) {
+        Logging::Logger.error("Direct FFmpeg override binding threw: {}", exception.what());
+        return reject("Quest could not bind the AFK image; details were written to the SaberStage log.");
+    } catch (...) {
+        return reject("Quest raised an unknown exception while binding the AFK image.");
     }
-    if (impl_) impl_->SetOverrideTexture(overrideTextureActive_ ? nativeTexture : 0);
-    if (!overrideTextureActive_ && camera_) camera_->set_enabled(false);
-    Logging::Logger.info(
-        "Direct FFmpeg source override {} (texture={})",
-        overrideTextureActive_ ? "enabled" : "disabled", nativeTexture);
 }
 
 bool DirectFfmpegCapture::HasOverrideTexture() const noexcept {

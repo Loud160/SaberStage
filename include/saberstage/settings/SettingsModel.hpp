@@ -288,6 +288,13 @@ struct FeatureSettings {
 };
 
 struct ChatSettings {
+    // The drag handle and settings validation share these bounds so an enlarged
+    // panel is not silently shrunk when its saved settings are loaded again.
+    static constexpr float kMinimumWidth = 45.0F;
+    static constexpr float kMaximumWidth = 240.0F;
+    static constexpr float kMinimumHeight = 32.0F;
+    static constexpr float kMaximumHeight = 200.0F;
+
     bool enabled = false;
     camera::Vec3 position{-0.48F, 1.25F, 1.45F};
     camera::Vec3 rotationDegrees{0.0F, 0.0F, 0.0F};

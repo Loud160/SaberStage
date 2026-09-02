@@ -17,8 +17,89 @@ are changed.
 The instrumented Quest run now confirms an inactive native indicator, content
 height collapsing to zero, and exceptions aborting chat updates on no-hit input.
 See the runtime findings below. The targeted code repair is now implemented;
-post-repair headset verification is still required. Build and host tests alone
-do not prove that a world-space UI control is visible.
+the user subsequently confirmed that the scrollbar appears when the panel fills.
+Joystick input still needed a page-arrow click after leaving/reentering the panel;
+the follow-up below addresses that remaining defect. Build and host tests alone
+do not prove world-space UI behavior.
+
+## Follow-up: joystick wake-up and larger resize limits
+
+Before changing code, the current repair was committed as **`83a682e`** on
+`logger-hardening-and-repo-audit`, at the user's request. This is the checkpoint
+where the scrollbar was confirmed visible but joystick input still needed an
+arrow click. Diagnostic captures and device backups were not included.
+
+### Confirmed input-lifecycle cause
+
+The BSML scroll component inherits HMUI's native implementation. The chat body
+deliberately lets pointer hits reach its full-panel grab handle; that handle is
+outside the scroll-view hierarchy, so it does not deliver native scroll hover
+events. SaberStage supplied the hover flag itself, but did not restore the
+native component's enabled state after it went idle.
+
+This was verified against the local Beat Saber 1.40.8 binary, matching pinned
+`bs-cordl` 4008 headers, rather than assuming the arrow click establishes a
+selected-object focus requirement:
+
+- `HMUI::ScrollView::Update` (`0x39fabb4`) checks input only while hovered and
+  disables its Behaviour when neither hovered nor animating.
+- `HandlePointerDidEnter` (`0x39fb820`) sets hover **and enables the Behaviour**.
+  `HandlePointerDidExit` (`0x39fb834`) clears hover without cancelling animation.
+- `ScrollTo` (`0x39f9a84`), used by page arrows, enables the Behaviour as well.
+  This explains why arrow clicks woke joystick input temporarily.
+- `VRPointer::get_pointingOver` (`0x4af1940`) returns the current raycast's object,
+  not the selected button. The existing live-hit lookup was the right input.
+
+Read-only reference APK:
+`C:/Users/Owner/source/repos/BigScreen/tmp-inspect/bs1408-apk/base.apk`.
+Local extracted inspection copy (untracked):
+`diagnostics/chat-joystick-input/libil2cpp.so`.
+Matching declarations are under
+`extern/includes/bs-cordl/include/HMUI/zzzz__ScrollView_def.hpp`,
+`UnityEngine/zzzz__Behaviour_def.hpp`, and
+`VRUIControls/zzzz__VRPointer_def.hpp` in the same include root.
+No BigScreen files were modified.
+
+### Implementation and boundaries
+
+- The existing pointer-hit/body-grab/overflow gate now invokes native enter or
+  exit handlers instead of writing the hover flag directly. Enter also runs if
+  hover is already true but the component is disabled. No button selection is
+  forced, no duplicate input/update loop is introduced, and HMUI retains its
+  dead-zone, scroll speed, bounds, animation, and indicator behavior.
+- Existing periodic diagnostics now include `scrollEnabled` and `scrollActive`
+  alongside `hovered`, without adding a per-frame log stream.
+- Maximum width/height increase from **120 x 100 to 240 x 200 canvas units**.
+  Minimum 45 x 32, default/reset 70 x 58, world scale, and text size stay unchanged.
+  `ChatSettings` owns the shared limits used by dragging and settings validation,
+  so saved larger sizes survive restart.
+- The fixed row pool increases from 32 to **50**, derived from maximum height and
+  minimum row height with partial-row allowance. A 200-unit panel could otherwise
+  run out of recycled text objects before its visible area was full. History stays
+  bounded to 128 messages, snapshots remain at 10 Hz, and inactive rows do not
+  render. No unbounded per-message UI object creation is added.
+
+### Follow-up validation and acceptance
+
+Tooling regressions cover native enter/exit routing and the disabled-but-hovered
+case without selection or duplicate Update calls, shared resize/load bounds,
+and extended diagnostic fields. Host tests cover doubled maximum settings
+save/load, invalid-size fallback, unchanged default/minimum sizes, and sufficient row capacity
+for the taller panel. **8/8 host suites and 48/48 tooling tests passed**; see
+`diagnostics/chat-joystick-input/host-tests-final.log`. The initial boundary test
+incorrectly expected invalid saved sizes to clamp; it was corrected to assert
+the existing reset-to-default policy, without changing that production behavior.
+The ARM64 build and private-logger ELF dependency verification also passed;
+see `diagnostics/chat-joystick-input/android-build.log`. `git diff --check`
+passed. The follow-up binary SHA-256 is:
+
+`79dc71e189f9f5cd9f7698c1fed5d30274b4c3a235877e91c25cdfe9bc89ca3b`.
+
+On-device acceptance for this follow-up remains: point at a full chat body and
+scroll without first clicking an arrow; point away/click elsewhere, return and
+scroll again; trigger-drag still moves the body; page arrows still work; releasing
+the grab restores scrolling; maximum-sized panels fill with short messages and
+keep their size after restart. No follow-up deployment has been requested yet.
 
 ## Repair implementation
 

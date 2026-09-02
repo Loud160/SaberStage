@@ -16,6 +16,7 @@
 
 #include "UnityEngine/Color32.hpp"
 #include "UnityEngine/FilterMode.hpp"
+#include "UnityEngine/HideFlags.hpp"
 #include "UnityEngine/ImageConversion.hpp"
 #include "UnityEngine/Object.hpp"
 #include "UnityEngine/Texture2D.hpp"
@@ -60,10 +61,6 @@ struct CodecContextDeleter {
         if (value) avcodec_free_context(&value);
     }
 };
-
-bool IsAlive(UnityEngine::Object* object) noexcept {
-    return object && UnityEngine::Object::op_Inequality(object, nullptr);
-}
 
 std::string LowerExtension(const std::filesystem::path& path) {
     auto extension = path.extension().string();
@@ -191,17 +188,22 @@ std::vector<std::uint8_t> ConvertFrame(const AVFrame* frame, int width, int heig
 AfkMediaSource::~AfkMediaSource() { Clear(); }
 
 bool AfkMediaSource::CreateTexture(std::int32_t width, std::int32_t height, std::string* error) {
-    if (IsAlive(texture_)) UnityEngine::Object::Destroy(texture_);
+    if (auto* previous = Texture()) UnityEngine::Object::Destroy(previous);
     texture_ = UnityEngine::Texture2D::New_ctor(
         width, height, UnityEngine::TextureFormat::RGBA32, false, false);
-    if (!IsAlive(texture_)) {
+    if (!texture_) {
         texture_ = nullptr;
         if (error) *error = "Quest could not allocate the AFK image texture.";
         return false;
     }
-    UnityEngine::Object::DontDestroyOnLoad(texture_);
+    // DontDestroyOnLoad is for scene objects, not an unused standalone texture.
+    // A persistent stream survives scene changes; its cached AFK image must
+    // survive both managed GC (SafePtrUnity) and UnloadUnusedAssets (this flag).
+    texture_->set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset);
     texture_->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
     texture_->set_filterMode(UnityEngine::FilterMode::Bilinear);
+    Logging::Logger.info("Created retained AFK texture id={} ({}x{})",
+        texture_->GetInstanceID(), width, height);
     return true;
 }
 
@@ -222,7 +224,7 @@ bool AfkMediaSource::PrepareStatic(const std::filesystem::path& path, std::strin
     if (bytes.empty()) return false;
     Clear();
     if (!CreateTexture(2, 2, error)) return false;
-    if (!UnityEngine::ImageConversion::LoadImage(texture_, ManagedArray(bytes), false)) {
+    if (!UnityEngine::ImageConversion::LoadImage(Texture(), ManagedArray(bytes), false)) {
         Clear();
         if (error) *error = "The selected AFK file is not a supported PNG or JPEG image.";
         return false;
@@ -342,7 +344,7 @@ bool AfkMediaSource::PrepareDefault(std::string* error) {
     const std::vector<std::uint8_t> bytes(begin, end);
     Clear();
     if (!CreateTexture(2, 2, error)) return false;
-    if (!UnityEngine::ImageConversion::LoadImage(texture_, ManagedArray(bytes), false)) {
+    if (!UnityEngine::ImageConversion::LoadImage(Texture(), ManagedArray(bytes), false)) {
         Clear();
         if (error) *error = "The built-in SaberStage AFK image could not be decoded.";
         Logging::Logger.error("Unity failed to decode the embedded default AFK PNG");
@@ -366,7 +368,7 @@ bool AfkMediaSource::PrepareDefault(std::string* error) {
 
 bool AfkMediaSource::UploadFrame(std::size_t index) noexcept {
     try {
-        if (!IsAlive(texture_) || index >= frames_.size()) return false;
+        if (!texture_ || index >= frames_.size()) return false;
         texture_->LoadRawTextureData(ManagedArray(frames_[index].rgba));
         texture_->Apply(false, false);
         return true;
@@ -376,11 +378,17 @@ bool AfkMediaSource::UploadFrame(std::size_t index) noexcept {
     }
 }
 
-void AfkMediaSource::Activate() noexcept {
-    active_ = IsAlive(texture_);
+bool AfkMediaSource::Activate() noexcept {
+    active_ = false;
     frameIndex_ = 0;
     frameElapsedSeconds_ = 0.0;
-    if (active_ && !frames_.empty()) UploadFrame(0);
+    if (!texture_) {
+        Logging::Logger.error("AFK activation rejected: cached Unity texture is missing or destroyed");
+        return false;
+    }
+    if (!frames_.empty() && !UploadFrame(0)) return false;
+    active_ = true;
+    return true;
 }
 
 void AfkMediaSource::Deactivate() noexcept {
@@ -390,7 +398,7 @@ void AfkMediaSource::Deactivate() noexcept {
 }
 
 void AfkMediaSource::Tick() noexcept {
-    if (!active_ || frames_.size() < 2 || !IsAlive(texture_)) return;
+    if (!active_ || frames_.size() < 2 || !texture_) return;
     frameElapsedSeconds_ += std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
     while (frameElapsedSeconds_ >= frames_[frameIndex_].durationSeconds) {
         frameElapsedSeconds_ -= frames_[frameIndex_].durationSeconds;
@@ -407,7 +415,7 @@ void AfkMediaSource::Clear() noexcept {
     frames_.clear();
     frameIndex_ = 0;
     frameElapsedSeconds_ = 0.0;
-    if (IsAlive(texture_)) UnityEngine::Object::Destroy(texture_);
+    if (auto* previous = Texture()) UnityEngine::Object::Destroy(previous);
     texture_ = nullptr;
 }
 

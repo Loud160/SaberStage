@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include "UnityEngine/Texture2D.hpp"
+#include "beatsaber-hook/shared/utils/typedefs-wrappers.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -38,12 +41,16 @@ public:
 
     bool Prepare(const std::filesystem::path& path, std::string* error = nullptr);
     bool PrepareDefault(std::string* error = nullptr);
-    void Activate() noexcept;
+    [[nodiscard]] bool Activate() noexcept;
     void Deactivate() noexcept;
     void Tick() noexcept;
     void Clear() noexcept;
 
-    [[nodiscard]] UnityEngine::Texture2D* Texture() const noexcept { return texture_; }
+    // SafePtrUnity::ptr() itself aborts on a dead object. Test the retained
+    // wrapper first so callers can reprepare an unloaded/destroyed image.
+    [[nodiscard]] UnityEngine::Texture2D* Texture() const noexcept {
+        return texture_ ? texture_.ptr() : nullptr;
+    }
     [[nodiscard]] bool Active() const noexcept { return active_; }
     [[nodiscard]] bool Animated() const noexcept { return frames_.size() > 1; }
     [[nodiscard]] const std::string& Description() const noexcept { return description_; }
@@ -59,7 +66,9 @@ private:
     bool CreateTexture(std::int32_t width, std::int32_t height, std::string* error);
     bool UploadFrame(std::size_t index) noexcept;
 
-    UnityEngine::Texture2D* texture_ = nullptr;
+    // This native owner is not scanned by Unity's GC. Keep the managed object
+    // rooted even between AFK pauses when no renderer references the image.
+    SafePtrUnity<UnityEngine::Texture2D> texture_;
     std::vector<Frame> frames_;
     std::string description_ = "Built-in SaberStage AFK image";
     double frameElapsedSeconds_ = 0.0;

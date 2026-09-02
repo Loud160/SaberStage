@@ -13,6 +13,7 @@
 #include "saberstage/recording/RecordingController.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/ErrorManager.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/camera/FrameDemand.hpp"
@@ -1198,10 +1199,26 @@ void RecordingController::DisableLivestreamWakeGuard() noexcept {
 bool RecordingController::PrepareAfkMedia(
     const std::filesystem::path& path,
     std::string* error) {
-    if (!afkMedia_) afkMedia_ = std::make_unique<AfkMediaSource>();
-    return path.empty()
-        ? afkMedia_->PrepareDefault(error)
-        : afkMedia_->Prepare(path, error);
+    // Never destroy a texture still selected by the render-thread bridge.
+    // Resume first; preparing a new image may release the old GPU resource.
+    if (livestreamAfk_.load(std::memory_order_acquire)) {
+        if (error) *error = "Resume the stream before changing its AFK image.";
+        return false;
+    }
+    bool prepared = false;
+    const bool completed = ErrorManager::Instance().Guard("preparing AFK media", [&] {
+        if (!afkMedia_) afkMedia_ = std::make_unique<AfkMediaSource>();
+        prepared = path.empty()
+            ? afkMedia_->PrepareDefault(error)
+            : afkMedia_->Prepare(path, error);
+    });
+    if (!completed) {
+        // A decoder exception can leave an allocated but incomplete texture.
+        // Discard it so the next attempt cannot mistake it for prepared media.
+        if (afkMedia_) afkMedia_->Clear();
+        if (error) *error = "Quest could not prepare the AFK image. Details were written to the SaberStage log.";
+    }
+    return completed && prepared;
 }
 
 bool RecordingController::PauseLivestream(std::string* error) {
@@ -1225,6 +1242,7 @@ bool RecordingController::PauseLivestream(std::string* error) {
     std::string mediaError;
     const auto configuredPath = settings_.Get().broadcast.afkMediaPath;
     if (!afkMedia_ || !afkMedia_->Texture()) {
+        Logging::Logger.info("Preparing AFK media: cached Unity texture is missing or no longer alive");
         if (!PrepareAfkMedia(configuredPath, &mediaError)) {
             Logging::Logger.warn(
                 "Configured AFK media could not be prepared; using built-in card: {}",
@@ -1236,11 +1254,13 @@ bool RecordingController::PauseLivestream(std::string* error) {
             }
         }
     }
-    afkMedia_->Activate();
-    directVideoCapture_->SetOverrideTexture(afkMedia_->Texture());
-    if (!directVideoCapture_->HasOverrideTexture()) {
+    if (!afkMedia_->Activate()) {
+        if (error) *error = "The AFK image could not be activated or uploaded. The stream has not been paused.";
+        return false;
+    }
+    if (!directVideoCapture_->SetOverrideTexture(afkMedia_->Texture(), &mediaError)) {
         afkMedia_->Deactivate();
-        if (error) *error = "Quest could not bind the AFK image to the live encoder.";
+        if (error) *error = "The stream has not been paused. " + mediaError;
         return false;
     }
     {
@@ -1268,7 +1288,8 @@ bool RecordingController::ResumeLivestream(std::string* error) {
         if (error) *error = "The Direct FFmpeg stream camera is unavailable.";
         return false;
     }
-    directVideoCapture_->SetOverrideTexture(nullptr);
+    // Keep AFK privacy/mute state intact if restoring the camera fails.
+    if (!directVideoCapture_->SetOverrideTexture(nullptr, error)) return false;
     if (afkMedia_) afkMedia_->Deactivate();
     {
         std::lock_guard lock(livestreamMutex_);

@@ -214,8 +214,6 @@ private:
     BSML::ModalView* livestreamValueConfirmationModal_ = nullptr;
     TMPro::TextMeshProUGUI* livestreamValueConfirmationText_ = nullptr;
     int pendingLivestreamValueKind_ = 0;
-    BSML::ModalView* livestreamActionErrorModal_ = nullptr;
-    TMPro::TextMeshProUGUI* livestreamActionErrorText_ = nullptr;
     BSML::ModalView* streamTitleModal_ = nullptr;
     HMUI::InputFieldView* streamTitleModalInput_ = nullptr;
     BSML::ModalView* twitchAuthorizationModal_ = nullptr;

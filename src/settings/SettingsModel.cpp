@@ -649,8 +649,10 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         ++result.repairedFields;
     }
     RepairVector(settings.chat.position, defaults.chat.position, result);
-    RepairFloat(settings.chat.width, 45.0F, 120.0F, defaults.chat.width, result);
-    RepairFloat(settings.chat.height, 32.0F, 100.0F, defaults.chat.height, result);
+    RepairFloat(settings.chat.width, ChatSettings::kMinimumWidth,
+                ChatSettings::kMaximumWidth, defaults.chat.width, result);
+    RepairFloat(settings.chat.height, ChatSettings::kMinimumHeight,
+                ChatSettings::kMaximumHeight, defaults.chat.height, result);
     if (!camera::IsFinite(settings.chat.rotationDegrees)) {
         settings.chat.rotationDegrees = defaults.chat.rotationDegrees;
         result.changed = true;

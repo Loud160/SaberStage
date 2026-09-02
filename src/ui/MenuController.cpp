@@ -50,6 +50,7 @@
 #include "UnityEngine/Component.hpp"
 #include "UnityEngine/FilterMode.hpp"
 #include "UnityEngine/GameObject.hpp"
+#include "UnityEngine/HideFlags.hpp"
 #include "UnityEngine/ImageConversion.hpp"
 #include "UnityEngine/LineRenderer.hpp"
 #include "UnityEngine/Material.hpp"
@@ -81,6 +82,7 @@
 #include "UnityEngine/UI/VerticalLayoutGroup.hpp"
 #include "bsml/shared/BSML-Lite.hpp"
 #include "bsml/shared/BSML.hpp"
+#include "beatsaber-hook/shared/utils/typedefs-wrappers.hpp"
 #include "bsml/shared/BSML/Components/ExternalComponents.hpp"
 #include "bsml/shared/BSML/Components/ModalView.hpp"
 #include "bsml/shared/BSML/Components/ScrollView.hpp"
@@ -171,20 +173,28 @@ constexpr float kRecordingPanelFpsRowHeight = 5.5F;
 constexpr float kRecordingPanelDropRowHeight = 5.0F;
 constexpr float kRecordingPanelScale = 0.0125F;
 // Audio buttons remain present in both panel modes so switching Record/Stream
-// never changes the control row's shape. They are deliberately a little larger
-// than the original compact buttons because these are icon-only VR targets.
-constexpr UnityEngine::Vector2 kRecordingPanelAudioButtonSize{7.7F, 6.875F};
+// never changes the control row's shape. Enlarge the blue buttons/hit targets
+// by 15%, NOT the artwork: the user needs more padding around the existing PNGs.
+constexpr float kRecordingPanelAudioSizeMultiplier = 1.15F;
+constexpr UnityEngine::Vector2 kRecordingPanelAudioButtonSize{
+    7.7F * kRecordingPanelAudioSizeMultiplier, 6.875F * kRecordingPanelAudioSizeMultiplier};
+constexpr UnityEngine::Vector2 kRecordingPanelAudioIconSize{3.8F, 3.8F};
+// Existing audio centers are x=12/23, y=12.8 above the panel bottom; the main
+// controls end at y=8. Keep larger hit targets clear of neighbors and grab area.
+static_assert(kRecordingPanelAudioButtonSize.x < 11.0F);
+static_assert(23.0F + kRecordingPanelAudioButtonSize.x * 0.5F < kRecordingPanelWidth * 0.5F - 1.0F);
+static_assert(12.8F - kRecordingPanelAudioButtonSize.y * 0.5F > 8.0F);
+static_assert(12.8F + kRecordingPanelAudioButtonSize.y * 0.5F < kRecordingPanelButtonBandHeight);
 const UnityEngine::Vector2 kChatPanelSize{70.0F, 58.0F};
 constexpr float kChatPanelScale = 0.011F;
-constexpr float kChatPanelMinimumWidth = 45.0F;
-constexpr float kChatPanelMaximumWidth = 120.0F;
-constexpr float kChatPanelMinimumHeight = 32.0F;
-constexpr float kChatPanelMaximumHeight = 100.0F;
 constexpr float kChatPanelHeaderHeight = 10.0F;
 constexpr float kChatResizeHandleSize = 14.0F;
 constexpr float kChatResizeHandleInset = 5.5F;
-constexpr std::size_t kChatVirtualRowPoolSize = 32;
 constexpr float kChatVirtualRowMinimumHeight = 4.25F;
+// A 200-unit panel can show more than the old 32-row pool. Allocate a bounded
+// 50-row pool once; message history still never creates additional TMP objects.
+constexpr std::size_t kChatVirtualRowPoolSize = ui::ChatPanelRowPoolCapacity(
+    settings::ChatSettings::kMaximumHeight, kChatVirtualRowMinimumHeight);
 constexpr float kChatVirtualRowPadding = 0.5F;
 constexpr float kChatDataRefreshIntervalSeconds = 0.10F;
 const camera::Vec3 kDefaultRecordingPanelPosition{0.42F, 1.25F, 1.45F};
@@ -695,36 +705,82 @@ UnityEngine::Texture2D* DecodeEmbeddedControlIcon(
     texture->set_wrapMode(UnityEngine::TextureWrapMode::Clamp);
     texture->set_filterMode(UnityEngine::FilterMode::Bilinear);
     texture->Apply(false, true);
-    UnityEngine::Object::DontDestroyOnLoad(texture);
+    // Inactive icon variants have no RawImage referencing them. Scene lifetime
+    // persistence alone is not protection from unused-asset cleanup: retain the
+    // Unity texture explicitly as well as its managed wrapper in the cache.
+    texture->set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset);
     return texture;
 }
 
-const RecordingPanelIconTextures& EmbeddedRecordingPanelIcons() {
-    // These five tiny textures are decoded once per game process. Keeping
-    // them outside the floating panel's lifetime prevents repeated PNG work
-    // when the user hides/reopens the panel or toggles its FPS row.
-    static const RecordingPanelIconTextures textures{
-        DecodeEmbeddedControlIcon(
+struct CachedRecordingPanelIcon {
+    SafePtrUnity<UnityEngine::Texture2D> texture;
+    bool attempted = false;
+    bool failed = false;
+
+    UnityEngine::Texture2D* Get(const std::uint8_t* begin, const std::uint8_t* end,
+                              std::string_view name) {
+        if (texture) return texture.ptr();
+        if (failed) return nullptr;
+        if (attempted) {
+            Logging::Logger.warn("Recording-panel icon '{}' lost its Unity texture; rebuilding from embedded PNG", name);
+        }
+        attempted = true;
+        // A corrupt PNG/allocation failure must not retry and log at every UI
+        // refresh. Successful textures are reused; explicitly destroyed ones
+        // can be recovered without handing a stale native pointer to RawImage.
+        failed = true;
+        texture = DecodeEmbeddedControlIcon(begin, end, name);
+        if (!texture) return nullptr;
+        failed = false;
+        Logging::Logger.info("Recording-panel icon '{}' ready id={} size={}x{} retainedForUnusedAssetCleanup=true",
+            name, texture->GetInstanceID(), texture->get_width(), texture->get_height());
+        return texture.ptr();
+    }
+};
+
+RecordingPanelIconTextures EmbeddedRecordingPanelIcons() {
+    // Process-lifetime strong managed references plus DontUnloadUnusedAsset
+    // retain all five variants, not only the two currently assigned to images.
+    // Callers borrow a snapshot for this refresh, never cache its raw pointers.
+    static std::array<CachedRecordingPanelIcon, 5> cache;
+    return {
+        cache[0].Get(
             _binary_saberstage_mic_active_png_start,
             _binary_saberstage_mic_active_png_end,
             "SaberStage Microphone Active"),
-        DecodeEmbeddedControlIcon(
+        cache[1].Get(
             _binary_saberstage_mic_muted_png_start,
             _binary_saberstage_mic_muted_png_end,
             "SaberStage Microphone Muted"),
-        DecodeEmbeddedControlIcon(
+        cache[2].Get(
             _binary_saberstage_mic_unavailable_png_start,
             _binary_saberstage_mic_unavailable_png_end,
             "SaberStage Microphone Unavailable"),
-        DecodeEmbeddedControlIcon(
+        cache[3].Get(
             _binary_saberstage_game_audio_active_png_start,
             _binary_saberstage_game_audio_active_png_end,
             "SaberStage Game Audio Active"),
-        DecodeEmbeddedControlIcon(
+        cache[4].Get(
             _binary_saberstage_game_audio_muted_png_start,
             _binary_saberstage_game_audio_muted_png_end,
             "SaberStage Game Audio Muted")};
-    return textures;
+}
+
+void SetRecordingPanelButtonIcon(UnityEngine::UI::RawImage* image,
+                                UnityEngine::Texture2D* texture,
+                                std::string_view control) {
+    if (!IsAlive(image)) return;
+    const bool available = IsAlive(texture);
+    // RawImage renders its white fallback when given a missing texture. If
+    // decoding fails, keep the blue button but suppress that misleading square;
+    // the cache reports the exact failing asset once instead of hiding the error.
+    if (image->get_enabled() != available) image->set_enabled(available);
+    if (!available) return;
+    auto current = image->get_texture();
+    if (current && current.unsafePtr() == texture) return;
+    image->set_texture(texture);
+    Logging::Logger.info("Recording-panel {} icon bound '{}' id={}",
+        control, std::string(texture->get_name()), texture->GetInstanceID());
 }
 
 UnityEngine::UI::RawImage* CreateRecordingPanelButtonIcon(
@@ -744,12 +800,18 @@ UnityEngine::UI::RawImage* CreateRecordingPanelButtonIcon(
     image->set_texture(texture);
     image->set_color(UnityEngine::Color::get_white());
     image->set_raycastTarget(false);
+    // The PNG is a manually sized overlay, not a participant in the native
+    // button's content layout. Do not let a prefab layout stretch the artwork
+    // to consume the extra space intended as blue padding around the icon.
+    if (auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_ignoreLayout(true);
+    }
     auto rect = image->get_rectTransform();
     rect->set_anchorMin({0.5F, 0.5F});
     rect->set_anchorMax({0.5F, 0.5F});
     rect->set_pivot({0.5F, 0.5F});
     rect->set_anchoredPosition({0.0F, 0.0F});
-    rect->set_sizeDelta({3.8F, 3.8F});
+    rect->set_sizeDelta(kRecordingPanelAudioIconSize);
     return image;
 }
 
@@ -3796,8 +3858,6 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     active_->livestreamValueConfirmationModal_ = nullptr;
     active_->livestreamValueConfirmationText_ = nullptr;
     active_->pendingLivestreamValueKind_ = 0;
-    active_->livestreamActionErrorModal_ = nullptr;
-    active_->livestreamActionErrorText_ = nullptr;
     active_->streamTitleModal_ = nullptr;
     active_->streamTitleModalInput_ = nullptr;
     active_->twitchAuthorizationModal_ = nullptr;
@@ -5037,41 +5097,17 @@ void MenuController::ResolveLivestreamValueConfirmation(int action) {
 void MenuController::ShowLivestreamActionError(
     std::string_view message,
     bool streamStillLive) {
-    if (!livestreamActionErrorModal_) {
-        if (!IsAlive(recordingView_)) return;
-        // Keep runtime failures on a dedicated topmost modal. Logging alone is
-        // not sufficient in-headset, where a disabled-looking or unresponsive
-        // action otherwise gives the user no useful recovery instruction.
-        livestreamActionErrorModal_ = BSML::Lite::CreateModal(
-            recordingView_, {76.0F, 42.0F}, nullptr, true);
-        if (!livestreamActionErrorModal_) return;
-        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
-            livestreamActionErrorModal_->get_transform());
-        layout->set_spacing(2.0F);
-        layout->set_childControlWidth(true);
-        layout->set_childControlHeight(true);
-        layout->set_childForceExpandWidth(true);
-        layout->set_childForceExpandHeight(false);
-        livestreamActionErrorText_ = BSML::Lite::CreateText(
-            layout->get_transform(), "", 3.8F, {0.0F, 0.0F}, {68.0F, 27.0F});
-        livestreamActionErrorText_->set_enableWordWrapping(true);
-        livestreamActionErrorText_->set_overflowMode(TMPro::TextOverflowModes::Overflow);
-        livestreamActionErrorText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-        ConfigureLayout(livestreamActionErrorText_, 68.0F, 27.0F, 1.0F);
-        auto* okay = BSML::Lite::CreateUIButton(layout->get_transform(), "OK", [] {
-            if (active_ && active_->livestreamActionErrorModal_) {
-                active_->livestreamActionErrorModal_->Hide();
-            }
-        });
-        ConfigureRightPanelButton(okay);
-    }
-    if (!livestreamActionErrorModal_ || !livestreamActionErrorText_) return;
-    livestreamActionErrorText_->set_text(StringW(
+    // World controls remain alive in gameplay, but recordingView_ belongs to
+    // the settings menu. Showing its modal during a map caused BSML's screen
+    // lookup to abort INSIDE its hook, before an outer try/catch could recover.
+    // Use the existing native-dialog queue: it logs immediately and presents
+    // only after ErrorManager resolves an active, non-transitioning menu flow.
+    // Never query or show a settings-menu modal from this callback.
+    ErrorManager::Instance().ReportUserVisible(
+        streamStillLive ? "STREAM IS LIVE" : "LIVE-STREAM ACTION COULD NOT BE COMPLETED",
         std::string(streamStillLive
-            ? "STREAM IS LIVE\n\nThe video and audio broadcast is still running. Only the separate Twitch channel update failed.\n\n"
-            : "LIVE-STREAM ACTION COULD NOT BE COMPLETED\n\n") +
-        std::string(message)));
-    livestreamActionErrorModal_->Show();
+            ? "The broadcast is still running, but the requested action failed.\n\n"
+            : "") + std::string(message));
 }
 
 void MenuController::ShowStreamTitleEditor() {
@@ -5920,9 +5956,9 @@ void MenuController::RefreshRecordingWorldPanel() {
             const bool gameAudioMuted = streamMode
                 ? livestream.gameAudioMuted
                 : snapshot.gameAudioMuted;
-            recordingWorldPanelGameAudioIcon_->set_texture(gameAudioMuted
-                ? controlIcons.gameAudioMuted
-                : controlIcons.gameAudioActive);
+            SetRecordingPanelButtonIcon(recordingWorldPanelGameAudioIcon_,
+                gameAudioMuted ? controlIcons.gameAudioMuted : controlIcons.gameAudioActive,
+                "game sound");
         }
     }
     if (IsAlive(recordingWorldPanelMicrophoneButton_)) {
@@ -5931,12 +5967,13 @@ void MenuController::RefreshRecordingWorldPanel() {
         // guarded action below decides whether the current stream can change.
         recordingWorldPanelMicrophoneButton_->set_interactable(true);
         if (IsAlive(recordingWorldPanelMicrophoneIcon_)) {
-            recordingWorldPanelMicrophoneIcon_->set_texture(
+            SetRecordingPanelButtonIcon(recordingWorldPanelMicrophoneIcon_,
                 !livestream.microphoneAvailable
                     ? controlIcons.microphoneUnavailable
                     : livestream.microphoneMuted
                         ? controlIcons.microphoneMuted
-                        : controlIcons.microphoneActive);
+                        : controlIcons.microphoneActive,
+                "microphone");
         }
     }
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
@@ -6295,11 +6332,8 @@ void MenuController::EnsureChatWorldPanel() {
     screenObject->set_layer(5);
     UnityEngine::Object::DontDestroyOnLoad(screenObject);
     chatWorldPanelScreen_->set_HandleSide(BSML::Side::Top);
-    // Keep highlight-state tracking enabled even though the primitive renderer
-    // is hidden below. FloatingScreenHandle only changes its material alpha on
-    // pointer enter/exit when this flag is true; TickChatWorldPanel reads that
-    // state to give the native HMUI ScrollView joystick focus without taking
-    // away the same full-panel trigger-to-grab behavior.
+    // The handle renderer is hidden below. Joystick hover uses the actual VR
+    // pointer hit, never the material's highlight color or alpha.
     chatWorldPanelScreen_->set_HighlightHandle(true);
     chatWorldPanelScreen_->get_transform()->set_localScale({
         kChatPanelScale, kChatPanelScale, kChatPanelScale});
@@ -6849,10 +6883,10 @@ void MenuController::TickChatWorldPanelResize() {
         auto& chat = root_.Settings().Edit().chat;
         const float width = std::clamp(
             (std::abs(local.x) + kChatResizeHandleInset) * 2.0F,
-            kChatPanelMinimumWidth, kChatPanelMaximumWidth);
+            settings::ChatSettings::kMinimumWidth, settings::ChatSettings::kMaximumWidth);
         const float height = std::clamp(
             (std::abs(local.y) + kChatResizeHandleInset) * 2.0F,
-            kChatPanelMinimumHeight, kChatPanelMaximumHeight);
+            settings::ChatSettings::kMinimumHeight, settings::ChatSettings::kMaximumHeight);
         if (std::abs(width - chat.width) > 0.05F ||
                 std::abs(height - chat.height) > 0.05F) {
             chat.width = width;
@@ -6994,6 +7028,7 @@ void MenuController::TickChatWorldPanel() noexcept {
             // keeps both interactions: trigger-drag moves the panel, while the
             // stock HMUI joystick path scrolls and updates its native bar.
             bool pointerOverPanel = false;
+            UnityEngine::EventSystems::PointerEventData* pointerEventData = nullptr;
             chatWorldPanelDiagnostics_.SetOperation("read current UI event system");
             auto eventSystem = UnityEngine::EventSystems::EventSystem::get_current();
             // UnityW::ptr() throws on an empty wrapper, BEFORE IsAlive can run.
@@ -7008,6 +7043,7 @@ void MenuController::TickChatWorldPanel() noexcept {
                     : UnityW<VRUIControls::VRInputModule>{nullptr};
                 if (inputModule && inputModule->_vrPointer) {
                     auto pointer = inputModule->_vrPointer;
+                    pointerEventData = pointer->_currentPointerData;
                     chatWorldPanelDiagnostics_.SetOperation("read VR pointer hit GameObject");
                     auto pointedObject = pointer->get_pointingOver();
                     if (pointedObject) {
@@ -7023,12 +7059,22 @@ void MenuController::TickChatWorldPanel() noexcept {
             // Route joystick input through HMUI's own scroll implementation.
             // The panel body intentionally passes trigger raycasts through to
             // FloatingScreen's movement handle, so the stock pointer-enter
-            // callback cannot own this flag. The actual VR pointer hit still
-            // tells us when the controller is over this panel; HMUI then keeps
-            // its proven dead-zone, quick-snap, bounds, and scroll indicator.
+            // callback cannot own hover. Forward the hit through HMUI's native
+            // enter/exit lifecycle: enter sets hover AND enables the component.
+            // HMUI Update disables itself when idle, so writing only its hover
+            // flag leaves joystick input asleep until a page button wakes it.
+            // Do not force-enable it off-panel or force-disable exit animations.
             chatWorldPanelDiagnostics_.SetOperation("assign native chat scroll hover state");
-            chatWorldPanelScrollView_->____isHoveredByPointer =
+            const bool shouldHover =
                 pointerOverPanel && !bodyGrabbed && chatWorldPanelContentOverflows_;
+            if (shouldHover) {
+                if (!chatWorldPanelScrollView_->____isHoveredByPointer ||
+                        !chatWorldPanelScrollView_->get_enabled()) {
+                    chatWorldPanelScrollView_->HandlePointerDidEnter(pointerEventData);
+                }
+            } else if (chatWorldPanelScrollView_->____isHoveredByPointer) {
+                chatWorldPanelScrollView_->HandlePointerDidExit(pointerEventData);
+            }
         }
 
         // The stock BSML scroll control supplies page-up/page-down buttons and

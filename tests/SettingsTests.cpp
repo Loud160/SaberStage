@@ -61,6 +61,31 @@ int main() {
     Check(defaults.preview.rotationDegrees.y == 0.0F &&
               defaults.recording.worldControlsRotationDegrees.y == 0.0F,
           "world panels default to the visible FloatingScreen face");
+    Check(defaults.chat.width == 70.0F && defaults.chat.height == 58.0F,
+          "larger chat size limits do not change the initial or reset size");
+    auto enlargedChat = defaults;
+    enlargedChat.chat.width = 240.0F;
+    enlargedChat.chat.height = 200.0F;
+    ValidateAndRepair(enlargedChat);
+    Check(enlargedChat.chat.width == 240.0F && enlargedChat.chat.height == 200.0F,
+          "chat accepts double the previous maximum width and height");
+    enlargedChat.chat.width = 241.0F;
+    enlargedChat.chat.height = 201.0F;
+    ValidateAndRepair(enlargedChat);
+    Check(enlargedChat.chat.width == defaults.chat.width &&
+              enlargedChat.chat.height == defaults.chat.height,
+          "invalid saved chat sizes retain the existing reset-to-default policy");
+    enlargedChat.chat.width = 45.0F;
+    enlargedChat.chat.height = 32.0F;
+    ValidateAndRepair(enlargedChat);
+    Check(enlargedChat.chat.width == 45.0F && enlargedChat.chat.height == 32.0F,
+          "chat minimum dimensions remain unchanged");
+    enlargedChat.chat.width = 0.0F;
+    enlargedChat.chat.height = 0.0F;
+    ValidateAndRepair(enlargedChat);
+    Check(enlargedChat.chat.width == defaults.chat.width &&
+              enlargedChat.chat.height == defaults.chat.height,
+          "undersized saved chat dimensions still reset to defaults");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
     Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
     Check(!defaults.recording.worldControlsVisible, "movable recording controls default off");
@@ -359,8 +384,8 @@ int main() {
     first.Edit().chat.enabled = true;
     first.Edit().chat.position = {-0.32F, 1.42F, 1.72F};
     first.Edit().chat.rotationDegrees = {2.0F, 170.0F, -3.0F};
-    first.Edit().chat.width = 86.0F;
-    first.Edit().chat.height = 64.0F;
+    first.Edit().chat.width = 240.0F;
+    first.Edit().chat.height = 200.0F;
     first.Edit().avatar.selectedFile = "Black Heart.vrm";
     first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
     first.Edit().avatar.maximumTextureDimension = 512;
@@ -496,8 +521,8 @@ int main() {
           "livestream destinations, AFK media, and protected Twitch account state survive restart");
     Check(second.Get().chat.enabled && second.Get().chat.position.x == -0.32F &&
               second.Get().chat.rotationDegrees.y == 170.0F &&
-              second.Get().chat.width == 86.0F && second.Get().chat.height == 64.0F,
-          "movable Twitch chat visibility, pose, and size survive restart");
+              second.Get().chat.width == 240.0F && second.Get().chat.height == 200.0F,
+          "movable Twitch chat visibility, pose, and doubled maximum size survive restart");
     Check(Read(path).find("\"destinations\"") != std::string::npos,
           "livestream destinations use the service-specific schema");
     Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&

@@ -76,7 +76,9 @@ public:
     // Replaces the spectator-camera texture at the GLES encoder bridge while
     // keeping the MediaCodec/RTMP presentation timeline alive. Passing null
     // restores camera frames. The caller owns the override texture lifetime.
-    void SetOverrideTexture(UnityEngine::Texture* texture) noexcept;
+    // A failed bind leaves the previous source unchanged and returns a
+    // diagnostic instead of throwing through the world-panel input callback.
+    bool SetOverrideTexture(UnityEngine::Texture* texture, std::string* error = nullptr) noexcept;
     [[nodiscard]] bool HasOverrideTexture() const noexcept;
     [[nodiscard]] bool Failed() const noexcept;
     [[nodiscard]] std::uint64_t DroppedFrameCount() const noexcept;

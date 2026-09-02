@@ -11,6 +11,7 @@
 // - Covers empty, full, resized, and virtualized histories without Unity.
 
 #include "saberstage/ui/ChatPanelScrollGeometry.hpp"
+#include "saberstage/settings/SettingsModel.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -28,6 +29,17 @@ bool Near(float actual, float expected) { return std::abs(actual - expected) < 0
 
 int main() {
     using saberstage::ui::CalculateChatPanelScrollGeometry;
+    // Even at maximum height, short messages must fill the whole viewport.
+    // Bound the render pool independently of stream duration/history length.
+    constexpr float maximumHeight = saberstage::settings::ChatSettings::kMaximumHeight;
+    constexpr float minimumRowHeight = 4.25F;
+    constexpr auto rowBudget = saberstage::ui::ChatPanelRowPoolCapacity(maximumHeight, minimumRowHeight);
+    static_assert(rowBudget == 50);
+    Require(rowBudget * minimumRowHeight > maximumHeight + 2 * minimumRowHeight,
+        "bounded render pool covers maximum panel plus partial rows at both edges");
+    auto largeGeometry = CalculateChatPanelScrollGeometry(228.0F, 181.0F, 128.0F * minimumRowHeight);
+    Require(largeGeometry.overflows && Near(largeGeometry.scrollEnd, 363.0F),
+        "maximum-size panel still scrolls through bounded retained history");
     // Recorded native viewport: the surrounding scroll root was 74.196 units
     // high, but its actual visible page was 68.196. Do not reintroduce that gap.
     constexpr float width = 58.01F;
@@ -56,7 +68,7 @@ int main() {
 
     geometry = CalculateChatPanelScrollGeometry(108.0F, 81.0F, 128.0F * 4.25F);
     Require(Near(geometry.contentHeight, 544.0F) && Near(geometry.scrollEnd, 463.0F),
-        "full retained history determines height, independent of the 32-row render pool");
+        "full retained history determines height, independent of the bounded render pool");
     geometry = CalculateChatPanelScrollGeometry(108.0F, 81.0F, 50.0F);
     Require(Near(geometry.textWidth, 107.0F) && !geometry.overflows && Near(geometry.scrollEnd, 0),
         "rewrapping into a wider/taller viewport can return to a single page");

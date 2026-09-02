@@ -323,7 +323,8 @@ class RepositoryInvariantTests(unittest.TestCase):
             service.index("while (response.size() < kMaximumHttpResponseBytes)"),
         )
         self.assertNotIn('"http_code"', service)
-        self.assertIn('"STREAM IS LIVE\\n\\nThe video and audio broadcast is still running.', menu)
+        self.assertIn('streamStillLive ? "STREAM IS LIVE"', menu)
+        self.assertIn("The broadcast is still running, but the requested action failed.", menu)
         self.assertIn("ShowLivestreamActionError(twitch.titleUpdateStatus, true)", menu)
 
     def test_twitch_chat_panel_resizes_scrolls_and_reports_live_viewers(self):
@@ -376,7 +377,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("chatWorldPanelResizeGripStrokes_", menu)
         self.assertIn("set_active(chatWorldPanelResizeEditing_)", menu)
         self.assertIn("chatWorldPanelResizeHandleScreen_->handle->set_layer(5)", menu)
-        self.assertIn("constexpr std::size_t kChatVirtualRowPoolSize = 32", menu)
+        self.assertIn("constexpr std::size_t kChatVirtualRowPoolSize = ui::ChatPanelRowPoolCapacity(", menu)
+        self.assertIn("settings::ChatSettings::kMaximumHeight, kChatVirtualRowMinimumHeight", menu)
         self.assertIn("chatWorldPanelRows_.reserve(kChatVirtualRowPoolSize)", menu)
         self.assertIn("row->set_color({0.92F, 0.95F, 1.0F, 1.0F})", menu)
         self.assertIn("row->set_enableWordWrapping(true)", menu)
@@ -481,6 +483,36 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("return;", input_path)
         self.assertLess(tick.index("pointerOverPanel && !bodyGrabbed"),
                         tick.index("root_.Twitch().Snapshot()"))
+
+    def test_chat_hover_wakes_native_scroll_without_button_selection(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
+                    menu.index("void MenuController::EnsureStandinProxy(")]
+        hover = tick[tick.index('SetOperation("assign native chat scroll hover state")'):
+                     tick.index("// The stock BSML scroll control")]
+        # HMUI stops its Update when idle. A hover flag alone cannot restart it;
+        # native enter must run even if that flag is already true but disabled.
+        self.assertIn("if (shouldHover)", hover)
+        self.assertIn("!chatWorldPanelScrollView_->____isHoveredByPointer ||", hover)
+        self.assertIn("!chatWorldPanelScrollView_->get_enabled()", hover)
+        self.assertIn("HandlePointerDidEnter(pointerEventData)", hover)
+        self.assertIn("else if (chatWorldPanelScrollView_->____isHoveredByPointer)", hover)
+        self.assertIn("HandlePointerDidExit(pointerEventData)", hover)
+        self.assertNotIn("____isHoveredByPointer =", tick)
+        self.assertNotIn("SetSelectedGameObject", tick)
+        self.assertNotIn("->CheckScrollInput(", tick)
+        self.assertNotIn("->Update();", tick)
+        diagnostics = (ROOT / "src/ui/ChatPanelDiagnostics.cpp").read_text(encoding="utf-8")
+        self.assertIn("scrollEnabled={} scrollActive={}", diagnostics)
+
+    def test_chat_drag_and_saved_size_use_the_same_bounds(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        validation = (ROOT / "src/settings/SettingsModel.cpp").read_text(encoding="utf-8")
+        resize = menu[menu.index("void MenuController::TickChatWorldPanelResize()"):
+                      menu.index("void MenuController::DestroyChatWorldPanel()")]
+        for bound in ("kMinimumWidth", "kMaximumWidth", "kMinimumHeight", "kMaximumHeight"):
+            self.assertIn("settings::ChatSettings::" + bound, resize)
+            self.assertIn("ChatSettings::" + bound, validation)
 
     def test_support_settings_redacts_every_service_key(self):
         source = {
@@ -690,9 +722,72 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("saberstage_afk_image.o", cmake)
         self.assertIn("_binary_saberstage_afk_image_png_start", source)
         self.assertIn("_binary_saberstage_afk_image_png_end", source)
-        self.assertIn("ImageConversion::LoadImage(texture_, ManagedArray(bytes), false)", source)
+        self.assertIn("ImageConversion::LoadImage(Texture(), ManagedArray(bytes), false)", source)
         self.assertIn("Built-in SaberStage AFK image", source)
         self.assertIn("Pause screen: built-in SaberStage AFK image", menu)
+
+    def test_stream_errors_never_open_settings_modals_from_world_controls(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "include/saberstage/ui/MenuController.hpp").read_text(encoding="utf-8")
+        handler = menu.split("void MenuController::ShowLivestreamActionError(", 1)[1].split(
+            "void MenuController::ShowStreamTitleEditor()", 1)[0]
+        # This is deliberately removal, not an outer catch: BSML's modal-show
+        # hook aborts internally before SaberStage can catch that exception.
+        self.assertIn("ErrorManager::Instance().ReportUserVisible(", handler)
+        self.assertNotIn("CreateModal(", handler)
+        self.assertNotIn("->Show(", handler)
+        self.assertNotIn("livestreamActionErrorModal_", menu + header)
+        self.assertNotIn("livestreamActionErrorText_", menu + header)
+
+    def test_afk_texture_is_rooted_and_activation_checks_unity_liveness(self):
+        header = (ROOT / "include/saberstage/recording/AfkMediaSource.hpp").read_text(encoding="utf-8")
+        source = (ROOT / "src/recording/AfkMediaSource.cpp").read_text(encoding="utf-8")
+        self.assertIn("SafePtrUnity<UnityEngine::Texture2D> texture_;", header)
+        self.assertIn("return texture_ ? texture_.ptr() : nullptr;", header)
+        self.assertIn("set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset)", source)
+        self.assertNotIn("Object::DontDestroyOnLoad(", source)
+        activate = source.split("bool AfkMediaSource::Activate()", 1)[1].split(
+            "void AfkMediaSource::Deactivate()", 1)[0]
+        self.assertIn("if (!texture_)", activate)
+        self.assertIn("if (!frames_.empty() && !UploadFrame(0)) return false;", activate)
+        self.assertLess(activate.index("!UploadFrame(0)"), activate.index("active_ = true"))
+        clear = source.split("void AfkMediaSource::Clear()", 1)[1]
+        self.assertIn("if (auto* previous = Texture())", clear)
+        self.assertIn("Object::Destroy(previous)", clear)
+        self.assertIn("texture_ = nullptr;", clear)
+
+    def test_afk_failure_cannot_commit_pause_or_unmute_on_failed_resume(self):
+        source = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
+        prepare = source.split("bool RecordingController::PrepareAfkMedia(", 1)[1].split(
+            "bool RecordingController::PauseLivestream(", 1)[0]
+        self.assertLess(prepare.index("livestreamAfk_.load"), prepare.index("afkMedia_->Prepare"))
+        self.assertIn('Guard("preparing AFK media"', prepare)
+        self.assertIn("if (afkMedia_) afkMedia_->Clear();", prepare)
+        pause = source.split("bool RecordingController::PauseLivestream(", 1)[1].split(
+            "bool RecordingController::ResumeLivestream(", 1)[0]
+        self.assertIn("!afkMedia_->Texture()", pause)
+        self.assertIn("if (!afkMedia_->Activate())", pause)
+        self.assertIn("if (!directVideoCapture_->SetOverrideTexture(afkMedia_->Texture(), &mediaError))", pause)
+        self.assertLess(pause.index("if (!afkMedia_->Activate())"), pause.index("SetOverrideTexture("))
+        self.assertLess(pause.index("SetOverrideTexture("), pause.index("SetMuted(true)"))
+        self.assertLess(pause.index("SetOverrideTexture("), pause.index("livestreamAfk_.store(true"))
+        resume = source.split("bool RecordingController::ResumeLivestream(", 1)[1].split(
+            "livestreamAfk_.store(false", 1)[0]
+        self.assertIn("if (!directVideoCapture_->SetOverrideTexture(nullptr, error)) return false;", resume)
+        self.assertLess(resume.index("SetOverrideTexture("), resume.index("SetMuted(false)"))
+
+    def test_override_bind_reports_failure_before_publishing_source(self):
+        source = (ROOT / "src/recording/DirectFfmpegCapture.cpp").read_text(encoding="utf-8")
+        bind = source.split("bool DirectFfmpegCapture::SetOverrideTexture(", 1)[1].split(
+            "bool DirectFfmpegCapture::HasOverrideTexture()", 1)[0]
+        self.assertIn("if (!UnityEngine::Object::op_Inequality(overrideTexture, nullptr))", bind)
+        self.assertIn("if (!impl_) return reject(", bind)
+        self.assertIn("if (nativeTexture == 0)", bind)
+        self.assertIn("has no native GPU handle", bind)
+        self.assertLess(bind.index("if (nativeTexture == 0)"), bind.index("impl_->SetOverrideTexture("))
+        self.assertLess(bind.index("if (nativeTexture == 0)"), bind.index("overrideTextureActive_ ="))
+        self.assertIn("catch (const std::exception& exception)", bind)
+        self.assertIn("catch (...)", bind)
 
     def test_movable_recording_panel_is_compact_persistent_and_capture_excluded(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -754,6 +849,46 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertGreaterEqual(menu.count("->get_gameObject()->SetActive(true)"), 2)
         self.assertIn("recordingWorldPanelGameAudioButton_->set_interactable(true)", menu)
         self.assertIn("recordingWorldPanelMicrophoneButton_->set_interactable(true)", menu)
+
+    def test_recording_panel_retains_unused_icon_variants_and_guards_white_fallback(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        icons = menu[menu.index("struct RecordingPanelIconTextures"):
+                     menu.index("void ConfigureLayout(")]
+        self.assertIn("SafePtrUnity<UnityEngine::Texture2D> texture", icons)
+        self.assertIn("set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset)", icons)
+        self.assertIn("static std::array<CachedRecordingPanelIcon, 5> cache", icons)
+        self.assertIn("if (texture) return texture.ptr();", icons)
+        self.assertIn("if (failed) return nullptr;", icons)
+        self.assertIn("lost its Unity texture; rebuilding from embedded PNG", icons)
+        self.assertNotIn("static const RecordingPanelIconTextures textures", icons)
+        self.assertNotIn("DontDestroyOnLoad(texture)", icons)
+        binding = icons[icons.index("void SetRecordingPanelButtonIcon("):
+                        icons.index("UnityEngine::UI::RawImage* CreateRecordingPanelButtonIcon(")]
+        self.assertLess(binding.index("if (!available) return;"), binding.index("image->set_texture(texture)"))
+        self.assertIn("image->set_enabled(available)", binding)
+        self.assertIn("Recording-panel {} icon bound", binding)
+        refresh = menu[menu.index("void MenuController::RefreshRecordingWorldPanel()"):
+                       menu.index("void MenuController::RecordingWorldPanelPrimaryAction()")]
+        self.assertIn("SetRecordingPanelButtonIcon(recordingWorldPanelGameAudioIcon_", refresh)
+        self.assertIn("gameAudioMuted ? controlIcons.gameAudioMuted : controlIcons.gameAudioActive", refresh)
+        self.assertIn("SetRecordingPanelButtonIcon(recordingWorldPanelMicrophoneIcon_", refresh)
+        recording = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
+        self.assertIn("snapshot.gameAudioMuted = snapshot.afk ||", recording)
+
+    def test_recording_audio_buttons_grow_without_enlarging_the_artwork(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        self.assertIn("kRecordingPanelAudioSizeMultiplier = 1.15F", menu)
+        self.assertIn("7.7F * kRecordingPanelAudioSizeMultiplier", menu)
+        self.assertIn("6.875F * kRecordingPanelAudioSizeMultiplier", menu)
+        self.assertIn("kRecordingPanelAudioIconSize{3.8F, 3.8F}", menu)
+        self.assertNotIn("3.8F * kRecordingPanelAudioSizeMultiplier", menu)
+        self.assertIn("rect->set_sizeDelta(kRecordingPanelAudioIconSize)", menu)
+        icon = menu[menu.index("UnityEngine::UI::RawImage* CreateRecordingPanelButtonIcon("):
+                    menu.index("void ConfigureLayout(")]
+        self.assertIn("layout->set_ignoreLayout(true)", icon)
+        self.assertIn("static_assert(kRecordingPanelAudioButtonSize.x < 11.0F)", menu)
+        self.assertIn("static_assert(12.8F - kRecordingPanelAudioButtonSize.y * 0.5F > 8.0F)", menu)
+        self.assertIn("static_assert(12.8F + kRecordingPanelAudioButtonSize.y * 0.5F < kRecordingPanelButtonBandHeight)", menu)
 
     def test_avatar_is_mandatory_in_primary_camera_and_preview_uses_primary_output(self):
         profile = (ROOT / "src/camera/CameraProfile.cpp").read_text(encoding="utf-8")
