@@ -93,8 +93,10 @@
 #include "bsml/shared/Helpers/utilities.hpp"
 #include "bsml/shared/BSML/Tags/RawImageTag.hpp"
 #include "HMUI/ImageView.hpp"
+#include "HMUI/VerticalScrollIndicator.hpp"
 #include "UnityEngine/UI/RawImage.hpp"
 #include "UnityEngine/UI/Selectable.hpp"
+#include "bsml/shared/BSML/Components/ScrollViewContent.hpp"
 #include "VRUIControls/VRInputModule.hpp"
 #include "VRUIControls/VRPointer.hpp"
 
@@ -6258,6 +6260,14 @@ void MenuController::SetChatWorldPanelVisible(bool visible) {
     else DestroyChatWorldPanel();
 }
 
+ChatPanelDiagnosticContext MenuController::ReadChatPanelDiagnosticContext() const {
+    return {
+        IsAlive(chatWorldPanelScreen_) ? chatWorldPanelScreen_->get_gameObject().ptr() : nullptr,
+        chatWorldPanelScrollView_, chatWorldPanelInnerContent_, chatWorldPanelBackground_,
+        chatWorldPanelEntries_.size(), chatWorldPanelRows_.size(),
+        chatWorldPanelContentOverflows_, chatWorldPanelResizeEditing_};
+}
+
 void MenuController::EnsureChatWorldPanel() {
     if (IsAlive(chatWorldPanelScreen_) || !root_.Settings().Get().chat.enabled ||
             !FloatingUiServicesReady()) return;
@@ -6351,22 +6361,35 @@ void MenuController::EnsureChatWorldPanel() {
     }
 
     auto* scrollContent = BSML::Lite::CreateScrollView(parent);
+    chatWorldPanelInnerContent_ = scrollContent;
     if (IsAlive(scrollContent)) {
         chatWorldPanelScrollView_ =
             scrollContent->GetComponentInParent<BSML::ScrollView*>();
-        // CreateScrollView normally lays out one ever-growing child. Chat uses
-        // the same native scrolling controls, but owns the content geometry so
-        // a fixed pool of visible rows can be recycled. Leaving either of these
-        // layout components active makes a short TMP line shrink to its
-        // preferred width, center itself, and then expand horizontally instead
-        // of wrapping at the viewport edge.
-        if (auto* layout = scrollContent->GetComponent<
-                UnityEngine::UI::VerticalLayoutGroup*>()) {
-            layout->set_enabled(false);
-        }
-        if (auto* fitter = scrollContent->GetComponent<
-                UnityEngine::UI::ContentSizeFitter*>()) {
-            fitter->set_enabled(false);
+    }
+    // Capture the actual cloned native hierarchy before changing its layout.
+    // This also records creation failures instead of assuming a scrollbar exists.
+    chatWorldPanelDiagnostics_.NativeCreated(ReadChatPanelDiagnosticContext());
+    chatWorldPanelDiagnostics_.SetOperation("initialize virtual chat content and row pool");
+    if (IsAlive(scrollContent)) {
+        // BSML returns the INNER row container, while its fitter, layout, and
+        // ScrollViewContent writer live on the OUTER native contentTransform.
+        // Chat owns a virtual list rather than a layout-driven list of rows.
+        // Disable both layout owners once, before adding rows; otherwise the
+        // outer fitter reduces content to zero and BSML overwrites SetContentSize.
+        // Keep the native ScrollView/viewport/buttons/indicator intact.
+        const auto disableContentLayout = [](UnityEngine::GameObject* content) {
+            if (!IsAlive(content)) return;
+            if (auto* driver = content->GetComponent<BSML::ScrollViewContent*>())
+                driver->set_enabled(false);
+            if (auto* fitter = content->GetComponent<UnityEngine::UI::ContentSizeFitter*>())
+                fitter->set_enabled(false);
+            if (auto* layout = content->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>())
+                layout->set_enabled(false);
+        };
+        disableContentLayout(scrollContent);
+        if (IsAlive(chatWorldPanelScrollView_)) {
+            auto outerContent = chatWorldPanelScrollView_->get_contentTransform();
+            if (outerContent) disableContentLayout(outerContent->get_gameObject());
         }
         if (IsAlive(chatWorldPanelScrollView_)) {
             // A BSML scroll view contains several passive Graphics in addition
@@ -6434,7 +6457,7 @@ void MenuController::EnsureChatWorldPanel() {
         line->get_gameObject()->set_name(
             "SaberStage Twitch Chat Visible Resize Grip " + std::to_string(index + 1));
         ConfigureWorldPanelImage(
-            line, {}, {resizeGripStrokes[index].length, 0.75F},
+            line, {0.0F, 0.0F}, {resizeGripStrokes[index].length, 0.75F},
             {1.0F, 0.68F, 0.18F, 1.0F});
         line->set_raycastTarget(false);
         line->get_rectTransform()->set_localEulerAngles({0.0F, 0.0F, 45.0F});
@@ -6486,7 +6509,9 @@ void MenuController::UpdateChatWorldPanelLayout() {
         rect->set_anchoredPosition(position);
         rect->set_sizeDelta(size);
     };
-    setRect(chatWorldPanelBackground_, {}, {width - 1.0F, height - 1.0F});
+    // Generated Unity Vector2's default constructor does not zero its fields.
+    // An empty initializer here sent the backdrop to an arbitrary world position.
+    setRect(chatWorldPanelBackground_, {0.0F, 0.0F}, {width - 1.0F, height - 1.0F});
     constexpr float borderThickness = 0.75F;
     const float inset = borderThickness * 0.5F;
     setRect(chatWorldPanelBorders_[0], {0.0F, height * 0.5F - inset},
@@ -6529,28 +6554,6 @@ void MenuController::UpdateChatWorldPanelLayout() {
         setRect(chatWorldPanelScrollView_,
             {0.0F, (bodyTop + bodyBottom) * 0.5F},
             {width - 5.0F, bodyHeight});
-        if (auto* content = chatWorldPanelScrollView_->get_contentTransform().ptr()) {
-            // BSML's ScrollView content is normally width-driven by a layout
-            // fitter. Chat deliberately disables that fitter for virtualization,
-            // so horizontal stretch can collapse to roughly one glyph on Quest.
-            // Give the content a deterministic width matching the text viewport.
-            const float textWidth = std::max(25.0F, width - 14.0F);
-            auto anchorMin = content->get_anchorMin();
-            auto anchorMax = content->get_anchorMax();
-            anchorMin.x = 0.5F;
-            anchorMax.x = 0.5F;
-            content->set_anchorMin(anchorMin);
-            content->set_anchorMax(anchorMax);
-            auto pivot = content->get_pivot();
-            pivot.x = 0.5F;
-            content->set_pivot(pivot);
-            auto position = content->get_anchoredPosition();
-            position.x = 0.0F;
-            content->set_anchoredPosition(position);
-            auto size = content->get_sizeDelta();
-            size.x = textWidth;
-            content->set_sizeDelta(size);
-        }
     }
     // Resizing changes the available line width even when no new Twitch
     // message arrives. Reflow immediately so TMP wraps the existing history
@@ -6559,13 +6562,49 @@ void MenuController::UpdateChatWorldPanelLayout() {
     ReflowChatWorldPanelText();
 }
 
-void MenuController::ReflowChatWorldPanelText() {
-    if (!IsAlive(chatWorldPanelText_) || chatWorldPanelRows_.empty()) return;
+void MenuController::RefreshChatWorldPanelScrollControls() {
+    if (!IsAlive(chatWorldPanelScrollView_)) return;
+    chatWorldPanelScrollView_->RefreshButtons();
+    chatWorldPanelScrollView_->UpdateVerticalScrollIndicator(
+        chatWorldPanelScrollView_->get_position());
 
-    const auto& chat = root_.Settings().Get().chat;
-    const float textWidth = std::max(25.0F, chat.width - 14.0F);
-    const float pageHeight = std::max(
-        10.0F, chat.height - kChatPanelHeaderHeight - 3.0F);
+    // The EULA template can have its scrollbar children inactive when cloned.
+    // Enabling the ScrollView parent does not reactivate those children. Keep
+    // the original native rail/handle and page buttons visible; HMUI controls
+    // button interactability and handle size from the actual content extent.
+    auto indicator = chatWorldPanelScrollView_->_verticalScrollIndicator;
+    if (indicator) {
+        auto object = indicator->get_gameObject();
+        if (object && !object->get_activeSelf()) object->set_active(true);
+    }
+    const std::array<UnityEngine::UI::Button*, 2> pageButtons{{
+        chatWorldPanelScrollView_->_pageUpButton,
+        chatWorldPanelScrollView_->_pageDownButton}};
+    for (auto* button : pageButtons) {
+        if (!IsAlive(button)) continue;
+        auto object = button->get_gameObject();
+        if (object && !object->get_activeSelf()) object->set_active(true);
+        // Passive chat graphics must stay non-raycasting for body grabbing,
+        // but the inherited page buttons need their real target graphic hit.
+        auto target = button->get_targetGraphic();
+        if (target) target->set_raycastTarget(true);
+    }
+}
+
+void MenuController::ReflowChatWorldPanelText() {
+    chatWorldPanelDiagnostics_.SetOperation("reflow chat text");
+    if (!IsAlive(chatWorldPanelText_) || chatWorldPanelRows_.empty() ||
+            !IsAlive(chatWorldPanelScrollView_) || !IsAlive(chatWorldPanelInnerContent_)) return;
+
+    auto viewport = chatWorldPanelScrollView_->get_viewportTransform();
+    auto outerContent = chatWorldPanelScrollView_->get_contentTransform();
+    auto* innerContent = chatWorldPanelInnerContent_->GetComponent<UnityEngine::RectTransform*>();
+    if (!viewport || !outerContent || !IsAlive(innerContent)) return;
+    const float viewportWidth = viewport->get_rect().get_width();
+    const float pageHeight = chatWorldPanelScrollView_->get_scrollPageSize();
+    auto geometry = CalculateChatPanelScrollGeometry(viewportWidth, pageHeight, 0.0F);
+    if (!geometry.Valid()) return;
+    const float textWidth = geometry.textWidth;
 
     // Measure the retained data, not an ever-growing rendered mesh. Heights
     // are cached until the viewport width changes; adding one chat message
@@ -6580,10 +6619,12 @@ void MenuController::ReflowChatWorldPanelText() {
     // the probe active during measurement avoids relying on that prefab- and
     // Unity-version-dependent behavior. The virtualization pass below returns
     // it to the correct visible/inactive state in the same update.
+    chatWorldPanelDiagnostics_.SetOperation("activate chat measurement probe");
     chatWorldPanelText_->get_gameObject()->set_active(true);
     float offset = 0.0F;
     for (auto& entry : chatWorldPanelEntries_) {
         if (widthChanged || entry.height <= 0.0F) {
+            chatWorldPanelDiagnostics_.SetOperation("measure wrapped chat text");
             const auto preferred = chatWorldPanelText_->GetPreferredValues(
                 StringW(entry.text), textWidth, 1000.0F);
             entry.height = std::max(
@@ -6593,13 +6634,38 @@ void MenuController::ReflowChatWorldPanelText() {
         entry.offset = offset;
         offset += entry.height;
     }
-    if (!IsAlive(chatWorldPanelScrollView_)) return;
-
-    const float contentHeight = std::max(pageHeight, offset);
-    const bool contentOverflows = offset > pageHeight + 0.5F;
+    geometry = CalculateChatPanelScrollGeometry(viewportWidth, pageHeight, offset);
+    if (!geometry.Valid()) {
+        Logging::Logger.error("Twitch chat reflow rejected invalid geometry: width={} pageHeight={} measuredHeight={}",
+            viewportWidth, pageHeight, offset);
+        return;
+    }
+    const float contentHeight = geometry.contentHeight;
+    const bool contentOverflows = geometry.overflows;
+    chatWorldPanelDiagnostics_.SetOperation("apply native chat content height");
+    // Both containers describe the SAME virtual list. The outer transform is
+    // moved by HMUI; the inner stays top-aligned at its origin and holds the
+    // fixed pool of manually positioned rows. Never infer list size from which
+    // pooled rows happen to be active. Only a message/width change writes sizes.
+    const float retainedPosition = std::clamp(
+        chatWorldPanelScrollView_->get_position(), 0.0F, geometry.scrollEnd);
+    outerContent->set_anchorMin({0.5F, 1.0F});
+    outerContent->set_anchorMax({0.5F, 1.0F});
+    outerContent->set_pivot({0.5F, 1.0F});
+    outerContent->set_sizeDelta({textWidth, contentHeight});
+    outerContent->set_anchoredPosition({0.0F, retainedPosition});
+    innerContent->set_anchorMin({0.5F, 1.0F});
+    innerContent->set_anchorMax({0.5F, 1.0F});
+    innerContent->set_pivot({0.5F, 1.0F});
+    innerContent->set_sizeDelta({textWidth, contentHeight});
+    innerContent->set_anchoredPosition({0.0F, 0.0F});
+    chatWorldPanelScrollGeometry_ = geometry;
     chatWorldPanelScrollView_->SetContentSize(contentHeight);
+    chatWorldPanelDiagnostics_.ContentSizeApplied(
+        contentHeight, chatWorldPanelScrollView_->get_contentSize());
     chatWorldPanelContentOverflows_ = contentOverflows;
-    chatWorldPanelScrollView_->RefreshButtons();
+    chatWorldPanelDiagnostics_.SetOperation("refresh native chat page buttons");
+    RefreshChatWorldPanelScrollControls();
     if (!contentOverflows) {
         // A status line or a small number of wrapped messages fits on the
         // page. Keep it top-aligned; ScrollToEnd on BSML's cloned scroll view
@@ -6611,18 +6677,22 @@ void MenuController::ReflowChatWorldPanelText() {
         // Allow Unity one frame to accept both the new viewport width and the
         // measured content height before following the newest message.
         chatWorldPanelScrollToEndFrames_ = 2;
+    } else {
+        // Rewrapping to a wider viewport can shorten history. Keep the user's
+        // reading position when possible, but do not leave it past the new end.
+        chatWorldPanelScrollView_->ScrollTo(retainedPosition, false);
     }
     chatWorldPanelRowsDirty_ = true;
     RefreshVirtualizedChatRows();
 }
 
 void MenuController::RefreshVirtualizedChatRows() {
+    chatWorldPanelDiagnostics_.SetOperation("read virtual chat scroll position");
     if (!IsAlive(chatWorldPanelScrollView_) || chatWorldPanelRows_.empty()) return;
 
-    const auto& chat = root_.Settings().Get().chat;
-    const float textWidth = std::max(25.0F, chat.width - 14.0F);
-    const float pageHeight = std::max(
-        10.0F, chat.height - kChatPanelHeaderHeight - 3.0F);
+    if (!chatWorldPanelScrollGeometry_.Valid()) return;
+    const float textWidth = chatWorldPanelScrollGeometry_.textWidth;
+    const float pageHeight = chatWorldPanelScrollGeometry_.pageHeight;
     const float visibleTop = std::max(0.0F, chatWorldPanelScrollView_->get_position());
     // TickChatWorldPanel runs at the HMD refresh rate so scroll input remains
     // responsive. Do not cross the IL2CPP boundary to reapply every pooled
@@ -6655,12 +6725,14 @@ void MenuController::RefreshVirtualizedChatRows() {
             ++poolIndex;
             continue;
         }
+        chatWorldPanelDiagnostics_.SetOperation("activate pooled chat row", static_cast<int>(poolIndex));
         row->get_gameObject()->set_active(true);
         if (poolIndex >= chatWorldPanelRowEntryIndices_.size() ||
                 poolIndex >= chatWorldPanelRowGenerations_.size() ||
                 chatWorldPanelRowEntryIndices_[poolIndex] != entryIndex ||
                 chatWorldPanelRowGenerations_[poolIndex] !=
                     chatWorldPanelEntryGeneration_) {
+            chatWorldPanelDiagnostics_.SetOperation("assign pooled chat row text", static_cast<int>(poolIndex));
             row->set_text(entry.text);
             if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
                 chatWorldPanelRowEntryIndices_[poolIndex] = entryIndex;
@@ -6670,6 +6742,7 @@ void MenuController::RefreshVirtualizedChatRows() {
                     chatWorldPanelEntryGeneration_;
             }
         }
+        chatWorldPanelDiagnostics_.SetOperation("position pooled chat row", static_cast<int>(poolIndex));
         auto rect = row->get_rectTransform();
         // Fixed-width pooled rows match the fixed-width virtualized content.
         // Stretch anchors here depend on a parent layout component that chat
@@ -6686,6 +6759,7 @@ void MenuController::RefreshVirtualizedChatRows() {
     // The number of TMP objects therefore remains fixed for the entire stream,
     // regardless of how many messages pass through the bounded data history.
     for (; poolIndex < chatWorldPanelRows_.size(); ++poolIndex) {
+        chatWorldPanelDiagnostics_.SetOperation("deactivate unused chat row", static_cast<int>(poolIndex));
         auto* row = chatWorldPanelRows_[poolIndex];
         if (IsAlive(row)) row->get_gameObject()->set_active(false);
         if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
@@ -6723,7 +6797,7 @@ void MenuController::EnsureChatWorldPanelResizeHandle() {
                 UnityEngine::MeshRenderer*>()) {
             renderer->set_enabled(false);
         }
-        chatWorldPanelResizeHandleScreen_->handle->get_transform()->set_localPosition({});
+        chatWorldPanelResizeHandleScreen_->handle->get_transform()->set_localPosition({0.0F, 0.0F, 0.0F});
         chatWorldPanelResizeHandleScreen_->handle->get_transform()->set_localScale({
             13.0F, 13.0F, 2.0F});
     }
@@ -6800,6 +6874,9 @@ void MenuController::TickChatWorldPanelResize() {
 }
 
 void MenuController::DestroyChatWorldPanel() noexcept {
+    chatWorldPanelDiagnostics_.Reset();
+    chatWorldPanelInnerContent_ = nullptr;
+    chatWorldPanelScrollGeometry_ = {};
     root_.Twitch().SetChatEnabled(false);
     DestroyChatWorldPanelResizeHandle();
     if (IsAlive(chatWorldPanelScreen_)) {
@@ -6882,20 +6959,30 @@ void MenuController::UpdateChatWorldPanelPersistence() {
 
 void MenuController::TickChatWorldPanel() noexcept {
     try {
+        chatWorldPanelDiagnostics_.SetOperation("read chat settings");
         if (!root_.Settings().Get().chat.enabled) {
             DestroyChatWorldPanel();
             return;
         }
+        chatWorldPanelDiagnostics_.SetOperation("create or initialize chat panel");
         EnsureChatWorldPanel();
         if (!IsAlive(chatWorldPanelScreen_)) return;
+        // Sample the previous frame's settled state before resize or message
+        // reflow can hide a competing native layout writer's changes.
+        chatWorldPanelDiagnostics_.Tick(
+            ReadChatPanelDiagnosticContext(), UnityEngine::Time::get_unscaledDeltaTime());
+        chatWorldPanelDiagnostics_.SetOperation("update chat grab handle rotation");
         UpdateWorldPanelHandleRotation(chatWorldPanelScreen_);
+        chatWorldPanelDiagnostics_.SetOperation("update chat resize handle");
         TickChatWorldPanelResize();
+        chatWorldPanelDiagnostics_.SetOperation("persist chat panel pose");
         UpdateChatWorldPanelPersistence();
 
-        if (IsAlive(chatWorldPanelScrollView_) &&
-                IsAlive(chatWorldPanelScreen_->handle)) {
-            auto* handle = chatWorldPanelScreen_->handle->GetComponent<
-                BSML::FloatingScreenHandle*>();
+        if (IsAlive(chatWorldPanelScrollView_)) {
+            chatWorldPanelDiagnostics_.SetOperation("read chat panel grabbing controller");
+            auto* handle = IsAlive(chatWorldPanelScreen_->handle)
+                ? chatWorldPanelScreen_->handle->GetComponent<BSML::FloatingScreenHandle*>()
+                : nullptr;
             const bool bodyGrabbed = IsAlive(handle) &&
                 static_cast<bool>(handle->__get__grabbingController());
 
@@ -6907,19 +6994,27 @@ void MenuController::TickChatWorldPanel() noexcept {
             // keeps both interactions: trigger-drag moves the panel, while the
             // stock HMUI joystick path scrolls and updates its native bar.
             bool pointerOverPanel = false;
+            chatWorldPanelDiagnostics_.SetOperation("read current UI event system");
             auto eventSystem = UnityEngine::EventSystems::EventSystem::get_current();
-            if (IsAlive(eventSystem.ptr())) {
-                auto inputModule = eventSystem->get_currentInputModule()
-                    .try_cast<VRUIControls::VRInputModule>()
-                    .value_or(nullptr);
-                if (IsAlive(inputModule.ptr()) && IsAlive(inputModule->_vrPointer.ptr())) {
-                    auto* pointer = inputModule->_vrPointer.ptr();
-                    auto* pointedObject = pointer->get_pointingOver().ptr();
-                    if (IsAlive(pointedObject)) {
-                        auto* pointedTransform = pointedObject->get_transform().ptr();
-                        auto* panelTransform = chatWorldPanelScreen_->get_transform().ptr();
-                        pointerOverPanel = IsAlive(pointedTransform) &&
-                            IsAlive(panelTransform) &&
+            // UnityW::ptr() throws on an empty wrapper, BEFORE IsAlive can run.
+            // Scene transitions and pointing into empty space are normal states;
+            // test each optional wrapper first and keep processing new messages
+            // even when there is no pointer hit or current UI input module.
+            if (eventSystem) {
+                chatWorldPanelDiagnostics_.SetOperation("read VR input module and pointer");
+                auto currentModule = eventSystem->get_currentInputModule();
+                auto inputModule = currentModule
+                    ? currentModule.try_cast<VRUIControls::VRInputModule>().value_or(nullptr)
+                    : UnityW<VRUIControls::VRInputModule>{nullptr};
+                if (inputModule && inputModule->_vrPointer) {
+                    auto pointer = inputModule->_vrPointer;
+                    chatWorldPanelDiagnostics_.SetOperation("read VR pointer hit GameObject");
+                    auto pointedObject = pointer->get_pointingOver();
+                    if (pointedObject) {
+                        chatWorldPanelDiagnostics_.SetOperation("compare VR pointer hit to chat hierarchy");
+                        auto pointedTransform = pointedObject->get_transform();
+                        auto panelTransform = chatWorldPanelScreen_->get_transform();
+                        pointerOverPanel = pointedTransform && panelTransform &&
                             (pointedTransform == panelTransform ||
                              pointedTransform->IsChildOf(panelTransform));
                     }
@@ -6931,6 +7026,7 @@ void MenuController::TickChatWorldPanel() noexcept {
             // callback cannot own this flag. The actual VR pointer hit still
             // tells us when the controller is over this panel; HMUI then keeps
             // its proven dead-zone, quick-snap, bounds, and scroll indicator.
+            chatWorldPanelDiagnostics_.SetOperation("assign native chat scroll hover state");
             chatWorldPanelScrollView_->____isHoveredByPointer =
                 pointerOverPanel && !bodyGrabbed && chatWorldPanelContentOverflows_;
         }
@@ -6941,6 +7037,7 @@ void MenuController::TickChatWorldPanel() noexcept {
         // until the user scrolls back to the live end.
         if (IsAlive(chatWorldPanelScrollView_) &&
                 chatWorldPanelContentOverflows_) {
+            chatWorldPanelDiagnostics_.SetOperation("update native chat follow-live scroll");
             if (chatWorldPanelScrollToEndFrames_ > 0) {
                 chatWorldPanelScrollView_->ScrollToEnd(false);
                 --chatWorldPanelScrollToEndFrames_;
@@ -6965,15 +7062,16 @@ void MenuController::TickChatWorldPanel() noexcept {
         chatWorldPanelDataRefreshSeconds_ += std::max(
             0.0F, UnityEngine::Time::get_unscaledDeltaTime());
         if (chatWorldPanelDataRefreshSeconds_ < kChatDataRefreshIntervalSeconds) {
-            chatWorldPanelTickFailureLogged_ = false;
             return;
         }
         chatWorldPanelDataRefreshSeconds_ = 0.0F;
 
+        chatWorldPanelDiagnostics_.SetOperation("read Twitch chat snapshot");
         const auto twitch = root_.Twitch().Snapshot();
         if (IsAlive(chatWorldPanelViewerText_) &&
                 (twitch.viewerCountKnown != chatWorldPanelDisplayedViewerKnown_ ||
                  twitch.viewerCount != chatWorldPanelDisplayedViewerCount_)) {
+            chatWorldPanelDiagnostics_.SetOperation("update chat viewer count label");
             chatWorldPanelDisplayedViewerKnown_ = twitch.viewerCountKnown;
             chatWorldPanelDisplayedViewerCount_ = twitch.viewerCount;
             chatWorldPanelViewerText_->set_text(
@@ -6987,9 +7085,9 @@ void MenuController::TickChatWorldPanel() noexcept {
         const int chatState = static_cast<int>(twitch.chatState);
         if (newestSequence == chatWorldPanelLastMessageSequence_ &&
                 chatState == chatWorldPanelDisplayedChatState_) {
-            chatWorldPanelTickFailureLogged_ = false;
             return;
         }
+        chatWorldPanelDiagnostics_.SetOperation("update bounded chat message history");
         const int previousChatState = chatWorldPanelDisplayedChatState_;
         chatWorldPanelLastMessageSequence_ = newestSequence;
         chatWorldPanelDisplayedChatState_ = chatState;
@@ -7050,17 +7148,10 @@ void MenuController::TickChatWorldPanel() noexcept {
         }
         ++chatWorldPanelEntryGeneration_;
         ReflowChatWorldPanelText();
-        chatWorldPanelTickFailureLogged_ = false;
     } catch (const std::exception& exception) {
-        if (!chatWorldPanelTickFailureLogged_) {
-            chatWorldPanelTickFailureLogged_ = true;
-            Logging::Logger.error("Twitch chat panel update failed: {}", exception.what());
-        }
+        chatWorldPanelDiagnostics_.ReportUpdateFailure(exception.what());
     } catch (...) {
-        if (!chatWorldPanelTickFailureLogged_) {
-            chatWorldPanelTickFailureLogged_ = true;
-            Logging::Logger.error("Twitch chat panel update failed unexpectedly");
-        }
+        chatWorldPanelDiagnostics_.ReportUpdateFailure("unknown exception");
     }
 }
 

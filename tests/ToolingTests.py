@@ -402,6 +402,86 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("context->eof_reached = 0", service)
         self.assertIn("Twitch IRC idle TLS timeout handled as an empty chat interval", service)
 
+    def test_chat_scrollbar_diagnostics_observe_without_mutating_ui(self):
+        source = (ROOT / "src/ui/ChatPanelDiagnostics.cpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        self.assertIn('"saberstage/Logging.hpp"', source)
+        self.assertIn("_verticalScrollIndicator", source)
+        self.assertIn('LogLayout("outer-content", outer)', source)
+        self.assertIn('LogLayout("inner-content", inner)', source)
+        self.assertIn("content-height-overwritten", source)
+        self.assertIn("get_absoluteDepth()", source)
+        self.assertIn("get_hasRectClipping()", source)
+        self.assertIn("GetInheritedAlpha()", source)
+        self.assertIn("get_cullingMask()", source)
+        self.assertNotIn("->set_", source)
+        self.assertNotIn("->SetContentSize(", source)
+        self.assertNotIn("->get_materialForRendering(", source)
+        self.assertNotIn("ForceRebuildLayoutImmediate", source)
+        self.assertNotIn("Logger.Flush", source)
+        self.assertNotIn("get_text()", source)
+        self.assertNotIn("std::thread", source)
+        self.assertNotIn(".ptr()", source.replace("UnityW::ptr()", "checked accessor"))
+        self.assertIn("object ? object.unsafePtr() : nullptr", source)
+        self.assertIn("operationSite={}:{}", source)
+        self.assertIn("std::chrono::seconds(5)", source)
+        self.assertIn('SetOperation("read VR pointer hit GameObject")', menu)
+        self.assertIn("ReportUpdateFailure(exception.what())", menu)
+        # Observation must precede resizing/reflow, or our own write would hide
+        # the very native-layout overwrite these diagnostics are measuring.
+        tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):]
+        self.assertLess(tick.index("chatWorldPanelDiagnostics_.Tick("),
+                        tick.index("TickChatWorldPanelResize();"))
+        self.assertIn("contentHeight, chatWorldPanelScrollView_->get_contentSize()", menu)
+        destroy = menu[menu.index("void MenuController::DestroyChatWorldPanel() noexcept"):]
+        self.assertLess(destroy.index("chatWorldPanelDiagnostics_.Reset();"),
+                        destroy.index("UnityEngine::Object::Destroy(screenObject)"))
+
+    def test_chat_virtual_content_has_one_layout_owner_and_visible_native_controls(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        chat = menu[menu.index("void MenuController::EnsureChatWorldPanel()"):
+                    menu.index("void MenuController::EnsureStandinProxy(")]
+        self.assertIn("disableContentLayout(scrollContent)", chat)
+        self.assertIn("disableContentLayout(outerContent->get_gameObject())", chat)
+        self.assertIn("GetComponent<BSML::ScrollViewContent*>()", chat)
+        self.assertIn("driver->set_enabled(false)", chat)
+        self.assertIn("fitter->set_enabled(false)", chat)
+        self.assertIn("layout->set_enabled(false)", chat)
+        self.assertIn("outerContent->set_sizeDelta({textWidth, contentHeight})", chat)
+        self.assertIn("innerContent->set_sizeDelta({textWidth, contentHeight})", chat)
+        self.assertIn("innerContent->set_anchoredPosition({0.0F, 0.0F})", chat)
+        self.assertIn("CalculateChatPanelScrollGeometry(viewportWidth, pageHeight, offset)", chat)
+        self.assertIn("chatWorldPanelScrollGeometry_.pageHeight", chat)
+        self.assertIn("chatWorldPanelScrollView_->get_scrollPageSize()", chat)
+        self.assertNotIn("chat.height - kChatPanelHeaderHeight - 3.0F", chat)
+        controls = chat[chat.index("void MenuController::RefreshChatWorldPanelScrollControls()"):
+                        chat.index("void MenuController::ReflowChatWorldPanelText()")]
+        self.assertIn("_verticalScrollIndicator", controls)
+        self.assertIn("_pageUpButton", controls)
+        self.assertIn("_pageDownButton", controls)
+        self.assertIn("!object->get_activeSelf()) object->set_active(true)", controls)
+        self.assertIn("target->set_raycastTarget(true)", controls)
+        self.assertIn("UpdateVerticalScrollIndicator(", controls)
+        self.assertNotIn("CreateImage", controls)
+        self.assertNotIn("AddComponent", controls)
+        self.assertNotIn("set_interactable(true)", controls)
+        self.assertIn("setRect(chatWorldPanelBackground_, {0.0F, 0.0F}", chat)
+        self.assertNotIn("set_localPosition({})", chat)
+
+    def test_chat_missing_pointer_does_not_abort_message_processing(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
+                    menu.index("void MenuController::EnsureStandinProxy(")]
+        input_path = tick[tick.index('SetOperation("read current UI event system")'):
+                          tick.index('SetOperation("assign native chat scroll hover state")')]
+        self.assertIn("if (eventSystem)", input_path)
+        self.assertIn("if (inputModule && inputModule->_vrPointer)", input_path)
+        self.assertIn("if (pointedObject)", input_path)
+        self.assertNotIn(".ptr()", input_path)
+        self.assertNotIn("return;", input_path)
+        self.assertLess(tick.index("pointerOverPanel && !bodyGrabbed"),
+                        tick.index("root_.Twitch().Snapshot()"))
+
     def test_support_settings_redacts_every_service_key(self):
         source = {
             "broadcast": {

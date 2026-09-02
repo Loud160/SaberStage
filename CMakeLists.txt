@@ -79,6 +79,14 @@ if(SABERSTAGE_HOST_TESTS)
     target_include_directories(saberstage_recording_state_tests PRIVATE include)
     add_test(NAME saberstage.recording_state COMMAND saberstage_recording_state_tests)
 
+    add_executable(saberstage_chat_diagnostics_tests tests/ChatPanelDiagnosticsTests.cpp)
+    target_include_directories(saberstage_chat_diagnostics_tests PRIVATE include)
+    add_test(NAME saberstage.chat_diagnostics COMMAND saberstage_chat_diagnostics_tests)
+
+    add_executable(saberstage_chat_scroll_tests tests/ChatPanelScrollGeometryTests.cpp)
+    target_include_directories(saberstage_chat_scroll_tests PRIVATE include)
+    add_test(NAME saberstage.chat_scroll COMMAND saberstage_chat_scroll_tests)
+
     add_executable(saberstage_avatar_tests tests/AvatarSolverTests.cpp)
     target_link_libraries(saberstage_avatar_tests PRIVATE saberstage_avatar_core)
     add_test(NAME saberstage.avatar COMMAND saberstage_avatar_tests)

@@ -13,6 +13,8 @@
 #pragma once
 
 #include "saberstage/camera/Math.hpp"
+#include "saberstage/ui/ChatPanelDiagnostics.hpp"
+#include "saberstage/ui/ChatPanelScrollGeometry.hpp"
 
 #include <functional>
 #include <array>
@@ -122,12 +124,14 @@ private:
     void ResetRecordingWorldPanelPose();
     void SetChatWorldPanelVisible(bool visible);
     void EnsureChatWorldPanel();
+    ChatPanelDiagnosticContext ReadChatPanelDiagnosticContext() const;
     void DestroyChatWorldPanel() noexcept;
     void ResetChatWorldPanelPose();
     void ToggleChatWorldPanelResize();
     void EnsureChatWorldPanelResizeHandle();
     void DestroyChatWorldPanelResizeHandle() noexcept;
     void UpdateChatWorldPanelLayout();
+    void RefreshChatWorldPanelScrollControls();
     void ReflowChatWorldPanelText();
     void RefreshVirtualizedChatRows();
     void TickChatWorldPanelResize();
@@ -386,6 +390,9 @@ private:
     UnityEngine::UI::Button* chatWorldPanelResizeButton_ = nullptr;
     UnityEngine::UI::Button* chatWorldPanelControlButton_ = nullptr;
     BSML::ScrollView* chatWorldPanelScrollView_ = nullptr;
+    UnityEngine::GameObject* chatWorldPanelInnerContent_ = nullptr;
+    ChatPanelScrollGeometry chatWorldPanelScrollGeometry_;
+    ChatPanelDiagnostics chatWorldPanelDiagnostics_;
     camera::Pose recordingWorldPanelLastPose_{};
     float recordingWorldPanelStableSeconds_ = 0.0F;
     int recordingWorldPanelDisplayedSecond_ = -1;
@@ -425,7 +432,6 @@ private:
     int chatWorldPanelDisplayedChatState_ = -1;
     std::uint64_t chatWorldPanelLastMessageSequence_ = 0;
     bool chatWorldPanelCreationFailureLogged_ = false;
-    bool chatWorldPanelTickFailureLogged_ = false;
     // Invisible body-sized grab handles for the free-standing avatar display
     // clones, one per slot (up to three), each driving its clone's placement.
     std::array<BSML::FloatingScreen*, 3> standinProxyScreens_{};
