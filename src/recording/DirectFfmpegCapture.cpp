@@ -10,6 +10,7 @@
 #include "UnityEngine/RenderTextureFormat.hpp"
 #include "UnityEngine/RenderTextureReadWrite.hpp"
 #include "UnityEngine/StereoTargetEyeMask.hpp"
+#include "UnityEngine/Texture.hpp"
 #include "UnityEngine/TextureWrapMode.hpp"
 #include "UnityEngine/Time.hpp"
 #include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
@@ -452,6 +453,7 @@ struct RenderBridge {
     GLuint sourceTexture = 0;
     std::int32_t width = 0;
     std::int32_t height = 0;
+    std::atomic<GLuint> overrideTexture{0};
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface surface = EGL_NO_SURFACE;
@@ -674,7 +676,10 @@ void RenderToEncoder(int slot) {
         glUseProgram(bridge->program);
         glBindVertexArray(bridge->vertexArray);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, bridge->sourceTexture);
+        const auto overrideTexture = bridge->overrideTexture.load(std::memory_order_acquire);
+        glBindTexture(
+            GL_TEXTURE_2D,
+            overrideTexture != 0 ? overrideTexture : bridge->sourceTexture);
         glUniform1i(glGetUniformLocation(bridge->program, "sourceTexture"), 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         const auto drawError = glGetError();
@@ -812,6 +817,13 @@ public:
         IssueRenderEvent(&RenderToEncoder, slot_);
     }
 
+    void SetOverrideTexture(GLuint texture) noexcept {
+        if (slot_ < 0) return;
+        if (auto* bridge = renderSlots[static_cast<std::size_t>(slot_)].load(std::memory_order_acquire)) {
+            bridge->overrideTexture.store(texture, std::memory_order_release);
+        }
+    }
+
     void Stop() noexcept {
         if (slot_ >= 0) {
             // Finish the codec worker while its input surface is still alive.
@@ -947,6 +959,7 @@ void DirectFfmpegCapture::Init(
     skippedTimelineFrames_ = 0;
     firstFrameMonotonicNanos_ = 0;
     failureLogged_ = false;
+    overrideTextureActive_ = false;
     lastDiagnostics_ = {};
     Logging::Logger.info(
         "Direct FFmpeg render bridge created: sourceTexture={}, {}x{}@{}",
@@ -990,13 +1003,37 @@ void DirectFfmpegCapture::Update() {
     lastPresentationFrame_ = timeline.presentationFrame;
     skippedTimelineFrames_ += timeline.skippedDeadlines;
     ++scheduledFrames_;
-    camera_->set_enabled(true);
+    // AFK frames come from an already prepared texture. Avoid rendering the
+    // full third-person camera while that image is active; the render bridge
+    // still submits one encoder frame at every normal presentation deadline.
+    camera_->set_enabled(!overrideTextureActive_);
     impl_->RenderFrame(CapturePresentationTimeNanos(
         timeline.presentationFrame, framesPerSecond_));
 }
 
+void DirectFfmpegCapture::SetOverrideTexture(UnityEngine::Texture* overrideTexture) noexcept {
+    overrideTextureActive_ = overrideTexture &&
+        UnityEngine::Object::op_Inequality(overrideTexture, nullptr);
+    GLuint nativeTexture = 0;
+    if (overrideTextureActive_) {
+        const auto native = overrideTexture->GetNativeTexturePtr().m_value.convert();
+        nativeTexture = static_cast<GLuint>(reinterpret_cast<std::uintptr_t>(native));
+        if (nativeTexture == 0) overrideTextureActive_ = false;
+    }
+    if (impl_) impl_->SetOverrideTexture(overrideTextureActive_ ? nativeTexture : 0);
+    if (!overrideTextureActive_ && camera_) camera_->set_enabled(false);
+    Logging::Logger.info(
+        "Direct FFmpeg source override {} (texture={})",
+        overrideTextureActive_ ? "enabled" : "disabled", nativeTexture);
+}
+
+bool DirectFfmpegCapture::HasOverrideTexture() const noexcept {
+    return overrideTextureActive_;
+}
+
 void DirectFfmpegCapture::Stop() noexcept {
     if (camera_) camera_->set_enabled(false);
+    overrideTextureActive_ = false;
     if (impl_) {
         impl_->Stop();
         // Preserve the final render-thread/codec snapshot after the worker has

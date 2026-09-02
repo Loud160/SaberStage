@@ -97,6 +97,11 @@ UnityEngine::Shader* EmbeddedVideoPreviewShader() noexcept;
 // the same Unity Android build guarantees the stereo variants Quest needs.
 UnityEngine::Shader* EmbeddedGripTargetShader() noexcept;
 
+// Bright multiview-safe UI shader that writes zero bloom weight. Floating
+// preview, recording, and chat borders share this asset so their blue accents
+// match without producing Beat Saber's alpha-weighted bloom haze.
+UnityEngine::Shader* EmbeddedNonBloomUiShader() noexcept;
+
 // Owns every Unity object created for one VRM. Destruction is centralized so
 // AvatarManager can unbind the humanoid first and then unload without leaving
 // meshes, materials, textures, or a hidden Animator behind.

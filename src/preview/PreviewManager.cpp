@@ -243,6 +243,10 @@ public:
         if (!started_) return;
         try {
             RestoreCaptureRoots();
+            // Do not discard a final drag that has not yet remained still for
+            // the normal debounce window. Shutdown is the last opportunity to
+            // persist the world panel's actual pose before Unity destroys it.
+            PersistFloatingPoseNow();
             camera_.SetCaptureExclusionHandler({});
             camera_.RemoveRenderDemand(kDockedDemand);
             camera_.RemoveRenderDemand(kFloatingDemand);
@@ -253,6 +257,8 @@ public:
             previewMaterial_ = nullptr;
             if (IsAlive(floatingMaterial_)) UnityEngine::Object::Destroy(floatingMaterial_);
             floatingMaterial_ = nullptr;
+            if (IsAlive(floatingBorderMaterial_)) UnityEngine::Object::Destroy(floatingBorderMaterial_);
+            floatingBorderMaterial_ = nullptr;
             UnbindPreviewRuntimeDriver(&owner_);
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
             driverObject_ = nullptr;
@@ -370,9 +376,8 @@ public:
     }
 
     // Places the preview 1.5 m ahead of the head, slightly below eye level,
-    // facing the player. Shared by Reset and by every enable so the panel
-    // always appears where the user is looking (a stale saved pose behind or
-    // beside the player made "enabled but nothing shows" reports).
+    // facing the player. This is used only by the explicit Reset Preview
+    // action; ordinary creation restores the user's persisted placement.
     void MovePreviewPoseInFrontOfPlayer(settings::PreviewSettings& preview) {
         auto mainCamera = UnityEngine::Camera::get_main();
         if (!mainCamera) return;
@@ -390,18 +395,21 @@ public:
         const auto ahead = UnityEngine::Vector3::op_Multiply(forward, 1.5F);
         const auto lowered = UnityEngine::Vector3::op_Addition(ahead, {0.0F, -0.35F, 0.0F});
         preview.position = FromUnity(UnityEngine::Vector3::op_Addition(headPosition, lowered));
+        // BSML FloatingScreen canvases present their UI face along local -Z.
+        // A panel placed in front of the HMD therefore uses the viewer's yaw,
+        // not yaw + 180. The previous offset exposed the canvas back: some
+        // two-sided Image artwork remained visible, while TMP captions and the
+        // live RawImage did not, which made a working panel look incomplete.
         preview.rotationDegrees = {
             0.0F,
-            camera::NormalizeDegrees(camera::YawDegrees(FromUnity(headRotation)) + 180.0F),
+            camera::NormalizeDegrees(camera::YawDegrees(FromUnity(headRotation))),
             0.0F};
     }
 
     void SetFloatingVisible(bool visible) {
         auto& preview = settings_.Edit().preview;
+        if (!visible) PersistFloatingPoseNow();
         preview.visible = visible;
-        // Destroy on enable so CreateFloatingPreview runs again; creation
-        // always recenters the panel in front of the player (see below).
-        if (visible) DestroyFloatingPreview();
         std::string error;
         if (!settings_.Save(&error)) Logging::Logger.error("Preview visibility save failed: {}", error);
         ApplyVisibility();
@@ -617,6 +625,23 @@ private:
         return IsAlive(floatingMaterial_);
     }
 
+    bool EnsureFloatingBorderMaterial() {
+        if (IsAlive(floatingBorderMaterial_)) return true;
+        auto* shader = avatar::vrm::EmbeddedNonBloomUiShader();
+        if (!IsAlive(shader)) {
+            Logging::Logger.warn(
+                "Camera preview border is using the stock UI material because the embedded non-bloom shader is unavailable");
+            return false;
+        }
+        floatingBorderMaterial_ = UnityEngine::Material::New_ctor(shader);
+        if (!IsAlive(floatingBorderMaterial_)) return false;
+        floatingBorderMaterial_->set_name("SaberStage Preview Panel Non-Bloom Accent");
+        floatingBorderMaterial_->set_color(UnityEngine::Color::get_white());
+        floatingBorderMaterial_->set_renderQueue(3020);
+        UnityEngine::Object::DontDestroyOnLoad(floatingBorderMaterial_);
+        return true;
+    }
+
     void ApplyPreviewMaterial(UnityEngine::UI::RawImage* image) {
         if (!IsAlive(image) || !EnsurePreviewMaterial()) return;
         image->set_color(UnityEngine::Color::get_white());
@@ -637,7 +662,7 @@ private:
         const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
         if (!whitePixel || !EnsureFloatingPreviewMaterial()) return nullptr;
         auto* parent = floatingScreen_->get_transform().ptr();
-        const UnityEngine::Color borderColor{0.0F, 0.80F, 1.0F, 1.0F};
+        const UnityEngine::Color borderColor{0.0F, 0.55F, 1.0F, 1.0F};
         const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.98F};
         constexpr float border = 1.0F;
         constexpr float halfWidth = kPreviewWidth * 0.5F;
@@ -650,20 +675,31 @@ private:
         // missing or the surface fails to draw, the panel shows an obviously
         // empty dark screen instead of the world behind it — which makes
         // "panel missing" and "video missing" distinguishable at a glance.
+        // The video and its dark fallback fill the complete interior bounded
+        // by the one-unit border. The previous four-unit inset left a visible
+        // one-unit gap on every edge after accounting for border thickness.
+        const UnityEngine::Vector2 previewInteriorSize{
+            kPreviewWidth - 2.0F * border,
+            kPreviewBodyHeight - 2.0F * border};
         ConfigureImage(
             BSML::Lite::CreateImage(parent, whitePixel),
             {0.0F, bodyCenter},
-            {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F},
+            previewInteriorSize,
             {0.01F, 0.02F, 0.045F, 1.0F});
         auto* preview = CreateWorldSpaceVideoSurface(
             parent,
             {0.0F, bodyCenter},
-            {kPreviewWidth - 4.0F, kPreviewBodyHeight - 4.0F},
+            previewInteriorSize,
             floatingMaterial_);
         if (!IsAlive(preview)) return nullptr;
 
+        EnsureFloatingBorderMaterial();
         const auto addBorder = [&](UnityEngine::Vector2 position, UnityEngine::Vector2 size) {
-            ConfigureImage(BSML::Lite::CreateImage(parent, whitePixel), position, size, borderColor);
+            auto* image = BSML::Lite::CreateImage(parent, whitePixel);
+            ConfigureImage(image, position, size, borderColor);
+            if (IsAlive(image) && IsAlive(floatingBorderMaterial_)) {
+                image->set_material(floatingBorderMaterial_);
+            }
         };
         addBorder({0.0F, bodyTop - 0.5F}, {kPreviewWidth, border});
         addBorder({0.0F, bodyBottom + 0.5F}, {kPreviewWidth, border});
@@ -736,16 +772,10 @@ private:
     }
 
     void CreateFloatingPreview() {
-        // The popout ALWAYS (re)appears directly in front of the player —
-        // session start included, not only when the toggle is flipped. A pose
-        // saved in an earlier session can be behind the player or facing away,
-        // and world-space UI renders nothing from its back side, so honoring a
-        // stale pose at creation reads as "enabled but nothing shows". The
-        // recentered pose is written back to settings so ApplySettings cannot
-        // later snap the panel to the stale one; in-session grabs still stick
-        // because the screen persists until hidden.
-        auto& preview = settings_.Edit().preview;
-        MovePreviewPoseInFrontOfPlayer(preview);
+        // Creation restores the persisted pose. Recenter is an explicit Reset
+        // Preview operation; doing it here used to overwrite a user's saved
+        // placement every time the game started.
+        const auto& preview = settings_.Get().preview;
         floatingScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
             {kPreviewWidth, kPreviewCanvasHeight},
             true,
@@ -865,6 +895,24 @@ private:
         floatingPoseDirty_ = false;
     }
 
+    void PersistFloatingPoseNow() {
+        if (!IsAlive(floatingScreen_)) return;
+        const auto pose = ReadPose(floatingScreen_->get_transform().ptr());
+        auto& preview = settings_.Edit().preview;
+        preview.position = pose.position;
+        const auto euler = ToUnity(pose.rotation).get_eulerAngles();
+        preview.rotationDegrees = {
+            camera::NormalizeDegrees(euler.x),
+            camera::NormalizeDegrees(euler.y),
+            camera::NormalizeDegrees(euler.z)};
+        std::string error;
+        if (!settings_.Save(&error)) {
+            Logging::Logger.error("Preview placement save failed: {}", error);
+        }
+        floatingPoseDirty_ = false;
+        floatingStableSeconds_ = 0.0F;
+    }
+
     void EnsurePlacementPreview() {
         if (!editorActive_) {
             DestroyPlacementPreview();
@@ -974,11 +1022,13 @@ private:
                         const auto dy = position.y - headPosition.y;
                         const auto dz = position.z - headPosition.z;
                         headDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
-                        // Positive dot = the canvas front faces the player.
+                        // FloatingScreen's visible face points along local -Z.
+                        // Positive dot therefore means that face points from
+                        // the panel back toward the player's head.
                         const auto panelForward = UnityEngine::Quaternion::op_Multiply(
                             screenTransform->get_rotation(), UnityEngine::Vector3::get_forward());
                         if (headDistance > 0.001F) {
-                            facingDot = -(panelForward.x * dx + panelForward.y * dy +
+                            facingDot = (panelForward.x * dx + panelForward.y * dy +
                                 panelForward.z * dz) / headDistance;
                         }
                     }
@@ -1056,6 +1106,10 @@ private:
     UnityEngine::Material* previewMaterial_ = nullptr;
     // Dedicated material for the movable popout; see EnsureFloatingPreviewMaterial.
     UnityEngine::Material* floatingMaterial_ = nullptr;
+    // Bright blue accent shared by this preview's frame/header/footer only.
+    // Its shader writes zero framebuffer alpha so the panel matches the other
+    // popouts without contributing to Beat Saber's bloom mask.
+    UnityEngine::Material* floatingBorderMaterial_ = nullptr;
     BSML::FloatingScreen* floatingScreen_ = nullptr;
     UnityEngine::UI::RawImage* floatingImage_ = nullptr;
     // Footer text on the popout that doubles as a live feed-status readout.

@@ -12,6 +12,7 @@
 
 namespace UnityEngine {
 class Camera;
+class Texture;
 }
 
 namespace saberstage::recording {
@@ -60,6 +61,11 @@ public:
         float fieldOfViewDegrees,
         saberstage::recording::EncodedVideoCallback callback);
     void Stop() noexcept;
+    // Replaces the spectator-camera texture at the GLES encoder bridge while
+    // keeping the MediaCodec/RTMP presentation timeline alive. Passing null
+    // restores camera frames. The caller owns the override texture lifetime.
+    void SetOverrideTexture(UnityEngine::Texture* texture) noexcept;
+    [[nodiscard]] bool HasOverrideTexture() const noexcept;
     [[nodiscard]] bool Failed() const noexcept;
     [[nodiscard]] std::uint64_t DroppedFrameCount() const noexcept;
     [[nodiscard]] std::int64_t FirstFrameMonotonicNanos() const noexcept;
@@ -76,6 +82,7 @@ private:
     std::uint64_t skippedTimelineFrames_ = 0;
     std::int64_t firstFrameMonotonicNanos_ = 0;
     bool failureLogged_ = false;
+    bool overrideTextureActive_ = false;
     saberstage::recording::DirectCaptureDiagnostics lastDiagnostics_{};
 };
 

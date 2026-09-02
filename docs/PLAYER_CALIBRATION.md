@@ -2,7 +2,7 @@
 
 ## Shared-Quest player profiles
 
-SaberStage provides five fixed local profile slots for people who share one headset or want separate configurations. The Avatar tab exposes them through one `Player Profile` dropdown (`Profile 1` through `Profile 5`). A profile contains only that player's calibration and the complete Avatar settings group, including selected avatar, avatar quality/visibility controls, controller-to-wrist offsets, display-clone placements, and per-avatar retargeting choices. Camera, recording, preview, broadcast, and every other SaberStage subsystem remain shared and are not changed when the active profile changes.
+SaberStage provides five fixed local profile slots for people who share one headset or want separate configurations. The center menu's **Setup** page exposes them through one `Player Profile` dropdown (`Profile 1` through `Profile 5`). A profile contains only that player's calibration and the complete Avatar settings group, including selected avatar, avatar quality/visibility controls, controller-to-wrist offsets, display-clone placements, and per-avatar retargeting choices. Camera, recording, preview, broadcast, and every other SaberStage subsystem remain shared and are not changed when the active profile changes.
 
 The migrated `Default` player becomes `Profile 1` and continues to use `PlayerCalibration.json`, so an existing installation does not require recalibration. Profiles 2 through 5 store calibration beneath `PlayerProfiles/<profile-id>/PlayerCalibration.json`. The settings document snapshots each profile's Avatar settings independently and restores the active Avatar UI when switching profiles.
 
@@ -37,9 +37,22 @@ Static instructions describe the pose to make during the countdown and hold thro
 
 ## Avatar menu workflow
 
-Changing avatars is a three-step operation: choose the `.vrm` file, select **Load Avatar**, then select **Attach Tracking**. A successfully loaded avatar safely replaces the previous avatar, so using **Unload Avatar** first is optional. Loading without tracking intentionally leaves the model in its rest pose for visual inspection; attaching tracking connects it to the HMD/controller solver.
+The center menu is organized by task instead of implementation detail:
 
-**Resync Player Pose** refreshes the transient standing height, floor, tracking origin, headset, and controller reference used by the currently loaded avatar. It is useful after recentering, changing play height, or noticing that the avatar is vertically misaligned. It does not delete the saved Basic or Advanced calibration profile. **Reset Saved Profile** is the destructive operation: it deletes those saved measurements and returns the solver to generic player defaults.
+- **Setup** contains the required first-run workflow, active player profile, avatar file selection, load/unload actions, calibration, and recovery/reset actions.
+- **Display** contains visibility, first-person wear options, display clones, and expression-preview controls.
+- **Quality** contains material, texture, cutout, SpringBone, and animated-expression controls.
+- **Fit** contains avatar sizing, proportions, posture, floor, controller grip, and collision controls.
+
+The normal setup path is deliberately short: select a player profile, choose a `.vrm`, and select **Load Avatar**. If that player has no valid calibration, SaberStage opens Basic Calibration instead of displaying a generic, badly fitted avatar. The selected VRM is staged invisibly because the calibration session needs a validated humanoid rig and bound Quest tracking, but it is not presented as an enabled avatar. Completing calibration saves the player measurements, applies the selected avatar settings, enables visibility, binds tracking, and resets the neutral pose. Cancelling a first-time calibration unloads that temporary staging model and leaves **Enable Avatar** off.
+
+For a calibrated profile, **Load Avatar** is a complete one-click lifecycle operation: it safely replaces the previous avatar, binds the HMD/controller solver, applies saved avatar settings, performs a final neutral-pose reset, enables the master state, and restores saved visibility. Users do not have to remember a Load, Bind, Reset sequence. Startup and profile switching use the same ordering and refuse to auto-enable an avatar when that profile has no valid calibration.
+
+**Enable Avatar** is the persisted master control. Turning it off unloads the avatar and releases its runtime objects while retaining the selected file, player calibration, and avatar-specific settings. Turning it back on runs the same complete load/bind/reset path. **Visible** on the Display page is intentionally separate: it hides or shows an already loaded avatar without unloading it.
+
+**Bind Tracking** and **Reset Avatar Pose** remain together under **Tracking Recovery** for unusual recovery cases. Bind Tracking reconnects an already loaded humanoid to the current HMD/controller sources and then attempts a pose reset. Reset Avatar Pose refreshes the transient standing height, floor, tracking origin, headset, and controller reference without deleting the saved Basic or Advanced calibration profile.
+
+The destructive actions are explicit and confirmed. **Reset Profile Calibration** deletes only the active player's body, reach, grip, and movement measurements, unloads and disables the avatar, and requires calibration before it can be enabled again. It keeps the avatar file and avatar-specific settings. **Clear Avatar Data** instead resets the active profile's selected avatar plus saved fit, grip, display, material, and quality settings; it does not delete the VRM file from storage or erase the player's calibration measurements.
 
 Motion validation distinguishes return-to-origin lean from persistent translation using requested direction, peak and final normalized displacement, controller-midpoint evidence, duration, velocity, head tilt, and return fraction. Squat, duck, look, and turn captures have separate transparent checks. Failed data never advances silently. Retry replaces only the current step; Cancel restores the previously active profile; Reset removes the saved profile and returns to generic defaults.
 

@@ -226,6 +226,42 @@ def remove(adb: Adb) -> None:
     print(f"Removed only receipt-owned source file: {REMOTE_LIBRARY}")
 
 
+def redact_settings_credentials(raw: str) -> str:
+    """Return support-safe settings JSON without forwarding broadcast secrets.
+
+    Settings can contain one saved stream key for each service plus Twitch
+    OAuth access/refresh tokens. Parse and redact by field name recursively so
+    future nesting changes remain safe. A malformed file is omitted entirely
+    because regex replacement cannot prove that a private value was removed.
+    """
+    if raw.strip() == "SaberStage settings file is absent.":
+        return raw
+    try:
+        document = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return "SaberStage settings were omitted because credential-safe redaction could not parse the file.\n"
+
+    def redact(value):
+        if isinstance(value, dict):
+            for name, child in value.items():
+                normalized = name.lower().replace("_", "")
+                if normalized in {
+                    "streamkey",
+                    "accesstoken",
+                    "refreshtoken",
+                    "protectedtokenenvelope",
+                }:
+                    value[name] = "<redacted>" if child else ""
+                else:
+                    redact(child)
+        elif isinstance(value, list):
+            for child in value:
+                redact(child)
+
+    redact(document)
+    return json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+
+
 def collect_logs(adb: Adb, output_root: pathlib.Path | None) -> None:
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     root = output_root or (ROOT / "SaberStage Support Logs")
@@ -269,7 +305,12 @@ def collect_logs(adb: Adb, output_root: pathlib.Path | None) -> None:
         }
         for name, command in remote_commands.items():
             result = adb._raw("shell", command, check=False)
-            (work / name).write_text(result.stdout + result.stderr, encoding="utf-8", errors="replace")
+            output = result.stdout + result.stderr
+            if name == "settings.json":
+                output = redact_settings_credentials(result.stdout)
+                if result.stderr:
+                    output += "\nADB error output:\n" + result.stderr
+            (work / name).write_text(output, encoding="utf-8", errors="replace")
 
         (work / "device.txt").write_text(
             adb.shell("getprop ro.product.model", check=False) + "\n" +

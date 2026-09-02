@@ -6,6 +6,7 @@
 #include "saberstage/broadcast/LivestreamState.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -41,6 +42,8 @@ namespace saberstage::recording {
 class AsyncVideoWriter;
 class DirectFfmpegCapture;
 class RealtimeAudioCapture;
+class AfkMediaSource;
+class MicrophoneCapture;
 
 }
 
@@ -62,14 +65,23 @@ struct RecordingSnapshot {
     // callbacks). UI consumers difference it over wall time to display the
     // achieved capture frame rate; it is never reset mid-recording.
     std::uint64_t encodedFrameCount = 0;
+    // Presentation deadlines or bounded encoder/network queue packets that
+    // could not be delivered. This is monotonic for the current session and
+    // powers both the five-second rolling and total counters in the movable
+    // controls.
+    std::uint64_t droppedFrameCount = 0;
 
     [[nodiscard]] bool CanStart() const noexcept {
         return recording::CanStart(state);
     }
-    [[nodiscard]] bool CanPause() const noexcept { return recording::CanPause(state); }
-    [[nodiscard]] bool CanResume() const noexcept { return recording::CanResume(state); }
+    [[nodiscard]] bool CanPause() const noexcept {
+        return outputType != RecordingOutputType::LiveStream && recording::CanPause(state);
+    }
+    [[nodiscard]] bool CanResume() const noexcept {
+        return outputType != RecordingOutputType::LiveStream && recording::CanResume(state);
+    }
     [[nodiscard]] bool CanStop() const noexcept {
-        return recording::CanStop(state);
+        return outputType != RecordingOutputType::LiveStream && recording::CanStop(state);
     }
 };
 
@@ -91,9 +103,36 @@ public:
     bool Resume(std::string* error = nullptr);
     bool Stop(std::string_view reason = "Stopped by user");
     bool StartLivestream(std::string* error = nullptr);
+    bool PauseLivestream(std::string* error = nullptr);
+    bool ResumeLivestream(std::string* error = nullptr);
+    // Gain changes are deliberately safe while live: the audio worker reads
+    // these cached values only while holding livestreamMutex_. Source-enable
+    // changes still require a new stream because they own capture resources.
+    void SetLivestreamGameAudioVolumePercent(float value);
+    void SetLivestreamMicrophoneVolumePercent(float value);
+    bool SetLivestreamMicrophoneMuted(
+        bool muted,
+        std::string* error = nullptr);
     void StopLivestream() noexcept;
-    bool SetStreamKey(std::string streamKey, std::string* error = nullptr);
-    void ClearStreamKey() noexcept;
+    bool PrepareAfkMedia(
+        const std::filesystem::path& path,
+        std::string* error = nullptr);
+    // Applies an RTMP/RTMPS endpoint for this Beat Saber session without
+    // mutating SettingsService. The UI clears this override after a successful
+    // Save in Settings action so the persisted value becomes authoritative.
+    bool SetStreamServerUrl(
+        settings::LivestreamProvider provider,
+        std::string serverUrl,
+        std::string* error = nullptr);
+    void ClearStreamServerUrlOverride(settings::LivestreamProvider provider) noexcept;
+    bool SetStreamKey(
+        settings::LivestreamProvider provider,
+        std::string streamKey,
+        std::string* error = nullptr);
+    void ClearStreamKey(settings::LivestreamProvider provider) noexcept;
+    [[nodiscard]] std::string StreamServerUrl(
+        settings::LivestreamProvider provider) const;
+    [[nodiscard]] std::string StreamKey(settings::LivestreamProvider provider) const;
     [[nodiscard]] broadcast::LivestreamSnapshot LivestreamSnapshot() const;
     void Shutdown() noexcept;
     void Tick() noexcept;
@@ -101,14 +140,30 @@ public:
     [[nodiscard]] RecordingSnapshot Snapshot() const;
 
 private:
-    bool StartCapture(std::string* error, bool forceContinuous = false);
+    // A live broadcast always requires the Direct FFmpeg packet callback, but
+    // that must not overwrite the user's preferred local-recording backend.
+    // forceDirectHardware changes only this capture session. writeLocalOutput
+    // controls whether H.264/WAV/MP4 files are created; Go Live passes false.
+    bool StartCapture(
+        std::string* error,
+        bool forceContinuous = false,
+        bool forceDirectHardware = false,
+        bool writeLocalOutput = true);
     void StartVideoSegment();
     void StopVideoSegment(bool recordCaptureFailure = true) noexcept;
     bool HandleDirectCaptureHealth() noexcept;
     void CreatePersistentAudioCapture();
+    void SubmitLivestreamAudioLocked(
+        const float* samples,
+        std::size_t count,
+        std::int32_t channels,
+        std::int32_t sampleRate) noexcept;
+    void StopLivestreamMicrophoneLocked() noexcept;
     void UpdateAudioCapturePose() noexcept;
     void RefreshAudioListenerOwnership() noexcept;
     void RestoreAudioListenerOwnership() noexcept;
+    void EnableLivestreamWakeGuard() noexcept;
+    void DisableLivestreamWakeGuard() noexcept;
     void HandleRuntimeCameraInvalidated() noexcept;
     void HandleRuntimeCameraReady() noexcept;
     void HandleSpectatorRendered() noexcept;
@@ -188,12 +243,40 @@ private:
     settings::RecordingBackend activeBackend_ = settings::RecordingBackend::Hollywood;
     float activeFovDegrees_ = 0.0F;
     bool gameplayOnlySession_ = false;
+    // True only when Go Live had to create an encoder/audio session of its
+    // own. Such a session feeds the network sink but never opens local media
+    // files, and Stop Stream must tear it down completely.
+    bool streamOnlySession_ = false;
     bool directFallbackAttempted_ = false;
     ControllerShortcut controllerShortcut_;
     std::uint32_t audioListenerRefreshFrame_ = 0;
     mutable std::mutex livestreamMutex_;
     std::unique_ptr<broadcast::DirectLivestreamSink> livestreamSink_;
-    std::string streamKey_;
+    std::unique_ptr<AfkMediaSource> afkMedia_;
+    // The Quest microphone and reusable mix buffers are owned by the stream,
+    // never by local recording. Access is serialized by livestreamMutex_ so a
+    // stream can stop while RealtimeAudioCapture's worker remains alive for a
+    // simultaneous local recording.
+    std::unique_ptr<MicrophoneCapture> livestreamMicrophone_;
+    std::vector<float> livestreamMixScratch_;
+    std::vector<float> livestreamMicrophoneScratch_;
+    bool livestreamGameAudioEnabled_ = true;
+    float livestreamGameAudioGain_ = 1.0F;
+    bool livestreamMicrophoneEnabled_ = false;
+    float livestreamMicrophoneGain_ = 1.0F;
+    bool livestreamMicrophoneMuted_ = false;
+    bool livestreamMicrophoneFailureReported_ = false;
+    // Session-only endpoint and key overrides are isolated by provider. Empty
+    // means the saved destination record is authoritative for that service.
+    std::array<std::string, 4> streamServerUrlOverrides_{};
+    std::array<std::string, 4> streamKeyOverrides_{};
+    std::atomic<bool> livestreamAfk_{false};
+    // A live stream can temporarily own both Unity's inactivity timeout and
+    // Quest's proximity-power override. The exact Unity value and normal
+    // proximity behavior are restored when streaming ends or startup fails.
+    bool livestreamWakeGuardActive_ = false;
+    bool livestreamProximityGuardActive_ = false;
+    std::int32_t previousSleepTimeout_ = -2;
     bool shuttingDown_ = false;
 };
 

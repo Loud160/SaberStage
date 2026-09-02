@@ -23,6 +23,12 @@ struct LivestreamSnapshot {
     std::uint64_t queuedVideoBytes = 0;
     std::uint64_t queuedAudioSamples = 0;
     bool streamKeyConfigured = false;
+    bool afk = false;
+    // Session microphone state is reported separately from the persistent
+    // source setting. A configured microphone can be muted from the movable
+    // controls without stopping capture or changing the saved preference.
+    bool microphoneAvailable = false;
+    bool microphoneMuted = true;
 };
 
 inline bool CanStart(LivestreamState state) noexcept {

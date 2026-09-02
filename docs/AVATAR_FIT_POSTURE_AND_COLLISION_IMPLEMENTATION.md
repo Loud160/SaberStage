@@ -327,7 +327,7 @@ The fit must solve against both sides together, reject asymmetric/outlier sample
 
 ## UI organization and gating
 
-The Avatar tab may need another subpage rather than compressing the existing calibration page. Controls should be grouped as:
+The center avatar menu now uses four task-oriented pages: Setup, Display, Quality, and Fit. Setup owns the required profile/avatar/calibration lifecycle; Display and Quality own their optional presentation controls. The Fit page keeps the adjustment controls grouped as:
 
 1. Sizing Mode and Height Fit.
 2. Manual Final Scale and Saber Reach.

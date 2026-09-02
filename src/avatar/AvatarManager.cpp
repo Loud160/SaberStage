@@ -1043,7 +1043,7 @@ public:
                 Logging::Logger.info("VRM humanoid validated and trackerless solver binding succeeded");
             } else {
                 Logging::Logger.info(
-                    "VRM humanoid validated; avatar is intentionally in rest pose until Attach Tracking is selected");
+                    "VRM humanoid validated; caller requested an unbound rest-pose load");
             }
             return true;
         } catch (const std::exception& exception) {

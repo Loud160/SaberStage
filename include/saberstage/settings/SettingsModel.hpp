@@ -9,7 +9,12 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 19;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 27;
+// Twitch Client IDs identify an application and are public by design. Keep
+// SaberStage's registered ID in one place so every installation authorizes
+// the same application without asking users to register their own.
+inline constexpr std::string_view kSaberStageTwitchClientId =
+    "p6shnc5g4vtb46a7xd26d1uh6xr6ee";
 
 enum class RecordingBackend {
     Hollywood,
@@ -156,7 +161,9 @@ struct PreviewSettings {
     bool visible = false;
     std::string selectedCameraId = std::string(camera::kPrimaryCameraId);
     camera::Vec3 position{0.0F, 1.15F, 2.1F};
-    camera::Vec3 rotationDegrees{0.0F, 180.0F, 0.0F};
+    // FloatingScreen's visible UI face points along local -Z. At the default
+    // positive-Z position, zero yaw faces the panel toward the player.
+    camera::Vec3 rotationDegrees{0.0F, 0.0F, 0.0F};
     float scale = 1.0F;
 };
 
@@ -178,24 +185,104 @@ struct RecordingSettings {
     // Adds a live "capture FPS / headset FPS" row to the floating recording
     // controls. On by default; off keeps the compact two-row panel.
     bool worldControlsShowFps = true;
+    // The movable panel controls exactly one output at a time. Persisting the
+    // selector keeps the panel predictable after a restart without coupling
+    // the local-recording and livestream setting records.
+    bool worldControlsStreamMode = false;
     camera::Vec3 worldControlsPosition{0.42F, 1.25F, 1.45F};
-    camera::Vec3 worldControlsRotationDegrees{0.0F, 180.0F, 0.0F};
+    camera::Vec3 worldControlsRotationDegrees{0.0F, 0.0F, 0.0F};
 };
+
+struct LivestreamDestinationSettings {
+    std::string serverUrl;
+    // Empty remains the safe default. A key is written here only after the
+    // user explicitly chooses Save in Settings from the confirmation dialog.
+    // Support archives redact this field before copying settings.json.
+    std::string streamKey;
+    // Provider-specific metadata is kept beside that provider's endpoint and
+    // key. Today only Twitch applies this through its public API; the values
+    // remain independent so YouTube/Kick support can be added without a
+    // migration that accidentally shares one title across services.
+    std::string streamTitle;
+};
+
+struct TwitchAccountSettings {
+    // Public application identifier, intentionally embedded in SaberStage.
+    // This is not Twitch's client secret and must never be confused with a
+    // user's private stream key or OAuth tokens.
+    std::string clientId = std::string(kSaberStageTwitchClientId);
+    // Plaintext OAuth tokens exist only in process memory. SettingsService
+    // still decodes the legacy fields so TwitchService can migrate alpha-era
+    // installations, but Encode deliberately never writes them back to disk.
+    std::string accessToken;
+    std::string refreshToken;
+    // Versioned AES-GCM envelope whose non-exportable key lives in Android
+    // Keystore. The envelope is safe to persist but remains redacted from
+    // support bundles as defense in depth.
+    std::string protectedTokenEnvelope;
+    std::string login;
+    std::string userId;
+    std::int64_t expiresAtUnixSeconds = 0;
+    // Tokens saved before schema 25 do not have Twitch's write-chat scope.
+    // Keep that distinction explicit so the map-announcement option can ask
+    // for a one-time reconnect instead of failing silently at song start.
+    bool chatWriteAuthorized = false;
+};
+
+[[nodiscard]] bool TwitchTokenNeedsRefresh(
+    const TwitchAccountSettings& account,
+    std::int64_t nowUnixSeconds,
+    std::int64_t refreshLeadSeconds = 300) noexcept;
 
 struct LivestreamSettings {
     bool enabled = false;
     LivestreamProvider provider = LivestreamProvider::Twitch;
-    // The stream key is deliberately not part of SettingsDocument. It is held
-    // only by the runtime credential store and must never be written to the
-    // ordinary JSON settings file or logs.
-    std::string serverUrl = "rtmp://ingest.global-contribute.live-video.net/app";
+    // Streaming owns a separate, non-destructive audio mix. These values do
+    // not alter local recording audio or Beat Saber's audible output. Gains
+    // are percentages so the UI can expose a direct 0-200% balance control.
+    bool gameAudioEnabled = true;
+    float gameAudioVolumePercent = 100.0F;
+    bool microphoneEnabled = false;
+    float microphoneVolumePercent = 100.0F;
+    // Quest's proximity power manager can suspend the app when the headset is
+    // removed even if Unity's ordinary inactivity timer is disabled. While a
+    // stream is active, opt into both guards so an unattended broadcast is not
+    // terminated with a network/player error. The previous Unity timeout and
+    // normal proximity behavior are restored when streaming ends.
+    bool keepHeadsetAwake = true;
+    // Each service owns an independent endpoint and key. Selecting or editing
+    // one provider must never replace another provider's credentials.
+    LivestreamDestinationSettings twitch{
+        "rtmp://ingest.global-contribute.live-video.net/app", {}, {}};
+    LivestreamDestinationSettings youtube{
+        "rtmps://a.rtmps.youtube.com/live2", {}, {}};
+    LivestreamDestinationSettings kick{
+        "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app", {}, {}};
+    LivestreamDestinationSettings custom{"rtmps://", {}, {}};
     bool reconnectEnabled = true;
     std::int32_t reconnectAttempts = 8;
     std::int32_t reconnectInitialDelaySeconds = 2;
+    // A selected still image or animated GIF replaces the camera while a
+    // Twitch stream is paused. Empty selects SaberStage's built-in AFK image.
+    std::string afkMediaPath;
+    // Off by default: opting in posts one concise map summary from the
+    // streamer's connected Twitch account when gameplay actually starts.
+    bool postMapInfoToChat = false;
+    TwitchAccountSettings twitchAccount;
 };
 
 struct FeatureSettings {
     bool enabled = false;
+};
+
+struct ChatSettings {
+    bool enabled = false;
+    camera::Vec3 position{-0.48F, 1.25F, 1.45F};
+    camera::Vec3 rotationDegrees{0.0F, 0.0F, 0.0F};
+    // Canvas-unit dimensions are persisted independently from world scale so
+    // the same saved size can be restored without changing text/button scale.
+    float width = 70.0F;
+    float height = 58.0F;
 };
 
 struct AvatarControllerOffsetSettings {
@@ -401,7 +488,7 @@ struct SettingsDocument {
     };
     FeatureSettings scenes;
     LivestreamSettings broadcast;
-    FeatureSettings chat;
+    ChatSettings chat;
 };
 
 void SyncActiveAvatarPlayerProfile(SettingsDocument& settings);
@@ -417,6 +504,14 @@ struct ValidationResult {
 };
 
 SettingsDocument Defaults();
+[[nodiscard]] LivestreamDestinationSettings& DestinationForProvider(
+    LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept;
+[[nodiscard]] const LivestreamDestinationSettings& DestinationForProvider(
+    const LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept;
+[[nodiscard]] bool IsValidLivestreamServerUrl(std::string_view value) noexcept;
+[[nodiscard]] bool IsValidStreamKey(std::string_view value) noexcept;
 ValidationResult ValidateAndRepair(SettingsDocument& settings);
 bool Migrate(SettingsDocument& settings, std::uint32_t sourceSchemaVersion);
 void ResetSubsystem(SettingsDocument& settings, Subsystem subsystem);

@@ -194,6 +194,9 @@ struct AvatarShaderResources {
     // this is retained from the embedded Android bundle so both Quest eyes
     // receive a guaranteed multiview variant.
     SafePtrUnity<UnityEngine::Shader> gripTarget;
+    // Optional non-bloom world-panel accent shader. Older bundles can still
+    // load avatars; callers fall back to their ordinary UI material.
+    SafePtrUnity<UnityEngine::Shader> nonBloomUi;
     bool attempted = false;
 };
 
@@ -249,6 +252,14 @@ bool LoadAvatarShaders() {
         } else {
             Logging::Logger.warn(
                 "Embedded bundle has no saberstage-grip-target shader; hand target uses the stock fallback");
+        }
+        auto* nonBloomUi = static_cast<UnityEngine::Shader*>(
+            bundle->LoadAsset<UnityEngine::Shader*>("saberstage-non-bloom-ui"));
+        if (RetainShader(nonBloomUi)) {
+            resources.nonBloomUi = nonBloomUi;
+        } else {
+            Logging::Logger.warn(
+                "Embedded bundle has no saberstage-non-bloom-ui shader; panel accents use the stock fallback");
         }
         resources.bundle = bundle;
         resources.mtoon = mtoon;
@@ -2332,6 +2343,16 @@ UnityEngine::Shader* EmbeddedGripTargetShader() noexcept {
         LoadAvatarShaders();
         auto& resources = AvatarShaders();
         return resources.gripTarget ? resources.gripTarget.ptr() : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+UnityEngine::Shader* EmbeddedNonBloomUiShader() noexcept {
+    try {
+        LoadAvatarShaders();
+        auto& resources = AvatarShaders();
+        return resources.nonBloomUi ? resources.nonBloomUi.ptr() : nullptr;
     } catch (...) {
         return nullptr;
     }

@@ -67,6 +67,10 @@ struct CameraProfile {
     SubjectAnchor subjectAnchor = SubjectAnchor::PlayerRoot;
     Vec3 position{0.0F, 2.2F, -3.5F};
     Vec3 rotationDegrees{8.0F, 0.0F, 0.0F};
+    // Keeps manually positioned cameras from rolling with an accidentally
+    // tilted grab/rotation. Movement scripts are authored camera motion and
+    // intentionally override this constraint while they are active.
+    bool keepLevel = false;
     float fovDegrees = 70.0F;
     std::int32_t requestedWidth = 1280;
     std::int32_t requestedHeight = 720;

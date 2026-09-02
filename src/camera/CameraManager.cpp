@@ -689,13 +689,24 @@ private:
         const auto& profile = settings_.Get().camera.Primary();
         if (!profile.enabled) return;
         const auto scriptSample = SampleMovementScript();
-        const auto motion = movement_.Evaluate(profile, {
+        auto motion = movement_.Evaluate(profile, {
             ResolveAnchor(headPose),
             BasePose(profile),
             scriptSample,
             ShortestAngleDegrees(forwardYawDegrees_, YawDegrees(headPose.rotation)),
             deltaSeconds,
         });
+        const bool scriptOwnsRotation = scriptSample && scriptSample->active;
+        if (profile.keepLevel && !scriptOwnsRotation) {
+            // Apply the constraint after anchoring and smoothing so head-follow
+            // or a tilted grab cannot reintroduce roll. Preserve pitch/yaw so
+            // the camera still aims at the subject. Active movement scripts
+            // deliberately own their complete authored rotation and bypass
+            // this manual-placement safety constraint.
+            auto euler = ToUnity(motion.worldPose.rotation).get_eulerAngles();
+            euler.z = 0.0F;
+            motion.worldPose.rotation = FromUnity(UnityEngine::Quaternion::Euler(euler));
+        }
         currentWorldPose_ = motion.worldPose;
         currentWorldPoseValid_ = true;
         cameraObject_->get_transform()->SetPositionAndRotation(ToUnity(motion.worldPose.position), ToUnity(motion.worldPose.rotation));

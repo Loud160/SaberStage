@@ -35,9 +35,9 @@ int main() {
     Require(RecordingOutputTypeName(RecordingOutputType::Local) == std::string_view("LOCAL"),
             "local recording output has the compact world-panel label");
     Require(RecordingOutputTypeName(RecordingOutputType::LiveStream) == std::string_view("LIVE STREAM"),
-            "future live output has the compact world-panel label");
+            "stream-only output has the compact world-panel label");
     Require(RecordingOutputTypeName(RecordingOutputType::LocalAndLive) == std::string_view("LOCAL + LIVE"),
-            "simultaneous safety recording and broadcast has a clear compact label");
+            "an intentional local recording with an attached broadcast has a clear compact label");
 
     Require(CanStart(RecordingState::Idle), "idle can start");
     Require(CanStart(RecordingState::Failed), "failed session can retry");

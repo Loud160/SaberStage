@@ -31,6 +31,10 @@ public:
     void OpenFile(
         const std::filesystem::path& path,
         saberstage::recording::PcmConsumer consumer = {});
+    // Starts the same bounded audio worker without opening a WAV file. This is
+    // used by stream-only sessions so game audio can reach the network sink
+    // without silently creating a local recording.
+    void OpenConsumerOnly(saberstage::recording::PcmConsumer consumer);
     void Save() noexcept;
     [[nodiscard]] std::uint64_t DroppedSampleCount() const noexcept;
     [[nodiscard]] bool Failed() const noexcept;

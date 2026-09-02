@@ -5,11 +5,15 @@
 #include <functional>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
+#include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace HMUI {
+class ImageView;
 class InputFieldView;
 class TextSegmentedControl;
 class ViewController;
@@ -20,6 +24,7 @@ class SliderSetting;
 class ToggleSetting;
 class ModalView;
 class FloatingScreen;
+class ScrollView;
 }
 
 namespace TMPro {
@@ -70,11 +75,25 @@ private:
     static void BuildPreviewPanel(HMUI::ViewController* view);
     static void BuildRecordingPanel(HMUI::ViewController* view);
     void BuildAvatarFilePicker(HMUI::ViewController* view);
+    void BuildAfkFilePicker(HMUI::ViewController* view);
     static void SetEditorPreviewActive(bool active);
     void EditCamera(const std::function<void(camera::CameraProfile&)>& edit, std::string_view reason);
     void RefreshScriptStatus();
     void RefreshRecordingStatus();
     void RefreshLivestreamKeyDisplay();
+    void ShowLivestreamValueConfirmation(int valueKind);
+    void ResolveLivestreamValueConfirmation(int action);
+    void ShowLivestreamActionError(
+        std::string_view message,
+        bool streamStillLive = false);
+    void ShowStreamTitleEditor();
+    void SaveStreamTitle();
+    void OpenAfkFilePicker();
+    void BrowseAfkDirectory(const std::filesystem::path& directory);
+    void SelectAfkFile(const std::filesystem::path& path);
+    void BeginTwitchAuthorization();
+    void RefreshTwitchControls();
+    void TryStartLivestreamWithTitle();
     void SetRecordingWorldPanelVisible(bool visible);
     void EnsureRecordingWorldPanel();
     void DestroyRecordingWorldPanel() noexcept;
@@ -82,8 +101,33 @@ private:
     void TickRecordingWorldPanel() noexcept;
     void UpdateRecordingWorldPanelPersistence();
     void RecordingWorldPanelPrimaryAction();
+    void RecordingWorldPanelPauseAction();
+    void RecordingWorldPanelStopAction();
+    void RecordingWorldPanelMicrophoneAction();
+    void SetRecordingWorldPanelStreamMode(bool streamMode);
+    void ResetRecordingWorldPanelPose();
+    void SetChatWorldPanelVisible(bool visible);
+    void EnsureChatWorldPanel();
+    void DestroyChatWorldPanel() noexcept;
+    void ResetChatWorldPanelPose();
+    void ToggleChatWorldPanelResize();
+    void EnsureChatWorldPanelResizeHandle();
+    void DestroyChatWorldPanelResizeHandle() noexcept;
+    void UpdateChatWorldPanelLayout();
+    void ReflowChatWorldPanelText();
+    void RefreshVirtualizedChatRows();
+    void TickChatWorldPanelResize();
+    void UpdateChatWorldPanelPersistence();
+    void TickChatWorldPanel() noexcept;
     void RefreshAvatarStatus();
     void RefreshCalibrationStatus();
+    bool LoadSelectedAvatar(bool calibrationOnly, std::string* error = nullptr);
+    void SetAvatarMasterEnabled(bool enabled);
+    void BeginPlayerCalibration(bool advanced);
+    bool CompletePlayerCalibrationWorkflow(std::string* error = nullptr);
+    void CancelPlayerCalibrationWorkflow() noexcept;
+    void ShowAvatarSetupConfirmation(int action);
+    void ResolveAvatarSetupConfirmation(bool accepted);
     void RefreshRetargetingControls();
     void ShowAvatarFitWarning(int warningKind);
     void ResolveAvatarFitWarning(bool accepted);
@@ -139,13 +183,39 @@ private:
     TMPro::TextMeshProUGUI* livestreamStatusText_ = nullptr;
     HMUI::InputFieldView* livestreamServerInput_ = nullptr;
     HMUI::InputFieldView* livestreamKeyInput_ = nullptr;
+    HMUI::InputFieldView* streamTitleInput_ = nullptr;
+    TMPro::TextMeshProUGUI* twitchAccountStatusText_ = nullptr;
+    TMPro::TextMeshProUGUI* livestreamProviderFeatureText_ = nullptr;
+    HMUI::ViewController* recordingView_ = nullptr;
+    BSML::ModalView* livestreamValueConfirmationModal_ = nullptr;
+    TMPro::TextMeshProUGUI* livestreamValueConfirmationText_ = nullptr;
+    int pendingLivestreamValueKind_ = 0;
+    BSML::ModalView* livestreamActionErrorModal_ = nullptr;
+    TMPro::TextMeshProUGUI* livestreamActionErrorText_ = nullptr;
+    BSML::ModalView* streamTitleModal_ = nullptr;
+    HMUI::InputFieldView* streamTitleModalInput_ = nullptr;
+    BSML::ModalView* twitchAuthorizationModal_ = nullptr;
+    TMPro::TextMeshProUGUI* twitchAuthorizationText_ = nullptr;
+    BSML::ModalView* twitchConnectionSuccessModal_ = nullptr;
+    TMPro::TextMeshProUGUI* twitchConnectionSuccessText_ = nullptr;
+    // True only while the device-code dialog owns an active authorization
+    // attempt. It prevents an unrelated, already-connected refresh from
+    // closing the modal and lets successful device authorization dismiss its
+    // now-obsolete Open Twitch / Cancel actions automatically.
+    bool twitchAuthorizationAwaitingCompletion_ = false;
     TMPro::TextMeshProUGUI* recordingWorldPanelTypeText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelTimeText_ = nullptr;
     // Optional FPS row on the floating recording controls; null when the
     // "Panel FPS Counters" setting is off (the panel is built shorter then).
     TMPro::TextMeshProUGUI* recordingWorldPanelFpsText_ = nullptr;
+    TMPro::TextMeshProUGUI* recordingWorldPanelDropText_ = nullptr;
+    BSML::ToggleSetting* recordingWorldPanelModeToggle_ = nullptr;
     TMPro::TextMeshProUGUI* avatarStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* calibrationStatusText_ = nullptr;
+    BSML::ToggleSetting* avatarEnabledToggle_ = nullptr;
+    BSML::ModalView* avatarSetupConfirmationModal_ = nullptr;
+    TMPro::TextMeshProUGUI* avatarSetupConfirmationText_ = nullptr;
+    int pendingAvatarSetupConfirmation_ = 0;
     HMUI::ViewController* avatarSettingsView_ = nullptr;
     BSML::ToggleSetting* matchPlayerHeightToggle_ = nullptr;
     BSML::SliderSetting* heightAdjustmentBalanceSlider_ = nullptr;
@@ -235,31 +305,103 @@ private:
     UnityEngine::GameObject* avatarPickerListContent_ = nullptr;
     std::vector<UnityEngine::GameObject*> avatarPickerRows_;
     std::filesystem::path avatarPickerDirectory_;
+    TMPro::TextMeshProUGUI* afkPickerPathText_ = nullptr;
+    TMPro::TextMeshProUGUI* afkSelectionText_ = nullptr;
+    BSML::ModalView* afkPickerModal_ = nullptr;
+    UnityEngine::GameObject* afkPickerListContent_ = nullptr;
+    std::vector<UnityEngine::GameObject*> afkPickerRows_;
+    std::filesystem::path afkPickerDirectory_;
     UnityEngine::UI::Button* startRecordingButton_ = nullptr;
     UnityEngine::UI::Button* pauseRecordingButton_ = nullptr;
     UnityEngine::UI::Button* resumeRecordingButton_ = nullptr;
     UnityEngine::UI::Button* stopRecordingButton_ = nullptr;
     UnityEngine::UI::Button* startLivestreamButton_ = nullptr;
     UnityEngine::UI::Button* stopLivestreamButton_ = nullptr;
+    UnityEngine::UI::Button* setLivestreamServerButton_ = nullptr;
+    UnityEngine::UI::Button* setLivestreamKeyButton_ = nullptr;
     UnityEngine::UI::Button* clearLivestreamKeyButton_ = nullptr;
+    BSML::SliderSetting* livestreamGameAudioVolumeSlider_ = nullptr;
+    BSML::SliderSetting* livestreamMicrophoneVolumeSlider_ = nullptr;
     std::vector<UnityEngine::UI::Selectable*> recordingEncodingControls_;
     std::vector<UnityEngine::UI::Selectable*> directRecordingEncodingControls_;
     std::vector<UnityEngine::UI::Selectable*> livestreamConfigurationControls_;
     BSML::FloatingScreen* recordingWorldPanelScreen_ = nullptr;
     UnityEngine::UI::Button* recordingWorldPanelPrimaryButton_ = nullptr;
+    UnityEngine::UI::Button* recordingWorldPanelPauseButton_ = nullptr;
     UnityEngine::UI::Button* recordingWorldPanelStopButton_ = nullptr;
+    UnityEngine::UI::Button* recordingWorldPanelStreamControlButton_ = nullptr;
+    UnityEngine::UI::Button* recordingWorldPanelMicrophoneButton_ = nullptr;
+    std::array<HMUI::ImageView*, 5> recordingWorldPanelMicrophoneGlyph_{};
+    HMUI::ImageView* recordingWorldPanelMicrophoneMuteSlash_ = nullptr;
+    HMUI::ImageView* recordingWorldPanelMicrophoneUnavailableSlash_ = nullptr;
+    // Per-panel material instances use the embedded zero-bloom alpha shader.
+    // They are not shared with avatar or preview surfaces, so destroying or
+    // rebuilding one floating panel cannot mutate another panel's UI state.
+    UnityEngine::Material* recordingWorldPanelBorderMaterial_ = nullptr;
+    BSML::FloatingScreen* chatWorldPanelScreen_ = nullptr;
+    BSML::FloatingScreen* chatWorldPanelResizeHandleScreen_ = nullptr;
+    HMUI::ImageView* chatWorldPanelBackground_ = nullptr;
+    std::array<HMUI::ImageView*, 4> chatWorldPanelBorders_{};
+    std::array<HMUI::ImageView*, 3> chatWorldPanelResizeGripStrokes_{};
+    HMUI::ImageView* chatWorldPanelHeaderDivider_ = nullptr;
+    UnityEngine::Material* chatWorldPanelBorderMaterial_ = nullptr;
+    struct ChatWorldPanelEntry {
+        std::uint64_t sequence = 0;
+        std::string text;
+        float height = 0.0F;
+        float offset = 0.0F;
+    };
+    TMPro::TextMeshProUGUI* chatWorldPanelText_ = nullptr;
+    std::vector<TMPro::TextMeshProUGUI*> chatWorldPanelRows_;
+    std::deque<ChatWorldPanelEntry> chatWorldPanelEntries_;
+    std::vector<std::size_t> chatWorldPanelRowEntryIndices_;
+    std::vector<std::uint64_t> chatWorldPanelRowGenerations_;
+    std::uint64_t chatWorldPanelEntryGeneration_ = 1;
+    float chatWorldPanelMeasuredWidth_ = 0.0F;
+    float chatWorldPanelDataRefreshSeconds_ = 0.1F;
+    float chatWorldPanelRenderedScrollPosition_ = -1.0F;
+    bool chatWorldPanelRowsDirty_ = true;
+    TMPro::TextMeshProUGUI* chatWorldPanelViewerText_ = nullptr;
+    UnityEngine::UI::Button* chatWorldPanelResizeButton_ = nullptr;
+    UnityEngine::UI::Button* chatWorldPanelControlButton_ = nullptr;
+    BSML::ScrollView* chatWorldPanelScrollView_ = nullptr;
     camera::Pose recordingWorldPanelLastPose_{};
     float recordingWorldPanelStableSeconds_ = 0.0F;
     int recordingWorldPanelDisplayedSecond_ = -1;
     int recordingWorldPanelDisplayedState_ = -1;
     bool recordingWorldPanelPoseDirty_ = false;
-    // FPS readout state: which panel variant is built, the encoded-frame count
-    // at the start of the current sampling window, the window's accumulated
-    // seconds, and the smoothed headset frame interval.
+    // FPS readout state. Capture rate is refreshed from encoder-frame deltas.
+    // HMD average deliberately uses total accepted frames / total accepted
+    // frame time for the active recording/stream session, matching Big
+    // Screen's mathematically correct average instead of averaging individual
+    // instantaneous rates or an exponential moving average.
     bool recordingWorldPanelShowsFps_ = false;
     float recordingWorldPanelFpsWindowSeconds_ = 0.0F;
     std::uint64_t recordingWorldPanelFpsWindowStartFrames_ = 0;
-    float recordingWorldPanelHmdFrameSeconds_ = 0.0F;
+    double recordingWorldPanelHmdTotalFrameSeconds_ = 0.0;
+    std::uint64_t recordingWorldPanelHmdSampledFrames_ = 0;
+    bool recordingWorldPanelHmdSessionActive_ = false;
+    std::deque<std::pair<double, std::uint64_t>> recordingWorldPanelDropSamples_;
+    std::uint64_t recordingWorldPanelSessionStartDrops_ = 0;
+    std::uint64_t recordingWorldPanelLastFrames_ = 0;
+    camera::Pose chatWorldPanelLastPose_{};
+    float chatWorldPanelStableSeconds_ = 0.0F;
+    bool chatWorldPanelPoseDirty_ = false;
+    bool chatWorldPanelResizeEditing_ = false;
+    bool chatWorldPanelFollowLive_ = true;
+    // Do not run the live-tail scrolling state machine until the rendered
+    // text is genuinely taller than the visible chat page. In particular,
+    // short connection and error messages must remain at the top of an
+    // otherwise empty panel rather than scrolling their useful first line
+    // out of view.
+    bool chatWorldPanelContentOverflows_ = false;
+    int chatWorldPanelScrollToEndFrames_ = 0;
+    int chatWorldPanelDisplayedViewerCount_ = -1;
+    bool chatWorldPanelDisplayedViewerKnown_ = false;
+    int chatWorldPanelDisplayedChatState_ = -1;
+    std::uint64_t chatWorldPanelLastMessageSequence_ = 0;
+    bool chatWorldPanelCreationFailureLogged_ = false;
+    bool chatWorldPanelTickFailureLogged_ = false;
     // Invisible body-sized grab handles for the free-standing avatar display
     // clones, one per slot (up to three), each driving its clone's placement.
     std::array<BSML::FloatingScreen*, 3> standinProxyScreens_{};
@@ -288,7 +430,12 @@ private:
     bool calibrationPanelCreationFailureLogged_ = false;
     bool calibrationPanelTickFailureLogged_ = false;
     bool livestreamKeyVisible_ = false;
+    // Distinguishes an in-place title change from the title update that must
+    // finish before a new Twitch stream is allowed to start.
+    bool pendingLiveTwitchTitleUpdate_ = false;
+    float twitchUiRefreshSeconds_ = 0.0F;
     bool refreshingRetargetingControls_ = false;
+    bool refreshingAvatarSetupControls_ = false;
     bool avatarSettingsRebuildPending_ = false;
     // Deliberately session-only diagnostic used while tuning neck/spine
     // behavior. It is never serialized into a player or avatar profile.

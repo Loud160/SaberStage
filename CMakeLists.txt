@@ -133,6 +133,7 @@ target_include_directories(${COMPILE_ID} SYSTEM PRIVATE "${SABERSTAGE_FFMPEG_DIR
 target_link_libraries(${COMPILE_ID} PRIVATE
     ${SABERSTAGE_FFMPEG_LIBS}
     -landroid
+    -ldl
     -lEGL
     -lGLESv3
     -lmediandk)
@@ -163,6 +164,34 @@ set_source_files_properties("${SABERSTAGE_AVATAR_SHADER_OBJECT}" PROPERTIES
     GENERATED TRUE
     EXTERNAL_OBJECT TRUE)
 target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AVATAR_SHADER_OBJECT}")
+
+# Keep the default pause image inside the native library for every install
+# path (source deploy and QMOD). This avoids a separately deployed asset that
+# could be omitted or become stale while still allowing a user-selected image
+# or GIF to override it at runtime.
+set(SABERSTAGE_AFK_IMAGE_ASSET
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/saberstage_afk_image.png")
+if(NOT EXISTS "${SABERSTAGE_AFK_IMAGE_ASSET}")
+    message(FATAL_ERROR
+        "Missing embedded default AFK image: assets/saberstage_afk_image.png")
+endif()
+set(SABERSTAGE_AFK_IMAGE_OBJECT
+    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_afk_image.o")
+add_custom_command(
+    OUTPUT "${SABERSTAGE_AFK_IMAGE_OBJECT}"
+    COMMAND ${CMAKE_OBJCOPY}
+        saberstage_afk_image.png
+        "${SABERSTAGE_AFK_IMAGE_OBJECT}"
+        --input-target binary
+        --output-target elf64-aarch64
+        --set-section-flags binary=alloc,load,readonly,data,contents
+    DEPENDS "${SABERSTAGE_AFK_IMAGE_ASSET}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+    COMMENT "Embedding SaberStage default AFK image")
+set_source_files_properties("${SABERSTAGE_AFK_IMAGE_OBJECT}" PROPERTIES
+    GENERATED TRUE
+    EXTERNAL_OBJECT TRUE)
+target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AFK_IMAGE_OBJECT}")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     set_property(TARGET ${COMPILE_ID} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)

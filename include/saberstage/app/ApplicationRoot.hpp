@@ -27,6 +27,10 @@ namespace saberstage::avatar {
 class AvatarManager;
 }
 
+namespace saberstage::broadcast {
+class TwitchService;
+}
+
 namespace saberstage::app {
 
 class ApplicationRoot final {
@@ -44,6 +48,7 @@ public:
     preview::PreviewManager& Preview() noexcept;
     recording::RecordingController& Recording() noexcept;
     avatar::AvatarManager& Avatar() noexcept;
+    broadcast::TwitchService& Twitch() noexcept;
     bool SwitchAvatarPlayerProfile(std::string_view profileId, std::string* error = nullptr);
     bool CreateAvatarPlayerProfile(std::string* error = nullptr);
     bool DeleteActiveAvatarPlayerProfile(std::string* error = nullptr);
@@ -56,6 +61,7 @@ private:
     std::unique_ptr<camera::CameraManager> camera_;
     std::unique_ptr<preview::PreviewManager> preview_;
     std::unique_ptr<recording::RecordingController> recording_;
+    std::unique_ptr<broadcast::TwitchService> twitch_;
     std::unique_ptr<avatar::AvatarManager> avatar_;
     std::unique_ptr<ui::MenuController> menu_;
 };

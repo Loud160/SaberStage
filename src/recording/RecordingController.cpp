@@ -7,14 +7,18 @@
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
 #include "saberstage/recording/AsyncVideoWriter.hpp"
+#include "saberstage/recording/AfkMediaSource.hpp"
 #include "saberstage/recording/CaptureTimeline.hpp"
 #include "saberstage/recording/DirectFfmpegCapture.hpp"
 #include "saberstage/recording/DirectFfmpegMuxer.hpp"
+#include "saberstage/recording/MicrophoneCapture.hpp"
 #include "saberstage/recording/RealtimeAudioCapture.hpp"
 #include "saberstage/settings/SettingsService.hpp"
 
 #include "GlobalNamespace/OVRInput.hpp"
 #include "UnityEngine/AudioListener.hpp"
+#include "UnityEngine/AudioSettings.hpp"
+#include "UnityEngine/Android/Permission.hpp"
 #include "UnityEngine/Behaviour.hpp"
 #include "UnityEngine/Camera.hpp"
 #include "UnityEngine/GameObject.hpp"
@@ -25,6 +29,7 @@
 #include "UnityEngine/SceneManagement/SceneManager.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Time.hpp"
+#include "beatsaber-hook/shared/utils/il2cpp-utils.hpp"
 #include "hollywood/shared/hollywood.hpp"
 
 #include <algorithm>
@@ -60,13 +65,26 @@ bool IsGameplaySceneActive() {
     return name == "GameCore" || name.find("GameCore") != std::string::npos;
 }
 
+std::size_t LivestreamProviderIndex(settings::LivestreamProvider provider) noexcept {
+    switch (provider) {
+        case settings::LivestreamProvider::Twitch: return 0;
+        case settings::LivestreamProvider::YouTube: return 1;
+        case settings::LivestreamProvider::Kick: return 2;
+        case settings::LivestreamProvider::Custom: return 3;
+    }
+    return 0;
+}
+
 } // namespace
 
 RecordingController::RecordingController(
     settings::SettingsService& settings,
     camera::CameraManager& camera,
     std::filesystem::path outputDirectory)
-    : settings_(settings), camera_(camera), outputDirectory_(std::move(outputDirectory)) {
+    : settings_(settings),
+      camera_(camera),
+      outputDirectory_(std::move(outputDirectory)),
+      afkMedia_(std::make_unique<AfkMediaSource>()) {
     RegisterRecordingRuntimeDriverType();
     RegisterDirectFfmpegCaptureType();
     RegisterRealtimeAudioCaptureType();
@@ -103,7 +121,11 @@ bool RecordingController::Start(std::string* error) {
     return StartCapture(error);
 }
 
-bool RecordingController::StartCapture(std::string* error, bool forceContinuous) {
+bool RecordingController::StartCapture(
+    std::string* error,
+    bool forceContinuous,
+    bool forceDirectHardware,
+    bool writeLocalOutput) {
     if (!TryTransition(
         {RecordingState::Idle, RecordingState::Failed, RecordingState::Armed},
         RecordingState::Starting,
@@ -112,6 +134,9 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
         return false;
     }
 
+    // A failed stream-only start must never leak its ownership flag into a
+    // later ordinary recording attempt.
+    streamOnlySession_ = false;
     const auto& profile = settings_.Get().camera.Primary();
     const auto& recording = settings_.Get().recording;
     gameplayOnlySession_ = recording.gameplayOnly && !forceContinuous;
@@ -121,20 +146,29 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
         return false;
     }
 
-    std::error_code filesystemError;
-    std::filesystem::create_directories(outputDirectory_, filesystemError);
-    if (filesystemError) {
-        const auto message = "Cannot create recording folder: " + filesystemError.message();
-        SetState(RecordingState::Failed, message);
-        if (error) *error = message;
-        return false;
-    }
+    if (writeLocalOutput) {
+        std::error_code filesystemError;
+        std::filesystem::create_directories(outputDirectory_, filesystemError);
+        if (filesystemError) {
+            const auto message = "Cannot create recording folder: " + filesystemError.message();
+            SetState(RecordingState::Failed, message);
+            if (error) *error = message;
+            return false;
+        }
 
-    const auto base = CreateUniqueBasePath();
-    rawVideoPath_ = std::filesystem::path(base.string() + ".partial.h264");
-    rawAudioPath_ = std::filesystem::path(base.string() + ".partial.wav");
-    partialOutputPath_ = std::filesystem::path(base.string() + ".partial.mp4");
-    finalOutputPath_ = std::filesystem::path(base.string() + ".mp4");
+        const auto base = CreateUniqueBasePath();
+        rawVideoPath_ = std::filesystem::path(base.string() + ".partial.h264");
+        rawAudioPath_ = std::filesystem::path(base.string() + ".partial.wav");
+        partialOutputPath_ = std::filesystem::path(base.string() + ".partial.mp4");
+        finalOutputPath_ = std::filesystem::path(base.string() + ".mp4");
+    } else {
+        // Stream-only capture must not leave even temporary recording files.
+        rawVideoPath_.clear();
+        rawAudioPath_.clear();
+        partialOutputPath_.clear();
+        finalOutputPath_.clear();
+    }
+    streamOnlySession_ = !writeLocalOutput;
     captureWriteFailed_.store(false);
     captureFailureDetail_.clear();
     directFallbackAttempted_ = false;
@@ -151,7 +185,11 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     settings::ResolutionDimensions(recording.resolution, activeWidth_, activeHeight_);
     activeFramesPerSecond_ = recording.framesPerSecond;
     activeBitrateBitsPerSecond_ = recording.bitrateBitsPerSecond;
-    activeBackend_ = recording.backend;
+    // Go Live requires Direct FFmpeg/MediaCodec but does not rewrite the
+    // user's preferred backend for explicitly started local recordings.
+    activeBackend_ = forceDirectHardware
+        ? settings::RecordingBackend::DirectFfmpegHardware
+        : recording.backend;
     activeFovDegrees_ = profile.fovDegrees;
 
     if (!camera_.SetRenderDemand(std::string(kRecordingDemandId), {
@@ -160,6 +198,7 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
             activeHeight_,
             recording.framesPerSecond})) {
         const std::string message = "Primary camera rejected the recording output settings.";
+        streamOnlySession_ = false;
         SetState(RecordingState::Failed, message);
         if (error) *error = message;
         return false;
@@ -169,6 +208,7 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     if (!IsUnityObjectAlive(runtimeCamera)) {
         camera_.RemoveRenderDemand(kRecordingDemandId);
         const std::string message = "Primary camera is not ready yet.";
+        streamOnlySession_ = false;
         SetState(RecordingState::Failed, message);
         if (error) *error = message;
         return false;
@@ -176,8 +216,10 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     activeRuntimeCamera_ = runtimeCamera;
 
     try {
-        videoWriter_ = std::make_unique<AsyncVideoWriter>(rawVideoPath_);
-        if (videoWriter_->Failed()) throw std::runtime_error("cannot open temporary H.264 output");
+        if (writeLocalOutput) {
+            videoWriter_ = std::make_unique<AsyncVideoWriter>(rawVideoPath_);
+            if (videoWriter_->Failed()) throw std::runtime_error("cannot open temporary H.264 output");
+        }
         StartVideoSegment();
 
         CreatePersistentAudioCapture();
@@ -187,22 +229,25 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
         accumulatedPaused_ = {};
         SetState(
             RecordingState::Recording,
-            "Recording Primary camera with game audio at " +
+            std::string(streamOnlySession_ ? "Streaming" : "Recording") +
+                " Primary camera with game audio at " +
                 std::to_string(activeWidth_) + " x " +
                 std::to_string(activeHeight_) + " / " +
                 std::to_string(recording.framesPerSecond) + " FPS.");
         Logging::Logger.info(
-            "Recording started: camera={}, {}x{}@{}, bitrate={}, work={}",
+            "Capture started: camera={}, {}x{}@{}, bitrate={}, localOutput={}, work={}",
             camera::kPrimaryCameraId,
             activeWidth_,
             activeHeight_,
             recording.framesPerSecond,
             recording.bitrateBitsPerSecond,
-            rawVideoPath_.string());
+            writeLocalOutput,
+            writeLocalOutput ? rawVideoPath_.string() : "none (stream only)");
         return true;
     } catch (const std::exception& exception) {
         CleanupCaptureObjects();
         camera_.RemoveRenderDemand(kRecordingDemandId);
+        streamOnlySession_ = false;
         const auto message = std::string("Recording could not start: ") + exception.what();
         SetState(RecordingState::Failed, message);
         if (error) *error = message;
@@ -211,6 +256,7 @@ bool RecordingController::StartCapture(std::string* error, bool forceContinuous)
     } catch (...) {
         CleanupCaptureObjects();
         camera_.RemoveRenderDemand(kRecordingDemandId);
+        streamOnlySession_ = false;
         const std::string message = "Recording could not start because of an unknown capture failure.";
         SetState(RecordingState::Failed, message);
         if (error) *error = message;
@@ -316,7 +362,7 @@ void RecordingController::StartVideoSegment() {
     if (!IsUnityObjectAlive(activeRuntimeCamera_)) {
         throw std::runtime_error("spectator camera is unavailable");
     }
-    if (!videoWriter_) {
+    if (!streamOnlySession_ && !videoWriter_) {
         throw std::runtime_error("temporary H.264 output is not open");
     }
     if (IsUnityObjectAlive(videoCapture_) || IsUnityObjectAlive(directVideoCapture_)) {
@@ -358,14 +404,21 @@ void RecordingController::StartVideoSegment() {
     if (!IsUnityObjectAlive(directVideoCapture_)) {
         throw std::runtime_error("cannot attach the direct FFmpeg hardware encoder");
     }
+    auto directSettings = settings_.Get().recording;
+    directSettings.backend = settings::RecordingBackend::DirectFfmpegHardware;
     directVideoCapture_->Init(
-        settings_.Get().recording,
+        directSettings,
         activeFovDegrees_,
         [this](const EncodedVideoPacketView& packet) {
-            if (!videoWriter_ || !packet.data || packet.size == 0) return;
-            if (!videoWriter_->TrySubmit(packet.data, packet.size)) captureWriteFailed_.store(true);
+            if (!packet.data || packet.size == 0) return;
+            if (videoWriter_ && !videoWriter_->TrySubmit(packet.data, packet.size)) {
+                captureWriteFailed_.store(true);
+            }
             encodedFrameCount_.fetch_add(1, std::memory_order_relaxed);
-            {
+            // Presentation-frame bookkeeping exists only to finalize a local
+            // MP4. Stream-only sessions deliberately avoid both the file and
+            // its associated growing timestamp table.
+            if (!streamOnlySession_) {
                 std::lock_guard timingLock(videoTimingMutex_);
                 const auto segmentFrame = packet.presentationTimestamp >= 0
                     ? packet.presentationTimestamp
@@ -454,6 +507,13 @@ void RecordingController::StopVideoSegment(bool recordCaptureFailure) noexcept {
 
 bool RecordingController::Stop(std::string_view reason) {
     try {
+        // A stream-only session has no local media to finalize. Route every
+        // stop source (UI, shutdown, camera loss, or encoder failure) through
+        // the live teardown path instead of manufacturing a failed MP4.
+        if (streamOnlySession_) {
+            StopLivestream();
+            return true;
+        }
         const auto current = state_.load();
         if (current == RecordingState::Armed) {
             if (!TryTransition({RecordingState::Armed}, RecordingState::Idle, "Armed recording canceled.")) {
@@ -502,8 +562,11 @@ void RecordingController::Shutdown() noexcept {
     {
         std::lock_guard lock(livestreamMutex_);
         livestreamSink_.reset();
-        std::fill(streamKey_.begin(), streamKey_.end(), '\0');
-        streamKey_.clear();
+        for (auto& key : streamKeyOverrides_) {
+            std::fill(key.begin(), key.end(), '\0');
+            key.clear();
+        }
+        streamServerUrlOverrides_.fill({});
     }
     if (finalizer_.joinable()) finalizer_.join();
     CleanupCaptureObjects();
@@ -579,6 +642,34 @@ bool RecordingController::HandleDirectCaptureHealth() noexcept {
 
 void RecordingController::Tick() noexcept {
     HandleControllerShortcut();
+    if (livestreamAfk_.load(std::memory_order_acquire) && afkMedia_) {
+        afkMedia_->Tick();
+    }
+    // A stream attached to an intentional local recording is not torn down
+    // automatically when the network sink fails, but it must still release
+    // the sleep override because there is no longer a live connection to
+    // protect. The local recording continues with its original sleep policy.
+    if (livestreamWakeGuardActive_ &&
+            LivestreamSnapshot().state == broadcast::LivestreamState::Failed) {
+        DisableLivestreamWakeGuard();
+    }
+    // A stream-only capture has no local Stop & Save escape hatch. If the
+    // network worker exhausts its reconnect policy, release the camera/audio
+    // session automatically and retain the network failure in plain language
+    // so the user can correct the endpoint or key and retry.
+    if (streamOnlySession_) {
+        const auto livestream = LivestreamSnapshot();
+        if (livestream.state == broadcast::LivestreamState::Failed) {
+            const auto failure = livestream.status;
+            StopLivestream();
+            SetState(
+                RecordingState::Failed,
+                failure.empty()
+                    ? "Live stream failed. No local recording was created."
+                    : failure + " No local recording was created.");
+            return;
+        }
+    }
     const auto current = state_.load();
     if (current == RecordingState::Recording) {
         if (HandleDirectCaptureHealth()) return;
@@ -671,16 +762,26 @@ RecordingSnapshot RecordingController::Snapshot() const {
         snapshot.elapsedSeconds = ElapsedSeconds(std::chrono::steady_clock::now());
     }
     snapshot.encodedFrameCount = encodedFrameCount_.load(std::memory_order_relaxed);
+    snapshot.droppedFrameCount = hollywoodSkippedPresentationFrames_;
+    if (IsUnityObjectAlive(directVideoCapture_)) {
+        const auto diagnostics = directVideoCapture_->Diagnostics();
+        snapshot.droppedFrameCount += diagnostics.skippedTimelineFrames + diagnostics.droppedFrames;
+    }
     const auto live = LivestreamSnapshot();
-    if (broadcast::CanStop(live.state)) snapshot.outputType = RecordingOutputType::LocalAndLive;
+    snapshot.droppedFrameCount += live.videoPacketsDropped;
+    if (streamOnlySession_) {
+        snapshot.outputType = RecordingOutputType::LiveStream;
+    } else if (broadcast::CanStop(live.state)) {
+        snapshot.outputType = RecordingOutputType::LocalAndLive;
+    }
     return snapshot;
 }
 
-bool RecordingController::SetStreamKey(std::string streamKey, std::string* error) {
-    if (streamKey.size() < 4 || streamKey.size() > 512 ||
-        std::any_of(streamKey.begin(), streamKey.end(), [](unsigned char value) {
-            return value <= 0x20 || value == 0x7F;
-        })) {
+bool RecordingController::SetStreamKey(
+    settings::LivestreamProvider provider,
+    std::string streamKey,
+    std::string* error) {
+    if (!settings::IsValidStreamKey(streamKey)) {
         if (error) *error = "The stream key is empty or contains spaces/control characters.";
         return false;
     }
@@ -689,34 +790,104 @@ bool RecordingController::SetStreamKey(std::string streamKey, std::string* error
         if (error) *error = "Stop the live stream before changing its key.";
         return false;
     }
-    std::fill(streamKey_.begin(), streamKey_.end(), '\0');
-    streamKey_ = std::move(streamKey);
+    auto& overrideKey = streamKeyOverrides_[LivestreamProviderIndex(provider)];
+    std::fill(overrideKey.begin(), overrideKey.end(), '\0');
+    overrideKey = std::move(streamKey);
     statusVersion_.fetch_add(1);
     return true;
 }
 
-void RecordingController::ClearStreamKey() noexcept {
+bool RecordingController::SetStreamServerUrl(
+    settings::LivestreamProvider provider,
+    std::string serverUrl,
+    std::string* error) {
+    if (!settings::IsValidLivestreamServerUrl(serverUrl)) {
+        if (error) *error = "The server address must be a valid RTMP or RTMPS URL without spaces.";
+        return false;
+    }
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) {
+        if (error) *error = "Stop the live stream before changing its server address.";
+        return false;
+    }
+    streamServerUrlOverrides_[LivestreamProviderIndex(provider)] = std::move(serverUrl);
+    statusVersion_.fetch_add(1);
+    return true;
+}
+
+void RecordingController::ClearStreamServerUrlOverride(
+    settings::LivestreamProvider provider) noexcept {
     std::lock_guard lock(livestreamMutex_);
     if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) return;
-    std::fill(streamKey_.begin(), streamKey_.end(), '\0');
-    streamKey_.clear();
+    streamServerUrlOverrides_[LivestreamProviderIndex(provider)].clear();
     statusVersion_.fetch_add(1);
 }
 
+void RecordingController::ClearStreamKey(settings::LivestreamProvider provider) noexcept {
+    std::lock_guard lock(livestreamMutex_);
+    if (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) return;
+    auto& overrideKey = streamKeyOverrides_[LivestreamProviderIndex(provider)];
+    std::fill(overrideKey.begin(), overrideKey.end(), '\0');
+    overrideKey.clear();
+    statusVersion_.fetch_add(1);
+}
+
+std::string RecordingController::StreamServerUrl(
+    settings::LivestreamProvider provider) const {
+    std::lock_guard lock(livestreamMutex_);
+    const auto& sessionValue = streamServerUrlOverrides_[LivestreamProviderIndex(provider)];
+    if (!sessionValue.empty()) return sessionValue;
+    return settings::DestinationForProvider(settings_.Get().broadcast, provider).serverUrl;
+}
+
+std::string RecordingController::StreamKey(settings::LivestreamProvider provider) const {
+    std::lock_guard lock(livestreamMutex_);
+    const auto& sessionValue = streamKeyOverrides_[LivestreamProviderIndex(provider)];
+    if (!sessionValue.empty()) return sessionValue;
+    return settings::DestinationForProvider(settings_.Get().broadcast, provider).streamKey;
+}
+
 bool RecordingController::StartLivestream(std::string* error) {
-    const auto& recording = settings_.Get().recording;
-    if (recording.backend != settings::RecordingBackend::DirectFfmpegHardware) {
-        if (error) *error = "Live streaming requires Direct FFmpeg (Hardware) as the recording backend.";
-        return false;
-    }
+    // Streaming owns its session backend. A user can keep Hollywood selected
+    // for ordinary local recording; Go Live starts a Direct FFmpeg stream-only
+    // capture without rewriting that preference or creating recording files.
+    auto recording = settings_.Get().recording;
+    recording.backend = settings::RecordingBackend::DirectFfmpegHardware;
     if (state_.load() == RecordingState::Recording &&
         activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware) {
         if (error) *error = "This recording was started with Hollywood. Stop it before switching to Direct FFmpeg for live streaming.";
         return false;
     }
+    const auto requestedBroadcastSettings = settings_.Get().broadcast;
+    if (requestedBroadcastSettings.microphoneEnabled) {
+        constexpr std::string_view permission = "android.permission.RECORD_AUDIO";
+        if (!UnityEngine::Android::Permission::HasUserAuthorizedPermission(permission)) {
+            // Requesting is still useful when the permission is declared but
+            // has not been accepted. If the APK lacks the declaration, Unity
+            // cannot grant it and the same plain-language start error directs
+            // the user to MBF's patch option.
+            UnityEngine::Android::Permission::RequestUserPermission(permission, nullptr);
+            if (error) {
+                *error = "Quest microphone access is not available. Accept the system microphone prompt, then try again. If no prompt appears, enable Microphone Access in MBF and repatch Beat Saber.";
+            }
+            return false;
+        }
+    }
     {
         std::lock_guard lock(livestreamMutex_);
-        if (streamKey_.empty()) {
+        auto livestreamSettings = settings_.Get().broadcast;
+        const auto providerIndex = LivestreamProviderIndex(livestreamSettings.provider);
+        auto& destination = settings::DestinationForProvider(
+            livestreamSettings, livestreamSettings.provider);
+        if (!streamServerUrlOverrides_[providerIndex].empty()) {
+            destination.serverUrl = streamServerUrlOverrides_[providerIndex];
+        }
+        const auto& savedDestination = settings::DestinationForProvider(
+            settings_.Get().broadcast, livestreamSettings.provider);
+        const auto& effectiveKey = streamKeyOverrides_[providerIndex].empty()
+            ? savedDestination.streamKey
+            : streamKeyOverrides_[providerIndex];
+        if (effectiveKey.empty()) {
             if (error) *error = "Enter a stream key before going live.";
             return false;
         }
@@ -725,20 +896,47 @@ bool RecordingController::StartLivestream(std::string* error) {
             return false;
         }
         livestreamSink_.reset();
+        StopLivestreamMicrophoneLocked();
+        livestreamGameAudioEnabled_ = livestreamSettings.gameAudioEnabled;
+        livestreamGameAudioGain_ = std::clamp(
+            livestreamSettings.gameAudioVolumePercent / 100.0F, 0.0F, 2.0F);
+        livestreamMicrophoneEnabled_ = livestreamSettings.microphoneEnabled;
+        livestreamMicrophoneGain_ = std::clamp(
+            livestreamSettings.microphoneVolumePercent / 100.0F, 0.0F, 2.0F);
+        livestreamMicrophoneMuted_ = false;
+        livestreamMicrophoneFailureReported_ = false;
+        // RealtimeAudioCapture drains at most 8192 interleaved samples per
+        // worker batch. Reserve once during the explicit Go Live action so
+        // normal audio mixing never allocates after the stream has started.
+        livestreamMixScratch_.reserve(8192U);
+        livestreamMicrophoneScratch_.reserve(8192U);
+        if (livestreamMicrophoneEnabled_) {
+            livestreamMicrophone_ = std::make_unique<MicrophoneCapture>();
+            const auto sampleRate = UnityEngine::AudioSettings::get_outputSampleRate();
+            std::string microphoneError;
+            if (!livestreamMicrophone_->Start(sampleRate, &microphoneError)) {
+                livestreamMicrophone_.reset();
+                if (error) {
+                    *error = "Quest microphone could not start: " + microphoneError;
+                }
+                return false;
+            }
+        }
         livestreamSink_ = std::make_unique<broadcast::DirectLivestreamSink>(
             recording,
-            settings_.Get().broadcast,
-            streamKey_,
+            std::move(livestreamSettings),
+            effectiveKey,
             [this] { statusVersion_.fetch_add(1); });
         if (!livestreamSink_->Start(error)) {
             livestreamSink_.reset();
+            StopLivestreamMicrophoneLocked();
             return false;
         }
     }
 
     const auto current = state_.load();
     if (recording::CanStart(current)) {
-        if (!StartCapture(error, true)) {
+        if (!StartCapture(error, true, true, false)) {
             StopLivestream();
             return false;
         }
@@ -747,13 +945,295 @@ bool RecordingController::StartLivestream(std::string* error) {
         if (error) *error = "Wait for local recording to finish starting, pausing, or saving before going live.";
         return false;
     }
+    EnableLivestreamWakeGuard();
     statusVersion_.fetch_add(1);
     return true;
 }
 
-void RecordingController::StopLivestream() noexcept {
+void RecordingController::EnableLivestreamWakeGuard() noexcept {
+    if (livestreamWakeGuardActive_) return;
+    if (!settings_.Get().broadcast.keepHeadsetAwake) {
+        Logging::Logger.info(
+            "Livestream wake guard is disabled in settings; Quest may suspend the stream when the headset is removed");
+        return;
+    }
+
+    bool guardApplied = false;
+    try {
+        const auto* getSleepTimeout = il2cpp_utils::FindMethodUnsafe(
+            "UnityEngine", "Screen", "get_sleepTimeout", 0);
+        const auto* setSleepTimeout = il2cpp_utils::FindMethodUnsafe(
+            "UnityEngine", "Screen", "set_sleepTimeout", 1);
+        if (!getSleepTimeout || !setSleepTimeout) {
+            Logging::Logger.warn(
+                "Livestream wake guard is unavailable because Unity Screen.sleepTimeout could not be resolved");
+        } else {
+            previousSleepTimeout_ = il2cpp_utils::RunMethodRethrow<std::int32_t, false>(
+                nullptr, getSleepTimeout);
+            // UnityEngine.SleepTimeout.NeverSleep is the documented value -1.
+            // Resolve the property dynamically because this Beat Saber cordl
+            // surface does not generate Screen.sleepTimeout accessors.
+            il2cpp_utils::RunMethodRethrow<void, false>(nullptr, setSleepTimeout, -1);
+            guardApplied = true;
+            Logging::Logger.info(
+                "Livestream Unity wake guard enabled; previous sleep timeout was {}",
+                previousSleepTimeout_);
+        }
+    } catch (const std::exception& exception) {
+        previousSleepTimeout_ = -2;
+        Logging::Logger.warn(
+            "Livestream Unity wake guard could not be enabled: {}", exception.what());
+    } catch (...) {
+        previousSleepTimeout_ = -2;
+        Logging::Logger.warn(
+            "Livestream Unity wake guard could not be enabled due to an unexpected error");
+    }
+
+    try {
+        // Hollywood's Quest integration performs the part Unity's inactivity
+        // timeout cannot: it broadcasts the Oculus proximity-power override
+        // and applies FLAG_KEEP_SCREEN_ON to the Beat Saber activity. This is
+        // why removing the headset previously suspended an otherwise healthy
+        // RTMP stream and Twitch surfaced player error 2000.
+        Hollywood::SetScreenOn(true);
+        livestreamProximityGuardActive_ = true;
+        guardApplied = true;
+        Logging::Logger.info(
+            "Livestream Quest proximity/display wake guard enabled");
+    } catch (const std::exception& exception) {
+        Logging::Logger.warn(
+            "Livestream Quest proximity/display wake guard could not be enabled: {}",
+            exception.what());
+    } catch (...) {
+        Logging::Logger.warn(
+            "Livestream Quest proximity/display wake guard could not be enabled due to an unexpected error");
+    }
+    livestreamWakeGuardActive_ = guardApplied;
+    if (!guardApplied) {
+        Logging::Logger.error(
+            "Livestream started without a working wake guard; removing the headset may suspend the stream");
+    }
+}
+
+void RecordingController::DisableLivestreamWakeGuard() noexcept {
+    if (!livestreamWakeGuardActive_ && previousSleepTimeout_ == -2 &&
+            !livestreamProximityGuardActive_) return;
+    const auto restoreValue = previousSleepTimeout_;
+    const bool restoreProximity = livestreamProximityGuardActive_;
+    livestreamWakeGuardActive_ = false;
+    livestreamProximityGuardActive_ = false;
+    previousSleepTimeout_ = -2;
+    if (restoreValue != -2) {
+        try {
+            const auto* setSleepTimeout = il2cpp_utils::FindMethodUnsafe(
+                "UnityEngine", "Screen", "set_sleepTimeout", 1);
+            if (!setSleepTimeout) {
+                Logging::Logger.warn(
+                    "Livestream wake guard could not restore Unity's previous sleep timeout because the property is unavailable");
+            } else {
+                il2cpp_utils::RunMethodRethrow<void, false>(
+                    nullptr, setSleepTimeout, restoreValue);
+                Logging::Logger.info(
+                    "Livestream Unity wake guard released; restored sleep timeout to {}",
+                    restoreValue);
+            }
+        } catch (const std::exception& exception) {
+            Logging::Logger.warn(
+                "Livestream Unity wake guard restore failed: {}", exception.what());
+        } catch (...) {
+            Logging::Logger.warn(
+                "Livestream Unity wake guard restore failed unexpectedly");
+        }
+    }
+    if (restoreProximity) {
+        try {
+            Hollywood::SetScreenOn(false);
+            Logging::Logger.info(
+                "Livestream Quest proximity/display wake guard released");
+        } catch (const std::exception& exception) {
+            Logging::Logger.warn(
+                "Livestream Quest proximity/display wake guard release failed: {}",
+                exception.what());
+        } catch (...) {
+            Logging::Logger.warn(
+                "Livestream Quest proximity/display wake guard release failed unexpectedly");
+        }
+    }
+}
+
+bool RecordingController::PrepareAfkMedia(
+    const std::filesystem::path& path,
+    std::string* error) {
+    if (!afkMedia_) afkMedia_ = std::make_unique<AfkMediaSource>();
+    return path.empty()
+        ? afkMedia_->PrepareDefault(error)
+        : afkMedia_->Prepare(path, error);
+}
+
+bool RecordingController::PauseLivestream(std::string* error) {
+    const auto live = LivestreamSnapshot();
+    if (!broadcast::CanStop(live.state) || live.afk) {
+        if (error) *error = live.afk
+            ? "The live stream is already showing the AFK screen."
+            : "Start the Twitch stream before pausing it.";
+        return false;
+    }
+    if (!streamOnlySession_) {
+        if (error) {
+            *error = "AFK pause is unavailable while one hardware encode is shared by a local recording and a live stream. Stop the local recording or stream separately first.";
+        }
+        return false;
+    }
+    if (!IsUnityObjectAlive(directVideoCapture_)) {
+        if (error) *error = "The Direct FFmpeg stream camera is not ready for an AFK image.";
+        return false;
+    }
+    std::string mediaError;
+    const auto configuredPath = settings_.Get().broadcast.afkMediaPath;
+    if (!afkMedia_ || !afkMedia_->Texture()) {
+        if (!PrepareAfkMedia(configuredPath, &mediaError)) {
+            Logging::Logger.warn(
+                "Configured AFK media could not be prepared; using built-in card: {}",
+                mediaError);
+            mediaError.clear();
+            if (!PrepareAfkMedia({}, &mediaError)) {
+                if (error) *error = "The AFK image could not be prepared: " + mediaError;
+                return false;
+            }
+        }
+    }
+    afkMedia_->Activate();
+    directVideoCapture_->SetOverrideTexture(afkMedia_->Texture());
+    if (!directVideoCapture_->HasOverrideTexture()) {
+        afkMedia_->Deactivate();
+        if (error) *error = "Quest could not bind the AFK image to the live encoder.";
+        return false;
+    }
+    {
+        std::lock_guard lock(livestreamMutex_);
+        if (livestreamSink_) livestreamSink_->SetMuted(true);
+        // AFK is an authoritative privacy state. Keep a distinct microphone
+        // mute bit even though the network sink also emits timed silence, so
+        // the movable control can show a locked muted microphone immediately.
+        livestreamMicrophoneMuted_ = true;
+    }
+    livestreamAfk_.store(true, std::memory_order_release);
+    statusVersion_.fetch_add(1);
+    Logging::Logger.info(
+        "Livestream entered AFK mode using '{}' while RTMP remained connected",
+        afkMedia_->Description());
+    return true;
+}
+
+bool RecordingController::ResumeLivestream(std::string* error) {
+    if (!livestreamAfk_.load(std::memory_order_acquire)) {
+        if (error) *error = "The live stream is not paused.";
+        return false;
+    }
+    if (!IsUnityObjectAlive(directVideoCapture_)) {
+        if (error) *error = "The Direct FFmpeg stream camera is unavailable.";
+        return false;
+    }
+    directVideoCapture_->SetOverrideTexture(nullptr);
+    if (afkMedia_) afkMedia_->Deactivate();
+    {
+        std::lock_guard lock(livestreamMutex_);
+        if (livestreamSink_) livestreamSink_->SetMuted(false);
+        // Resume deliberately restores the microphone rather than retaining a
+        // pre-AFK manual mute. This matches the panel contract: AFK owns and
+        // locks mute, then releases it in the unmuted state on resume.
+        livestreamMicrophoneMuted_ = false;
+    }
+    livestreamAfk_.store(false, std::memory_order_release);
+    statusVersion_.fetch_add(1);
+    Logging::Logger.info("Livestream left AFK mode and restored the spectator camera/audio");
+    return true;
+}
+
+void RecordingController::SetLivestreamGameAudioVolumePercent(float value) {
     std::lock_guard lock(livestreamMutex_);
-    if (livestreamSink_) livestreamSink_->Stop();
+    livestreamGameAudioGain_ = std::clamp(value / 100.0F, 0.0F, 2.0F);
+}
+
+void RecordingController::SetLivestreamMicrophoneVolumePercent(float value) {
+    std::lock_guard lock(livestreamMutex_);
+    livestreamMicrophoneGain_ = std::clamp(value / 100.0F, 0.0F, 2.0F);
+    statusVersion_.fetch_add(1);
+}
+
+bool RecordingController::SetLivestreamMicrophoneMuted(
+    bool muted,
+    std::string* error) {
+    std::lock_guard lock(livestreamMutex_);
+    if (!livestreamSink_ || !broadcast::CanStop(livestreamSink_->Snapshot().state)) {
+        if (error) *error = "Start the live stream before changing microphone mute.";
+        return false;
+    }
+    if (livestreamAfk_.load(std::memory_order_acquire)) {
+        if (error) *error = "The microphone is locked while the AFK screen is active.";
+        return false;
+    }
+    if (!livestreamMicrophoneEnabled_ || !livestreamMicrophone_ ||
+            livestreamMicrophoneGain_ <= 0.0001F) {
+        if (error) {
+            *error = "Enable Quest Microphone and set its volume above 0% before using microphone mute.";
+        }
+        return false;
+    }
+    if (livestreamMicrophoneMuted_ == muted) return true;
+    livestreamMicrophoneMuted_ = muted;
+    statusVersion_.fetch_add(1);
+    Logging::Logger.info(
+        "Livestream microphone {} from movable controls",
+        muted ? "muted" : "unmuted");
+    return true;
+}
+
+void RecordingController::StopLivestream() noexcept {
+    // When Go Live created the encoder itself, stop/drain capture while the
+    // sink still exists so final H.264/AAC packets can reach its worker. An
+    // explicitly started local recording owns its capture independently and
+    // therefore continues when only the network stream is stopped.
+    livestreamAfk_.store(false, std::memory_order_release);
+    DisableLivestreamWakeGuard();
+    if (IsUnityObjectAlive(directVideoCapture_)) {
+        directVideoCapture_->SetOverrideTexture(nullptr);
+    }
+    if (afkMedia_) afkMedia_->Deactivate();
+    const bool stopStreamOnlyCapture =
+        streamOnlySession_ && recording::CanStop(state_.load());
+    bool captureTransitioned = false;
+    if (stopStreamOnlyCapture) {
+        captureTransitioned = TryTransition(
+            {RecordingState::Starting, RecordingState::Recording, RecordingState::Pausing,
+             RecordingState::Paused, RecordingState::Resuming},
+            RecordingState::Stopping,
+            "Stopping live stream capture...");
+        if (captureTransitioned) {
+            CleanupCaptureObjects();
+            camera_.RemoveRenderDemand(kRecordingDemandId);
+        }
+    }
+    {
+        std::lock_guard lock(livestreamMutex_);
+        if (livestreamSink_) livestreamSink_->Stop();
+        StopLivestreamMicrophoneLocked();
+        livestreamMicrophoneMuted_ = false;
+    }
+    if (captureTransitioned) {
+        rawVideoPath_.clear();
+        rawAudioPath_.clear();
+        partialOutputPath_.clear();
+        finalOutputPath_.clear();
+        recordingStarted_ = {};
+        pauseStarted_ = {};
+        accumulatedPaused_ = {};
+        captureWriteFailed_.store(false);
+        captureFailureDetail_.clear();
+        streamOnlySession_ = false;
+        SetState(RecordingState::Idle, "Live stream stopped. No local recording was created.");
+        Logging::Logger.info("Stream-only capture stopped without creating local media files");
+    }
     statusVersion_.fetch_add(1);
 }
 
@@ -761,11 +1241,30 @@ broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
     std::lock_guard lock(livestreamMutex_);
     if (livestreamSink_) {
         auto snapshot = livestreamSink_->Snapshot();
-        snapshot.streamKeyConfigured = !streamKey_.empty();
+        const auto& broadcastSettings = settings_.Get().broadcast;
+        const auto providerIndex = LivestreamProviderIndex(broadcastSettings.provider);
+        const auto& saved = settings::DestinationForProvider(
+            broadcastSettings, broadcastSettings.provider);
+        snapshot.streamKeyConfigured =
+            !streamKeyOverrides_[providerIndex].empty() || !saved.streamKey.empty();
+        snapshot.afk = livestreamAfk_.load(std::memory_order_acquire);
+        snapshot.microphoneAvailable = livestreamMicrophoneEnabled_ &&
+            livestreamMicrophone_ && livestreamMicrophoneGain_ > 0.0001F;
+        snapshot.microphoneMuted = snapshot.afk ||
+            !snapshot.microphoneAvailable || livestreamMicrophoneMuted_;
         return snapshot;
     }
     broadcast::LivestreamSnapshot snapshot;
-    snapshot.streamKeyConfigured = !streamKey_.empty();
+    const auto& broadcastSettings = settings_.Get().broadcast;
+    const auto providerIndex = LivestreamProviderIndex(broadcastSettings.provider);
+    const auto& saved = settings::DestinationForProvider(
+        broadcastSettings, broadcastSettings.provider);
+    snapshot.streamKeyConfigured =
+        !streamKeyOverrides_[providerIndex].empty() || !saved.streamKey.empty();
+    snapshot.afk = livestreamAfk_.load(std::memory_order_acquire);
+    snapshot.microphoneAvailable = broadcastSettings.microphoneEnabled &&
+        broadcastSettings.microphoneVolumePercent > 0.0001F;
+    snapshot.microphoneMuted = !snapshot.microphoneAvailable;
     return snapshot;
 }
 
@@ -835,15 +1334,89 @@ void RecordingController::CreatePersistentAudioCapture() {
     if (!IsUnityObjectAlive(audioCapture_)) throw std::runtime_error("cannot attach persistent game-audio capture");
 
     RefreshAudioListenerOwnership();
-    audioCapture_->OpenFile(
-        rawAudioPath_,
+    auto networkConsumer =
         [this](const float* samples, std::size_t count, std::int32_t channels, std::int32_t sampleRate) {
             std::lock_guard lock(livestreamMutex_);
-            if (livestreamSink_) livestreamSink_->SubmitAudio(samples, count, channels, sampleRate);
-        });
+            SubmitLivestreamAudioLocked(samples, count, channels, sampleRate);
+        };
+    if (streamOnlySession_) {
+        audioCapture_->OpenConsumerOnly(std::move(networkConsumer));
+    } else {
+        audioCapture_->OpenFile(rawAudioPath_, std::move(networkConsumer));
+    }
     audioObject_->SetActive(true);
     RefreshAudioListenerOwnership();
-    Logging::Logger.info("Persistent game-audio capture started across scene transitions");
+    Logging::Logger.info(
+        "Persistent game-audio capture started across scene transitions (localOutput={})",
+        !streamOnlySession_);
+}
+
+void RecordingController::SubmitLivestreamAudioLocked(
+    const float* samples,
+    std::size_t count,
+    std::int32_t channels,
+    std::int32_t sampleRate) noexcept {
+    if (!livestreamSink_ || !samples || count == 0 || channels <= 0 || sampleRate <= 0) return;
+
+    // Preserve the zero-cost legacy path when the stream uses unmodified game
+    // audio and no microphone. Local WAV output always receives the original
+    // samples before this consumer is called, so no stream mix can alter it.
+    if (livestreamGameAudioEnabled_ &&
+            (!livestreamMicrophoneEnabled_ || livestreamMicrophoneMuted_ ||
+             livestreamMicrophoneGain_ <= 0.0001F) &&
+            std::abs(livestreamGameAudioGain_ - 1.0F) <= 0.0001F) {
+        livestreamSink_->SubmitAudio(samples, count, channels, sampleRate);
+        return;
+    }
+
+    const auto channelCount = static_cast<std::size_t>(channels);
+    const auto frameCount = count / channelCount;
+    if (frameCount == 0) return;
+    const auto usableSampleCount = frameCount * channelCount;
+    livestreamMixScratch_.resize(usableSampleCount);
+
+    const float* microphone = nullptr;
+    if (livestreamMicrophoneEnabled_ && !livestreamMicrophoneMuted_ &&
+            livestreamMicrophoneGain_ > 0.0001F && livestreamMicrophone_) {
+        livestreamMicrophoneScratch_.resize(frameCount);
+        livestreamMicrophone_->ReadForMix(livestreamMicrophoneScratch_.data(), frameCount);
+        microphone = livestreamMicrophoneScratch_.data();
+        if (livestreamMicrophone_->Failed() && !livestreamMicrophoneFailureReported_) {
+            livestreamMicrophoneFailureReported_ = true;
+            Logging::Logger.error(
+                "Quest microphone input failed during the live stream; game audio will continue and microphone input will be silent");
+        }
+    }
+
+    for (std::size_t frame = 0; frame < frameCount; ++frame) {
+        const auto microphoneSample = microphone
+            ? microphone[frame] * livestreamMicrophoneGain_
+            : 0.0F;
+        for (std::size_t channel = 0; channel < channelCount; ++channel) {
+            const auto index = frame * channelCount + channel;
+            const auto gameSample = livestreamGameAudioEnabled_
+                ? samples[index] * livestreamGameAudioGain_
+                : 0.0F;
+            livestreamMixScratch_[index] = std::clamp(
+                gameSample + microphoneSample, -1.0F, 1.0F);
+        }
+    }
+    livestreamSink_->SubmitAudio(
+        livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+}
+
+void RecordingController::StopLivestreamMicrophoneLocked() noexcept {
+    if (!livestreamMicrophone_) return;
+    const auto dropped = livestreamMicrophone_->DroppedFrameCount();
+    const auto underflow = livestreamMicrophone_->UnderflowFrameCount();
+    const auto failed = livestreamMicrophone_->Failed();
+    livestreamMicrophone_->Stop();
+    livestreamMicrophone_.reset();
+    Logging::Logger.info(
+        "Quest microphone capture stopped (droppedFrames={}, underflowFrames={}, failed={})",
+        dropped,
+        underflow,
+        failed);
 }
 
 void RecordingController::RefreshAudioListenerOwnership() noexcept {

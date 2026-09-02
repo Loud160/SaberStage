@@ -46,6 +46,9 @@ int main() {
     Check(defaults.camera.Primary().multisampleCount == 1,
           "third-person MSAA defaults off to protect Quest 2 gameplay performance");
     Check(defaults.preview.selectedCameraId == "primary", "preview targets the stable primary camera");
+    Check(defaults.preview.rotationDegrees.y == 0.0F &&
+              defaults.recording.worldControlsRotationDegrees.y == 0.0F,
+          "world panels default to the visible FloatingScreen face");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
     Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
     Check(!defaults.recording.worldControlsVisible, "movable recording controls default off");
@@ -57,8 +60,33 @@ int main() {
     Check(defaults.recording.peakBitrateBitsPerSecond >= defaults.recording.bitrateBitsPerSecond,
           "default peak bitrate is not below target bitrate");
     Check(defaults.broadcast.provider == LivestreamProvider::Twitch &&
-              defaults.broadcast.serverUrl.rfind("rtmp://", 0) == 0,
-          "livestream defaults use Twitch's ordinary RTMP ingest endpoint");
+              defaults.broadcast.twitch.serverUrl.rfind("rtmp://", 0) == 0 &&
+              defaults.broadcast.youtube.serverUrl.rfind("rtmps://", 0) == 0 &&
+              defaults.broadcast.twitch.streamKey.empty() &&
+              defaults.broadcast.youtube.streamKey.empty() &&
+              defaults.broadcast.twitchAccount.clientId == kSaberStageTwitchClientId &&
+              defaults.broadcast.keepHeadsetAwake &&
+              defaults.broadcast.gameAudioEnabled &&
+              defaults.broadcast.gameAudioVolumePercent == 100.0F &&
+              !defaults.broadcast.microphoneEnabled &&
+              defaults.broadcast.microphoneVolumePercent == 100.0F &&
+               !defaults.broadcast.postMapInfoToChat &&
+               !defaults.broadcast.twitchAccount.chatWriteAuthorized &&
+               defaults.broadcast.twitchAccount.protectedTokenEnvelope.empty(),
+           "livestream defaults keep independent endpoints and SaberStage's public Twitch identity");
+    auto refreshFixture = defaults.broadcast.twitchAccount;
+    refreshFixture.accessToken = "access";
+    refreshFixture.refreshToken = "refresh";
+    refreshFixture.login = "channel";
+    refreshFixture.userId = "123";
+    refreshFixture.expiresAtUnixSeconds = 10'000;
+    Check(!TwitchTokenNeedsRefresh(refreshFixture, 9'000),
+          "healthy Twitch tokens are not refreshed early");
+    Check(TwitchTokenNeedsRefresh(refreshFixture, 9'700),
+          "Twitch tokens refresh within the five-minute safety window");
+    refreshFixture.refreshToken.clear();
+    Check(!TwitchTokenNeedsRefresh(refreshFixture, 10'000),
+          "missing refresh credentials require authorization instead of a broken refresh attempt");
     Check(defaults.avatar.maximumTextureDimension == 1024, "VRM textures default to the Quest-conscious 1024 cap");
     Check(defaults.avatar.qualityPreset == AvatarQualityPreset::Balanced &&
               defaults.avatar.toonLighting && defaults.avatar.normalMaps &&
@@ -95,6 +123,8 @@ int main() {
           "five fixed migration-safe Avatar player slots are available");
     Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
+    Check(!defaults.camera.Primary().keepLevel,
+          "camera level lock defaults off to preserve existing authored/manual roll");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
           "every scaffold description line fits the narrow menu budget");
     Check(saberstage::ui::copy::LineCount(saberstage::ui::copy::kScaffoldDescription) <= 8,
@@ -112,6 +142,10 @@ int main() {
     invalid.recording.bitrateBitsPerSecond = 20'000'000;
     invalid.recording.peakBitrateBitsPerSecond = 5'000'000;
     invalid.broadcast.reconnectAttempts = 1000;
+    invalid.broadcast.gameAudioVolumePercent = -20.0F;
+    invalid.broadcast.microphoneVolumePercent = 500.0F;
+    invalid.broadcast.youtube.serverUrl = "https://not-an-rtmp-endpoint";
+    invalid.broadcast.kick.streamKey = "invalid key with spaces";
     invalid.avatar.selectedFile = "../outside.vrm";
     invalid.avatar.selectedPath = "relative/outside.vrm";
     invalid.avatar.maximumTextureDimension = 8192;
@@ -154,6 +188,12 @@ int main() {
           "recording peak bitrate repairs to at least the target bitrate");
     Check(invalid.broadcast.reconnectAttempts == defaults.broadcast.reconnectAttempts,
           "livestream reconnect count repairs to its bounded default");
+    Check(invalid.broadcast.gameAudioVolumePercent == 100.0F &&
+              invalid.broadcast.microphoneVolumePercent == 100.0F,
+          "livestream audio mix volumes repair to safe defaults");
+    Check(invalid.broadcast.youtube.serverUrl == defaults.broadcast.youtube.serverUrl &&
+              invalid.broadcast.kick.streamKey.empty(),
+          "invalid service-specific livestream destinations repair without exposing credentials");
     Check(invalid.avatar.materialStage == AvatarMaterialStage::Configured &&
               invalid.avatar.lightingMode == AvatarLightingMode::Balanced &&
               invalid.avatar.cutoutSmoothing == AvatarCutoutSmoothing::Low,
@@ -253,6 +293,7 @@ int main() {
     first.Edit().camera.Primary().position = {1.0F, 2.0F, -4.0F};
     first.Edit().camera.Primary().anchoredFloatMaxOffsetMeters = 1.25F;
     first.Edit().camera.Primary().multisampleCount = 2;
+    first.Edit().camera.Primary().keepLevel = true;
     first.Edit().preview.visible = true;
     first.Edit().preview.position = {0.25F, 1.4F, 2.25F};
     first.Edit().preview.rotationDegrees = {5.0F, 175.0F, 0.0F};
@@ -260,6 +301,7 @@ int main() {
     first.Edit().recording.gameplayOnly = true;
     first.Edit().recording.controllerShortcutEnabled = true;
     first.Edit().recording.worldControlsVisible = true;
+    first.Edit().recording.worldControlsStreamMode = true;
     first.Edit().recording.worldControlsPosition = {0.45F, 1.35F, 1.55F};
     first.Edit().recording.worldControlsRotationDegrees = {4.0F, 170.0F, -2.0F};
     first.Edit().recording.backend = RecordingBackend::DirectFfmpegHardware;
@@ -274,8 +316,39 @@ int main() {
     first.Edit().recording.keyframeIntervalSeconds = 3;
     first.Edit().recording.audioBitrateBitsPerSecond = 192'000;
     first.Edit().broadcast.provider = LivestreamProvider::YouTube;
-    first.Edit().broadcast.serverUrl = "rtmps://a.rtmps.youtube.com/live2";
+    first.Edit().broadcast.twitch.serverUrl = "rtmps://twitch.example/app";
+    first.Edit().broadcast.twitch.streamKey = "test-twitch-key";
+    first.Edit().broadcast.twitch.streamTitle = "Test Twitch title";
+    first.Edit().broadcast.youtube.serverUrl = "rtmps://youtube.example/live2";
+    first.Edit().broadcast.youtube.streamKey = "test-youtube-key";
+    first.Edit().broadcast.kick.serverUrl = "rtmps://kick.example/app";
+    first.Edit().broadcast.kick.streamKey = "test-kick-key";
+    first.Edit().broadcast.custom.serverUrl = "rtmp://custom.example/live";
+    first.Edit().broadcast.custom.streamKey = "test-custom-key";
     first.Edit().broadcast.reconnectAttempts = 12;
+    first.Edit().broadcast.afkMediaPath = "/sdcard/Pictures/afk.gif";
+    first.Edit().broadcast.keepHeadsetAwake = false;
+    first.Edit().broadcast.gameAudioEnabled = false;
+    first.Edit().broadcast.gameAudioVolumePercent = 65.0F;
+    first.Edit().broadcast.microphoneEnabled = true;
+    first.Edit().broadcast.microphoneVolumePercent = 135.0F;
+    first.Edit().broadcast.postMapInfoToChat = true;
+    // Saving migrates any alpha-era per-user Client ID to SaberStage's
+    // registered public application identifier.
+    first.Edit().broadcast.twitchAccount.clientId = "legacy-client-id";
+    first.Edit().broadcast.twitchAccount.accessToken = "test-access-token";
+    first.Edit().broadcast.twitchAccount.refreshToken = "test-refresh-token";
+    first.Edit().broadcast.twitchAccount.protectedTokenEnvelope =
+        "ak1:00112233445566778899aabb:00112233445566778899aabbccddeeff";
+    first.Edit().broadcast.twitchAccount.login = "test-login";
+    first.Edit().broadcast.twitchAccount.userId = "123456";
+    first.Edit().broadcast.twitchAccount.expiresAtUnixSeconds = 1'800'000'000;
+    first.Edit().broadcast.twitchAccount.chatWriteAuthorized = true;
+    first.Edit().chat.enabled = true;
+    first.Edit().chat.position = {-0.32F, 1.42F, 1.72F};
+    first.Edit().chat.rotationDegrees = {2.0F, 170.0F, -3.0F};
+    first.Edit().chat.width = 86.0F;
+    first.Edit().chat.height = 64.0F;
     first.Edit().avatar.selectedFile = "Black Heart.vrm";
     first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
     first.Edit().avatar.maximumTextureDimension = 512;
@@ -350,6 +423,8 @@ int main() {
           "anchored-float tuning survives restart");
     Check(second.Get().camera.Primary().multisampleCount == 2,
           "third-person camera MSAA survives restart");
+    Check(second.Get().camera.Primary().keepLevel,
+          "third-person camera level lock survives restart");
     Check(second.Get().preview.visible && second.Get().preview.position.x == 0.25F &&
               second.Get().preview.rotationDegrees.y == 175.0F && second.Get().preview.scale == 1.5F,
           "floating preview pose, scale, and visibility survive restart");
@@ -357,6 +432,7 @@ int main() {
     Check(second.Get().recording.controllerShortcutEnabled,
           "controller recording shortcut preference survives restart");
     Check(second.Get().recording.worldControlsVisible &&
+              second.Get().recording.worldControlsStreamMode &&
               second.Get().recording.worldControlsPosition.x == 0.45F &&
               second.Get().recording.worldControlsRotationDegrees.y == 170.0F,
           "movable recording controls visibility and pose survive restart");
@@ -372,12 +448,46 @@ int main() {
               second.Get().recording.keyframeIntervalSeconds == 3 &&
               second.Get().recording.audioBitrateBitsPerSecond == 192'000,
           "all direct hardware encoder controls survive restart");
+    const auto serializedSettings = Read(path);
+    Check(serializedSettings.find("test-access-token") == std::string::npos &&
+              serializedSettings.find("test-refresh-token") == std::string::npos &&
+              serializedSettings.find("\"accessToken\"") == std::string::npos &&
+              serializedSettings.find("\"refreshToken\"") == std::string::npos,
+          "Twitch OAuth plaintext is never serialized to settings");
     Check(second.Get().broadcast.provider == LivestreamProvider::YouTube &&
-              second.Get().broadcast.serverUrl == "rtmps://a.rtmps.youtube.com/live2" &&
-              second.Get().broadcast.reconnectAttempts == 12,
-          "livestream service, endpoint, and reconnect settings survive restart");
-    Check(Read(path).find("streamKey") == std::string::npos,
-          "stream keys are never persisted in settings JSON");
+              second.Get().broadcast.twitch.serverUrl == "rtmps://twitch.example/app" &&
+              second.Get().broadcast.twitch.streamKey == "test-twitch-key" &&
+              second.Get().broadcast.twitch.streamTitle == "Test Twitch title" &&
+              second.Get().broadcast.youtube.serverUrl == "rtmps://youtube.example/live2" &&
+              second.Get().broadcast.youtube.streamKey == "test-youtube-key" &&
+              second.Get().broadcast.kick.serverUrl == "rtmps://kick.example/app" &&
+              second.Get().broadcast.kick.streamKey == "test-kick-key" &&
+              second.Get().broadcast.custom.serverUrl == "rtmp://custom.example/live" &&
+              second.Get().broadcast.custom.streamKey == "test-custom-key" &&
+              second.Get().broadcast.reconnectAttempts == 12 &&
+              second.Get().broadcast.afkMediaPath == "/sdcard/Pictures/afk.gif" &&
+               !second.Get().broadcast.keepHeadsetAwake &&
+               !second.Get().broadcast.gameAudioEnabled &&
+               second.Get().broadcast.gameAudioVolumePercent == 65.0F &&
+               second.Get().broadcast.microphoneEnabled &&
+               second.Get().broadcast.microphoneVolumePercent == 135.0F &&
+               second.Get().broadcast.postMapInfoToChat &&
+               second.Get().broadcast.twitchAccount.clientId == kSaberStageTwitchClientId &&
+               second.Get().broadcast.twitchAccount.accessToken.empty() &&
+               second.Get().broadcast.twitchAccount.refreshToken.empty() &&
+               second.Get().broadcast.twitchAccount.protectedTokenEnvelope ==
+                   "ak1:00112233445566778899aabb:00112233445566778899aabbccddeeff" &&
+               second.Get().broadcast.twitchAccount.login == "test-login" &&
+              second.Get().broadcast.twitchAccount.userId == "123456" &&
+              second.Get().broadcast.twitchAccount.expiresAtUnixSeconds == 1'800'000'000 &&
+              second.Get().broadcast.twitchAccount.chatWriteAuthorized,
+          "livestream destinations, AFK media, and protected Twitch account state survive restart");
+    Check(second.Get().chat.enabled && second.Get().chat.position.x == -0.32F &&
+              second.Get().chat.rotationDegrees.y == 170.0F &&
+              second.Get().chat.width == 86.0F && second.Get().chat.height == 64.0F,
+          "movable Twitch chat visibility, pose, and size survive restart");
+    Check(Read(path).find("\"destinations\"") != std::string::npos,
+          "livestream destinations use the service-specific schema");
     Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&
               second.Get().avatar.selectedPath == "/sdcard/Download/Black Heart.vrm" &&
               second.Get().avatar.maximumTextureDimension == 512 &&
@@ -476,6 +586,42 @@ int main() {
           "older settings migrate with the controller shortcut disabled");
     Check(!migration.Get().recording.worldControlsVisible,
           "older settings migrate with movable recording controls disabled");
+
+    Write(path, R"({"schemaVersion":20,"preview":{"position":{"x":0.0,"y":1.15,"z":2.1},"rotationDegrees":{"x":0.0,"y":180.0,"z":0.0}},"recording":{"worldControlsPosition":{"x":0.42,"y":1.25,"z":1.45},"worldControlsRotationDegrees":{"x":0.0,"y":180.0,"z":0.0}}})");
+    SettingsService legacyWorldPanels(path);
+    const auto legacyWorldPanelLoad = legacyWorldPanels.Load();
+    Check(legacyWorldPanelLoad.migrated &&
+              legacyWorldPanels.Get().preview.rotationDegrees.y == 0.0F &&
+              legacyWorldPanels.Get().recording.worldControlsRotationDegrees.y == 0.0F,
+          "schema 20 untouched world panels migrate from their reversed default face");
+
+    Write(path, R"({"schemaVersion":19,"broadcast":{"provider":"kick","serverUrl":"rtmps://legacy-kick.example/app","reconnectAttempts":5}})");
+    SettingsService legacyLivestream(path);
+    const auto legacyLivestreamLoad = legacyLivestream.Load();
+    Check(legacyLivestreamLoad.migrated &&
+              legacyLivestream.Get().broadcast.kick.serverUrl ==
+                  "rtmps://legacy-kick.example/app" &&
+              legacyLivestream.Get().broadcast.twitch.serverUrl ==
+                  defaults.broadcast.twitch.serverUrl,
+          "schema 19 moves its shared endpoint into only the selected service");
+    Check(Read(path).find("\"destinations\"") != std::string::npos,
+          "legacy livestream migration rewrites the service-specific schema");
+
+    Write(path, R"({"schemaVersion":25,"broadcast":{"twitchAccount":{"clientId":"legacy-client-id","accessToken":"legacy-access-secret","refreshToken":"legacy-refresh-secret","login":"legacy-login","userId":"654321","expiresAtUnixSeconds":1800000000,"chatWriteAuthorized":true}}})");
+    SettingsService legacyPlaintextTwitch(path);
+    const auto legacyPlaintextLoad = legacyPlaintextTwitch.Load();
+    const auto migratedTwitchJson = Read(path);
+    Check(legacyPlaintextLoad.migrated &&
+              legacyPlaintextTwitch.Get().broadcast.twitchAccount.accessToken ==
+                  "legacy-access-secret" &&
+              legacyPlaintextTwitch.Get().broadcast.twitchAccount.refreshToken ==
+                  "legacy-refresh-secret",
+          "schema 25 Twitch plaintext remains available in memory for one-time Keystore migration");
+    Check(migratedTwitchJson.find("legacy-access-secret") == std::string::npos &&
+              migratedTwitchJson.find("legacy-refresh-secret") == std::string::npos &&
+              migratedTwitchJson.find("\"accessToken\"") == std::string::npos &&
+              migratedTwitchJson.find("\"refreshToken\"") == std::string::npos,
+          "schema 25 migration immediately removes plaintext Twitch OAuth fields from disk");
 
     Write(path, R"({"schemaVersion":1,"camera":{"fovDegrees":"invalid","requestedWidth":1281},"chat":{"enabled":"invalid"}})");
     SettingsService wrongTypes(path);

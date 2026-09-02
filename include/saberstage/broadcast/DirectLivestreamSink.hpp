@@ -34,6 +34,9 @@ public:
         std::size_t sampleCount,
         std::int32_t channels,
         std::int32_t sampleRate) noexcept;
+    // Muting does not stop or retime AAC. It replaces incoming samples with
+    // silence so Twitch's RTMP session remains continuous during AFK mode.
+    void SetMuted(bool muted) noexcept;
     [[nodiscard]] LivestreamSnapshot Snapshot() const;
 
 private:

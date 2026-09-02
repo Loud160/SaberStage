@@ -90,72 +90,24 @@ void InspectAnnexB(const std::uint8_t* data, std::size_t size, ParameterSets& se
     }
 }
 
-std::vector<std::uint8_t> BuildAvcc(const ParameterSets& sets) {
-    if (sets.sps.size() < 4 || sets.pps.empty() || sets.sps.size() > 65'535 || sets.pps.size() > 65'535) {
+std::vector<std::uint8_t> BuildAnnexBExtradata(const ParameterSets& sets) {
+    if (sets.sps.empty() || sets.pps.empty()) {
         return {};
     }
-    std::vector<std::uint8_t> result;
-    result.reserve(11 + sets.sps.size() + sets.pps.size());
-    result.push_back(1);
-    result.push_back(sets.sps[1]);
-    result.push_back(sets.sps[2]);
-    result.push_back(sets.sps[3]);
-    result.push_back(0xFF);
-    result.push_back(0xE1);
-    result.push_back(static_cast<std::uint8_t>(sets.sps.size() >> 8U));
-    result.push_back(static_cast<std::uint8_t>(sets.sps.size()));
-    result.insert(result.end(), sets.sps.begin(), sets.sps.end());
-    result.push_back(1);
-    result.push_back(static_cast<std::uint8_t>(sets.pps.size() >> 8U));
-    result.push_back(static_cast<std::uint8_t>(sets.pps.size()));
-    result.insert(result.end(), sets.pps.begin(), sets.pps.end());
-    return result;
-}
 
-std::vector<std::uint8_t> AnnexBAccessUnitToAvcc(const std::uint8_t* data, std::size_t size) {
+    // Keep the encoder headers in their native Annex-B representation.  The
+    // FFmpeg FLV muxer recognizes non-AVCC H.264 extradata, builds the complete
+    // AVCDecoderConfigurationRecord itself, and converts Annex-B access units
+    // to length-prefixed FLV packets.  That is the same well-tested boundary
+    // used by FFmpeg's raw-H.264-to-FLV path and avoids maintaining a partial
+    // hand-written AVCC implementation here (notably for High-profile SPS).
+    constexpr std::array<std::uint8_t, 4> startCode{0, 0, 0, 1};
     std::vector<std::uint8_t> result;
-    result.reserve(size + 16);
-    bool sawStartCode = false;
-    auto startCode = [&](std::size_t offset, std::size_t& length) {
-        length = 0;
-        if (offset + 3 <= size && data[offset] == 0 && data[offset + 1] == 0 && data[offset + 2] == 1) {
-            length = 3;
-            return true;
-        }
-        if (offset + 4 <= size && data[offset] == 0 && data[offset + 1] == 0 &&
-            data[offset + 2] == 0 && data[offset + 3] == 1) {
-            length = 4;
-            return true;
-        }
-        return false;
-    };
-    std::size_t cursor = 0;
-    while (cursor < size) {
-        std::size_t prefix = 0;
-        while (cursor < size && !startCode(cursor, prefix)) ++cursor;
-        if (cursor >= size) break;
-        sawStartCode = true;
-        const auto nalStart = cursor + prefix;
-        auto nalEnd = nalStart;
-        std::size_t nextPrefix = 0;
-        while (nalEnd < size && !startCode(nalEnd, nextPrefix)) ++nalEnd;
-        if (nalStart < nalEnd) {
-            const auto type = data[nalStart] & 0x1FU;
-            // SPS/PPS are sent once in FLV's AVC sequence header. Repeating
-            // them inside every access unit wastes bandwidth and can confuse
-            // stricter ingest servers. AUD NALs are not meaningful in FLV.
-            if (type != 7 && type != 8 && type != 9) {
-                const auto length = static_cast<std::uint32_t>(nalEnd - nalStart);
-                result.push_back(static_cast<std::uint8_t>(length >> 24U));
-                result.push_back(static_cast<std::uint8_t>(length >> 16U));
-                result.push_back(static_cast<std::uint8_t>(length >> 8U));
-                result.push_back(static_cast<std::uint8_t>(length));
-                result.insert(result.end(), data + nalStart, data + nalEnd);
-            }
-        }
-        cursor = nalEnd;
-    }
-    if (!sawStartCode) result.assign(data, data + size);
+    result.reserve(startCode.size() * 2 + sets.sps.size() + sets.pps.size());
+    result.insert(result.end(), startCode.begin(), startCode.end());
+    result.insert(result.end(), sets.sps.begin(), sets.sps.end());
+    result.insert(result.end(), startCode.begin(), startCode.end());
+    result.insert(result.end(), sets.pps.begin(), sets.pps.end());
     return result;
 }
 
@@ -191,8 +143,10 @@ public:
             if (error) *error = "Enter a stream key before going live.";
             return false;
         }
-        if (livestream_.serverUrl.rfind("rtmp://", 0) != 0 &&
-            livestream_.serverUrl.rfind("rtmps://", 0) != 0) {
+        const auto& destination = settings::DestinationForProvider(
+            livestream_, livestream_.provider);
+        if (destination.serverUrl.rfind("rtmp://", 0) != 0 &&
+            destination.serverUrl.rfind("rtmps://", 0) != 0) {
             if (error) *error = "The server URL must begin with rtmp:// or rtmps://.";
             return false;
         }
@@ -259,7 +213,11 @@ public:
                 return false;
             }
             AudioChunk chunk;
-            chunk.samples.assign(samples, samples + count);
+            if (muted_.load(std::memory_order_acquire)) {
+                chunk.samples.assign(count, 0.0F);
+            } else {
+                chunk.samples.assign(samples, samples + count);
+            }
             chunk.channels = channels;
             chunk.sampleRate = sampleRate;
             queuedAudioSamples_ += count;
@@ -270,6 +228,10 @@ public:
             audioSamplesDropped_.fetch_add(count, std::memory_order_relaxed);
             return false;
         }
+    }
+
+    void SetMuted(bool muted) noexcept {
+        muted_.store(muted, std::memory_order_release);
     }
 
     LivestreamSnapshot Snapshot() const {
@@ -300,13 +262,16 @@ private:
         {
             std::lock_guard lock(statusMutex_);
             status_ = std::move(status);
+            // Status text is deliberately free of endpoint/key material and
+            // gives support logs the state transitions that the UI observed.
+            Logging::Logger.info("Livestream state changed: {}", status_);
         }
         if (statusHandler_) statusHandler_();
     }
 
     bool OpenOutput(std::int32_t sampleRate, std::int32_t channels, std::string& error) {
-        const auto avcc = BuildAvcc(parameterSets_);
-        if (avcc.empty()) {
+        const auto annexBHeaders = BuildAnnexBExtradata(parameterSets_);
+        if (annexBHeaders.empty()) {
             error = "The hardware encoder has not supplied H.264 stream headers yet.";
             return false;
         }
@@ -322,21 +287,24 @@ private:
             return false;
         }
         videoStream_->time_base = {1, recording_.framesPerSecond};
+        videoStream_->avg_frame_rate = {recording_.framesPerSecond, 1};
+        videoStream_->r_frame_rate = {recording_.framesPerSecond, 1};
         auto* video = videoStream_->codecpar;
         video->codec_type = AVMEDIA_TYPE_VIDEO;
         video->codec_id = AV_CODEC_ID_H264;
+        video->codec_tag = 0;
         video->width = width_;
         video->height = height_;
         video->format = AV_PIX_FMT_YUV420P;
         video->bit_rate = recording_.bitrateBitsPerSecond;
         video->extradata = static_cast<std::uint8_t*>(
-            av_mallocz(avcc.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            av_mallocz(annexBHeaders.size() + AV_INPUT_BUFFER_PADDING_SIZE));
         if (!video->extradata) {
             error = "Cannot allocate H.264 stream headers.";
             return false;
         }
-        std::memcpy(video->extradata, avcc.data(), avcc.size());
-        video->extradata_size = static_cast<int>(avcc.size());
+        std::memcpy(video->extradata, annexBHeaders.data(), annexBHeaders.size());
+        video->extradata_size = static_cast<int>(annexBHeaders.size());
 
         const auto* audioCodec = avcodec_find_encoder(AV_CODEC_ID_AAC);
         if (!audioCodec) {
@@ -376,6 +344,13 @@ private:
             error = "The AAC encoder rejected the game-audio format: " + FfmpegError(audioOpen);
             return false;
         }
+        // FFmpeg documents that an audio encoder moves the first output PTS
+        // backwards by initial_padding.  The FLV stream has already begun at
+        // video DTS 0, so feeding AAC from input PTS 0 would produce a later
+        // negative-DTS audio packet and make the FLV muxer reject the stream.
+        // Starting input at the encoder's priming length keeps the first AAC
+        // packet at timestamp zero without changing the ongoing audio clock.
+        audioPts_ = std::max<std::int64_t>(0, audioCodec_->initial_padding);
         audioStream_ = avformat_new_stream(format_, nullptr);
         if (!audioStream_) {
             error = "Cannot create the live audio stream.";
@@ -392,22 +367,54 @@ private:
         av_dict_set(&options, "rw_timeout", "5000000", 0);
         av_dict_set(&options, "tls_verify", "1", 0);
         av_dict_set(&options, "ca_file", "/system/etc/security/cacerts/", 0);
-        const auto url = JoinEndpointAndKey(livestream_.serverUrl, streamKey_);
+        const auto& destination = settings::DestinationForProvider(
+            livestream_, livestream_.provider);
+        const auto url = JoinEndpointAndKey(destination.serverUrl, streamKey_);
+        Logging::Logger.info(
+            "Opening {} livestream output: {}x{}@{}, video={} bps, audio={} bps, AAC priming={} samples, "
+            "SPS={} bytes, PPS={} bytes",
+            settings::ToString(livestream_.provider), width_, height_, recording_.framesPerSecond,
+            recording_.bitrateBitsPerSecond, recording_.audioBitrateBitsPerSecond,
+            audioCodec_->initial_padding,
+            parameterSets_.sps.size(), parameterSets_.pps.size());
         const auto open = avio_open2(&format_->pb, url.c_str(), AVIO_FLAG_WRITE, nullptr, &options);
         av_dict_free(&options);
         if (open < 0) {
             error = "Could not connect to the selected streaming service: " + FfmpegError(open);
             return false;
         }
-        const auto header = avformat_write_header(format_, nullptr);
+        AVDictionary* headerOptions = nullptr;
+        // Live sockets cannot seek back to update file-size/duration metadata.
+        // Omitting those fields is the intended FLV live-stream behavior.
+        av_dict_set(&headerOptions, "flvflags", "no_duration_filesize", 0);
+        const auto header = avformat_write_header(format_, &headerOptions);
+        av_dict_free(&headerOptions);
         if (header < 0) {
             error = "The streaming service rejected the stream header: " + FfmpegError(header);
             return false;
         }
+        headerWritten_ = true;
+        // FLV timestamps are always milliseconds.  avformat_write_header()
+        // therefore replaces both AVStream time bases with 1/1000 even though
+        // the hardware encoder reports video timestamps in 1/fps units.  Keep
+        // that muxer-selected value visible in support logs: every packet must
+        // be rescaled into it before it is submitted below.
+        Logging::Logger.info(
+            "Livestream FLV header accepted: video time base={}/{}, audio time base={}/{}",
+            videoStream_->time_base.num, videoStream_->time_base.den,
+            audioStream_->time_base.num, audioStream_->time_base.den);
         return true;
     }
 
     void CloseOutput(bool writeTrailer) noexcept {
+        if (headerWritten_ || videoPacketsWritten_ > 0 || audioPacketsWritten_ > 0) {
+            Logging::Logger.info(
+                "Livestream output summary: video packets={}, video bytes={}, audio packets={}, audio bytes={}, "
+                "queued video drops={}, queued audio sample drops={}",
+                videoPacketsWritten_, videoBytesWritten_, audioPacketsWritten_, audioBytesWritten_,
+                videoPacketsDropped_.load(std::memory_order_relaxed),
+                audioSamplesDropped_.load(std::memory_order_relaxed));
+        }
         if (format_) {
             if (writeTrailer && format_->pb) av_write_trailer(format_);
             if (format_->pb) avio_closep(&format_->pb);
@@ -421,6 +428,7 @@ private:
         firstVideoPts_ = AV_NOPTS_VALUE;
         audioPts_ = 0;
         audioAccumulator_.clear();
+        headerWritten_ = false;
     }
 
     bool WriteVideo(VideoPacket& packet, std::string& error) {
@@ -437,29 +445,52 @@ private:
             needsKeyframe_ = false;
         }
 
-        const auto accessUnit = AnnexBAccessUnitToAvcc(packet.bytes.data(), packet.bytes.size());
-        if (accessUnit.empty()) return true;
         AVPacket* output = av_packet_alloc();
         if (!output) {
             error = "Cannot allocate a live video packet.";
             return false;
         }
-        if (av_new_packet(output, static_cast<int>(accessUnit.size())) < 0) {
+        if (av_new_packet(output, static_cast<int>(packet.bytes.size())) < 0) {
             av_packet_free(&output);
             error = "Cannot copy a live video packet.";
             return false;
         }
-        std::memcpy(output->data, accessUnit.data(), accessUnit.size());
+        // Keep Annex-B here as well. Because codec extradata is Annex-B, the
+        // FFmpeg FLV muxer converts each access unit to the exact AVCC packet
+        // representation expected by legacy RTMP ingest servers.
+        std::memcpy(output->data, packet.bytes.data(), packet.bytes.size());
         output->stream_index = videoStream_->index;
         output->pts = packet.pts - firstVideoPts_;
         output->dts = packet.dts == AV_NOPTS_VALUE ? output->pts : packet.dts - firstVideoPts_;
         output->duration = 1;
         if (idr) output->flags |= AV_PKT_FLAG_KEY;
+
+        // DirectFfmpegCapture timestamps one encoded packet per camera frame,
+        // using 1/fps as its clock.  The FLV muxer changes AVStream::time_base
+        // to milliseconds while writing the header.  Passing frame numbers to
+        // that millisecond clock makes 30 FPS look like 1,000 FPS and compresses
+        // an 80-second video timeline to roughly 2.4 seconds while AAC remains
+        // correctly timed.  Twitch accepts the RTMP publisher in that state but
+        // cannot present the malformed A/V timeline.  Rescale at the ownership
+        // boundary, just as the AAC path already does.
+        const AVRational encoderTimeBase{1, recording_.framesPerSecond};
+        av_packet_rescale_ts(output, encoderTimeBase, videoStream_->time_base);
+        const auto muxPts = output->pts;
+        const auto muxDts = output->dts;
+        const auto muxDuration = output->duration;
         const auto write = av_interleaved_write_frame(format_, output);
         av_packet_free(&output);
         if (write < 0) {
             error = "The streaming connection stopped accepting video: " + FfmpegError(write);
             return false;
+        }
+        ++videoPacketsWritten_;
+        videoBytesWritten_ += packet.bytes.size();
+        if (videoPacketsWritten_ == 1) {
+            Logging::Logger.info(
+                "Livestream first video packet written: keyframe={}, source pts={}, source dts={}, "
+                "mux pts={}, mux dts={}, mux duration={}, bytes={}",
+                idr, packet.pts, packet.dts, muxPts, muxDts, muxDuration, packet.bytes.size());
         }
         return true;
     }
@@ -480,12 +511,22 @@ private:
             }
             av_packet_rescale_ts(packet, audioCodec_->time_base, audioStream_->time_base);
             packet->stream_index = audioStream_->index;
+            const auto packetSize = static_cast<std::uint64_t>(packet->size);
+            const auto packetPts = packet->pts;
+            const auto packetDts = packet->dts;
             const auto write = av_interleaved_write_frame(format_, packet);
             av_packet_unref(packet);
             if (write < 0) {
                 error = "The streaming connection stopped accepting audio: " + FfmpegError(write);
                 av_packet_free(&packet);
                 return false;
+            }
+            ++audioPacketsWritten_;
+            audioBytesWritten_ += packetSize;
+            if (audioPacketsWritten_ == 1) {
+                Logging::Logger.info(
+                    "Livestream first audio packet written: pts={}, dts={}, bytes={}",
+                    packetPts, packetDts, packetSize);
             }
         }
         av_packet_free(&packet);
@@ -646,6 +687,7 @@ private:
     std::string status_ = "Offline";
     std::atomic<LivestreamState> state_{LivestreamState::Offline};
     std::atomic<bool> stopRequested_{false};
+    std::atomic<bool> muted_{false};
     std::chrono::steady_clock::time_point startedAt_{};
     mutable std::mutex queueMutex_;
     std::condition_variable ready_;
@@ -669,6 +711,11 @@ private:
     std::int32_t lastSampleRate_ = 48'000;
     std::int32_t width_ = 1920;
     std::int32_t height_ = 1080;
+    bool headerWritten_ = false;
+    std::uint64_t videoPacketsWritten_ = 0;
+    std::uint64_t videoBytesWritten_ = 0;
+    std::uint64_t audioPacketsWritten_ = 0;
+    std::uint64_t audioBytesWritten_ = 0;
 };
 
 DirectLivestreamSink::DirectLivestreamSink(
@@ -693,6 +740,7 @@ bool DirectLivestreamSink::SubmitAudio(
     std::int32_t sampleRate) noexcept {
     return impl_->SubmitAudio(samples, count, channels, sampleRate);
 }
+void DirectLivestreamSink::SetMuted(bool muted) noexcept { impl_->SetMuted(muted); }
 LivestreamSnapshot DirectLivestreamSink::Snapshot() const { return impl_->Snapshot(); }
 
 std::string DefaultServerUrl(settings::LivestreamProvider provider) {

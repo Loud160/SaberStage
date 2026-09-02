@@ -6,6 +6,7 @@
 #include "saberstage/avatar/Math.hpp"
 #include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
+#include "saberstage/broadcast/TwitchService.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
@@ -22,9 +23,13 @@
 #include "GlobalNamespace/VRController.hpp"
 #include "GlobalNamespace/OVRInput.hpp"
 #include "TMPro/FontStyles.hpp"
+#include "TMPro/HorizontalAlignmentOptions.hpp"
 #include "TMPro/TextAlignmentOptions.hpp"
 #include "TMPro/TextOverflowModes.hpp"
+#include "TMPro/VerticalAlignmentOptions.hpp"
 #include "UnityEngine/Canvas.hpp"
+#include "UnityEngine/Application.hpp"
+#include "UnityEngine/Android/Permission.hpp"
 #include "UnityEngine/Camera.hpp"
 #include "UnityEngine/Color.hpp"
 #include "UnityEngine/Collider.hpp"
@@ -49,6 +54,7 @@
 #include "UnityEngine/XR/XRNode.hpp"
 #include "UnityEngine/UI/Button.hpp"
 #include "UnityEngine/UI/ContentSizeFitter.hpp"
+#include "UnityEngine/UI/Graphic.hpp"
 #include "UnityEngine/UI/HorizontalLayoutGroup.hpp"
 #include "UnityEngine/UI/Image.hpp"
 #include "UnityEngine/UI/LayoutElement.hpp"
@@ -58,7 +64,9 @@
 #include "bsml/shared/BSML.hpp"
 #include "bsml/shared/BSML/Components/ExternalComponents.hpp"
 #include "bsml/shared/BSML/Components/ModalView.hpp"
+#include "bsml/shared/BSML/Components/ScrollView.hpp"
 #include "bsml/shared/BSML/Components/Settings/SliderSetting.hpp"
+#include "bsml/shared/BSML/Components/Settings/ToggleSetting.hpp"
 #include "bsml/shared/BSML/FloatingScreen/FloatingScreen.hpp"
 #include "bsml/shared/BSML/FloatingScreen/FloatingScreenHandle.hpp"
 #include "bsml/shared/BSML/FloatingScreen/Side.hpp"
@@ -120,18 +128,54 @@ constexpr float kCalibrationPanelControlBandHeight = 22.0F;
 // must cover ONLY the information band — a physics handle hit always wins over
 // Unity's UI raycast, so any handle overlap with the button band turns button
 // clicks into panel grabs.
-constexpr float kRecordingPanelWidth = 48.0F;
-constexpr float kRecordingPanelButtonBandHeight = 11.0F;
-constexpr float kRecordingPanelHeaderHeight = 8.0F;
+constexpr float kRecordingPanelWidth = 60.0F;
+constexpr float kRecordingPanelButtonBandHeight = 18.0F;
+constexpr float kRecordingPanelModeRowHeight = 7.0F;
+constexpr float kRecordingPanelHeaderHeight = 7.0F;
 constexpr float kRecordingPanelFpsRowHeight = 5.5F;
+constexpr float kRecordingPanelDropRowHeight = 5.0F;
 constexpr float kRecordingPanelScale = 0.0125F;
+const UnityEngine::Vector2 kChatPanelSize{70.0F, 58.0F};
+constexpr float kChatPanelScale = 0.011F;
+constexpr float kChatPanelMinimumWidth = 45.0F;
+constexpr float kChatPanelMaximumWidth = 120.0F;
+constexpr float kChatPanelMinimumHeight = 32.0F;
+constexpr float kChatPanelMaximumHeight = 100.0F;
+constexpr float kChatPanelHeaderHeight = 10.0F;
+constexpr float kChatResizeHandleSize = 14.0F;
+constexpr float kChatResizeHandleInset = 5.5F;
+constexpr std::size_t kChatVirtualRowPoolSize = 32;
+constexpr float kChatVirtualRowMinimumHeight = 4.25F;
+constexpr float kChatVirtualRowPadding = 0.5F;
+constexpr float kChatDataRefreshIntervalSeconds = 0.10F;
+const camera::Vec3 kDefaultRecordingPanelPosition{0.42F, 1.25F, 1.45F};
+const camera::Vec3 kDefaultChatPanelPosition{-0.48F, 1.25F, 1.45F};
+
+settings::LivestreamProvider LivestreamProviderFromLabel(std::string_view value) noexcept {
+    if (value == "YouTube (Not Supported)") return settings::LivestreamProvider::YouTube;
+    if (value == "Kick (Not Supported)") return settings::LivestreamProvider::Kick;
+    if (value == "Custom") return settings::LivestreamProvider::Custom;
+    return settings::LivestreamProvider::Twitch;
+}
+
+std::string_view LivestreamProviderLabel(settings::LivestreamProvider provider) noexcept {
+    switch (provider) {
+        case settings::LivestreamProvider::Twitch: return "Twitch";
+        case settings::LivestreamProvider::YouTube: return "YouTube (Not Supported)";
+        case settings::LivestreamProvider::Kick: return "Kick (Not Supported)";
+        case settings::LivestreamProvider::Custom: return "Custom";
+    }
+    return "Twitch";
+}
 
 // The panel height depends on whether the FPS row is enabled. Toggling the
 // row rebuilds the panel at the matching size rather than leaving dead space.
 UnityEngine::Vector2 RecordingPanelSize(bool showFps) {
     return {
         kRecordingPanelWidth,
-        kRecordingPanelHeaderHeight + (showFps ? kRecordingPanelFpsRowHeight : 0.0F) +
+        kRecordingPanelModeRowHeight + kRecordingPanelHeaderHeight +
+            kRecordingPanelDropRowHeight +
+            (showFps ? kRecordingPanelFpsRowHeight : 0.0F) +
             kRecordingPanelButtonBandHeight + 2.0F};
 }
 
@@ -433,6 +477,27 @@ void ConfigureWorldPanelImage(
     rect->set_sizeDelta(size);
 }
 
+UnityEngine::Material* CreateNonBloomWorldPanelMaterial(std::string_view name) {
+    auto* shader = avatar::vrm::EmbeddedNonBloomUiShader();
+    if (!IsAlive(shader)) {
+        Logging::Logger.warn(
+            "World-panel accent '{}' is using the stock UI material because the embedded non-bloom shader is unavailable",
+            name);
+        return nullptr;
+    }
+    auto* material = UnityEngine::Material::New_ctor(shader);
+    if (!IsAlive(material)) return nullptr;
+    material->set_name(name);
+    material->set_color(UnityEngine::Color::get_white());
+    material->set_renderQueue(3020);
+    UnityEngine::Object::DontDestroyOnLoad(material);
+    return material;
+}
+
+void ApplyWorldPanelMaterial(HMUI::ImageView* image, UnityEngine::Material* material) {
+    if (IsAlive(image) && IsAlive(material)) image->set_material(material);
+}
+
 void ConfigureWorldPanelText(
     TMPro::TextMeshProUGUI* text,
     UnityEngine::Vector2 position,
@@ -452,25 +517,22 @@ void ConfigureWorldPanelText(
     rect->set_sizeDelta(size);
 }
 
-void HideAndFitWorldPanelHandleAboveButtons(
+void HideAndFitWorldPanelHandleBehindContent(
     BSML::FloatingScreen* screen,
     UnityEngine::Vector2 panelSize) {
     if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
     if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
         renderer->set_enabled(false);
     }
-    // Same proven scheme as the calibration panel: one invisible native handle
-    // covering the full information band, stopping exactly at the top of the
-    // button band. The previous 2.5-unit sliver at the very top edge was a
-    // ~3 cm grab target at world scale, which is why the panel felt immovable.
-    // Never extend this collider over the buttons: the physics handle wins
-    // over UI raycasts and would swallow every click. The Z scale of 2 canvas
-    // units keeps the box thin enough not to shadow neighboring UI.
-    const float handleHeight = panelSize.y - kRecordingPanelButtonBandHeight;
-    screen->handle->get_transform()->set_localPosition({
-        0.0F, kRecordingPanelButtonBandHeight * 0.5F, 0.0F});
+    // Put one thin native movement collider behind the complete panel. Unity's
+    // nearer interactive graphics (buttons, toggles, and explicit scroll
+    // controls) receive their pointer events first. Non-interactive body
+    // graphics must disable raycastTarget so those areas fall through to this
+    // handle, making the panel draggable without stealing real control presses.
+    screen->handle->set_layer(5);
+    screen->handle->get_transform()->set_localPosition({0.0F, 0.0F, 0.65F});
     screen->handle->get_transform()->set_localScale({
-        panelSize.x, handleHeight, 2.0F});
+        panelSize.x, panelSize.y, 0.2F});
 }
 
 void HideAndFitCalibrationPanelHandleAboveControls(BSML::FloatingScreen* screen) {
@@ -624,8 +686,20 @@ T* ConstrainRightPanelRow(T* control) {
     return control;
 }
 
-constexpr float kCenterPanelRowWidth = 52.0F;
-constexpr float kCenterPanelLabelFraction = 0.44F;
+// The center screen is substantially wider than either side screen. Use that
+// space instead of squeezing the stock 90-unit BSML rows into a 52-unit strip:
+// long labels stay readable, slider tracks retain useful travel, and adjacent
+// action buttons can be arranged in rows without overlapping captions.
+constexpr float kCenterPanelRowWidth = 82.0F;
+constexpr float kCenterPanelTextWidth = 84.0F;
+constexpr float kCenterPanelLabelFraction = 0.42F;
+// The Setup page's three-action rows deliberately use more of the center
+// screen than ordinary setting rows. The four tab captions above establish
+// the safe visual width on Quest; 116 units remains inside that span while
+// preventing labels such as Enable Avatar and Reset Profile Calibration from
+// being compressed. Equal columns keep the profile selector truly centered.
+constexpr float kCenterThreeColumnRowWidth = 116.0F;
+constexpr float kCenterThreeColumnWidth = 38.0F;
 
 void ConstrainCenterPanelRowObject(UnityEngine::GameObject* object) {
     if (!object) return;
@@ -634,7 +708,7 @@ void ConstrainCenterPanelRowObject(UnityEngine::GameObject* object) {
     if (!layout) return;
 
     // BSML's setting prefabs are authored for a 90-unit settings screen.
-    // SaberStage's center tab deliberately owns a 52-unit content column.
+    // SaberStage's center tab deliberately owns a wide 82-unit content column.
     // The parent layout and every stock row must agree on that same width or
     // Unity preserves the prefab's 90-unit geometry outside the scroll mask.
     layout->set_minWidth(kCenterPanelRowWidth);
@@ -703,7 +777,7 @@ BSML::SliderSetting* ConstrainCenterPanelRow(BSML::SliderSetting* control) {
     if (!object) return control;
 
     // SliderSettingTag reserves a fixed 52 units for the slider by default.
-    // On this 52-unit page that leaves the title with no width at all. Split
+    // Split
     // the row explicitly so the title and the complete native slider remain
     // visible and interactive inside the same masked column.
     auto root = object->get_transform().cast<UnityEngine::RectTransform>();
@@ -809,6 +883,104 @@ BSML::ToggleSetting* ConstrainCenterPanelRow(BSML::ToggleSetting* control) {
     return control;
 }
 
+void ConfigureCompactCenterControl(UnityEngine::Component* component, float width) {
+    if (!component) return;
+    NeutralizeContentSizeFitter(component);
+    ConfigureLayout(component, width, 8.0F, 0.0F, 0.0F);
+    auto object = component->get_gameObject();
+    if (!object) return;
+    if (auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(width);
+    }
+    FlattenFlatPanelDepth(object->get_transform().ptr());
+}
+
+BSML::ToggleSetting* ConfigureCompactCenterToggle(BSML::ToggleSetting* control, float width) {
+    if (!control) return nullptr;
+    ConfigureCompactCenterControl(control, width);
+    auto object = control->get_gameObject();
+    if (!object) return control;
+
+    // This compact variant is used only by the three-column Setup row. Keep
+    // the label and native switch together inside the left column instead of
+    // inheriting the ordinary center setting-row geometry.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    auto switchTransform = root->Find("SwitchView");
+    auto* switchRect = switchTransform
+        ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
+        : nullptr;
+    const auto switchWidth = switchRect ? switchRect->get_sizeDelta().x : 12.0F;
+    if (auto nameTransform = root->Find("NameText")) {
+        auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
+        nameRect->set_anchorMin({0.0F, 0.0F});
+        nameRect->set_anchorMax({1.0F, 1.0F});
+        nameRect->set_pivot({0.5F, 0.5F});
+        nameRect->set_offsetMin({0.5F, 0.0F});
+        nameRect->set_offsetMax({-(switchWidth + 0.75F), 0.0F});
+        if (control->text) {
+            control->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+            control->text->set_enableWordWrapping(false);
+            control->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        }
+    }
+    if (switchRect) {
+        switchRect->set_anchorMin({1.0F, 0.5F});
+        switchRect->set_anchorMax({1.0F, 0.5F});
+        switchRect->set_pivot({1.0F, 0.5F});
+        switchRect->set_anchoredPosition({-0.25F, 0.0F});
+    }
+    return control;
+}
+
+BSML::DropdownListSetting* ConfigureCompactCenterDropdown(
+    BSML::DropdownListSetting* control,
+    float width) {
+    if (!control) return nullptr;
+    ConfigureCompactCenterControl(control, width);
+    auto object = control->get_gameObject();
+    if (!object) return control;
+
+    // The profile's location in the Setup row already communicates its
+    // purpose. Remove the stock prefix label and let the selector occupy the
+    // complete middle column so the profile name is centered and readable.
+    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+    if (auto labelTransform = root->Find("Label")) {
+        labelTransform->get_gameObject()->SetActive(false);
+    }
+    if (control->dropdown) {
+        FitRectToParentRegion(
+            control->dropdown->get_transform().cast<UnityEngine::RectTransform>(),
+            0.0F,
+            1.0F,
+            0.5F,
+            0.5F);
+    }
+    return control;
+}
+
+UnityEngine::UI::HorizontalLayoutGroup* CreateCenterThreeColumnRow(UnityEngine::Transform* parent) {
+    auto* row = BSML::Lite::CreateHorizontalLayoutGroup(parent);
+    if (!row) return nullptr;
+    row->set_spacing(1.0F);
+    row->set_childControlWidth(true);
+    row->set_childControlHeight(true);
+    row->set_childForceExpandWidth(false);
+    row->set_childForceExpandHeight(false);
+    row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    ConfigureLayout(row, kCenterThreeColumnRowWidth, 8.0F, 0.0F, 0.0F);
+    return row;
+}
+
+UnityEngine::UI::Button* ConfigureCenterRowButton(
+    UnityEngine::UI::Button* button,
+    float width,
+    float textSize = 3.0F) {
+    if (!button) return nullptr;
+    ConfigureCompactCenterControl(button, width);
+    BSML::Lite::SetButtonTextSize(button, textSize);
+    return button;
+}
+
 void ConfigureRightPanelButton(UnityEngine::UI::Button* button) {
     if (!IsAlive(button)) return;
     NeutralizeContentSizeFitter(button);
@@ -845,7 +1017,7 @@ TMPro::TextMeshProUGUI* CreateCenterPanelSubheader(
     text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
     text->set_enableWordWrapping(false);
     text->set_raycastTarget(false);
-    // Center pages own a 52-unit content column (kCenterPanelRowWidth); the
+    // Center pages own the kCenterPanelRowWidth content column; the
     // subheader takes the same width so it aligns with the rows it titles.
     ConfigureLayout(text, kCenterPanelRowWidth, 5.0F, 0.0F, 0.0F);
     if (auto* layout = text->get_gameObject()->GetComponent<UnityEngine::UI::LayoutElement*>()) {
@@ -855,16 +1027,43 @@ TMPro::TextMeshProUGUI* CreateCenterPanelSubheader(
     return text;
 }
 
-void ConfigureFullWidthRightPanelInput(HMUI::InputFieldView* input, int textLengthLimit) {
+void ConfigureRightPanelInput(
+    HMUI::InputFieldView* input,
+    int textLengthLimit,
+    float preferredWidth = 48.0F) {
     if (!IsAlive(input)) return;
     ConstrainRightPanelRow(input);
     if (auto* layout = input->GetComponent<UnityEngine::UI::LayoutElement*>()) {
-        layout->set_minWidth(48.0F);
-        layout->set_preferredWidth(48.0F);
+        layout->set_minWidth(preferredWidth);
+        layout->set_preferredWidth(preferredWidth);
         layout->set_flexibleWidth(0.0F);
         layout->set_preferredHeight(8.0F);
     }
     input->_textLengthLimit = textLengthLimit;
+}
+
+UnityEngine::UI::HorizontalLayoutGroup* CreateRightPanelInputActionRow(
+    UnityEngine::Transform* parent) {
+    auto* row = BSML::Lite::CreateHorizontalLayoutGroup(parent);
+    if (!IsAlive(row)) return nullptr;
+    row->set_spacing(1.0F);
+    row->set_childControlWidth(true);
+    row->set_childControlHeight(true);
+    row->set_childForceExpandWidth(false);
+    row->set_childForceExpandHeight(false);
+    row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    ConfigureLayout(row, 48.0F, 8.0F, 0.0F, 0.0F);
+    return row;
+}
+
+void ConfigureRightPanelInlineButton(UnityEngine::UI::Button* button) {
+    if (!IsAlive(button)) return;
+    NeutralizeContentSizeFitter(button);
+    ConfigureLayout(button, 9.0F, 8.0F, 0.0F, 0.0F);
+    if (auto* layout = button->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+        layout->set_minWidth(9.0F);
+    }
+    BSML::Lite::SetButtonTextSize(button, 3.0F);
 }
 
 void ConfigureCalibrationPanelText(
@@ -915,6 +1114,29 @@ bool IsVrmFile(const std::filesystem::path& path) {
     return Lower(path.extension().string()) == ".vrm";
 }
 
+bool IsAfkMediaFile(const std::filesystem::path& path) {
+    const auto extension = Lower(path.extension().string());
+    return extension == ".png" || extension == ".jpg" ||
+           extension == ".jpeg" || extension == ".gif";
+}
+
+std::string EscapeTmpText(std::string value) {
+    // Twitch display names and messages are untrusted input. TMP treats angle
+    // brackets as rich-text tags, so escape them before placing chat in the
+    // world panel; ampersands are escaped first to avoid double conversion.
+    const auto replaceAll = [&value](std::string_view from, std::string_view to) {
+        std::size_t offset = 0;
+        while ((offset = value.find(from, offset)) != std::string::npos) {
+            value.replace(offset, from.size(), to);
+            offset += to.size();
+        }
+    };
+    replaceAll("&", "&amp;");
+    replaceAll("<", "&lt;");
+    replaceAll(">", "&gt;");
+    return value;
+}
+
 } // namespace
 
 MenuController* MenuController::active_ = nullptr;
@@ -931,6 +1153,7 @@ MenuController::~MenuController() {
     root_.Recording().SetStatusChangedHandler({});
     root_.Avatar().SetCalibrationStatusChangedHandler({});
     DestroyRecordingWorldPanel();
+    DestroyChatWorldPanel();
     DestroyAllStandinProxies();
     DestroyGripEditor(true);
     DestroyCalibrationPanel();
@@ -968,20 +1191,23 @@ void MenuController::Register() {
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
     active_->avatarSettingsView_ = view;
-    static std::array<std::string_view, 4> tabNames{"Avatar", "Quality", "Fit", "Calibration"};
+    static std::array<std::string_view, 4> tabNames{"Setup", "Display", "Quality", "Fit"};
     active_->avatarTabViewRoots_.fill(nullptr);
     active_->avatarTabContentRoots_.fill(nullptr);
-    active_->selectedAvatarTab_ = 0;
+    // selectedAvatarTab_ is initialized to Setup for the first construction,
+    // but is deliberately not reset here. Rebuilding the center panel after
+    // a profile, avatar, or capability change must leave the user on the page
+    // where that action occurred instead of unexpectedly jumping to Setup.
     active_->avatarTabs_ = BSML::Lite::CreateTextSegmentedControl(
         view,
         {0.0F, 0.0F},
-        {54.0F, 7.0F},
+        {86.0F, 7.0F},
         tabNames,
         [](int index) {
             if (active_) active_->ShowAvatarTab(index);
         });
     if (active_->avatarTabs_) {
-        WithHint(active_->avatarTabs_, "Switches the center panel between avatar loading, visual quality, and player calibration.");
+        WithHint(active_->avatarTabs_, "Setup contains the required first-run workflow. Display, Quality, and Fit contain optional adjustments grouped by purpose.");
         auto tabsRect = active_->avatarTabs_->get_transform().cast<UnityEngine::RectTransform>();
         tabsRect->set_anchorMin({0.0F, 1.0F});
         tabsRect->set_anchorMax({1.0F, 1.0F});
@@ -1003,8 +1229,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }
         if (!active_->avatarTabViewRoots_[index]) active_->avatarTabViewRoots_[index] = page;
         if (auto* rows = page->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
-            // The scroll content owns a narrow center-column layout. Width
-            // control is required here; without it the row-level 52-unit
+            // The scroll content owns one consistent center-column layout.
+            // Width control is required here; without it the row-level
             // LayoutElements are ignored and BSML retains its 90-unit prefab
             // geometry beyond both sides of the visible mask.
             rows->set_childControlWidth(true);
@@ -1028,75 +1254,160 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
 
     auto* container = pages[0];
     auto* heading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar", 6.0F, {0.0F, 0.0F}, {55.0F, 8.0F});
+        container->get_transform(), "Avatar Setup", 6.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 8.0F});
     heading->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* note = BSML::Lite::CreateText(
-        container->get_transform(),
-        "To change avatars: 1) Choose Avatar File, 2) Load Avatar, then 3) Attach Tracking. Loading a new avatar safely replaces the current one; Unload is optional.",
-        3.3F, {0.0F, 0.0F}, {55.0F, 15.0F});
-    note->set_enableWordWrapping(true);
-    note->set_alignment(TMPro::TextAlignmentOptions::Center);
 
     const auto& avatar = active_->root_.Settings().Get().avatar;
+    auto* setupQuickActions = CreateCenterThreeColumnRow(container->get_transform());
+    active_->avatarEnabledToggle_ = ConfigureCompactCenterToggle(WithHint(BSML::Lite::CreateToggle(
+        setupQuickActions, "Enable Avatar", avatar.enabled, [](bool enabled) {
+            if (active_) active_->SetAvatarMasterEnabled(enabled);
+        }), "Master avatar control. Enabling loads, binds tracking, and resets the selected avatar automatically. Disabling unloads it and frees its runtime resources."), kCenterThreeColumnWidth);
+
+    const auto& playerProfiles = active_->root_.Settings().Get().avatarPlayerProfiles;
+    const auto activeProfileId = active_->root_.Settings().Get().activeAvatarPlayerProfileId;
+    const auto activeProfile = std::find_if(
+        playerProfiles.begin(),
+        playerProfiles.end(),
+        [&](const auto& profile) { return profile.id == activeProfileId; });
+    const auto profileName = activeProfile == playerProfiles.end()
+        ? std::string("Profile 1")
+        : activeProfile->displayName;
+    static std::array<std::string_view, 5> playerProfileNames{
+        "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"};
+    ConfigureCompactCenterDropdown(WithHint(BSML::Lite::CreateDropdown(
+        setupQuickActions,
+        "",
+        profileName,
+        playerProfileNames,
+        [](StringW value) {
+            if (!active_) return;
+            const auto name = static_cast<std::string>(value);
+            const auto slot = std::find(playerProfileNames.begin(), playerProfileNames.end(), name);
+            if (slot == playerProfileNames.end()) return;
+            static constexpr std::array<std::string_view, 5> ids{
+                "default", "player-2", "player-3", "player-4", "player-5"};
+            const auto id = ids[static_cast<std::size_t>(std::distance(playerProfileNames.begin(), slot))];
+            if (id == active_->root_.Settings().Get().activeAvatarPlayerProfileId) return;
+            std::string error;
+            if (!active_->root_.SwitchAvatarPlayerProfile(id, &error)) {
+                Logging::Logger.error("Could not switch avatar player profile: {}", error);
+                return;
+            }
+            active_->DestroyAllStandinProxies();
+            active_->RequestAvatarSettingsRebuild();
+        }), "Player Profile: selects one of five local players. Each slot keeps independent calibration and avatar settings; camera and recording settings remain shared."), kCenterThreeColumnWidth);
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(setupQuickActions, "Reset Avatar Pose", [] {
+        if (active_ && !active_->root_.Avatar().RecalibrateNeutral()) {
+            Logging::Logger.warn("Avatar pose reset needs a loaded avatar and valid HMD/controller tracking");
+        }
+        if (active_) active_->RefreshAvatarStatus();
+    }), "Recovery action: resynchronizes the loaded avatar with the current floor, headset, and controller pose without deleting saved calibration."), kCenterThreeColumnWidth);
+
+    active_->calibrationStatusText_ = BSML::Lite::CreateText(
+        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 10.0F});
+    active_->calibrationStatusText_->set_enableWordWrapping(true);
+    active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    auto* profileActions = CreateCenterThreeColumnRow(container->get_transform());
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(profileActions, "Basic Calibration", [] {
+        if (active_) active_->BeginPlayerCalibration(false);
+    }), "Opens the shorter guided calibration. If necessary, the selected avatar is staged invisibly and tracking is bound automatically before the guide opens."), kCenterThreeColumnWidth);
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(profileActions, "Advanced Calibration", [] {
+        if (active_) active_->BeginPlayerCalibration(true);
+    }), "Opens the full guided calibration with additional poses and movement samples. No countdown begins until you choose a start mode on the guide."), kCenterThreeColumnWidth);
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(
+        profileActions, "Reset Profile Calibration", [] {
+            if (active_) active_->ShowAvatarSetupConfirmation(1);
+        }), "Deletes only the active player's saved calibration after a confirmation. Avatar files and avatar-specific settings are kept."), kCenterThreeColumnWidth, 2.75F);
+
+    CreateCenterPanelSubheader(container->get_transform(), "Avatar File");
     active_->avatarSelectionText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 8.0F});
+        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 6.0F});
     active_->avatarSelectionText_->set_enableWordWrapping(false);
     active_->avatarSelectionText_->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
     active_->avatarSelectionText_->set_alignment(TMPro::TextAlignmentOptions::Center);
     auto* chooseAvatar = WithHint(BSML::Lite::CreateUIButton(container, "Choose Avatar File", [] {
         if (active_) active_->OpenAvatarFilePicker();
     }), "Browse the headset and choose the VRM avatar SaberStage should display.");
-    ConfigureLayout(chooseAvatar, 48.0F, 8.0F, 1.0F);
+    ConfigureLayout(chooseAvatar, kCenterPanelRowWidth, 8.0F, 1.0F);
 
-    // Steps 2 and 3 side by side, directly under step 1, so the setup flow
-    // reads top-to-bottom. The status line follows the actions it reports on.
-    auto* loadActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    loadActions->set_spacing(1.0F);
-    loadActions->set_childControlWidth(true);
-    loadActions->set_childControlHeight(true);
-    loadActions->set_childForceExpandWidth(true);
-    loadActions->set_childForceExpandHeight(false);
-    ConfigureLayout(loadActions, 52.0F, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(loadActions, "Load Avatar", [] {
+    // Primary lifecycle and tracking actions share one clearly titled row.
+    // Their fixed columns preserve the left/center/right alignment even when
+    // one caption is longer than another.
+    CreateCenterPanelSubheader(container->get_transform(), "Avatar Controls");
+    auto* loadActions = CreateCenterThreeColumnRow(container->get_transform());
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Load Avatar", [] {
         if (!active_) return;
-        auto& settings = active_->root_.Settings().Edit().avatar;
-        const auto path = active_->ConfiguredAvatarPath();
-        if (path.empty()) {
-            Logging::Logger.warn("Choose a VRM avatar file before loading");
-            active_->RefreshAvatarStatus();
+        std::string error;
+        if (!active_->root_.Avatar().PlayerProfile().valid) {
+            // First load is calibration, not a chance to display a malformed
+            // generic fit. BeginPlayerCalibration stages and binds the model
+            // invisibly, then activates it only after the profile is saved.
+            active_->BeginPlayerCalibration(false);
             return;
         }
-        std::string error;
-        if (active_->root_.Avatar().LoadVrmAvatar(
-                path, static_cast<std::uint32_t>(settings.maximumTextureDimension), &error, false)) {
-            settings.enabled = true;
-            active_->root_.Avatar().SetAvatarVisible(settings.visible);
-            active_->root_.Avatar().ApplyAvatarSettings(settings);
-            active_->root_.Settings().Save(nullptr);
-        } else {
+        if (!active_->LoadSelectedAvatar(false, &error)) {
             Logging::Logger.error("Avatar load button failed: {}", error);
+            active_->RefreshAvatarStatus();
+            if (active_->avatarStatusText_) {
+                active_->avatarStatusText_->set_text("Avatar could not be loaded\n" + error);
+            }
+            return;
         }
         active_->RefreshAvatarStatus();
         // Material capability (not merely the .vrm extension) determines
         // whether AlphaToMask can be used. Rebuild after loading so the
         // capability-gated control immediately reflects this avatar.
         active_->RequestAvatarSettingsRebuild();
-    }), "Step 2: loads the selected VRM in its rest pose. A successfully loaded avatar safely replaces the current avatar; unloading first is not required.");
-    WithHint(BSML::Lite::CreateUIButton(loadActions, "Attach Tracking", [] {
+    }), "Loads the selected VRM, binds Quest tracking, applies its saved settings, and resets its neutral pose in the correct order. With no player calibration, this opens Basic Calibration instead of displaying a broken avatar."), kCenterThreeColumnWidth);
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Unload Avatar", [] {
+        if (!active_) return;
+        active_->DestroyGripEditor(true);
+        active_->DestroyAllStandinProxies();
+        active_->root_.Avatar().UnloadVrmAvatar();
+        active_->root_.Settings().Edit().avatar.enabled = false;
+        active_->root_.Settings().Save(nullptr);
+        active_->RefreshAvatarStatus();
+        active_->RequestAvatarSettingsRebuild();
+    }), "Unloads the avatar and frees its runtime resources. The selected file, player calibration, and avatar settings remain saved."), kCenterThreeColumnWidth);
+    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Bind Tracking", [] {
         if (!active_) return;
         std::string error;
         if (!active_->root_.Avatar().BindLoadedVrmAvatar(&error)) {
-            Logging::Logger.error("Avatar solver bind button failed: {}", error);
+            Logging::Logger.error("Avatar tracking rebind failed: {}", error);
+        } else if (!active_->root_.Avatar().RecalibrateNeutral()) {
+            Logging::Logger.info("Avatar rebound; pose reset is waiting for tracked HMD/controllers");
         }
         active_->RefreshAvatarStatus();
-    }), "Step 3: connects the loaded avatar to the Quest headset and controller tracking solver so it follows you.");
+    }), "Recovery action: reconnects the already loaded avatar to headset/controller tracking, then resets its neutral pose. Normal loading does this automatically."), kCenterThreeColumnWidth);
 
     active_->avatarStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 21.0F});
+        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 13.0F});
     active_->avatarStatusText_->set_enableWordWrapping(true);
     active_->avatarStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
 
-    CreateCenterPanelSubheader(container->get_transform(), "Options");
+    CreateCenterPanelSubheader(container->get_transform(), "Saved Avatar Data");
+    auto* dataActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
+    dataActions->set_spacing(1.0F);
+    dataActions->set_childControlWidth(true);
+    dataActions->set_childControlHeight(true);
+    dataActions->set_childForceExpandWidth(true);
+    dataActions->set_childForceExpandHeight(false);
+    ConfigureLayout(dataActions, kCenterPanelRowWidth, 8.0F, 1.0F);
+    WithHint(BSML::Lite::CreateUIButton(dataActions, "Clear Avatar Data", [] {
+        if (active_) active_->ShowAvatarSetupConfirmation(2);
+    }), "After confirmation, clears this profile's selected avatar plus saved fit, grip, display, material, and quality settings. It does not delete the VRM file or player calibration.");
+    WithHint(BSML::Lite::CreateUIButton(dataActions, "Write Diagnostic Log", [] {
+        if (active_) active_->root_.Avatar().LogDiagnostics();
+    }), "Writes detailed avatar tracking and solver measurements to the SaberStage log without changing the avatar.");
+
+    // Display-only controls are separated from the required setup flow.
+    container = pages[1];
+    auto* displayHeading = BSML::Lite::CreateText(
+        container->get_transform(), "Avatar Display", 5.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
+    displayHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
+    CreateCenterPanelSubheader(container->get_transform(), "Visibility and First-Person View");
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Visible", avatar.visible, [](bool visible) {
         if (!active_) return;
         active_->root_.Settings().Edit().avatar.visible = visible;
@@ -1234,11 +1545,11 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         active_->DestroyAllStandinProxies();
         applyAndSaveAvatar();
     }), "Moves every clone back in front of you at floor level, facing you, spread side by side.");
-    ConfigureLayout(resetStandin, 48.0F, 8.0F, 1.0F);
+    ConfigureLayout(resetStandin, kCenterPanelRowWidth, 8.0F, 1.0F);
     auto* standinNote = BSML::Lite::CreateText(
         container->get_transform(),
         "Each visible clone renders a full extra copy of the avatar in every view that shows it and can reduce performance during gameplay.",
-        3.0F, {0.0F, 0.0F}, {55.0F, 10.0F});
+        3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 10.0F});
     standinNote->set_enableWordWrapping(true);
     standinNote->set_alignment(TMPro::TextAlignmentOptions::Center);
 
@@ -1249,7 +1560,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     expressionActions->set_childControlHeight(true);
     expressionActions->set_childForceExpandWidth(true);
     expressionActions->set_childForceExpandHeight(false);
-    ConfigureLayout(expressionActions, 52.0F, 8.0F, 1.0F);
+    ConfigureLayout(expressionActions, kCenterPanelRowWidth, 8.0F, 1.0F);
     WithHint(BSML::Lite::CreateUIButton(expressionActions, "Blink", [] {
         if (active_) active_->root_.Avatar().SetExpression("blink", 1.0F, nullptr);
     }), "Tests the avatar's blink expression by closing its eyes.");
@@ -1260,34 +1571,14 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         if (active_) active_->root_.Avatar().SetExpression("joy", 1.0F, nullptr);
     }), "Tests the avatar's happy or joy expression, when the VRM supplies one.");
 
-    // Rarely used, potentially disruptive actions live at the bottom of the
-    // page under their own header so they cannot be mistaken for setup steps.
-    CreateCenterPanelSubheader(container->get_transform(), "Maintenance");
-    WithHint(BSML::Lite::CreateUIButton(container, "Unload Avatar", [] {
-        if (!active_) return;
-        active_->root_.Avatar().UnloadVrmAvatar();
-        active_->root_.Settings().Edit().avatar.enabled = false;
-        active_->root_.Settings().Save(nullptr);
-        active_->RefreshAvatarStatus();
-    }), "Removes the current avatar from the scene and frees its resources.");
-    WithHint(BSML::Lite::CreateUIButton(container, "Resync Player Pose", [] {
-        if (active_ && !active_->root_.Avatar().RecalibrateNeutral()) {
-            Logging::Logger.warn("Avatar neutral recalibration needs a loaded avatar and valid HMD/controller tracking");
-        }
-        if (active_) active_->RefreshAvatarStatus();
-    }), "Resynchronizes the avatar with your current standing height, floor, headset, and controller pose. This does not erase your saved Basic or Advanced calibration.");
-    WithHint(BSML::Lite::CreateUIButton(container, "Write Diagnostic Log", [] {
-        if (active_) active_->root_.Avatar().LogDiagnostics();
-    }), "Writes detailed avatar tracking and solver measurements to the SaberStage log for troubleshooting; it does not change the avatar.");
-
-    container = pages[1];
+    container = pages[2];
     auto* qualityHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Quality and Motion", 5.0F, {0.0F, 0.0F}, {55.0F, 7.0F});
+        container->get_transform(), "Avatar Quality", 5.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
     qualityHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
     auto* qualityNote = BSML::Lite::CreateText(
         container->get_transform(),
         "Presets set the controls below. Change any individual option to create a Custom profile. Texture Limit applies on the next avatar load; 4096 can use about 85 MB per RGBA texture with mipmaps. The other controls update live.",
-        3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
+        3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 13.0F});
     qualityNote->set_enableWordWrapping(true);
     qualityNote->set_alignment(TMPro::TextAlignmentOptions::Center);
     // Page grouping: Rendering (preset + material features), Posture & Motion
@@ -1468,8 +1759,14 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         active_->alphaToMaskToggle_->set_interactable(alphaToMaskSupported);
     }
 
-    // Solver posture limits are not render-quality controls; they get their
-    // own section so the Rendering block above stays a coherent unit.
+    // Solver posture limits belong with body fitting, not render quality.
+    // Build them on the Fit page before returning to Quality for the remaining
+    // shader/secondary-motion controls.
+    container = pages[3];
+    auto* fitHeading = BSML::Lite::CreateText(
+        container->get_transform(), "Avatar Fit and Posture", 4.5F,
+        {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
+    fitHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
     CreateCenterPanelSubheader(container->get_transform(), "Posture and Motion");
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
         container,
@@ -1544,6 +1841,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }),
         "Limits only backward spine bowing. 0% prevents rearward curve; forward attack and lunge bending remain available."));
 
+    container = pages[2];
     CreateCenterPanelSubheader(container->get_transform(), "SpringBones");
     addQualityToggle("SpringBones", avatar.springBones, &settings::AvatarSettings::springBones,
         "Animates VRM hair, clothing, and accessories. Off performs no secondary-motion work.");
@@ -1596,10 +1894,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     addQualityToggle("Animated Expressions", avatar.animatedExpressions, &settings::AvatarSettings::animatedExpressions,
         "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
 
-    container = pages[2];
-    auto* fitHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Fit and Posture", 4.5F, {0.0F, 0.0F}, {55.0F, 7.0F});
-    fitHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
+    container = pages[3];
     const auto fitSettings = settings::RetargetingForSelectedAvatar(avatar);
     const auto applyFitAndSave = [] {
         if (!active_) return;
@@ -1647,7 +1942,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             active_->RefreshRetargetingControls();
         }, "Resets Height Balance to Even (0.00), preserving the fitted leg-to-torso proportions.");
     auto* fitBalanceCaption = BSML::Lite::CreateText(
-        container->get_transform(), "Legs  ←  Even  →  Torso", 3.0F, {0.0F, 0.0F}, {52.0F, 5.0F});
+        container->get_transform(), "Legs  ←  Even  →  Torso", 3.0F, {0.0F, 0.0F}, {kCenterPanelRowWidth, 5.0F});
     fitBalanceCaption->set_alignment(TMPro::TextAlignmentOptions::Center);
 
     active_->manualAvatarScaleToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
@@ -1691,7 +1986,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     gripActions->set_childControlHeight(true);
     gripActions->set_childForceExpandWidth(true);
     gripActions->set_childForceExpandHeight(false);
-    ConfigureLayout(gripActions, 52.0F, 8.0F, 1.0F);
+    ConfigureLayout(gripActions, kCenterPanelRowWidth, 8.0F, 1.0F);
     WithHint(BSML::Lite::CreateUIButton(gripActions, "Position Left Hand", [] {
         if (active_) active_->OpenGripEditor(0);
     }), "Opens a movable position, rotation, and finger-closure editor for this player, avatar, and physical grip style.");
@@ -1991,95 +2286,6 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             applyFitAndSave();
         }), "Lets solved arms push compatible VRM SpringBone chains such as hair or clothing. It has no visible effect when SpringBones are off or the avatar has no compatible chains, and it adds per-update collision work."));
 
-    container = pages[3];
-    auto* calibrationHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Player Calibration", 4.5F, {0.0F, 0.0F}, {55.0F, 7.0F});
-    calibrationHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* calibrationNote = BSML::Lite::CreateText(
-        container->get_transform(),
-        "Basic learns normal grip, reach, side lean/steps, squat/duck, and body turns. Starting calibration places a large eye-level guide in front of you. The guide remains fixed in the world and provides its own recenter, retry, cancel, review, and save controls.",
-        3.0F, {0.0F, 0.0F}, {55.0F, 16.0F});
-    calibrationNote->set_enableWordWrapping(true);
-    calibrationNote->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    CreateCenterPanelSubheader(container->get_transform(), "Player Profile");
-    const auto& playerProfiles = active_->root_.Settings().Get().avatarPlayerProfiles;
-    const auto activeProfileId = active_->root_.Settings().Get().activeAvatarPlayerProfileId;
-    const auto activeProfile = std::find_if(
-        playerProfiles.begin(),
-        playerProfiles.end(),
-        [&](const auto& profile) { return profile.id == activeProfileId; });
-    const auto profileName = activeProfile == playerProfiles.end()
-        ? std::string("Profile 1")
-        : activeProfile->displayName;
-    static std::array<std::string_view, 5> playerProfileNames{
-        "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"};
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
-        container,
-        "Player Profile",
-        profileName,
-        playerProfileNames,
-        [](StringW value) {
-            if (!active_) return;
-            const auto name = static_cast<std::string>(value);
-            const auto slot = std::find(playerProfileNames.begin(), playerProfileNames.end(), name);
-            if (slot == playerProfileNames.end()) return;
-            static constexpr std::array<std::string_view, 5> ids{
-                "default", "player-2", "player-3", "player-4", "player-5"};
-            const auto id = ids[static_cast<std::size_t>(std::distance(playerProfileNames.begin(), slot))];
-            if (id == active_->root_.Settings().Get().activeAvatarPlayerProfileId) return;
-            std::string error;
-            if (!active_->root_.SwitchAvatarPlayerProfile(id, &error)) {
-                Logging::Logger.error("Could not switch avatar player profile: {}", error);
-                return;
-            }
-            active_->DestroyAllStandinProxies();
-            active_->RequestAvatarSettingsRebuild();
-        }), "Selects one of five local players. Each slot keeps independent calibration and Avatar settings; camera and recording settings remain shared."));
-
-    // Current profile state before the actions: the user should know whether
-    // a saved profile exists before choosing to start or reset anything.
-    active_->calibrationStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {55.0F, 13.0F});
-    active_->calibrationStatusText_->set_enableWordWrapping(true);
-    active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    auto* calibrationStart = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    calibrationStart->set_spacing(1.0F);
-    calibrationStart->set_childControlWidth(true);
-    calibrationStart->set_childControlHeight(true);
-    calibrationStart->set_childForceExpandWidth(true);
-    calibrationStart->set_childForceExpandHeight(false);
-    ConfigureLayout(calibrationStart, 52.0F, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(calibrationStart, "Start Basic", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().PreparePlayerCalibration(
-                avatar::calibration::CalibrationMode::Basic, &error)) {
-            Logging::Logger.warn("Could not open basic player calibration: {}", error);
-        }
-        active_->RefreshCalibrationStatus();
-    }), "Opens the shorter guided calibration for grip, reach, turns, crouch, and common movement. No countdown begins until you choose a start mode on the guide.");
-    WithHint(BSML::Lite::CreateUIButton(calibrationStart, "Start Advanced", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().PreparePlayerCalibration(
-                avatar::calibration::CalibrationMode::Advanced, &error)) {
-            Logging::Logger.warn("Could not open advanced player calibration: {}", error);
-        }
-        active_->RefreshCalibrationStatus();
-    }), "Opens the full guided calibration with additional poses and motion samples. No countdown begins until you choose a start mode on the guide.");
-
-    auto* resetCalibration = WithHint(BSML::Lite::CreateUIButton(container, "Reset Saved Profile", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().ResetPlayerCalibration(&error)) {
-            Logging::Logger.warn("Could not reset player calibration: {}", error);
-        }
-        active_->RefreshCalibrationStatus();
-    }), "Permanently deletes the saved Basic or Advanced player measurements and returns to generic solver defaults. Resync Player Pose does not do this.");
-    ConfigureLayout(resetCalibration, 48.0F, 8.0F, 1.0F);
-
     active_->BuildAvatarFilePicker(view);
     active_->RefreshAvatarStatus();
     active_->RefreshCalibrationStatus();
@@ -2295,6 +2501,191 @@ void MenuController::SelectAvatarFile(const std::filesystem::path& selected) {
     // page so every control and interactivity rule points at the new avatar's
     // record instead of retaining values from the previous avatar key.
     RequestAvatarSettingsRebuild();
+}
+
+void MenuController::BuildAfkFilePicker(HMUI::ViewController* view) {
+    afkPickerModal_ = BSML::Lite::CreateModal(view, {86.0F, 72.0F}, nullptr, true);
+    if (!afkPickerModal_) {
+        Logging::Logger.error("Could not create the SaberStage AFK media picker");
+        return;
+    }
+    auto* root = BSML::Lite::CreateVerticalLayoutGroup(afkPickerModal_->get_transform());
+    root->set_spacing(0.6F);
+    root->set_childControlWidth(true);
+    root->set_childControlHeight(true);
+    root->set_childForceExpandWidth(true);
+    root->set_childForceExpandHeight(false);
+    if (auto rect = root->get_rectTransform()) {
+        rect->set_anchorMin({0.5F, 0.0F});
+        rect->set_anchorMax({0.5F, 1.0F});
+        rect->set_pivot({0.5F, 0.5F});
+        rect->set_anchoredPosition({0.0F, 0.0F});
+        rect->set_sizeDelta({80.0F, -4.0F});
+    }
+    auto* title = BSML::Lite::CreateText(
+        root, "Select AFK Picture or GIF", TMPro::FontStyles::Bold, 4.2F);
+    title->set_alignment(TMPro::TextAlignmentOptions::Center);
+    ConfigureLayout(title, 80.0F, 6.0F, 1.0F);
+
+    auto* navigation = BSML::Lite::CreateHorizontalLayoutGroup(root);
+    navigation->set_spacing(0.6F);
+    navigation->set_childControlWidth(true);
+    navigation->set_childControlHeight(true);
+    navigation->set_childForceExpandWidth(true);
+    navigation->set_childForceExpandHeight(false);
+    ConfigureLayout(navigation, 80.0F, 8.0F, 1.0F);
+    auto* sharedStorage = WithHint(BSML::Lite::CreateUIButton(navigation, "Shared Storage", [] {
+        if (active_) active_->BrowseAfkDirectory("/sdcard");
+    }), "Opens the headset's shared storage.");
+    auto* systemRoot = WithHint(BSML::Lite::CreateUIButton(navigation, "System Root", [] {
+        if (active_) active_->BrowseAfkDirectory("/");
+    }), "Opens the Android filesystem root.");
+    auto* up = WithHint(BSML::Lite::CreateUIButton(navigation, "Up", [] {
+        if (!active_) return;
+        const auto parent = active_->afkPickerDirectory_.parent_path();
+        active_->BrowseAfkDirectory(parent.empty() ? std::filesystem::path("/") : parent);
+    }), "Moves to the parent folder.");
+    ConfigureLayout(sharedStorage, 28.0F, 7.5F, 1.0F);
+    ConfigureLayout(systemRoot, 24.0F, 7.5F, 1.0F);
+    ConfigureLayout(up, 14.0F, 7.5F, 1.0F);
+
+    afkPickerPathText_ = BSML::Lite::CreateText(root, "", 2.8F);
+    afkPickerPathText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    afkPickerPathText_->set_enableWordWrapping(false);
+    afkPickerPathText_->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+    ConfigureLayout(afkPickerPathText_, 80.0F, 5.0F, 1.0F);
+
+    afkPickerListContent_ = BSML::Lite::CreateScrollableSettingsContainer(root);
+    if (afkPickerListContent_) {
+        if (auto* external = afkPickerListContent_->GetComponent<BSML::ExternalComponents*>()) {
+            if (auto* layout = external->Get<UnityEngine::UI::LayoutElement*>()) {
+                layout->set_minHeight(30.0F);
+                layout->set_preferredHeight(42.0F);
+                layout->set_flexibleHeight(1.0F);
+                layout->set_preferredWidth(80.0F);
+                layout->set_flexibleWidth(1.0F);
+            }
+        }
+        if (auto* rows = afkPickerListContent_->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
+            rows->set_spacing(0.35F);
+            rows->set_childControlWidth(true);
+            rows->set_childControlHeight(true);
+            rows->set_childForceExpandWidth(true);
+            rows->set_childForceExpandHeight(false);
+            rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
+        }
+    }
+    auto* close = WithHint(BSML::Lite::CreateUIButton(root, "Cancel", [] {
+        if (active_ && active_->afkPickerModal_) active_->afkPickerModal_->Hide();
+    }), "Closes the file picker without changing the AFK screen.");
+    ConfigureLayout(close, 30.0F, 7.5F, 0.0F);
+}
+
+void MenuController::OpenAfkFilePicker() {
+    if (!afkPickerModal_) return;
+    std::filesystem::path start(root_.Settings().Get().broadcast.afkMediaPath);
+    if (!start.empty()) start = start.parent_path();
+    std::error_code error;
+    if (start.empty() || !std::filesystem::is_directory(start, error)) start = "/sdcard";
+    error.clear();
+    if (!std::filesystem::is_directory(start, error)) start = "/";
+    BrowseAfkDirectory(start);
+    afkPickerModal_->Show();
+}
+
+void MenuController::BrowseAfkDirectory(const std::filesystem::path& requestedDirectory) {
+    if (!afkPickerListContent_) return;
+    auto directory = requestedDirectory.empty()
+        ? std::filesystem::path("/") : requestedDirectory.lexically_normal();
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error)) {
+        Logging::Logger.warn("AFK picker cannot open '{}': {}", directory.string(), error.message());
+        return;
+    }
+    for (auto* row : afkPickerRows_) {
+        if (!row) continue;
+        row->SetActive(false);
+        UnityEngine::Object::Destroy(row);
+    }
+    afkPickerRows_.clear();
+    afkPickerDirectory_ = directory;
+    if (afkPickerPathText_) afkPickerPathText_->set_text(directory.string());
+
+    std::vector<std::filesystem::path> directories;
+    std::vector<std::filesystem::path> media;
+    constexpr std::size_t maximumRows = 512;
+    std::filesystem::directory_iterator iterator(
+        directory, std::filesystem::directory_options::skip_permission_denied, error);
+    const std::filesystem::directory_iterator end;
+    for (; !error && iterator != end && directories.size() + media.size() < maximumRows;
+            iterator.increment(error)) {
+        std::error_code entryError;
+        if (iterator->is_directory(entryError)) directories.push_back(iterator->path());
+        else if (!entryError && iterator->is_regular_file(entryError) &&
+                 IsAfkMediaFile(iterator->path())) media.push_back(iterator->path());
+    }
+    const auto byName = [](const auto& left, const auto& right) {
+        return Lower(left.filename().string()) < Lower(right.filename().string());
+    };
+    std::sort(directories.begin(), directories.end(), byName);
+    std::sort(media.begin(), media.end(), byName);
+    for (const auto& child : directories) {
+        auto* button = BSML::Lite::CreateUIButton(
+            afkPickerListContent_, "[Folder]  " + child.filename().string(), [child] {
+                if (active_) active_->BrowseAfkDirectory(child);
+            });
+        WithHint(button, "Opens this folder.");
+        ConfigureLayout(button, 76.0F, 7.0F, 0.0F);
+        BSML::Lite::SetButtonTextSize(button, 2.5F);
+        afkPickerRows_.push_back(button->get_gameObject());
+    }
+    for (const auto& path : media) {
+        auto* button = BSML::Lite::CreateUIButton(
+            afkPickerListContent_, path.filename().string(), [path] {
+                if (active_) active_->SelectAfkFile(path);
+            });
+        WithHint(button, "Uses this PNG, JPEG, or GIF while a Twitch stream is paused.");
+        ConfigureLayout(button, 76.0F, 7.0F, 0.0F);
+        BSML::Lite::SetButtonTextSize(button, 2.5F);
+        afkPickerRows_.push_back(button->get_gameObject());
+    }
+    if (directories.empty() && media.empty()) {
+        auto* text = BSML::Lite::CreateText(
+            afkPickerListContent_->get_transform(),
+            error ? "This folder cannot be read." : "No PNG, JPEG, or GIF files are visible here.",
+            3.0F);
+        text->set_alignment(TMPro::TextAlignmentOptions::Center);
+        text->set_enableWordWrapping(true);
+        ConfigureLayout(text, 76.0F, 12.0F, 1.0F);
+        afkPickerRows_.push_back(text->get_gameObject());
+    }
+}
+
+void MenuController::SelectAfkFile(const std::filesystem::path& selected) {
+    const auto normalized = selected.lexically_normal();
+    std::error_code filesystemError;
+    if (!normalized.is_absolute() ||
+            !std::filesystem::is_regular_file(normalized, filesystemError) ||
+            !IsAfkMediaFile(normalized)) {
+        ShowLivestreamActionError("Select a readable PNG, JPEG, or GIF file.");
+        return;
+    }
+    std::string error;
+    // Decode before persisting the path. An unsupported/corrupt image cannot
+    // poison a future session; the previous working AFK screen remains active.
+    if (!root_.Recording().PrepareAfkMedia(normalized, &error)) {
+        ShowLivestreamActionError(error);
+        return;
+    }
+    root_.Settings().Edit().broadcast.afkMediaPath = normalized.string();
+    if (!root_.Settings().Save(&error)) {
+        ShowLivestreamActionError("The AFK image was loaded but its path could not be saved: " + error);
+        return;
+    }
+    if (afkSelectionText_) {
+        afkSelectionText_->set_text("Pause screen: " + normalized.filename().string());
+    }
+    if (afkPickerModal_) afkPickerModal_->Hide();
 }
 
 void MenuController::RefreshRetargetingControls() {
@@ -3002,9 +3393,14 @@ void MenuController::TickGripEditor() noexcept {
 
 std::filesystem::path MenuController::ConfiguredAvatarPath() const {
     const auto& profile = root_.Settings().Get().avatar;
-    if (!profile.selectedPath.empty()) return std::filesystem::path(profile.selectedPath);
-    if (profile.selectedFile.empty()) return {};
-    return root_.Settings().Path().parent_path() / "Avatars" / profile.selectedFile;
+    auto path = !profile.selectedPath.empty()
+        ? std::filesystem::path(profile.selectedPath)
+        : profile.selectedFile.empty()
+            ? std::filesystem::path{}
+            : root_.Settings().Path().parent_path() / "Avatars" / profile.selectedFile;
+    if (path.empty()) return {};
+    std::error_code error;
+    return std::filesystem::is_regular_file(path, error) && !error ? path : std::filesystem::path{};
 }
 
 void MenuController::BuildCameraListPanel(HMUI::ViewController* view) {
@@ -3054,11 +3450,28 @@ void MenuController::BuildPreviewPanel(HMUI::ViewController* view) {
 
 void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
+    active_->recordingView_ = view;
+    active_->livestreamValueConfirmationModal_ = nullptr;
+    active_->livestreamValueConfirmationText_ = nullptr;
+    active_->pendingLivestreamValueKind_ = 0;
+    active_->livestreamActionErrorModal_ = nullptr;
+    active_->livestreamActionErrorText_ = nullptr;
+    active_->streamTitleModal_ = nullptr;
+    active_->streamTitleModalInput_ = nullptr;
+    active_->twitchAuthorizationModal_ = nullptr;
+    active_->twitchAuthorizationText_ = nullptr;
+    active_->twitchConnectionSuccessModal_ = nullptr;
+    active_->twitchConnectionSuccessText_ = nullptr;
+    active_->twitchAuthorizationAwaitingCompletion_ = false;
+    active_->twitchAccountStatusText_ = nullptr;
+    active_->livestreamProviderFeatureText_ = nullptr;
     static std::array<std::string_view, 3> tabNames{"Record", "Live Stream", "Files"};
     active_->recordingTabViewRoots_.fill(nullptr);
     active_->recordingEncodingControls_.clear();
     active_->directRecordingEncodingControls_.clear();
     active_->livestreamConfigurationControls_.clear();
+    active_->livestreamGameAudioVolumeSlider_ = nullptr;
+    active_->livestreamMicrophoneVolumeSlider_ = nullptr;
     active_->livestreamKeyVisible_ = false;
     active_->selectedRecordingTab_ = 0;
 
@@ -3186,14 +3599,20 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             }
         }), "Lets you hold both thumbsticks during a song: release after 0.75 seconds to start, pause, or resume; hold 2.5 seconds to stop and save.");
     ConstrainRightPanelRow(controllerShortcut);
+    auto* floatingControlsRow = CreateRightPanelInputActionRow(recordPage->get_transform());
     auto* floatingControls = WithHint(BSML::Lite::CreateToggle(
-        recordPage,
+        floatingControlsRow,
         "Floating Recording Controls",
         recording.worldControlsVisible,
         [](bool value) {
             if (active_) active_->SetRecordingWorldPanelVisible(value);
         }), "Shows a small movable world panel with start and stop buttons, elapsed time, recording/stream status, and optional FPS counters.");
-    ConstrainRightPanelRow(floatingControls);
+    ConfigureLayout(floatingControls, 38.0F, 7.0F, 1.0F);
+    auto* resetFloatingControls = WithHint(BSML::Lite::CreateUIButton(
+        floatingControlsRow, "↻", [] {
+            if (active_) active_->ResetRecordingWorldPanelPose();
+        }), "Moves the floating recording controls back to their default reachable position.");
+    ConfigureRightPanelInlineButton(resetFloatingControls);
     auto* panelFpsCounters = WithHint(BSML::Lite::CreateToggle(
         recordPage,
         "Panel FPS Counters",
@@ -3442,80 +3861,276 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
 
     active_->startLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
         livestreamPage, "Go Live", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Recording().StartLivestream(&error)) {
-                Logging::Logger.error("Live stream start failed: {}", error);
-            }
-            active_->RefreshRecordingStatus();
-        }), "Starts broadcasting the Primary camera and game audio. Direct FFmpeg is required. If no local recording is running, SaberStage also starts a local safety recording from the same single hardware encode.");
+            if (active_) active_->TryStartLivestreamWithTitle();
+        }), "Starts broadcasting the Primary camera and game audio with Direct FFmpeg. Going live does not start or save a local recording. While live, SaberStage keeps the Quest awake so removing the headset does not normally interrupt the stream. If you explicitly started a compatible local recording first, the stream can share that existing hardware encode.");
     ConfigureRightPanelButton(active_->startLivestreamButton_);
     active_->stopLivestreamButton_ = WithHint(BSML::Lite::CreateUIButton(
         livestreamPage, "Stop Stream", [] {
             if (!active_) return;
             active_->root_.Recording().StopLivestream();
             active_->RefreshRecordingStatus();
-        }), "Ends the network broadcast in the background. The local recording keeps running until you use Stop & Save.");
+        }), "Ends the broadcast. A stream-only capture stops completely; an explicitly started local recording keeps running until you use Stop & Save.");
     ConfigureRightPanelButton(active_->stopLivestreamButton_);
+
+    auto* keepHeadsetAwake = WithHint(BSML::Lite::CreateToggle(
+        livestreamPage,
+        "Keep Headset Awake",
+        active_->root_.Settings().Get().broadcast.keepHeadsetAwake,
+        [](bool enabled) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.keepHeadsetAwake = enabled;
+            active_->root_.Settings().Save(nullptr);
+        }),
+        "Keeps the Quest display, game, encoder, and network stream running when the headset is removed. This prevents off-head sleep from ending Twitch playback with error 2000, but increases battery use and leaves the display active until the stream stops. This setting cannot be changed during a live stream.");
+    RememberSelectables(keepHeadsetAwake, active_->livestreamConfigurationControls_);
+    ConstrainRightPanelRow(keepHeadsetAwake);
+
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Audio Mix");
+    auto* gameAudio = WithHint(BSML::Lite::CreateToggle(
+        livestreamPage,
+        "Game Sound",
+        active_->root_.Settings().Get().broadcast.gameAudioEnabled,
+        [](bool enabled) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.gameAudioEnabled = enabled;
+            active_->root_.Settings().Save(nullptr);
+            active_->RefreshRecordingStatus();
+        }),
+        "Includes Beat Saber's game and menu audio in the live stream. This affects only the stream mix and never changes what you hear or what a local recording saves. This setting cannot be changed while live.");
+    RememberSelectables(gameAudio, active_->livestreamConfigurationControls_);
+    ConstrainRightPanelRow(gameAudio);
+
+    active_->livestreamGameAudioVolumeSlider_ = ConstrainRightPanelRow(WithHint(
+        BSML::Lite::CreateSliderSetting(
+            livestreamPage,
+            "Game Sound Volume",
+            5.0F,
+            active_->root_.Settings().Get().broadcast.gameAudioVolumePercent,
+            0.0F,
+            200.0F,
+            0.15F,
+            true,
+            {0.0F, 0.0F},
+            [](float value) {
+                if (!active_) return;
+                active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
+                active_->root_.Settings().Save(nullptr);
+                // Gain is mutable during a stream. RecordingController owns
+                // the synchronized worker-side cache, so the slider never
+                // reaches into the AAC callback or mixer directly.
+                active_->root_.Recording().SetLivestreamGameAudioVolumePercent(value);
+                active_->RefreshRecordingStatus();
+            }),
+        "Balances game sound in the live stream from 0% (silent) to 200%. 100% preserves the captured level. Higher values can clip when combined with a loud microphone. This can be adjusted while live without changing the game volume or local recording."));
+
+    auto* microphone = WithHint(BSML::Lite::CreateToggle(
+        livestreamPage,
+        "Quest Microphone",
+        active_->root_.Settings().Get().broadcast.microphoneEnabled,
+        [](bool enabled) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.microphoneEnabled = enabled;
+            active_->root_.Settings().Save(nullptr);
+            if (enabled) {
+                constexpr const char* permission = "android.permission.RECORD_AUDIO";
+                if (!UnityEngine::Android::Permission::HasUserAuthorizedPermission(permission)) {
+                    UnityEngine::Android::Permission::RequestUserPermission(permission, nullptr);
+                    active_->ShowLivestreamActionError(
+                        "Quest microphone access was requested. Accept the system prompt, then start the stream. If no prompt appears, enable Microphone Access in MBF and repatch Beat Saber.");
+                }
+            }
+            active_->RefreshRecordingStatus();
+        }),
+        "Adds the Quest headset microphone to the live-stream audio mix. Android microphone permission is required; MBF installs expose it as Microphone Access. The microphone is never added to local recordings by this switch. This setting cannot be changed while live.");
+    RememberSelectables(microphone, active_->livestreamConfigurationControls_);
+    ConstrainRightPanelRow(microphone);
+
+    active_->livestreamMicrophoneVolumeSlider_ = ConstrainRightPanelRow(WithHint(
+        BSML::Lite::CreateSliderSetting(
+            livestreamPage,
+            "Microphone Volume",
+            5.0F,
+            active_->root_.Settings().Get().broadcast.microphoneVolumePercent,
+            0.0F,
+            200.0F,
+            0.15F,
+            true,
+            {0.0F, 0.0F},
+            [](float value) {
+                if (!active_) return;
+                active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
+                active_->root_.Settings().Save(nullptr);
+                active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
+                active_->RefreshRecordingStatus();
+            }),
+        "Balances the Quest microphone in the live stream from 0% (silent) to 200%. 100% uses the captured microphone level. Higher values can clip when mixed with loud game sound. This can be adjusted while live; 0% also marks the movable microphone control unavailable."));
 
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Service Setup");
     const auto& stream = active_->root_.Settings().Get().broadcast;
-    static std::array<std::string_view, 4> providers{"Twitch", "YouTube", "Kick", "Custom"};
-    std::string selectedProvider = stream.provider == settings::LivestreamProvider::YouTube ? "YouTube"
-        : stream.provider == settings::LivestreamProvider::Kick ? "Kick"
-        : stream.provider == settings::LivestreamProvider::Custom ? "Custom" : "Twitch";
+    static std::array<std::string_view, 4> providers{
+        "Twitch", "YouTube (Not Supported)", "Kick (Not Supported)", "Custom"};
+    std::string selectedProvider(LivestreamProviderLabel(stream.provider));
     auto* provider = WithHint(BSML::Lite::CreateDropdown(
         livestreamPage, "Service", selectedProvider, providers,
         [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
             auto& editable = active_->root_.Settings().Edit().broadcast;
-            editable.provider = selected == "YouTube" ? settings::LivestreamProvider::YouTube
-                : selected == "Kick" ? settings::LivestreamProvider::Kick
-                : selected == "Custom" ? settings::LivestreamProvider::Custom
-                                       : settings::LivestreamProvider::Twitch;
-            editable.serverUrl = broadcast::DefaultServerUrl(editable.provider);
+            editable.provider = LivestreamProviderFromLabel(selected);
             if (active_->livestreamServerInput_) {
-                active_->livestreamServerInput_->SetText(editable.serverUrl);
+                active_->livestreamServerInput_->SetText(
+                    active_->root_.Recording().StreamServerUrl(editable.provider));
+            }
+            if (active_->livestreamKeyInput_) {
+                active_->livestreamKeyInput_->SetText(
+                    active_->root_.Recording().StreamKey(editable.provider));
             }
             std::string error;
             if (!active_->root_.Settings().Save(&error)) {
                 Logging::Logger.error("Could not save live-stream service: {}", error);
             }
-        }), "Selects the streaming service and fills in its normal ingest server. Twitch, YouTube, and Kick use the stream key from their creator dashboard; Custom accepts another RTMP or RTMPS server.");
+            active_->RefreshLivestreamKeyDisplay();
+            active_->RefreshTwitchControls();
+            active_->RefreshRecordingStatus();
+        }), "Selects which service-specific server address and stream key are being edited. Switching services does not overwrite another service's values.");
     RememberSelectables(provider, active_->livestreamConfigurationControls_);
     ConstrainRightPanelRow(provider);
 
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Server Address");
-    active_->livestreamServerInput_ = WithHint(BSML::Lite::CreateStringSetting(
-        livestreamPage, "Enter RTMP or RTMPS server address", stream.serverUrl,
-        [](StringW value) {
+    active_->livestreamProviderFeatureText_ = BSML::Lite::CreateText(
+        livestreamPage->get_transform(), "", 3.0F,
+        {0.0F, 0.0F}, {48.0F, 11.0F});
+    active_->livestreamProviderFeatureText_->set_enableWordWrapping(true);
+    active_->livestreamProviderFeatureText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Twitch Channel Controls");
+    active_->twitchAccountStatusText_ = BSML::Lite::CreateText(
+        livestreamPage->get_transform(), "", 3.0F,
+        {0.0F, 0.0F}, {48.0F, 11.0F});
+    active_->twitchAccountStatusText_->set_enableWordWrapping(true);
+    active_->twitchAccountStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+
+    auto* twitchAppText = BSML::Lite::CreateText(
+        livestreamPage->get_transform(),
+        "Uses SaberStage's registered public Twitch application. No Client ID or client secret entry is required.",
+        2.8F, {0.0F, 0.0F}, {48.0F, 10.0F});
+    twitchAppText->set_enableWordWrapping(true);
+    twitchAppText->set_alignment(TMPro::TextAlignmentOptions::Center);
+    auto* connectTwitch = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Connect Twitch Account", [] {
+            if (active_) active_->BeginTwitchAuthorization();
+        }), "Links Twitch through its device authorization page so SaberStage can set the channel title, read live chat, and optionally post map information. Accounts connected before map announcements were added must reconnect once. The RTMP stream key remains separate.");
+    ConfigureRightPanelButton(connectTwitch);
+    auto* disconnectTwitch = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Disconnect Twitch Account", [] {
             if (!active_) return;
-            const auto endpoint = static_cast<std::string>(value);
-            if (endpoint.rfind("rtmp://", 0) != 0 && endpoint.rfind("rtmps://", 0) != 0) return;
-            active_->root_.Settings().Edit().broadcast.serverUrl = endpoint;
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) {
-                Logging::Logger.error("Could not save live-stream server URL: {}", error);
+            active_->root_.Twitch().DisconnectAccount();
+            active_->SetChatWorldPanelVisible(false);
+            active_->RefreshTwitchControls();
+        }), "Removes SaberStage's saved Twitch authorization. This does not erase the separately configured RTMP stream key.");
+    ConfigureRightPanelButton(disconnectTwitch);
+    auto* titleButton = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Set Stream Title", [] {
+            if (active_) active_->ShowStreamTitleEditor();
+        }), "Saves the Twitch title for the next stream, or updates it immediately when a Twitch stream is already live. YouTube and Kick title control are not supported yet.");
+    ConfigureRightPanelButton(titleButton);
+
+    auto* postMapInfo = WithHint(BSML::Lite::CreateToggle(
+        livestreamPage,
+        "Post Map Info to Chat",
+        active_->root_.Settings().Get().broadcast.postMapInfoToChat,
+        [](bool enabled) {
+            if (!active_) return;
+            auto& settings = active_->root_.Settings().Edit();
+            settings.broadcast.postMapInfoToChat = enabled;
+            std::string saveError;
+            if (!active_->root_.Settings().Save(&saveError)) {
+                Logging::Logger.error(
+                    "Could not save Twitch map-announcement preference: {}", saveError);
             }
-        }), "The RTMP or RTMPS ingest address supplied by your streaming service. This is not the public channel page. The stream key is entered separately and is never added to this saved setting.");
+            if (enabled && !settings.broadcast.twitchAccount.chatWriteAuthorized) {
+                active_->ShowLivestreamActionError(
+                    "Connect Twitch Account to post map information. If this account was already connected, reconnect it once to grant the new chat permission.");
+            }
+            active_->RefreshTwitchControls();
+        }),
+        "Posts one map summary from your connected Twitch account when gameplay starts. It includes song, artist, difficulty, mapper, duration, NPS, and locally available map-extension or rating data. Network work never runs on the gameplay thread. Existing Twitch links must reconnect once for permission.");
+    ConstrainRightPanelRow(postMapInfo);
+
+    auto* chatRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
+    auto* showChat = WithHint(BSML::Lite::CreateToggle(
+        chatRow,
+        "Show Twitch Chat Panel",
+        active_->root_.Settings().Get().chat.enabled,
+        [](bool visible) {
+            if (active_) active_->SetChatWorldPanelVisible(visible);
+        }), "Shows a movable, HMD-only Twitch chat panel. Twitch account linking is required; YouTube and Kick chat are not supported yet.");
+    ConfigureLayout(showChat, 38.0F, 7.0F, 1.0F);
+    auto* resetChat = WithHint(BSML::Lite::CreateUIButton(
+        chatRow, "↻", [] {
+            if (active_) active_->ResetChatWorldPanelPose();
+        }), "Returns the Twitch chat panel to its default position and size.");
+    ConfigureRightPanelInlineButton(resetChat);
+
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Paused Stream Screen");
+    active_->afkSelectionText_ = BSML::Lite::CreateText(
+        livestreamPage->get_transform(), "", 3.0F,
+        {0.0F, 0.0F}, {48.0F, 8.0F});
+    active_->afkSelectionText_->set_enableWordWrapping(true);
+    active_->afkSelectionText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+    auto* chooseAfk = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Choose AFK Picture or GIF", [] {
+            if (active_) active_->OpenAfkFilePicker();
+        }), "Selects a PNG, JPEG, or animated GIF shown instead of the camera while a Twitch stream is paused.");
+    ConfigureRightPanelButton(chooseAfk);
+    auto* builtInAfk = WithHint(BSML::Lite::CreateUIButton(
+        livestreamPage, "Use Built-in AFK Screen", [] {
+            if (!active_) return;
+            std::string error;
+            if (!active_->root_.Recording().PrepareAfkMedia({}, &error)) {
+                active_->ShowLivestreamActionError(error);
+                return;
+            }
+            active_->root_.Settings().Edit().broadcast.afkMediaPath.clear();
+            active_->root_.Settings().Save(nullptr);
+            if (active_->afkSelectionText_) {
+                active_->afkSelectionText_->set_text("Pause screen: built-in SaberStage AFK image");
+            }
+        }), "Returns paused Twitch streams to SaberStage's built-in AFK screen without deleting your image or GIF file.");
+    ConfigureRightPanelButton(builtInAfk);
+
+    CreateRightPanelSubheader(livestreamPage->get_transform(), "Server Address");
+    auto* serverInputRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
+    active_->livestreamServerInput_ = WithHint(BSML::Lite::CreateStringSetting(
+        serverInputRow,
+        "Enter RTMP or RTMPS server address",
+        active_->root_.Recording().StreamServerUrl(stream.provider)),
+        "The selected service's RTMP or RTMPS ingest address. Editing does not apply it until Set is pressed, where you can use it once or save it for later sessions.");
     RememberSelectables(active_->livestreamServerInput_, active_->livestreamConfigurationControls_);
-    ConfigureFullWidthRightPanelInput(active_->livestreamServerInput_, 512);
+    ConfigureRightPanelInput(active_->livestreamServerInput_, 2048, 38.0F);
+    active_->setLivestreamServerButton_ = WithHint(BSML::Lite::CreateUIButton(
+        serverInputRow, "Set", [] {
+            if (active_) active_->ShowLivestreamValueConfirmation(1);
+        }), "Choose whether the typed server address is used only this session or saved in SaberStage settings.");
+    ConfigureRightPanelInlineButton(active_->setLivestreamServerButton_);
+    RememberSelectables(active_->setLivestreamServerButton_, active_->livestreamConfigurationControls_);
 
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Key");
+    auto* streamKeyInputRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
     active_->livestreamKeyInput_ = WithHint(BSML::Lite::CreateStringSetting(
-        livestreamPage, "Enter private stream key", "",
-        [](StringW value) {
-            if (!active_) return;
-            std::string error;
-            if (active_->root_.Recording().SetStreamKey(static_cast<std::string>(value), &error)) {
-                active_->RefreshLivestreamKeyDisplay();
-            } else {
-                Logging::Logger.error("Could not accept live-stream key: {}", error);
-            }
-            active_->RefreshRecordingStatus();
-        }), "Paste the private stream key from the service dashboard. SaberStage keeps it only in memory for this Beat Saber session, never writes it to settings, and never logs it.");
-    ConfigureFullWidthRightPanelInput(active_->livestreamKeyInput_, 512);
+        streamKeyInputRow,
+        "Enter private stream key",
+        active_->root_.Recording().StreamKey(stream.provider),
+        [](StringW) {
+            if (active_) active_->RefreshLivestreamKeyDisplay();
+        }), "Paste the selected service's private stream key. Set lets you keep it for this session only or explicitly save it in local SaberStage settings. It is never logged and is redacted from support archives.");
+    ConfigureRightPanelInput(active_->livestreamKeyInput_, 512, 38.0F);
+    RememberSelectables(active_->livestreamKeyInput_, active_->livestreamConfigurationControls_);
+    active_->setLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
+        streamKeyInputRow, "Set", [] {
+            if (active_) active_->ShowLivestreamValueConfirmation(2);
+        }), "Choose whether the typed private stream key is used only this session or saved in SaberStage settings.");
+    ConfigureRightPanelInlineButton(active_->setLivestreamKeyButton_);
+    RememberSelectables(active_->setLivestreamKeyButton_, active_->livestreamConfigurationControls_);
     auto* livestreamKeyVisibility = WithHint(BSML::Lite::CreateToggle(
         livestreamPage,
         "Show Stream Key",
@@ -3524,18 +4139,32 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             if (!active_) return;
             active_->livestreamKeyVisible_ = visible;
             active_->RefreshLivestreamKeyDisplay();
-        }), "Shows the private stream key in this field. Leave this off to display password-style masking while keeping the real key available only in memory.");
+        }), "Shows the private stream key in this field. Leave this off to display password-style masking whether the key is session-only or saved locally.");
     ConstrainRightPanelRow(livestreamKeyVisibility);
 
     active_->clearLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
         livestreamPage, "Clear Stream Key", [] {
             if (!active_) return;
-            active_->root_.Recording().ClearStreamKey();
+            auto& broadcastSettings = active_->root_.Settings().Edit().broadcast;
+            const auto provider = broadcastSettings.provider;
+            auto& savedKey = settings::DestinationForProvider(
+                broadcastSettings, provider).streamKey;
+            const auto previous = savedKey;
+            savedKey.clear();
+            std::string error;
+            if (!active_->root_.Settings().Save(&error)) {
+                savedKey = previous;
+                Logging::Logger.error("Could not clear the saved live-stream key: {}", error);
+                return;
+            }
+            active_->root_.Recording().ClearStreamKey(provider);
             if (active_->livestreamKeyInput_) active_->livestreamKeyInput_->SetText("");
             active_->RefreshLivestreamKeyDisplay();
             active_->RefreshRecordingStatus();
-        }), "Removes the in-memory stream key. It cannot be changed or cleared while a stream is active.");
+        }), "Removes only the selected service's current session key and saved key. Other streaming services are not changed. It cannot be cleared while a stream is active.");
     ConfigureRightPanelButton(active_->clearLivestreamKeyButton_);
+    RememberSelectables(
+        active_->clearLivestreamKeyButton_, active_->livestreamConfigurationControls_);
 
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Reliability");
     auto* reconnect = WithHint(BSML::Lite::CreateToggle(
@@ -3544,7 +4173,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             if (!active_) return;
             active_->root_.Settings().Edit().broadcast.reconnectEnabled = value;
             active_->root_.Settings().Save(nullptr);
-        }), "Retries a dropped connection in the background with increasing delays. Gameplay and the local safety recording continue while the network reconnects.");
+        }), "Retries a dropped connection in the background with increasing delays while gameplay and the live capture continue.");
     RememberSelectables(reconnect, active_->livestreamConfigurationControls_);
     ConstrainRightPanelRow(reconnect);
 
@@ -3581,6 +4210,8 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     partialNote->set_enableWordWrapping(true);
     partialNote->set_alignment(TMPro::TextAlignmentOptions::Center);
 
+    active_->BuildAfkFilePicker(view);
+    active_->RefreshTwitchControls();
     active_->ShowRecordingTab(0);
     if (active_->recordingTabs_) active_->recordingTabs_->SelectCellWithNumber(0);
     active_->RefreshRecordingStatus();
@@ -3751,6 +4382,12 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
         3.0F, {0.0F, 0.0F}, {48.0F, 10.0F});
     placementHint->set_enableWordWrapping(true);
     placementHint->set_alignment(TMPro::TextAlignmentOptions::Center);
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(
+        placeContainer, "Keep Camera Level", profile.keepLevel, [](bool value) {
+            if (active_) active_->EditCamera(
+                [&](auto& camera) { camera.keepLevel = value; }, "level lock");
+        }),
+        "Keeps the manually positioned third-person camera horizon level. Movement scripts may still use authored off-level rotation while they are active."));
     ConstrainRightPanelRow(WithHint(BSML::Lite::CreateIncrementSetting(placeContainer, "X", 2, 0.05F, profile.position.x, -20.0F, 20.0F, [](float value) {
         if (active_) active_->EditCamera([&](auto& camera) { camera.position.x = value; }, "X position");
     }), "Moves the camera left or right in meters."));
@@ -3911,6 +4548,450 @@ void MenuController::RefreshLivestreamKeyDisplay() {
     textView->SetAllDirty();
 }
 
+void MenuController::ShowLivestreamValueConfirmation(int valueKind) {
+    if (valueKind != 1 && valueKind != 2) return;
+    pendingLivestreamValueKind_ = valueKind;
+    if (!livestreamValueConfirmationModal_) {
+        if (!IsAlive(recordingView_)) return;
+        // Parent the modal to the currently active Recording side panel. BSML
+        // renders this modal above that flow controller, keeping it visible and
+        // clickable even when other SaberStage panels are open.
+        livestreamValueConfirmationModal_ = BSML::Lite::CreateModal(
+            recordingView_, {76.0F, 54.0F}, nullptr, true);
+        if (!livestreamValueConfirmationModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            livestreamValueConfirmationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        livestreamValueConfirmationText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "", 3.7F, {0.0F, 0.0F}, {68.0F, 34.0F});
+        livestreamValueConfirmationText_->set_enableWordWrapping(true);
+        livestreamValueConfirmationText_->set_overflowMode(
+            TMPro::TextOverflowModes::Overflow);
+        livestreamValueConfirmationText_->set_alignment(
+            TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(livestreamValueConfirmationText_, 68.0F, 34.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 68.0F, 8.0F, 1.0F);
+        WithHint(BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveLivestreamValueConfirmation(0);
+        }), "Closes this dialog without applying or clearing the text you entered.");
+        WithHint(BSML::Lite::CreateUIButton(actions, "Use Once", [] {
+            if (active_) active_->ResolveLivestreamValueConfirmation(1);
+        }), "Uses this value only for the selected service until Beat Saber closes. It is not written to settings.");
+        WithHint(BSML::Lite::CreateUIButton(actions, "Save in Settings", [] {
+            if (active_) active_->ResolveLivestreamValueConfirmation(2);
+        }), "Saves this value locally for only the selected streaming service so it is available in later sessions.");
+    }
+    if (!livestreamValueConfirmationModal_ || !livestreamValueConfirmationText_) return;
+    const auto provider = root_.Settings().Get().broadcast.provider;
+    const auto providerName = LivestreamProviderLabel(provider);
+    livestreamValueConfirmationText_->set_text(valueKind == 1
+        ? StringW(std::string("Apply the server address for ") + std::string(providerName) +
+                  "?\n\nUse Once keeps it only until Beat Saber closes. Save in Settings stores it locally for this service. Cancel leaves your typed text unchanged without applying it.")
+        : StringW(std::string("Apply the private stream key for ") + std::string(providerName) +
+                  "?\n\nUse Once keeps it only until Beat Saber closes. Save in Settings stores it locally for this service. Support logs redact saved keys. Cancel leaves your typed text unchanged without applying it."));
+    livestreamValueConfirmationModal_->Show();
+}
+
+void MenuController::ResolveLivestreamValueConfirmation(int action) {
+    const auto valueKind = pendingLivestreamValueKind_;
+    if (action == 0) {
+        pendingLivestreamValueKind_ = 0;
+        if (livestreamValueConfirmationModal_) livestreamValueConfirmationModal_->Hide();
+        return;
+    }
+    if ((valueKind != 1 && valueKind != 2) || (action != 1 && action != 2)) return;
+
+    auto& broadcastSettings = root_.Settings().Edit().broadcast;
+    const auto provider = broadcastSettings.provider;
+    const auto providerName = LivestreamProviderLabel(provider);
+    const auto value = valueKind == 1
+        ? (IsAlive(livestreamServerInput_)
+               ? static_cast<std::string>(livestreamServerInput_->get_text())
+               : std::string{})
+        : (IsAlive(livestreamKeyInput_)
+               ? static_cast<std::string>(livestreamKeyInput_->get_text())
+               : std::string{});
+    std::string error;
+    const auto valid = valueKind == 1
+        ? settings::IsValidLivestreamServerUrl(value)
+        : settings::IsValidStreamKey(value);
+    if (!valid) {
+        livestreamValueConfirmationText_->set_text(valueKind == 1
+            ? "The server address was not applied. Enter a complete RTMP or RTMPS address without spaces, then try again."
+            : "The stream key was not applied. Paste a non-empty key without spaces, then try again.");
+        return;
+    }
+
+    if (action == 1) {
+        const auto applied = valueKind == 1
+            ? root_.Recording().SetStreamServerUrl(provider, value, &error)
+            : root_.Recording().SetStreamKey(provider, value, &error);
+        if (!applied) {
+            livestreamValueConfirmationText_->set_text(
+                StringW(std::string("The value was not applied: ") + error));
+            return;
+        }
+    } else {
+        auto& destination = settings::DestinationForProvider(broadcastSettings, provider);
+        const auto previous = valueKind == 1 ? destination.serverUrl : destination.streamKey;
+        if (valueKind == 1) destination.serverUrl = value;
+        else destination.streamKey = value;
+        if (!root_.Settings().Save(&error)) {
+            if (valueKind == 1) destination.serverUrl = previous;
+            else destination.streamKey = previous;
+            // Never include a private value in an error or diagnostic line.
+            Logging::Logger.error(
+                "Could not save the {} live-stream {}: {}",
+                providerName,
+                valueKind == 1 ? "server address" : "stream key",
+                error);
+            livestreamValueConfirmationText_->set_text(
+                "The value could not be saved. Your typed text is still present; close this dialog and try again.");
+            return;
+        }
+        if (valueKind == 1) root_.Recording().ClearStreamServerUrlOverride(provider);
+        else root_.Recording().ClearStreamKey(provider);
+    }
+
+    pendingLivestreamValueKind_ = 0;
+    if (livestreamValueConfirmationModal_) livestreamValueConfirmationModal_->Hide();
+    RefreshLivestreamKeyDisplay();
+    RefreshRecordingStatus();
+}
+
+void MenuController::ShowLivestreamActionError(
+    std::string_view message,
+    bool streamStillLive) {
+    if (!livestreamActionErrorModal_) {
+        if (!IsAlive(recordingView_)) return;
+        // Keep runtime failures on a dedicated topmost modal. Logging alone is
+        // not sufficient in-headset, where a disabled-looking or unresponsive
+        // action otherwise gives the user no useful recovery instruction.
+        livestreamActionErrorModal_ = BSML::Lite::CreateModal(
+            recordingView_, {76.0F, 42.0F}, nullptr, true);
+        if (!livestreamActionErrorModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            livestreamActionErrorModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        livestreamActionErrorText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "", 3.8F, {0.0F, 0.0F}, {68.0F, 27.0F});
+        livestreamActionErrorText_->set_enableWordWrapping(true);
+        livestreamActionErrorText_->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        livestreamActionErrorText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(livestreamActionErrorText_, 68.0F, 27.0F, 1.0F);
+        auto* okay = BSML::Lite::CreateUIButton(layout->get_transform(), "OK", [] {
+            if (active_ && active_->livestreamActionErrorModal_) {
+                active_->livestreamActionErrorModal_->Hide();
+            }
+        });
+        ConfigureRightPanelButton(okay);
+    }
+    if (!livestreamActionErrorModal_ || !livestreamActionErrorText_) return;
+    livestreamActionErrorText_->set_text(StringW(
+        std::string(streamStillLive
+            ? "STREAM IS LIVE\n\nThe video and audio broadcast is still running. Only the separate Twitch channel update failed.\n\n"
+            : "LIVE-STREAM ACTION COULD NOT BE COMPLETED\n\n") +
+        std::string(message)));
+    livestreamActionErrorModal_->Show();
+}
+
+void MenuController::ShowStreamTitleEditor() {
+    if (!IsAlive(recordingView_)) return;
+    if (!streamTitleModal_) {
+        streamTitleModal_ = BSML::Lite::CreateModal(
+            recordingView_, {76.0F, 46.0F}, nullptr, true);
+        if (!streamTitleModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(streamTitleModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* instructions = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "Enter the Twitch stream title. If you are already live, SaberStage will update the active stream without ending it.",
+            3.7F, {0.0F, 0.0F}, {68.0F, 13.0F});
+        instructions->set_enableWordWrapping(true);
+        instructions->set_alignment(TMPro::TextAlignmentOptions::Center);
+        streamTitleModalInput_ = BSML::Lite::CreateStringSetting(
+            layout, "Stream title", "");
+        ConfigureRightPanelInput(streamTitleModalInput_, 140, 68.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 68.0F, 8.0F, 1.0F);
+        auto* cancel = BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_ && active_->streamTitleModal_) active_->streamTitleModal_->Hide();
+        });
+        auto* save = BSML::Lite::CreateUIButton(actions, "Save Title", [] {
+            if (active_) active_->SaveStreamTitle();
+        });
+        ConfigureLayout(cancel, 30.0F, 7.0F, 1.0F);
+        ConfigureLayout(save, 34.0F, 7.0F, 1.0F);
+    }
+    const auto provider = root_.Settings().Get().broadcast.provider;
+    if (provider != settings::LivestreamProvider::Twitch) {
+        ShowLivestreamActionError(
+            std::string(LivestreamProviderLabel(provider)) +
+            " title control is not supported yet. Twitch is supported in this build.");
+        return;
+    }
+    if (streamTitleModalInput_) {
+        streamTitleModalInput_->SetText(
+            settings::DestinationForProvider(root_.Settings().Get().broadcast, provider).streamTitle);
+    }
+    streamTitleModal_->Show();
+}
+
+void MenuController::SaveStreamTitle() {
+    if (!streamTitleModalInput_) return;
+    auto title = static_cast<std::string>(streamTitleModalInput_->get_text());
+    if (title.size() > 140 || title.find('\0') != std::string::npos) {
+        ShowLivestreamActionError("Twitch titles must be 140 characters or fewer.");
+        return;
+    }
+    auto& destination = settings::DestinationForProvider(
+        root_.Settings().Edit().broadcast,
+        settings::LivestreamProvider::Twitch);
+    const auto previous = destination.streamTitle;
+    destination.streamTitle = std::move(title);
+    std::string error;
+    if (!root_.Settings().Save(&error)) {
+        destination.streamTitle = previous;
+        ShowLivestreamActionError("The Twitch title could not be saved: " + error);
+        return;
+    }
+    if (streamTitleModal_) streamTitleModal_->Hide();
+
+    // Twitch's Helix channel-title endpoint supports updates while a channel
+    // is live. Saving the field alone previously changed only the next-stream
+    // preference, which made a successful-looking Save action do nothing to
+    // an active broadcast. Start the same background title worker used by Go
+    // Live and leave the media/RTMP session untouched.
+    const auto livestream = root_.Recording().LivestreamSnapshot();
+    if (broadcast::CanStop(livestream.state)) {
+        const auto twitch = root_.Twitch().Snapshot();
+        if (twitch.authorizationState != broadcast::TwitchAuthorizationState::Connected) {
+            ShowLivestreamActionError(
+                "The title was saved for your next stream, but the active Twitch stream could not be updated because no Twitch account is connected.");
+            RefreshTwitchControls();
+            return;
+        }
+        if (!root_.Twitch().BeginTitleUpdate(destination.streamTitle, &error)) {
+            ShowLivestreamActionError(
+                "The title was saved for your next stream, but the active Twitch stream was not updated: " + error);
+            RefreshTwitchControls();
+            return;
+        }
+        pendingLiveTwitchTitleUpdate_ = true;
+    }
+    RefreshTwitchControls();
+}
+
+void MenuController::BeginTwitchAuthorization() {
+    std::string error;
+    if (!twitchAuthorizationModal_) {
+        twitchAuthorizationModal_ = BSML::Lite::CreateModal(
+            recordingView_, {64.0F, 32.0F}, nullptr, true);
+        if (!twitchAuthorizationModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            twitchAuthorizationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        twitchAuthorizationText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "Requesting a Twitch device code...",
+            3.7F, {0.0F, 0.0F}, {56.0F, 16.0F});
+        twitchAuthorizationText_->set_enableWordWrapping(true);
+        twitchAuthorizationText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 56.0F, 7.0F, 1.0F);
+        auto* open = BSML::Lite::CreateUIButton(actions, "Open Twitch", [] {
+            if (!active_) return;
+            const auto snapshot = active_->root_.Twitch().Snapshot();
+            if (!snapshot.verificationUri.empty()) {
+                UnityEngine::Application::OpenURL(snapshot.verificationUri);
+            }
+        });
+        auto* close = BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (!active_) return;
+            active_->twitchAuthorizationAwaitingCompletion_ = false;
+            active_->root_.Twitch().CancelDeviceAuthorization();
+            if (active_->twitchAuthorizationModal_) active_->twitchAuthorizationModal_->Hide();
+        });
+        ConfigureLayout(open, 34.0F, 7.0F, 1.0F);
+        ConfigureLayout(close, 30.0F, 7.0F, 1.0F);
+    }
+    if (!root_.Twitch().BeginDeviceAuthorization(&error)) {
+        ShowLivestreamActionError(error);
+        return;
+    }
+    twitchAuthorizationAwaitingCompletion_ = true;
+    if (twitchAuthorizationText_) {
+        twitchAuthorizationText_->set_text(
+            "Requesting a Twitch code...\n\nKeep this window open. The code and authorization address will appear here.");
+    }
+    twitchAuthorizationModal_->Show();
+    RefreshTwitchControls();
+}
+
+void MenuController::RefreshTwitchControls() {
+    const auto provider = root_.Settings().Get().broadcast.provider;
+    if (livestreamProviderFeatureText_) {
+        livestreamProviderFeatureText_->set_text(
+            provider == settings::LivestreamProvider::Twitch
+                ? "Twitch streaming, title control, and live chat are supported. YouTube and Kick support is coming later."
+                : provider == settings::LivestreamProvider::Custom
+                    ? "Custom RTMP/RTMPS is available for advanced endpoint testing. Provider-specific title and chat controls are not available."
+                    : std::string(LivestreamProviderLabel(provider)) +
+                        " cannot start a stream yet. Twitch is the first supported service.");
+    }
+    const auto twitch = root_.Twitch().Snapshot();
+    if (twitchAccountStatusText_) {
+        auto status = twitch.status;
+        const auto& title = settings::DestinationForProvider(
+            root_.Settings().Get().broadcast,
+            settings::LivestreamProvider::Twitch).streamTitle;
+        const bool live = broadcast::CanStop(root_.Recording().LivestreamSnapshot().state);
+        status += title.empty()
+            ? (live ? "\nLive/saved title: unchanged" : "\nNext title: unchanged")
+            : (live ? "\nLive/saved title: " : "\nNext title: ") + title;
+        if (twitch.titleUpdatePending || twitch.titleUpdateComplete) {
+            status += "\n" + twitch.titleUpdateStatus;
+        }
+        if (root_.Settings().Get().broadcast.postMapInfoToChat &&
+                !root_.Settings().Get().broadcast.twitchAccount.chatWriteAuthorized) {
+            status += "\nMap posts: reconnect Twitch once to grant chat permission";
+        } else if (!twitch.mapAnnouncementStatus.empty()) {
+            status += "\n" + twitch.mapAnnouncementStatus;
+        }
+        twitchAccountStatusText_->set_text(status);
+    }
+    if (afkSelectionText_) {
+        const auto& path = root_.Settings().Get().broadcast.afkMediaPath;
+        afkSelectionText_->set_text(path.empty()
+            ? "Pause screen: built-in SaberStage AFK image"
+            : "Pause screen: " + std::filesystem::path(path).filename().string());
+    }
+    if (twitchAuthorizationText_) {
+        if (twitch.authorizationState == broadcast::TwitchAuthorizationState::WaitingForUser) {
+            twitchAuthorizationText_->set_text(
+                "Open the Twitch authorization page and enter this code:\n\n" +
+                twitch.userCode + "\n\n" + twitch.verificationUri);
+        } else if (twitch.authorizationState == broadcast::TwitchAuthorizationState::Connected) {
+            twitchAuthorizationText_->set_text(twitch.status);
+            if (twitchAuthorizationAwaitingCompletion_) {
+                // The account status directly below the Connect button now
+                // carries the lasting account state. Replace the one-purpose
+                // device-code dialog because its Open Twitch and Cancel
+                // actions no longer apply after authorization succeeds.
+                twitchAuthorizationAwaitingCompletion_ = false;
+                if (twitchAuthorizationModal_) twitchAuthorizationModal_->Hide();
+                if (!twitchConnectionSuccessModal_) {
+                    twitchConnectionSuccessModal_ = BSML::Lite::CreateModal(
+                        recordingView_, {52.0F, 22.0F}, nullptr, true);
+                    if (twitchConnectionSuccessModal_) {
+                        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+                            twitchConnectionSuccessModal_->get_transform());
+                        layout->set_spacing(1.5F);
+                        layout->set_childControlWidth(true);
+                        layout->set_childControlHeight(true);
+                        layout->set_childForceExpandWidth(true);
+                        layout->set_childForceExpandHeight(false);
+                        twitchConnectionSuccessText_ = BSML::Lite::CreateText(
+                            layout->get_transform(), "Twitch account connected.",
+                            3.8F, {0.0F, 0.0F}, {46.0F, 8.0F});
+                        twitchConnectionSuccessText_->set_enableWordWrapping(true);
+                        twitchConnectionSuccessText_->set_alignment(
+                            TMPro::TextAlignmentOptions::Center);
+                        auto* ok = BSML::Lite::CreateUIButton(layout->get_transform(), "OK", [] {
+                            if (active_ && active_->twitchConnectionSuccessModal_) {
+                                active_->twitchConnectionSuccessModal_->Hide();
+                            }
+                        });
+                        ConfigureLayout(ok, 28.0F, 7.0F, 1.0F);
+                    }
+                }
+                if (twitchConnectionSuccessText_) {
+                    twitchConnectionSuccessText_->set_text(
+                        "Twitch account connected.\n\nSigned in as " + twitch.login);
+                }
+                if (twitchConnectionSuccessModal_) twitchConnectionSuccessModal_->Show();
+            }
+        } else if (twitch.authorizationState == broadcast::TwitchAuthorizationState::Failed) {
+            twitchAuthorizationAwaitingCompletion_ = false;
+            twitchAuthorizationText_->set_text(twitch.status);
+        }
+    }
+}
+
+void MenuController::TryStartLivestreamWithTitle() {
+    const auto provider = root_.Settings().Get().broadcast.provider;
+    if (provider == settings::LivestreamProvider::YouTube ||
+            provider == settings::LivestreamProvider::Kick) {
+        ShowLivestreamActionError(
+            std::string(LivestreamProviderLabel(provider)) +
+            " cannot be used yet. Twitch is the first fully supported service; "
+            "YouTube and Kick support will be added later.");
+        return;
+    }
+    std::string error;
+    if (!root_.Recording().StartLivestream(&error)) {
+        Logging::Logger.error("Live stream start failed: {}", error);
+        ShowLivestreamActionError(error);
+        RefreshRecordingStatus();
+        return;
+    }
+
+    // Channel metadata is a separate Twitch control-plane request.  It must
+    // never gate the RTMP media path: a transient Helix/TLS failure previously
+    // left the user offline even though the stream encoder and ingest endpoint
+    // were healthy.  Start broadcasting first, then update the saved title in
+    // parallel and report any metadata failure without stopping the stream.
+    const auto& destination = settings::DestinationForProvider(
+        root_.Settings().Get().broadcast, provider);
+    if (provider == settings::LivestreamProvider::Twitch && !destination.streamTitle.empty()) {
+        const auto twitch = root_.Twitch().Snapshot();
+        if (twitch.authorizationState == broadcast::TwitchAuthorizationState::Connected) {
+            std::string titleError;
+            if (root_.Twitch().BeginTitleUpdate(destination.streamTitle, &titleError)) {
+                pendingLiveTwitchTitleUpdate_ = true;
+            } else {
+                Logging::Logger.warn(
+                    "Twitch stream started, but its saved title could not be applied: {}",
+                    titleError);
+                ShowLivestreamActionError(
+                    "The stream started, but Twitch could not apply its saved title: " +
+                    titleError,
+                    true);
+            }
+        } else {
+            Logging::Logger.warn(
+                "Twitch stream started without applying its saved title because no Twitch account is connected");
+        }
+    }
+    RefreshRecordingStatus();
+    RefreshTwitchControls();
+}
+
 void MenuController::RefreshRecordingStatus() {
     const auto snapshot = root_.Recording().Snapshot();
     const auto livestream = root_.Recording().LivestreamSnapshot();
@@ -3950,6 +5031,15 @@ void MenuController::RefreshRecordingStatus() {
     for (auto* selectable : livestreamConfigurationControls_) {
         if (selectable) selectable->set_interactable(!broadcast::CanStop(livestream.state));
     }
+    const auto& audioMix = root_.Settings().Get().broadcast;
+    if (livestreamGameAudioVolumeSlider_) {
+        livestreamGameAudioVolumeSlider_->set_interactable(
+            audioMix.gameAudioEnabled);
+    }
+    if (livestreamMicrophoneVolumeSlider_) {
+        livestreamMicrophoneVolumeSlider_->set_interactable(
+            audioMix.microphoneEnabled);
+    }
     if (livestreamStatusText_) {
         auto text = livestream.status;
         text += livestream.streamKeyConfigured
@@ -3969,8 +5059,7 @@ void MenuController::RefreshRecordingStatus() {
     }
     if (startLivestreamButton_) {
         startLivestreamButton_->set_interactable(
-            broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured &&
-            root_.Settings().Get().recording.backend == settings::RecordingBackend::DirectFfmpegHardware);
+            broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured);
     }
     if (stopLivestreamButton_) {
         stopLivestreamButton_->set_interactable(broadcast::CanStop(livestream.state));
@@ -4042,7 +5131,7 @@ void MenuController::EnsureRecordingWorldPanel() {
     UnityEngine::Object::DontDestroyOnLoad(screenObject);
     recordingWorldPanelScreen_->set_HandleSide(BSML::Side::Top);
     recordingWorldPanelScreen_->set_HighlightHandle(false);
-    HideAndFitWorldPanelHandleAboveButtons(recordingWorldPanelScreen_, panelSize);
+    HideAndFitWorldPanelHandleBehindContent(recordingWorldPanelScreen_, panelSize);
     recordingWorldPanelScreen_->get_transform()->set_localScale({
         kRecordingPanelScale, kRecordingPanelScale, kRecordingPanelScale});
 
@@ -4054,29 +5143,105 @@ void MenuController::EnsureRecordingWorldPanel() {
         return;
     }
 
-    // Visual stack (draw order = sibling creation order on one canvas):
-    // rounded body first, then the accent strip, then text, then buttons.
-    // All positions are canvas units from the panel center.
+    // Visual/input stack: four narrow border strips, a solid black body,
+    // accent divider, text, then controls. Do not implement the border as a
+    // full blue rectangle behind the body: the zero-bloom material has its own
+    // transparent render queue, so Unity can legally draw it after the normal
+    // UI body and turn the entire panel blue. Real strips have no blue pixels
+    // under the body and remain correct regardless of material queue ordering.
+    // The body is deliberately not a UI raycast target: blank areas reach the
+    // thin native movement handle immediately behind it, while later controls
+    // remain the nearest interactive surface and keep their normal behavior.
     const auto half = panelSize.y * 0.5F;
-    const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.96F};
-    const UnityEngine::Color accentColor{0.0F, 0.80F, 1.0F, 1.0F};
+    const UnityEngine::Color panelColor{0.0F, 0.0F, 0.0F, 1.0F};
+    // All three popout panels use the same bright blue. Its dedicated shader
+    // writes zero bloom weight, so this no longer needs a dim color workaround
+    // to avoid casting a blue haze over the black panel body.
+    const UnityEngine::Color accentColor{0.0F, 0.55F, 1.0F, 1.0F};
+    recordingWorldPanelBorderMaterial_ =
+        CreateNonBloomWorldPanelMaterial("SaberStage Recording Panel Non-Bloom Accent");
+    constexpr float recordingBorderThickness = 0.8F;
+    const float borderInset = recordingBorderThickness * 0.5F;
+    const auto addRecordingBorder = [&](
+        std::string_view name,
+        UnityEngine::Vector2 position,
+        UnityEngine::Vector2 size) {
+        auto* border = BSML::Lite::CreateImage(parent, whitePixel);
+        ConfigureWorldPanelImage(border, position, size, accentColor);
+        if (IsAlive(border)) {
+            border->get_gameObject()->set_name(name);
+            border->set_raycastTarget(false);
+        }
+        ApplyWorldPanelMaterial(border, recordingWorldPanelBorderMaterial_);
+    };
+    addRecordingBorder(
+        "SaberStage Recording Panel Blue Border",
+        {0.0F, panelSize.y * 0.5F - borderInset},
+        {panelSize.x, recordingBorderThickness});
+    addRecordingBorder(
+        "SaberStage Recording Panel Bottom Border",
+        {0.0F, -panelSize.y * 0.5F + borderInset},
+        {panelSize.x, recordingBorderThickness});
+    addRecordingBorder(
+        "SaberStage Recording Panel Left Border",
+        {-panelSize.x * 0.5F + borderInset, 0.0F},
+        {recordingBorderThickness, panelSize.y});
+    addRecordingBorder(
+        "SaberStage Recording Panel Right Border",
+        {panelSize.x * 0.5F - borderInset, 0.0F},
+        {recordingBorderThickness, panelSize.y});
+    auto* inputShield = BSML::Lite::CreateImage(parent, whitePixel);
     ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(parent, whitePixel),
+        inputShield,
         {0.0F, 0.0F},
-        {panelSize.x - 1.0F, panelSize.y - 1.0F},
+        {panelSize.x - 2.0F, panelSize.y - 2.0F},
         panelColor);
-    // Thin accent line under the header band; matches the calibration panel
-    // and movable preview borders so the SaberStage surfaces read as a family.
+    if (IsAlive(inputShield)) {
+        inputShield->get_gameObject()->set_name("SaberStage Recording Panel Input Shield");
+        inputShield->set_raycastTarget(false);
+    }
+    // Thin accent line below the mode selector; this visually separates the
+    // output target from the status section without adding another collider.
+    auto* recordingDivider = BSML::Lite::CreateImage(parent, whitePixel);
     ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(parent, whitePixel),
-        {0.0F, half - 1.0F - kRecordingPanelHeaderHeight},
+        recordingDivider,
+        {0.0F, half - 1.0F - kRecordingPanelModeRowHeight},
         {panelSize.x - 4.0F, 0.6F},
         accentColor);
+    ApplyWorldPanelMaterial(recordingDivider, recordingWorldPanelBorderMaterial_);
 
-    // Header band: output type on the left half, elapsed time on the right.
-    const float headerY = half - 1.0F - kRecordingPanelHeaderHeight * 0.5F;
+    const float modeY = half - 1.0F - kRecordingPanelModeRowHeight * 0.5F;
+    auto* recordLabel = BSML::Lite::CreateText(
+        parent, "Record", TMPro::FontStyles::Bold, 3.6F);
+    ConfigureWorldPanelText(recordLabel, {-17.0F, modeY}, {18.0F, 5.5F}, 3.6F);
+    auto* streamLabel = BSML::Lite::CreateText(
+        parent, "Stream", TMPro::FontStyles::Bold, 3.6F);
+    ConfigureWorldPanelText(streamLabel, {17.0F, modeY}, {18.0F, 5.5F}, 3.6F);
+    recordingWorldPanelModeToggle_ = BSML::Lite::CreateToggle(
+        parent,
+        "",
+        settings.worldControlsStreamMode,
+        [](bool streamMode) {
+            if (active_) active_->SetRecordingWorldPanelStreamMode(streamMode);
+        });
+    if (recordingWorldPanelModeToggle_) {
+        auto rect = recordingWorldPanelModeToggle_->get_transform().cast<UnityEngine::RectTransform>();
+        rect->set_anchorMin({0.5F, 0.5F});
+        rect->set_anchorMax({0.5F, 0.5F});
+        rect->set_pivot({0.5F, 0.5F});
+        // The stock toggle's visible switch is not centered inside its wider
+        // BSML layout rect. Shift that rect right so the visible gaps—not just
+        // the mathematical rect bounds—are balanced around Record / Stream.
+        rect->set_anchoredPosition({2.5F, modeY});
+        rect->set_sizeDelta({10.0F, 5.5F});
+    }
+
+    // Header band: selected output state on the left, elapsed time on right.
+    const float headerY = half - 1.0F - kRecordingPanelModeRowHeight -
+        kRecordingPanelHeaderHeight * 0.5F;
     recordingWorldPanelTypeText_ = BSML::Lite::CreateText(
-        parent, "LOCAL", TMPro::FontStyles::Bold, 4.5F);
+        parent, settings.worldControlsStreamMode ? "STREAM" : "LOCAL",
+        TMPro::FontStyles::Bold, 4.5F);
     ConfigureWorldPanelText(
         recordingWorldPanelTypeText_, {-11.0F, headerY}, {22.0F, 6.0F}, 4.5F);
     recordingWorldPanelTimeText_ = BSML::Lite::CreateText(
@@ -4088,10 +5253,11 @@ void MenuController::EnsureRecordingWorldPanel() {
     // headset rate on the right, refreshed at 2 Hz by TickRecordingWorldPanel.
     recordingWorldPanelFpsText_ = nullptr;
     if (recordingWorldPanelShowsFps_) {
-        const float fpsY = half - 1.0F - kRecordingPanelHeaderHeight -
+        const float fpsY = half - 1.0F - kRecordingPanelModeRowHeight -
+            kRecordingPanelHeaderHeight -
             kRecordingPanelFpsRowHeight * 0.5F;
         recordingWorldPanelFpsText_ = BSML::Lite::CreateText(
-            parent, "REC --.- FPS   HMD --.- FPS", TMPro::FontStyles::Normal, 3.4F);
+            parent, "REC --.- FPS   HMD AVG --.- FPS", TMPro::FontStyles::Normal, 3.4F);
         ConfigureWorldPanelText(
             recordingWorldPanelFpsText_, {0.0F, fpsY}, {panelSize.x - 4.0F, 5.0F}, 3.4F);
         if (IsAlive(recordingWorldPanelFpsText_)) {
@@ -4099,8 +5265,21 @@ void MenuController::EnsureRecordingWorldPanel() {
         }
     }
 
+    const float dropY = half - 1.0F - kRecordingPanelModeRowHeight -
+        kRecordingPanelHeaderHeight -
+        (recordingWorldPanelShowsFps_ ? kRecordingPanelFpsRowHeight : 0.0F) -
+        kRecordingPanelDropRowHeight * 0.5F;
+    recordingWorldPanelDropText_ = BSML::Lite::CreateText(
+        parent, "Current Frame Loss: 0   Total Frames Lost: 0", TMPro::FontStyles::Normal, 3.2F);
+    ConfigureWorldPanelText(
+        recordingWorldPanelDropText_, {0.0F, dropY}, {panelSize.x - 4.0F, 4.5F}, 3.2F);
+    if (IsAlive(recordingWorldPanelDropText_)) {
+        recordingWorldPanelDropText_->set_color({0.74F, 0.82F, 0.90F, 1.0F});
+    }
+
     // Button band, pinned to the very bottom of the panel with a clear gap
-    // below the grab handle (see HideAndFitWorldPanelHandleAboveButtons).
+    // over the background movement handle (see
+    // HideAndFitWorldPanelHandleBehindContent).
     // Stock button prefabs carry ContentSizeFitters and their own anchors, so
     // every rect is forced explicitly after creation; otherwise the visual
     // button grows past the requested size and its top half lands under the
@@ -4118,43 +5297,139 @@ void MenuController::EnsureRecordingWorldPanel() {
         rect->set_sizeDelta(size);
     };
     const float buttonsY = -half + 4.5F;
+    const float streamControlY = -half + 12.2F;
+    recordingWorldPanelStopButton_ = BSML::Lite::CreateUIButton(
+        parent,
+        "STOP",
+        "PlayButton",
+        {-19.0F, buttonsY},
+        {16.0F, 7.0F},
+        [] {
+            if (active_) active_->RecordingWorldPanelStopAction();
+        });
+    recordingWorldPanelPauseButton_ = BSML::Lite::CreateUIButton(
+        parent,
+        "PAUSE",
+        "PlayButton",
+        {0.0F, buttonsY},
+        {16.0F, 7.0F},
+        [] {
+            if (active_) active_->RecordingWorldPanelPauseAction();
+        });
     recordingWorldPanelPrimaryButton_ = BSML::Lite::CreateUIButton(
         parent,
-        "●",
+        "START",
         "PlayButton",
-        {-8.5F, buttonsY},
-        {14.0F, 7.0F},
+        {19.0F, buttonsY},
+        {16.0F, 7.0F},
         [] {
             if (active_) active_->RecordingWorldPanelPrimaryAction();
         });
-    recordingWorldPanelStopButton_ = BSML::Lite::CreateUIButton(
+    recordingWorldPanelStreamControlButton_ = BSML::Lite::CreateUIButton(
         parent,
-        "■",
+        "Stream Control",
         "PlayButton",
-        {8.5F, buttonsY},
-        {14.0F, 7.0F},
+        {-7.0F, streamControlY},
+        {38.0F, 6.0F},
         [] {
-            if (!active_) return;
-            active_->root_.Recording().Stop("Stopped from movable recording controls.");
-            active_->RefreshRecordingStatus();
+            // Reserved for the provider-specific popout added in the next
+            // streaming-control phase. It remains visibly disabled for now.
+        });
+    recordingWorldPanelMicrophoneButton_ = BSML::Lite::CreateUIButton(
+        parent,
+        "",
+        "PlayButton",
+        {20.0F, streamControlY},
+        {10.0F, 6.0F},
+        [] {
+            if (active_) active_->RecordingWorldPanelMicrophoneAction();
         });
     // No hover hints on world panels: the hint system is menu-scoped and
     // renders an empty white box out here instead of tooltip text.
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
         recordingWorldPanelPrimaryButton_->get_gameObject()->set_name(
-            "SaberStage Movable Record Pause Resume");
-        BSML::Lite::SetButtonTextSize(recordingWorldPanelPrimaryButton_, 5.0F);
-        pinWorldPanelButton(recordingWorldPanelPrimaryButton_, {-8.5F, buttonsY}, {14.0F, 7.0F});
+            "SaberStage Movable Start Resume");
+        BSML::Lite::SetButtonTextSize(recordingWorldPanelPrimaryButton_, 3.2F);
+        pinWorldPanelButton(recordingWorldPanelPrimaryButton_, {19.0F, buttonsY}, {16.0F, 7.0F});
     }
     if (IsAlive(recordingWorldPanelStopButton_)) {
         recordingWorldPanelStopButton_->get_gameObject()->set_name(
-            "SaberStage Movable Stop Recording");
-        BSML::Lite::SetButtonTextSize(recordingWorldPanelStopButton_, 5.0F);
-        pinWorldPanelButton(recordingWorldPanelStopButton_, {8.5F, buttonsY}, {14.0F, 7.0F});
+            "SaberStage Movable Stop");
+        BSML::Lite::SetButtonTextSize(recordingWorldPanelStopButton_, 3.2F);
+        pinWorldPanelButton(recordingWorldPanelStopButton_, {-19.0F, buttonsY}, {16.0F, 7.0F});
+    }
+    if (IsAlive(recordingWorldPanelPauseButton_)) {
+        recordingWorldPanelPauseButton_->get_gameObject()->set_name(
+            "SaberStage Movable Pause");
+        BSML::Lite::SetButtonTextSize(recordingWorldPanelPauseButton_, 3.2F);
+        pinWorldPanelButton(recordingWorldPanelPauseButton_, {0.0F, buttonsY}, {16.0F, 7.0F});
+    }
+    if (IsAlive(recordingWorldPanelStreamControlButton_)) {
+        recordingWorldPanelStreamControlButton_->get_gameObject()->set_name(
+            "SaberStage Movable Stream Control Placeholder");
+        BSML::Lite::SetButtonTextSize(recordingWorldPanelStreamControlButton_, 2.8F);
+        pinWorldPanelButton(
+            recordingWorldPanelStreamControlButton_, {-7.0F, streamControlY}, {38.0F, 6.0F});
+        recordingWorldPanelStreamControlButton_->set_interactable(false);
+    }
+    if (IsAlive(recordingWorldPanelMicrophoneButton_)) {
+        recordingWorldPanelMicrophoneButton_->get_gameObject()->set_name(
+            "SaberStage Movable Livestream Microphone Mute");
+        pinWorldPanelButton(
+            recordingWorldPanelMicrophoneButton_, {20.0F, streamControlY}, {10.0F, 6.0F});
+
+        // Draw the microphone from the same zero-bloom UI primitives as the
+        // panel rather than relying on an optional icon font. The five white
+        // pieces form the microphone/stem, one red diagonal is the ordinary
+        // mute mark, and the second diagonal turns it into an X when the
+        // microphone source is disabled or its gain is 0%.
+        const auto addMicrophonePart = [&](std::size_t index,
+                                           std::string_view name,
+                                           UnityEngine::Vector2 position,
+                                           UnityEngine::Vector2 size) {
+            auto* image = BSML::Lite::CreateImage(
+                recordingWorldPanelMicrophoneButton_->get_transform(), whitePixel);
+            ConfigureWorldPanelImage(
+                image, position, size, UnityEngine::Color{0.92F, 0.96F, 1.0F, 1.0F});
+            ApplyWorldPanelMaterial(image, recordingWorldPanelBorderMaterial_);
+            if (IsAlive(image)) {
+                image->get_gameObject()->set_name(name);
+                image->set_raycastTarget(false);
+            }
+            recordingWorldPanelMicrophoneGlyph_[index] = image;
+        };
+        addMicrophonePart(0, "Microphone Capsule", {0.0F, 0.65F}, {1.8F, 2.8F});
+        addMicrophonePart(1, "Microphone Stem", {0.0F, -1.05F}, {0.45F, 1.25F});
+        addMicrophonePart(2, "Microphone Base", {0.0F, -1.70F}, {2.5F, 0.45F});
+        addMicrophonePart(3, "Microphone Left Cradle", {-1.25F, -0.35F}, {0.35F, 1.65F});
+        addMicrophonePart(4, "Microphone Right Cradle", {1.25F, -0.35F}, {0.35F, 1.65F});
+
+        const auto addMicrophoneSlash = [&](std::string_view name, float rotation) {
+            auto* image = BSML::Lite::CreateImage(
+                recordingWorldPanelMicrophoneButton_->get_transform(), whitePixel);
+            ConfigureWorldPanelImage(
+                image, {0.0F, 0.0F}, {0.55F, 5.1F},
+                UnityEngine::Color{1.0F, 0.18F, 0.15F, 1.0F});
+            ApplyWorldPanelMaterial(image, recordingWorldPanelBorderMaterial_);
+            if (IsAlive(image)) {
+                image->get_gameObject()->set_name(name);
+                image->set_raycastTarget(false);
+                image->get_rectTransform()->set_localEulerAngles({0.0F, 0.0F, rotation});
+            }
+            return image;
+        };
+        recordingWorldPanelMicrophoneMuteSlash_ =
+            addMicrophoneSlash("Microphone Muted Slash", -38.0F);
+        recordingWorldPanelMicrophoneUnavailableSlash_ =
+            addMicrophoneSlash("Microphone Unavailable X", 38.0F);
     }
     if (!IsAlive(recordingWorldPanelTypeText_) || !IsAlive(recordingWorldPanelTimeText_) ||
             !IsAlive(recordingWorldPanelPrimaryButton_) ||
-            !IsAlive(recordingWorldPanelStopButton_)) {
+            !IsAlive(recordingWorldPanelPauseButton_) ||
+            !IsAlive(recordingWorldPanelStopButton_) ||
+            !IsAlive(recordingWorldPanelMicrophoneButton_) ||
+            !IsAlive(recordingWorldPanelDropText_) ||
+            !recordingWorldPanelModeToggle_) {
         Logging::Logger.error("Movable recording controls were incomplete");
         DestroyRecordingWorldPanel();
         return;
@@ -4166,6 +5441,8 @@ void MenuController::EnsureRecordingWorldPanel() {
     recordingWorldPanelStableSeconds_ = 0.0F;
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDisplayedState_ = -1;
+    recordingWorldPanelDropSamples_.clear();
+    recordingWorldPanelSessionStartDrops_ = root_.Recording().Snapshot().droppedFrameCount;
     RefreshRecordingWorldPanel();
     Logging::Logger.info("Created movable HMD-only recording controls");
 }
@@ -4180,67 +5457,201 @@ void MenuController::DestroyRecordingWorldPanel() noexcept {
     recordingWorldPanelTypeText_ = nullptr;
     recordingWorldPanelTimeText_ = nullptr;
     recordingWorldPanelFpsText_ = nullptr;
+    recordingWorldPanelDropText_ = nullptr;
+    recordingWorldPanelModeToggle_ = nullptr;
     recordingWorldPanelPrimaryButton_ = nullptr;
+    recordingWorldPanelPauseButton_ = nullptr;
     recordingWorldPanelStopButton_ = nullptr;
+    recordingWorldPanelStreamControlButton_ = nullptr;
+    recordingWorldPanelMicrophoneButton_ = nullptr;
+    recordingWorldPanelMicrophoneGlyph_.fill(nullptr);
+    recordingWorldPanelMicrophoneMuteSlash_ = nullptr;
+    recordingWorldPanelMicrophoneUnavailableSlash_ = nullptr;
+    if (IsAlive(recordingWorldPanelBorderMaterial_)) {
+        UnityEngine::Object::Destroy(recordingWorldPanelBorderMaterial_);
+    }
+    recordingWorldPanelBorderMaterial_ = nullptr;
     recordingWorldPanelPoseDirty_ = false;
     recordingWorldPanelStableSeconds_ = 0.0F;
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDisplayedState_ = -1;
     recordingWorldPanelFpsWindowSeconds_ = 0.0F;
     recordingWorldPanelFpsWindowStartFrames_ = 0;
-    recordingWorldPanelHmdFrameSeconds_ = 0.0F;
+    recordingWorldPanelHmdTotalFrameSeconds_ = 0.0;
+    recordingWorldPanelHmdSampledFrames_ = 0;
+    recordingWorldPanelHmdSessionActive_ = false;
+    recordingWorldPanelDropSamples_.clear();
+    recordingWorldPanelSessionStartDrops_ = 0;
+    recordingWorldPanelLastFrames_ = 0;
 }
 
 void MenuController::RefreshRecordingWorldPanel() {
     if (!IsAlive(recordingWorldPanelScreen_)) return;
     const auto snapshot = root_.Recording().Snapshot();
-    const auto elapsedSecond = recording::HasRecordingTimeline(snapshot.state)
-        ? std::max(0, static_cast<int>(snapshot.elapsedSeconds))
-        : 0;
+    const auto livestream = root_.Recording().LivestreamSnapshot();
+    const auto streamMode = root_.Settings().Get().recording.worldControlsStreamMode;
+    const auto elapsed = streamMode ? livestream.elapsedSeconds : snapshot.elapsedSeconds;
+    const auto elapsedSecond = std::max(0, static_cast<int>(elapsed));
     recordingWorldPanelDisplayedSecond_ = elapsedSecond;
-    recordingWorldPanelDisplayedState_ = static_cast<int>(snapshot.state);
+    recordingWorldPanelDisplayedState_ = streamMode
+        ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
+            (livestream.microphoneAvailable ? 40 : 0) +
+            (livestream.microphoneMuted ? 80 : 0)
+        : static_cast<int>(snapshot.state);
     if (IsAlive(recordingWorldPanelTypeText_)) {
-        recordingWorldPanelTypeText_->set_text(
-            recording::RecordingOutputTypeName(snapshot.outputType));
+        recordingWorldPanelTypeText_->set_text(streamMode
+            ? (livestream.afk ? "AFK" : "STREAM")
+            : std::string(recording::RecordingOutputTypeName(snapshot.outputType)));
         // Color communicates state at a glance: red while the encoder is
         // rolling, amber while paused, neutral gray otherwise.
-        if (snapshot.state == recording::RecordingState::Recording ||
+        if (streamMode && broadcast::CanStop(livestream.state) && !livestream.afk) {
+            recordingWorldPanelTypeText_->set_color({0.75F, 0.25F, 1.0F, 1.0F});
+        } else if (streamMode && livestream.afk) {
+            recordingWorldPanelTypeText_->set_color({1.0F, 0.72F, 0.20F, 1.0F});
+        } else if (!streamMode && (snapshot.state == recording::RecordingState::Recording ||
                 snapshot.state == recording::RecordingState::Starting ||
-                snapshot.state == recording::RecordingState::Resuming) {
+                snapshot.state == recording::RecordingState::Resuming)) {
             recordingWorldPanelTypeText_->set_color({1.0F, 0.32F, 0.30F, 1.0F});
-        } else if (snapshot.state == recording::RecordingState::Paused ||
-                snapshot.state == recording::RecordingState::Pausing) {
+        } else if (!streamMode && (snapshot.state == recording::RecordingState::Paused ||
+                snapshot.state == recording::RecordingState::Pausing)) {
             recordingWorldPanelTypeText_->set_color({1.0F, 0.72F, 0.20F, 1.0F});
         } else {
             recordingWorldPanelTypeText_->set_color({0.72F, 0.82F, 0.92F, 1.0F});
         }
     }
     if (IsAlive(recordingWorldPanelTimeText_)) {
-        recordingWorldPanelTimeText_->set_text(RecordingElapsed(snapshot.elapsedSeconds));
+        recordingWorldPanelTimeText_->set_text(RecordingElapsed(elapsed));
+    }
+    if (IsAlive(recordingWorldPanelStreamControlButton_)) {
+        BSML::Lite::SetButtonText(
+            recordingWorldPanelStreamControlButton_,
+            streamMode ? "Stream Control" : "Recording Control");
+    }
+    if (IsAlive(recordingWorldPanelMicrophoneButton_)) {
+        recordingWorldPanelMicrophoneButton_->get_gameObject()->SetActive(streamMode);
+        recordingWorldPanelMicrophoneButton_->set_interactable(
+            streamMode && broadcast::CanStop(livestream.state) &&
+            !livestream.afk && livestream.microphoneAvailable);
+        const auto microphoneColor = livestream.microphoneAvailable
+            ? UnityEngine::Color{0.92F, 0.96F, 1.0F, 1.0F}
+            : UnityEngine::Color{0.52F, 0.57F, 0.64F, 1.0F};
+        for (auto* image : recordingWorldPanelMicrophoneGlyph_) {
+            if (IsAlive(image)) image->set_color(microphoneColor);
+        }
+        if (IsAlive(recordingWorldPanelMicrophoneMuteSlash_)) {
+            recordingWorldPanelMicrophoneMuteSlash_->get_gameObject()->SetActive(
+                livestream.microphoneMuted);
+        }
+        if (IsAlive(recordingWorldPanelMicrophoneUnavailableSlash_)) {
+            recordingWorldPanelMicrophoneUnavailableSlash_->get_gameObject()->SetActive(
+                !livestream.microphoneAvailable);
+        }
     }
     if (IsAlive(recordingWorldPanelPrimaryButton_)) {
-        // The panel is deliberately just start/stop — no pause: the record
-        // glyph starts a recording and is disabled while one is rolling.
-        // Pause/resume remain available in the mod's Record tab.
-        BSML::Lite::SetButtonText(recordingWorldPanelPrimaryButton_, "●");
-        recordingWorldPanelPrimaryButton_->set_interactable(snapshot.CanStart());
+        BSML::Lite::SetButtonText(recordingWorldPanelPrimaryButton_,
+            streamMode && livestream.afk ? "RESUME" :
+            !streamMode && snapshot.CanResume() ? "RESUME" : "START");
+        recordingWorldPanelPrimaryButton_->set_interactable(streamMode
+            ? (livestream.afk ||
+               (broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured))
+            : (snapshot.CanStart() || snapshot.CanResume()));
+    }
+    if (IsAlive(recordingWorldPanelPauseButton_)) {
+        recordingWorldPanelPauseButton_->set_interactable(streamMode
+            ? (broadcast::CanStop(livestream.state) && !livestream.afk)
+            : snapshot.CanPause());
     }
     if (IsAlive(recordingWorldPanelStopButton_)) {
-        recordingWorldPanelStopButton_->set_interactable(snapshot.CanStop());
+        recordingWorldPanelStopButton_->set_interactable(streamMode
+            ? broadcast::CanStop(livestream.state)
+            : snapshot.CanStop());
     }
 }
 
 void MenuController::RecordingWorldPanelPrimaryAction() {
-    // Start only — the floating panel is a simple start/stop surface. The
-    // stop button next to it ends the recording (and any live stream sharing
-    // the encoder); pause/resume live in the mod's Record tab.
+    const auto streamMode = root_.Settings().Get().recording.worldControlsStreamMode;
+    if (streamMode) {
+        std::string error;
+        const auto livestream = root_.Recording().LivestreamSnapshot();
+        if (livestream.afk) {
+            if (!root_.Recording().ResumeLivestream(&error)) {
+                ShowLivestreamActionError(error);
+            }
+        } else if (broadcast::CanStart(livestream.state)) {
+            TryStartLivestreamWithTitle();
+        }
+        RefreshRecordingStatus();
+        return;
+    }
     const auto snapshot = root_.Recording().Snapshot();
-    if (!snapshot.CanStart()) return;
     std::string error;
-    if (!root_.Recording().Start(&error) && !error.empty()) {
+    const auto succeeded = snapshot.CanResume()
+        ? root_.Recording().Resume(&error)
+        : snapshot.CanStart() && root_.Recording().Start(&error);
+    if (!succeeded && !error.empty()) {
         Logging::Logger.error("Movable recording control failed: {}", error);
     }
     RefreshRecordingStatus();
+}
+
+void MenuController::RecordingWorldPanelPauseAction() {
+    std::string error;
+    const auto streamMode = root_.Settings().Get().recording.worldControlsStreamMode;
+    const auto succeeded = streamMode
+        ? root_.Recording().PauseLivestream(&error)
+        : root_.Recording().Pause(&error);
+    if (!succeeded && !error.empty()) {
+        Logging::Logger.error("Movable pause control failed: {}", error);
+        if (streamMode) ShowLivestreamActionError(error);
+    }
+    RefreshRecordingStatus();
+}
+
+void MenuController::RecordingWorldPanelStopAction() {
+    if (root_.Settings().Get().recording.worldControlsStreamMode) {
+        root_.Recording().StopLivestream();
+    } else {
+        root_.Recording().Stop("Stopped from movable recording controls.");
+    }
+    RefreshRecordingStatus();
+}
+
+void MenuController::RecordingWorldPanelMicrophoneAction() {
+    const auto livestream = root_.Recording().LivestreamSnapshot();
+    if (!root_.Settings().Get().recording.worldControlsStreamMode ||
+            !broadcast::CanStop(livestream.state) || livestream.afk ||
+            !livestream.microphoneAvailable) {
+        RefreshRecordingWorldPanel();
+        return;
+    }
+
+    std::string error;
+    if (!root_.Recording().SetLivestreamMicrophoneMuted(
+            !livestream.microphoneMuted, &error)) {
+        Logging::Logger.error("Movable microphone control failed: {}", error);
+        if (!error.empty()) ShowLivestreamActionError(error, true);
+    }
+    RefreshRecordingStatus();
+}
+
+void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode) {
+    auto& settings = root_.Settings().Edit().recording;
+    settings.worldControlsStreamMode = streamMode;
+    root_.Settings().Save(nullptr);
+    recordingWorldPanelDisplayedState_ = -1;
+    recordingWorldPanelDisplayedSecond_ = -1;
+    recordingWorldPanelDropSamples_.clear();
+    recordingWorldPanelSessionStartDrops_ = root_.Recording().Snapshot().droppedFrameCount;
+    RefreshRecordingWorldPanel();
+}
+
+void MenuController::ResetRecordingWorldPanelPose() {
+    auto& settings = root_.Settings().Edit().recording;
+    settings.worldControlsPosition = kDefaultRecordingPanelPosition;
+    settings.worldControlsRotationDegrees = {};
+    root_.Settings().Save(nullptr);
+    DestroyRecordingWorldPanel();
+    if (settings.worldControlsVisible) EnsureRecordingWorldPanel();
 }
 
 void MenuController::UpdateRecordingWorldPanelPersistence() {
@@ -4291,22 +5702,72 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         UpdateWorldPanelHandleRotation(recordingWorldPanelScreen_);
         UpdateRecordingWorldPanelPersistence();
         const auto snapshot = root_.Recording().Snapshot();
-        const auto elapsedSecond = recording::HasRecordingTimeline(snapshot.state)
-            ? std::max(0, static_cast<int>(snapshot.elapsedSeconds))
-            : 0;
+        const auto livestream = root_.Recording().LivestreamSnapshot();
+        const auto streamMode = recordingSettings.worldControlsStreamMode;
+        const auto selectedElapsed = streamMode
+            ? livestream.elapsedSeconds : snapshot.elapsedSeconds;
+        const auto elapsedSecond = std::max(0, static_cast<int>(selectedElapsed));
+        const auto selectedState = streamMode
+            ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
+                (livestream.microphoneAvailable ? 40 : 0) +
+                (livestream.microphoneMuted ? 80 : 0)
+            : static_cast<int>(snapshot.state);
         if (recordingWorldPanelDisplayedSecond_ != elapsedSecond ||
-                recordingWorldPanelDisplayedState_ != static_cast<int>(snapshot.state)) {
+                recordingWorldPanelDisplayedState_ != selectedState) {
             RefreshRecordingWorldPanel();
+        }
+
+        // Both local and live Direct FFmpeg sessions feed this capture-level
+        // count. Sampling it against the active timeline produces the recent
+        // five-second delta requested by the movable controls without resetting
+        // or mutating the encoder's lifetime diagnostics.
+        const auto dropped = snapshot.droppedFrameCount;
+        if (selectedElapsed <= 0.0 ||
+                (!recording::HasRecordingTimeline(snapshot.state) &&
+                 !broadcast::CanStop(livestream.state))) {
+            recordingWorldPanelDropSamples_.clear();
+            recordingWorldPanelSessionStartDrops_ = dropped;
+        }
+        recordingWorldPanelDropSamples_.push_back({selectedElapsed, dropped});
+        while (recordingWorldPanelDropSamples_.size() > 1 &&
+                recordingWorldPanelDropSamples_.front().first < selectedElapsed - 5.0) {
+            recordingWorldPanelDropSamples_.pop_front();
+        }
+        const auto recentDrops = dropped >= recordingWorldPanelDropSamples_.front().second
+            ? dropped - recordingWorldPanelDropSamples_.front().second : 0;
+        const auto totalDrops = dropped >= recordingWorldPanelSessionStartDrops_
+            ? dropped - recordingWorldPanelSessionStartDrops_ : dropped;
+        if (IsAlive(recordingWorldPanelDropText_)) {
+            recordingWorldPanelDropText_->set_text(
+                "Current Frame Loss: " + std::to_string(recentDrops) +
+                "   Total Frames Lost: " + std::to_string(totalDrops));
+            recordingWorldPanelDropText_->set_color(recentDrops > 0
+                ? UnityEngine::Color{1.0F, 0.55F, 0.25F, 1.0F}
+                : UnityEngine::Color{0.74F, 0.82F, 0.90F, 1.0F});
         }
         if (IsAlive(recordingWorldPanelFpsText_)) {
             const auto delta = std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
-            // Headset FPS: exponential moving average of the frame interval so
-            // the number is readable rather than flickering every frame.
-            if (delta > 0.0F) {
-                recordingWorldPanelHmdFrameSeconds_ =
-                    recordingWorldPanelHmdFrameSeconds_ <= 0.0F
-                        ? delta
-                        : recordingWorldPanelHmdFrameSeconds_ * 0.9F + delta * 0.1F;
+            const bool outputActive =
+                recording::HasRecordingTimeline(snapshot.state) ||
+                broadcast::CanStop(livestream.state);
+            if (!outputActive) {
+                recordingWorldPanelHmdTotalFrameSeconds_ = 0.0;
+                recordingWorldPanelHmdSampledFrames_ = 0;
+                recordingWorldPanelHmdSessionActive_ = false;
+            } else {
+                if (!recordingWorldPanelHmdSessionActive_) {
+                    recordingWorldPanelHmdTotalFrameSeconds_ = 0.0;
+                    recordingWorldPanelHmdSampledFrames_ = 0;
+                    recordingWorldPanelHmdSessionActive_ = true;
+                }
+                // Match Big Screen's average-FPS definition: accepted frame
+                // count divided by total accepted frame time. Ignore only the
+                // long gaps produced by headset sleep/system menus, which are
+                // not active gameplay/recording performance samples.
+                if (delta > 0.0001F && delta <= 0.10F) {
+                    recordingWorldPanelHmdTotalFrameSeconds_ += delta;
+                    ++recordingWorldPanelHmdSampledFrames_;
+                }
             }
             recordingWorldPanelFpsWindowSeconds_ += delta;
             // Capture FPS: encoded packets over a half-second window. Both
@@ -4318,15 +5779,16 @@ void MenuController::TickRecordingWorldPanel() noexcept {
                         : 0;
                 const auto captureFps = static_cast<float>(framesInWindow) /
                     recordingWorldPanelFpsWindowSeconds_;
-                const auto hmdFps = recordingWorldPanelHmdFrameSeconds_ > 0.0F
-                    ? 1.0F / recordingWorldPanelHmdFrameSeconds_
+                const auto hmdFps = recordingWorldPanelHmdTotalFrameSeconds_ > 0.0
+                    ? static_cast<double>(recordingWorldPanelHmdSampledFrames_) /
+                        recordingWorldPanelHmdTotalFrameSeconds_
                     : 0.0F;
                 std::ostringstream text;
                 text << std::fixed << std::setprecision(1);
-                if (recording::HasRecordingTimeline(snapshot.state)) {
-                    text << "REC " << captureFps << " FPS   HMD " << hmdFps << " FPS";
+                if (outputActive) {
+                    text << "REC " << captureFps << " FPS   HMD AVG " << hmdFps << " FPS";
                 } else {
-                    text << "REC --.- FPS   HMD " << hmdFps << " FPS";
+                    text << "REC --.- FPS   HMD AVG --.- FPS";
                 }
                 recordingWorldPanelFpsText_->set_text(text.str());
                 recordingWorldPanelFpsWindowSeconds_ = 0.0F;
@@ -4347,6 +5809,771 @@ void MenuController::TickRecordingWorldPanel() noexcept {
             recordingWorldPanelTickFailureLogged_ = true;
             Logging::Logger.error(
                 "Movable recording-controls update failed with a non-standard exception");
+        }
+    }
+}
+
+void MenuController::SetChatWorldPanelVisible(bool visible) {
+    auto& settings = root_.Settings().Edit().chat;
+    if (!visible && IsAlive(chatWorldPanelScreen_)) {
+        const auto pose = ReadWorldPose(chatWorldPanelScreen_->get_transform().ptr());
+        settings.position = pose.position;
+        const auto euler = ToUnity(pose.rotation).get_eulerAngles();
+        settings.rotationDegrees = {
+            camera::NormalizeDegrees(euler.x),
+            camera::NormalizeDegrees(euler.y),
+            camera::NormalizeDegrees(euler.z)};
+    }
+    settings.enabled = visible;
+    root_.Settings().Save(nullptr);
+    root_.Twitch().SetChatEnabled(visible);
+    if (visible) EnsureChatWorldPanel();
+    else DestroyChatWorldPanel();
+}
+
+void MenuController::EnsureChatWorldPanel() {
+    if (IsAlive(chatWorldPanelScreen_) || !root_.Settings().Get().chat.enabled ||
+            !FloatingUiServicesReady()) return;
+    const auto& settings = root_.Settings().Get().chat;
+    const UnityEngine::Vector2 panelSize{settings.width, settings.height};
+    chatWorldPanelScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
+        panelSize, true, ToUnity(settings.position),
+        UnityEngine::Quaternion::Euler(ToUnity(settings.rotationDegrees)),
+        0.0F, false);
+    if (!IsAlive(chatWorldPanelScreen_)) {
+        if (!chatWorldPanelCreationFailureLogged_) {
+            chatWorldPanelCreationFailureLogged_ = true;
+            Logging::Logger.error("Could not create the movable Twitch chat panel");
+        }
+        chatWorldPanelScreen_ = nullptr;
+        return;
+    }
+    chatWorldPanelCreationFailureLogged_ = false;
+    auto* screenObject = chatWorldPanelScreen_->get_gameObject().ptr();
+    if (!IsAlive(screenObject)) {
+        chatWorldPanelScreen_ = nullptr;
+        return;
+    }
+    screenObject->set_name("SaberStage Movable Twitch Chat");
+    screenObject->set_layer(5);
+    UnityEngine::Object::DontDestroyOnLoad(screenObject);
+    chatWorldPanelScreen_->set_HandleSide(BSML::Side::Top);
+    chatWorldPanelScreen_->set_HighlightHandle(false);
+    chatWorldPanelScreen_->get_transform()->set_localScale({
+        kChatPanelScale, kChatPanelScale, kChatPanelScale});
+    HideAndFitWorldPanelHandleBehindContent(chatWorldPanelScreen_, panelSize);
+    auto* parent = chatWorldPanelScreen_->get_transform().ptr();
+    const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
+    if (!whitePixel) {
+        DestroyChatWorldPanel();
+        return;
+    }
+    chatWorldPanelBackground_ = BSML::Lite::CreateImage(parent, whitePixel);
+    ConfigureWorldPanelImage(
+        chatWorldPanelBackground_, {0.0F, 0.0F},
+        {panelSize.x - 1.0F, panelSize.y - 1.0F},
+        {0.0F, 0.0F, 0.0F, 1.0F});
+    const UnityEngine::Color panelAccent{0.0F, 0.55F, 1.0F, 1.0F};
+    chatWorldPanelBorderMaterial_ =
+        CreateNonBloomWorldPanelMaterial("SaberStage Chat Panel Non-Bloom Accent");
+    for (auto*& border : chatWorldPanelBorders_) {
+        border = BSML::Lite::CreateImage(parent, whitePixel);
+        ConfigureWorldPanelImage(
+            border, {}, {1.0F, 1.0F}, panelAccent);
+        ApplyWorldPanelMaterial(border, chatWorldPanelBorderMaterial_);
+    }
+    chatWorldPanelHeaderDivider_ = BSML::Lite::CreateImage(parent, whitePixel);
+    ConfigureWorldPanelImage(
+        chatWorldPanelHeaderDivider_, {}, {1.0F, 0.6F},
+        panelAccent);
+    ApplyWorldPanelMaterial(chatWorldPanelHeaderDivider_, chatWorldPanelBorderMaterial_);
+
+    chatWorldPanelResizeButton_ = BSML::Lite::CreateUIButton(
+        parent, "Resize Panel", "PlayButton", {0.0F, 0.0F}, {18.0F, 7.0F}, [] {
+            if (active_) active_->ToggleChatWorldPanelResize();
+        });
+    chatWorldPanelControlButton_ = BSML::Lite::CreateUIButton(
+        parent, "Chat Control", "PlayButton", {0.0F, 0.0F}, {18.0F, 7.0F}, [] {});
+    if (IsAlive(chatWorldPanelResizeButton_)) {
+        BSML::Lite::SetButtonTextSize(chatWorldPanelResizeButton_, 2.6F);
+    }
+    if (IsAlive(chatWorldPanelControlButton_)) {
+        BSML::Lite::SetButtonTextSize(chatWorldPanelControlButton_, 2.6F);
+        // Reserved for the provider-control popup. Keeping this visibly
+        // disabled is safer than presenting a button that silently does
+        // nothing while that popup is still being designed. Match the
+        // disabled tint to PlayButton's normal tint so both header buttons
+        // retain the requested blue appearance without making this future
+        // action interactive before it has an implementation.
+        auto colors = chatWorldPanelControlButton_->get_colors();
+        colors.set_disabledColor(colors.get_normalColor());
+        chatWorldPanelControlButton_->set_colors(colors);
+        chatWorldPanelControlButton_->set_interactable(false);
+    }
+    chatWorldPanelViewerText_ = BSML::Lite::CreateText(
+        parent, "♟ --", TMPro::FontStyles::Bold, 3.4F);
+    if (IsAlive(chatWorldPanelViewerText_)) {
+        chatWorldPanelViewerText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+        chatWorldPanelViewerText_->set_enableWordWrapping(false);
+        chatWorldPanelViewerText_->set_raycastTarget(false);
+    }
+
+    auto* scrollContent = BSML::Lite::CreateScrollView(parent);
+    if (IsAlive(scrollContent)) {
+        chatWorldPanelScrollView_ =
+            scrollContent->GetComponentInParent<BSML::ScrollView*>();
+        // CreateScrollView normally lays out one ever-growing child. Chat uses
+        // the same native scrolling controls, but owns the content geometry so
+        // a fixed pool of visible rows can be recycled. Leaving either of these
+        // layout components active makes a short TMP line shrink to its
+        // preferred width, center itself, and then expand horizontally instead
+        // of wrapping at the viewport edge.
+        if (auto* layout = scrollContent->GetComponent<
+                UnityEngine::UI::VerticalLayoutGroup*>()) {
+            layout->set_enabled(false);
+        }
+        if (auto* fitter = scrollContent->GetComponent<
+                UnityEngine::UI::ContentSizeFitter*>()) {
+            fitter->set_enabled(false);
+        }
+        if (IsAlive(chatWorldPanelScrollView_)) {
+            // A BSML scroll view contains several passive Graphics in addition
+            // to its viewport mask. Disabling only the viewport still leaves
+            // one of those full-body graphics in front of FloatingScreen's
+            // movement collider, which is why the header could be grabbed but
+            // the visible chat body could not. Make every passive scroll-view
+            // graphic transparent to pointer raycasts, while retaining the
+            // Graphics underneath real Buttons so the page-scroll controls
+            // remain clickable. Chat text itself is also non-raycasting below,
+            // so every otherwise empty part of the panel reaches the same
+            // full-surface grab handle used by the recording control panel.
+            for (auto* graphic : chatWorldPanelScrollView_->get_gameObject()
+                    ->GetComponentsInChildren<UnityEngine::UI::Graphic*>(true)) {
+                if (!IsAlive(graphic)) continue;
+                auto* button = graphic->GetComponentInParent<
+                    UnityEngine::UI::Button*>();
+                if (!IsAlive(button)) graphic->set_raycastTarget(false);
+            }
+        }
+        chatWorldPanelRows_.clear();
+        chatWorldPanelRows_.reserve(kChatVirtualRowPoolSize);
+        chatWorldPanelRowEntryIndices_.assign(
+            kChatVirtualRowPoolSize, std::numeric_limits<std::size_t>::max());
+        chatWorldPanelRowGenerations_.assign(kChatVirtualRowPoolSize, 0);
+        for (std::size_t index = 0; index < kChatVirtualRowPoolSize; ++index) {
+            auto* row = BSML::Lite::CreateText(
+                scrollContent->get_transform(), "",
+                TMPro::FontStyles::Normal, 3.3F);
+            if (!IsAlive(row)) continue;
+            row->get_gameObject()->set_name(
+                "SaberStage Virtual Twitch Chat Row " + std::to_string(index));
+            row->set_enableWordWrapping(true);
+            row->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+            // Set both the legacy combined alignment and TMP's split alignment
+            // properties. Some Beat Saber TMP prefabs retain split values from
+            // their template after set_alignment(), so all three are explicit.
+            row->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+            row->set_horizontalAlignment(TMPro::HorizontalAlignmentOptions::Left);
+            row->set_verticalAlignment(TMPro::VerticalAlignmentOptions::Top);
+            row->set_richText(true);
+            row->set_raycastTarget(false);
+            row->set_color({0.92F, 0.95F, 1.0F, 1.0F});
+            row->get_gameObject()->set_active(false);
+            chatWorldPanelRows_.push_back(row);
+        }
+        chatWorldPanelText_ = chatWorldPanelRows_.empty()
+            ? nullptr : chatWorldPanelRows_.front();
+    }
+
+    // Keep the visible resize grip on this panel's canvas and use the second
+    // FloatingScreen only as its drag collider. A full-size opaque chat
+    // background can sort over artwork from a different canvas even when the
+    // collider sits slightly nearer in world space; that made the orange grip
+    // disappear after the black background was added. These non-raycasting
+    // strokes are created after the backdrop/content and therefore remain
+    // visible without intercepting the controller pointer.
+    struct ResizeGripStroke { UnityEngine::Vector2 offset; float length; };
+    constexpr ResizeGripStroke resizeGripStrokes[] = {
+        {{2.4F, -2.4F}, 3.0F}, {{0.8F, -0.8F}, 5.2F}, {{-0.8F, 0.8F}, 7.4F}};
+    for (std::size_t index = 0; index < chatWorldPanelResizeGripStrokes_.size(); ++index) {
+        auto* line = BSML::Lite::CreateImage(parent, whitePixel);
+        chatWorldPanelResizeGripStrokes_[index] = line;
+        if (!IsAlive(line)) continue;
+        line->get_gameObject()->set_name(
+            "SaberStage Twitch Chat Visible Resize Grip " + std::to_string(index + 1));
+        ConfigureWorldPanelImage(
+            line, {}, {resizeGripStrokes[index].length, 0.75F},
+            {1.0F, 0.68F, 0.18F, 1.0F});
+        line->set_raycastTarget(false);
+        line->get_rectTransform()->set_localEulerAngles({0.0F, 0.0F, 45.0F});
+        line->get_gameObject()->set_active(false);
+    }
+    UpdateChatWorldPanelLayout();
+    root_.Preview().RegisterCaptureExcludedRoot(screenObject);
+    root_.Twitch().SetChatEnabled(true);
+    chatWorldPanelLastPose_ = ReadWorldPose(chatWorldPanelScreen_->get_transform().ptr());
+    chatWorldPanelPoseDirty_ = false;
+    chatWorldPanelStableSeconds_ = 0.0F;
+    chatWorldPanelLastMessageSequence_ = 0;
+    chatWorldPanelFollowLive_ = true;
+    chatWorldPanelContentOverflows_ = false;
+    chatWorldPanelScrollToEndFrames_ = 0;
+    chatWorldPanelDisplayedViewerCount_ = -1;
+    chatWorldPanelDisplayedViewerKnown_ = false;
+    chatWorldPanelDisplayedChatState_ = -1;
+    Logging::Logger.info(
+        "Created movable HMD-only Twitch chat panel at {:.0f} x {:.0f}",
+        settings.width, settings.height);
+}
+
+void MenuController::UpdateChatWorldPanelLayout() {
+    if (!IsAlive(chatWorldPanelScreen_)) return;
+    const auto& chat = root_.Settings().Get().chat;
+    const float width = chat.width;
+    const float height = chat.height;
+    chatWorldPanelScreen_->set_ScreenSize({width, height});
+    HideAndFitWorldPanelHandleBehindContent(
+        chatWorldPanelScreen_, {width, height});
+    // set_ScreenSize may re-enable BSML's primitive handle renderer. The
+    // native collider remains active, but SaberStage draws its own border.
+    if (IsAlive(chatWorldPanelScreen_->handle)) {
+        if (auto* renderer = chatWorldPanelScreen_->handle->GetComponent<
+                UnityEngine::MeshRenderer*>()) {
+            renderer->set_enabled(false);
+        }
+    }
+
+    const auto setRect = [](UnityEngine::Component* component,
+                            UnityEngine::Vector2 position,
+                            UnityEngine::Vector2 size) {
+        if (!IsAlive(component)) return;
+        auto rect = component->get_transform().cast<UnityEngine::RectTransform>();
+        rect->set_anchorMin({0.5F, 0.5F});
+        rect->set_anchorMax({0.5F, 0.5F});
+        rect->set_pivot({0.5F, 0.5F});
+        rect->set_anchoredPosition(position);
+        rect->set_sizeDelta(size);
+    };
+    setRect(chatWorldPanelBackground_, {}, {width - 1.0F, height - 1.0F});
+    constexpr float borderThickness = 0.75F;
+    const float inset = borderThickness * 0.5F;
+    setRect(chatWorldPanelBorders_[0], {0.0F, height * 0.5F - inset},
+        {width, borderThickness});
+    setRect(chatWorldPanelBorders_[1], {0.0F, -height * 0.5F + inset},
+        {width, borderThickness});
+    setRect(chatWorldPanelBorders_[2], {-width * 0.5F + inset, 0.0F},
+        {borderThickness, height});
+    setRect(chatWorldPanelBorders_[3], {width * 0.5F - inset, 0.0F},
+        {borderThickness, height});
+
+    const float headerY = height * 0.5F - kChatPanelHeaderHeight * 0.5F;
+    setRect(chatWorldPanelHeaderDivider_,
+        {0.0F, height * 0.5F - kChatPanelHeaderHeight},
+        {width - 3.0F, 0.6F});
+    setRect(chatWorldPanelResizeButton_,
+        {-width * 0.5F + 11.0F, headerY}, {18.0F, 7.0F});
+    setRect(chatWorldPanelControlButton_,
+        {width * 0.5F - 11.0F, headerY}, {18.0F, 7.0F});
+    setRect(chatWorldPanelViewerText_, {0.0F, headerY}, {15.0F, 6.0F});
+
+    struct ResizeGripStroke { UnityEngine::Vector2 offset; };
+    constexpr ResizeGripStroke resizeGripStrokes[] = {
+        {{2.4F, -2.4F}}, {{0.8F, -0.8F}}, {{-0.8F, 0.8F}}};
+    const UnityEngine::Vector2 resizeGripCenter{
+        width * 0.5F - kChatResizeHandleInset,
+        -height * 0.5F + kChatResizeHandleInset};
+    for (std::size_t index = 0; index < chatWorldPanelResizeGripStrokes_.size(); ++index) {
+        setRect(
+            chatWorldPanelResizeGripStrokes_[index],
+            {resizeGripCenter.x + resizeGripStrokes[index].offset.x,
+             resizeGripCenter.y + resizeGripStrokes[index].offset.y},
+            {index == 0 ? 3.0F : (index == 1 ? 5.2F : 7.4F), 0.75F});
+    }
+
+    const float bodyTop = height * 0.5F - kChatPanelHeaderHeight - 1.0F;
+    const float bodyBottom = -height * 0.5F + 2.0F;
+    const float bodyHeight = std::max(10.0F, bodyTop - bodyBottom);
+    if (IsAlive(chatWorldPanelScrollView_)) {
+        setRect(chatWorldPanelScrollView_,
+            {0.0F, (bodyTop + bodyBottom) * 0.5F},
+            {width - 5.0F, bodyHeight});
+        if (auto* content = chatWorldPanelScrollView_->get_contentTransform().ptr()) {
+            // Stretch the content canvas across the complete viewport. The
+            // recycled TMP rows use the same horizontal stretch, so even a
+            // one-word message owns the full available width and begins at the
+            // left margin instead of being centered at its preferred width.
+            auto anchorMin = content->get_anchorMin();
+            auto anchorMax = content->get_anchorMax();
+            anchorMin.x = 0.0F;
+            anchorMax.x = 1.0F;
+            content->set_anchorMin(anchorMin);
+            content->set_anchorMax(anchorMax);
+            auto size = content->get_sizeDelta();
+            size.x = 0.0F;
+            content->set_sizeDelta(size);
+        }
+    }
+    // Resizing changes the available line width even when no new Twitch
+    // message arrives. Reflow immediately so TMP wraps the existing history
+    // to the new viewport instead of retaining the geometry/content height
+    // calculated for the panel's previous size.
+    ReflowChatWorldPanelText();
+}
+
+void MenuController::ReflowChatWorldPanelText() {
+    if (!IsAlive(chatWorldPanelText_) || chatWorldPanelRows_.empty()) return;
+
+    const auto& chat = root_.Settings().Get().chat;
+    const float textWidth = std::max(25.0F, chat.width - 14.0F);
+    const float pageHeight = std::max(
+        10.0F, chat.height - kChatPanelHeaderHeight - 3.0F);
+
+    // Measure the retained data, not an ever-growing rendered mesh. Heights
+    // are cached until the viewport width changes; adding one chat message
+    // therefore performs one TMP measurement rather than rebuilding every
+    // previous message. A resize invalidates the cache because wrapping is a
+    // function of the viewport width.
+    const bool widthChanged =
+        std::abs(chatWorldPanelMeasuredWidth_ - textWidth) > 0.05F;
+    if (widthChanged) chatWorldPanelMeasuredWidth_ = textWidth;
+    // The first pooled row doubles as the TMP measurement probe. TMP can
+    // usually calculate preferred values for an inactive object, but keeping
+    // the probe active during measurement avoids relying on that prefab- and
+    // Unity-version-dependent behavior. The virtualization pass below returns
+    // it to the correct visible/inactive state in the same update.
+    chatWorldPanelText_->get_gameObject()->set_active(true);
+    float offset = 0.0F;
+    for (auto& entry : chatWorldPanelEntries_) {
+        if (widthChanged || entry.height <= 0.0F) {
+            const auto preferred = chatWorldPanelText_->GetPreferredValues(
+                StringW(entry.text), textWidth, 1000.0F);
+            entry.height = std::max(
+                kChatVirtualRowMinimumHeight,
+                preferred.y + kChatVirtualRowPadding);
+        }
+        entry.offset = offset;
+        offset += entry.height;
+    }
+    if (!IsAlive(chatWorldPanelScrollView_)) return;
+
+    const float contentHeight = std::max(pageHeight, offset);
+    const bool contentOverflows = offset > pageHeight + 0.5F;
+    chatWorldPanelScrollView_->SetContentSize(contentHeight);
+    chatWorldPanelContentOverflows_ = contentOverflows;
+    if (!contentOverflows) {
+        // A status line or a small number of wrapped messages fits on the
+        // page. Keep it top-aligned; ScrollToEnd on BSML's cloned scroll view
+        // can otherwise use a stale page size and hide the first line.
+        chatWorldPanelFollowLive_ = true;
+        chatWorldPanelScrollToEndFrames_ = 0;
+        chatWorldPanelScrollView_->ScrollTo(0.0F, false);
+    } else if (chatWorldPanelFollowLive_) {
+        // Allow Unity one frame to accept both the new viewport width and the
+        // measured content height before following the newest message.
+        chatWorldPanelScrollToEndFrames_ = 2;
+    }
+    chatWorldPanelRowsDirty_ = true;
+    RefreshVirtualizedChatRows();
+}
+
+void MenuController::RefreshVirtualizedChatRows() {
+    if (!IsAlive(chatWorldPanelScrollView_) || chatWorldPanelRows_.empty()) return;
+
+    const auto& chat = root_.Settings().Get().chat;
+    const float textWidth = std::max(25.0F, chat.width - 14.0F);
+    const float pageHeight = std::max(
+        10.0F, chat.height - kChatPanelHeaderHeight - 3.0F);
+    const float visibleTop = std::max(0.0F, chatWorldPanelScrollView_->get_position());
+    // TickChatWorldPanel runs at the HMD refresh rate so scroll input remains
+    // responsive. Do not cross the IL2CPP boundary to reapply every pooled
+    // row's active state and RectTransform when the viewport and content have
+    // not changed; an idle panel then costs only this position comparison.
+    if (!chatWorldPanelRowsDirty_ &&
+            std::abs(visibleTop - chatWorldPanelRenderedScrollPosition_) < 0.01F) {
+        return;
+    }
+    chatWorldPanelRowsDirty_ = false;
+    chatWorldPanelRenderedScrollPosition_ = visibleTop;
+    const float visibleBottom = visibleTop + pageHeight;
+
+    std::size_t first = 0;
+    while (first < chatWorldPanelEntries_.size() &&
+            chatWorldPanelEntries_[first].offset +
+                chatWorldPanelEntries_[first].height < visibleTop - 1.0F) {
+        ++first;
+    }
+
+    std::size_t poolIndex = 0;
+    for (std::size_t entryIndex = first;
+         entryIndex < chatWorldPanelEntries_.size() &&
+             poolIndex < chatWorldPanelRows_.size();
+         ++entryIndex) {
+        auto& entry = chatWorldPanelEntries_[entryIndex];
+        if (entry.offset > visibleBottom + 1.0F) break;
+        auto* row = chatWorldPanelRows_[poolIndex];
+        if (!IsAlive(row)) {
+            ++poolIndex;
+            continue;
+        }
+        row->get_gameObject()->set_active(true);
+        if (poolIndex >= chatWorldPanelRowEntryIndices_.size() ||
+                poolIndex >= chatWorldPanelRowGenerations_.size() ||
+                chatWorldPanelRowEntryIndices_[poolIndex] != entryIndex ||
+                chatWorldPanelRowGenerations_[poolIndex] !=
+                    chatWorldPanelEntryGeneration_) {
+            row->set_text(entry.text);
+            if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
+                chatWorldPanelRowEntryIndices_[poolIndex] = entryIndex;
+            }
+            if (poolIndex < chatWorldPanelRowGenerations_.size()) {
+                chatWorldPanelRowGenerations_[poolIndex] =
+                    chatWorldPanelEntryGeneration_;
+            }
+        }
+        auto rect = row->get_rectTransform();
+        rect->set_anchorMin({0.0F, 1.0F});
+        rect->set_anchorMax({1.0F, 1.0F});
+        rect->set_pivot({0.5F, 1.0F});
+        rect->set_anchoredPosition({0.0F, -entry.offset});
+        rect->set_sizeDelta({-(std::max(0.0F, chat.width - textWidth)), entry.height});
+        ++poolIndex;
+    }
+
+    // Rows outside the viewport are deactivated and reused on the next scroll.
+    // The number of TMP objects therefore remains fixed for the entire stream,
+    // regardless of how many messages pass through the bounded data history.
+    for (; poolIndex < chatWorldPanelRows_.size(); ++poolIndex) {
+        auto* row = chatWorldPanelRows_[poolIndex];
+        if (IsAlive(row)) row->get_gameObject()->set_active(false);
+        if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
+            chatWorldPanelRowEntryIndices_[poolIndex] =
+                std::numeric_limits<std::size_t>::max();
+        }
+        if (poolIndex < chatWorldPanelRowGenerations_.size()) {
+            chatWorldPanelRowGenerations_[poolIndex] = 0;
+        }
+    }
+}
+
+void MenuController::EnsureChatWorldPanelResizeHandle() {
+    if (IsAlive(chatWorldPanelResizeHandleScreen_) ||
+            !IsAlive(chatWorldPanelScreen_)) return;
+    chatWorldPanelResizeHandleScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
+        {kChatResizeHandleSize, kChatResizeHandleSize}, true,
+        chatWorldPanelScreen_->get_transform()->get_position(),
+        chatWorldPanelScreen_->get_transform()->get_rotation(), 0.0F, false);
+    if (!IsAlive(chatWorldPanelResizeHandleScreen_)) return;
+    auto* object = chatWorldPanelResizeHandleScreen_->get_gameObject().ptr();
+    object->set_name("SaberStage Twitch Chat Resize Handle");
+    object->set_layer(5);
+    UnityEngine::Object::DontDestroyOnLoad(object);
+    chatWorldPanelResizeHandleScreen_->set_HandleSide(BSML::Side::Top);
+    chatWorldPanelResizeHandleScreen_->set_HighlightHandle(false);
+    chatWorldPanelResizeHandleScreen_->get_transform()->set_localScale({
+        kChatPanelScale, kChatPanelScale, kChatPanelScale});
+    if (IsAlive(chatWorldPanelResizeHandleScreen_->handle)) {
+        // GameObject::set_layer does not propagate to children. The Quest VR
+        // pointer only includes the UI layer, so explicitly placing the native
+        // handle there is what makes the visible lower-right grip draggable.
+        chatWorldPanelResizeHandleScreen_->handle->set_layer(5);
+        if (auto* renderer = chatWorldPanelResizeHandleScreen_->handle->GetComponent<
+                UnityEngine::MeshRenderer*>()) {
+            renderer->set_enabled(false);
+        }
+        chatWorldPanelResizeHandleScreen_->handle->get_transform()->set_localPosition({});
+        chatWorldPanelResizeHandleScreen_->handle->get_transform()->set_localScale({
+            13.0F, 13.0F, 2.0F});
+    }
+    root_.Preview().RegisterCaptureExcludedRoot(object);
+}
+
+void MenuController::DestroyChatWorldPanelResizeHandle() noexcept {
+    if (IsAlive(chatWorldPanelResizeHandleScreen_)) {
+        auto* object = chatWorldPanelResizeHandleScreen_->get_gameObject().ptr();
+        root_.Preview().UnregisterCaptureExcludedRoot(object);
+        UnityEngine::Object::Destroy(object);
+    }
+    chatWorldPanelResizeHandleScreen_ = nullptr;
+}
+
+void MenuController::ToggleChatWorldPanelResize() {
+    chatWorldPanelResizeEditing_ = !chatWorldPanelResizeEditing_;
+    if (IsAlive(chatWorldPanelResizeButton_)) {
+        BSML::Lite::SetButtonText(
+            chatWorldPanelResizeButton_,
+            chatWorldPanelResizeEditing_ ? "Lock Size" : "Resize Panel");
+    }
+    for (auto* line : chatWorldPanelResizeGripStrokes_) {
+        if (IsAlive(line)) line->get_gameObject()->set_active(chatWorldPanelResizeEditing_);
+    }
+    if (chatWorldPanelResizeEditing_) {
+        EnsureChatWorldPanelResizeHandle();
+    } else {
+        DestroyChatWorldPanelResizeHandle();
+        root_.Settings().Save(nullptr);
+    }
+}
+
+void MenuController::TickChatWorldPanelResize() {
+    if (!chatWorldPanelResizeEditing_) return;
+    EnsureChatWorldPanelResizeHandle();
+    if (!IsAlive(chatWorldPanelScreen_) ||
+            !IsAlive(chatWorldPanelResizeHandleScreen_)) return;
+    auto* handle = IsAlive(chatWorldPanelResizeHandleScreen_->handle)
+        ? chatWorldPanelResizeHandleScreen_->handle->GetComponent<
+              BSML::FloatingScreenHandle*>()
+        : nullptr;
+    const bool resizing = handle && handle->__get__grabbingController();
+    if (resizing) {
+        const auto markerWorld = chatWorldPanelResizeHandleScreen_->get_transform()
+            ->TransformPoint({0.0F, 0.0F, 0.0F});
+        const auto local = chatWorldPanelScreen_->get_transform()
+            ->InverseTransformPoint(markerWorld);
+        auto& chat = root_.Settings().Edit().chat;
+        const float width = std::clamp(
+            (std::abs(local.x) + kChatResizeHandleInset) * 2.0F,
+            kChatPanelMinimumWidth, kChatPanelMaximumWidth);
+        const float height = std::clamp(
+            (std::abs(local.y) + kChatResizeHandleInset) * 2.0F,
+            kChatPanelMinimumHeight, kChatPanelMaximumHeight);
+        if (std::abs(width - chat.width) > 0.05F ||
+                std::abs(height - chat.height) > 0.05F) {
+            chat.width = width;
+            chat.height = height;
+            UpdateChatWorldPanelLayout();
+            chatWorldPanelPoseDirty_ = true;
+            chatWorldPanelStableSeconds_ = 0.0F;
+        }
+    }
+    if (!resizing) {
+        const auto& chat = root_.Settings().Get().chat;
+        chatWorldPanelResizeHandleScreen_->get_transform()->SetPositionAndRotation(
+            chatWorldPanelScreen_->get_transform()->TransformPoint({
+                chat.width * 0.5F - kChatResizeHandleInset,
+                -chat.height * 0.5F + kChatResizeHandleInset,
+                -0.5F}),
+            chatWorldPanelScreen_->get_transform()->get_rotation());
+    }
+}
+
+void MenuController::DestroyChatWorldPanel() noexcept {
+    root_.Twitch().SetChatEnabled(false);
+    DestroyChatWorldPanelResizeHandle();
+    if (IsAlive(chatWorldPanelScreen_)) {
+        auto* screenObject = chatWorldPanelScreen_->get_gameObject().ptr();
+        root_.Preview().UnregisterCaptureExcludedRoot(screenObject);
+        UnityEngine::Object::Destroy(screenObject);
+    }
+    chatWorldPanelScreen_ = nullptr;
+    chatWorldPanelBackground_ = nullptr;
+    chatWorldPanelBorders_.fill(nullptr);
+    chatWorldPanelResizeGripStrokes_.fill(nullptr);
+    chatWorldPanelHeaderDivider_ = nullptr;
+    if (IsAlive(chatWorldPanelBorderMaterial_)) {
+        UnityEngine::Object::Destroy(chatWorldPanelBorderMaterial_);
+    }
+    chatWorldPanelBorderMaterial_ = nullptr;
+    chatWorldPanelText_ = nullptr;
+    chatWorldPanelRows_.clear();
+    chatWorldPanelEntries_.clear();
+    chatWorldPanelRowEntryIndices_.clear();
+    chatWorldPanelRowGenerations_.clear();
+    ++chatWorldPanelEntryGeneration_;
+    chatWorldPanelMeasuredWidth_ = 0.0F;
+    chatWorldPanelDataRefreshSeconds_ = kChatDataRefreshIntervalSeconds;
+    chatWorldPanelRenderedScrollPosition_ = -1.0F;
+    chatWorldPanelRowsDirty_ = true;
+    chatWorldPanelViewerText_ = nullptr;
+    chatWorldPanelResizeButton_ = nullptr;
+    chatWorldPanelControlButton_ = nullptr;
+    chatWorldPanelScrollView_ = nullptr;
+    chatWorldPanelPoseDirty_ = false;
+    chatWorldPanelStableSeconds_ = 0.0F;
+    chatWorldPanelResizeEditing_ = false;
+    chatWorldPanelFollowLive_ = true;
+    chatWorldPanelContentOverflows_ = false;
+    chatWorldPanelScrollToEndFrames_ = 0;
+    chatWorldPanelDisplayedViewerCount_ = -1;
+    chatWorldPanelDisplayedViewerKnown_ = false;
+    chatWorldPanelDisplayedChatState_ = -1;
+    chatWorldPanelLastMessageSequence_ = 0;
+}
+
+void MenuController::ResetChatWorldPanelPose() {
+    auto& settings = root_.Settings().Edit().chat;
+    settings.position = kDefaultChatPanelPosition;
+    settings.rotationDegrees = {};
+    settings.width = kChatPanelSize.x;
+    settings.height = kChatPanelSize.y;
+    root_.Settings().Save(nullptr);
+    DestroyChatWorldPanel();
+    if (settings.enabled) {
+        root_.Twitch().SetChatEnabled(true);
+        EnsureChatWorldPanel();
+    }
+}
+
+void MenuController::UpdateChatWorldPanelPersistence() {
+    if (!IsAlive(chatWorldPanelScreen_)) return;
+    const auto pose = ReadWorldPose(chatWorldPanelScreen_->get_transform().ptr());
+    if (WorldPoseDifference(pose, chatWorldPanelLastPose_) > 0.000001F) {
+        chatWorldPanelLastPose_ = pose;
+        chatWorldPanelPoseDirty_ = true;
+        chatWorldPanelStableSeconds_ = 0.0F;
+        return;
+    }
+    if (!chatWorldPanelPoseDirty_) return;
+    chatWorldPanelStableSeconds_ += std::max(
+        0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+    if (chatWorldPanelStableSeconds_ < 0.5F) return;
+    auto& settings = root_.Settings().Edit().chat;
+    settings.position = pose.position;
+    const auto euler = ToUnity(pose.rotation).get_eulerAngles();
+    settings.rotationDegrees = {
+        camera::NormalizeDegrees(euler.x),
+        camera::NormalizeDegrees(euler.y),
+        camera::NormalizeDegrees(euler.z)};
+    root_.Settings().Save(nullptr);
+    chatWorldPanelPoseDirty_ = false;
+}
+
+void MenuController::TickChatWorldPanel() noexcept {
+    try {
+        if (!root_.Settings().Get().chat.enabled) {
+            DestroyChatWorldPanel();
+            return;
+        }
+        EnsureChatWorldPanel();
+        if (!IsAlive(chatWorldPanelScreen_)) return;
+        UpdateWorldPanelHandleRotation(chatWorldPanelScreen_);
+        TickChatWorldPanelResize();
+        UpdateChatWorldPanelPersistence();
+
+        // The stock BSML scroll control supplies page-up/page-down buttons and
+        // a visible position bar. Auto-follow remains active only while the
+        // user is at the bottom; scrolling upward freezes the reading position
+        // until the user scrolls back to the live end.
+        if (IsAlive(chatWorldPanelScrollView_) &&
+                chatWorldPanelContentOverflows_) {
+            if (chatWorldPanelScrollToEndFrames_ > 0) {
+                chatWorldPanelScrollView_->ScrollToEnd(false);
+                --chatWorldPanelScrollToEndFrames_;
+            } else {
+                const float end = std::max(
+                    0.0F,
+                    chatWorldPanelScrollView_->get_contentSize() -
+                        chatWorldPanelScrollView_->get_scrollPageSize());
+                const bool atEnd = chatWorldPanelScrollView_->get_position() >= end - 0.75F;
+                if (chatWorldPanelFollowLive_ && !atEnd) {
+                    chatWorldPanelFollowLive_ = false;
+                } else if (!chatWorldPanelFollowLive_ && atEnd) {
+                    chatWorldPanelFollowLive_ = true;
+                }
+            }
+        }
+        // Recycling is only a position comparison plus updates for rows that
+        // entered or left the viewport. It must run with scrolling, but the
+        // Twitch snapshot itself contains strings and is intentionally sampled
+        // at 10 Hz rather than copied on every 90 Hz HMD frame.
+        RefreshVirtualizedChatRows();
+        chatWorldPanelDataRefreshSeconds_ += std::max(
+            0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+        if (chatWorldPanelDataRefreshSeconds_ < kChatDataRefreshIntervalSeconds) {
+            chatWorldPanelTickFailureLogged_ = false;
+            return;
+        }
+        chatWorldPanelDataRefreshSeconds_ = 0.0F;
+
+        const auto twitch = root_.Twitch().Snapshot();
+        if (IsAlive(chatWorldPanelViewerText_) &&
+                (twitch.viewerCountKnown != chatWorldPanelDisplayedViewerKnown_ ||
+                 twitch.viewerCount != chatWorldPanelDisplayedViewerCount_)) {
+            chatWorldPanelDisplayedViewerKnown_ = twitch.viewerCountKnown;
+            chatWorldPanelDisplayedViewerCount_ = twitch.viewerCount;
+            chatWorldPanelViewerText_->set_text(
+                twitch.viewerCountKnown
+                    ? "♟ " + std::to_string(twitch.viewerCount)
+                    : "♟ --");
+        }
+
+        const auto newestSequence = twitch.messages.empty()
+            ? 0 : twitch.messages.back().sequence;
+        const int chatState = static_cast<int>(twitch.chatState);
+        if (newestSequence == chatWorldPanelLastMessageSequence_ &&
+                chatState == chatWorldPanelDisplayedChatState_) {
+            chatWorldPanelTickFailureLogged_ = false;
+            return;
+        }
+        const int previousChatState = chatWorldPanelDisplayedChatState_;
+        chatWorldPanelLastMessageSequence_ = newestSequence;
+        chatWorldPanelDisplayedChatState_ = chatState;
+
+        const auto replaceWithStatus = [this](std::string status) {
+            chatWorldPanelEntries_.clear();
+            chatWorldPanelEntries_.push_back({0, std::move(status), 0.0F, 0.0F});
+        };
+        if (twitch.chatState == broadcast::TwitchChatState::Connecting) {
+            replaceWithStatus("Connecting to chat...");
+        } else if (twitch.chatState == broadcast::TwitchChatState::Failed) {
+            replaceWithStatus(
+                EscapeTmpText(twitch.status) +
+                "\n\nTurn the chat panel off and on to retry.");
+        } else if (twitch.chatState != broadcast::TwitchChatState::Connected) {
+            replaceWithStatus("Connect a Twitch account in the Live Stream tab.");
+        } else if (twitch.messages.empty()) {
+            replaceWithStatus("Connected. Waiting for chat messages...");
+        } else {
+            const bool needsFreshHistory =
+                previousChatState != chatState ||
+                chatWorldPanelEntries_.empty() ||
+                chatWorldPanelEntries_.front().sequence == 0 ||
+                chatWorldPanelEntries_.back().sequence > newestSequence;
+            if (needsFreshHistory) chatWorldPanelEntries_.clear();
+
+            // TwitchService already retains at most 128 messages. Mirror that
+            // moving window without rebuilding strings or TMP measurements for
+            // entries that are still present. If the reader is scrolled up,
+            // compensate for retired rows so the same message stays in view.
+            const auto oldestSequence = twitch.messages.front().sequence;
+            float removedHeight = 0.0F;
+            while (!chatWorldPanelEntries_.empty() &&
+                    chatWorldPanelEntries_.front().sequence < oldestSequence) {
+                removedHeight += chatWorldPanelEntries_.front().height;
+                chatWorldPanelEntries_.pop_front();
+            }
+            const auto retainedNewest = chatWorldPanelEntries_.empty()
+                ? std::uint64_t{0}
+                : chatWorldPanelEntries_.back().sequence;
+            for (const auto& message : twitch.messages) {
+                if (message.sequence <= retainedNewest) continue;
+                chatWorldPanelEntries_.push_back({
+                    message.sequence,
+                    "<b><color=#66D9FF>" + EscapeTmpText(message.author) +
+                        ":</color></b> " + EscapeTmpText(message.text),
+                    0.0F,
+                    0.0F});
+            }
+            if (!chatWorldPanelFollowLive_ && removedHeight > 0.0F &&
+                    IsAlive(chatWorldPanelScrollView_)) {
+                chatWorldPanelScrollView_->ScrollTo(
+                    std::max(
+                        0.0F,
+                        chatWorldPanelScrollView_->get_position() - removedHeight),
+                    false);
+            }
+        }
+        ++chatWorldPanelEntryGeneration_;
+        ReflowChatWorldPanelText();
+        chatWorldPanelTickFailureLogged_ = false;
+    } catch (const std::exception& exception) {
+        if (!chatWorldPanelTickFailureLogged_) {
+            chatWorldPanelTickFailureLogged_ = true;
+            Logging::Logger.error("Twitch chat panel update failed: {}", exception.what());
+        }
+    } catch (...) {
+        if (!chatWorldPanelTickFailureLogged_) {
+            chatWorldPanelTickFailureLogged_ = true;
+            Logging::Logger.error("Twitch chat panel update failed unexpectedly");
         }
     }
 }
@@ -4501,8 +6728,11 @@ void MenuController::TickAvatarStandinProxy() noexcept {
 }
 
 void MenuController::RefreshAvatarStatus() {
-    if (!avatarStatusText_) return;
     const auto& profile = root_.Settings().Get().avatar;
+    refreshingAvatarSetupControls_ = true;
+    if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(profile.enabled);
+    refreshingAvatarSetupControls_ = false;
+    if (!avatarStatusText_) return;
     const auto path = ConfiguredAvatarPath();
     if (avatarSelectionText_) {
         avatarSelectionText_->set_text(path.empty()
@@ -4512,9 +6742,14 @@ void MenuController::RefreshAvatarStatus() {
     const auto* asset = root_.Avatar().LoadedVrmAsset();
     const auto* stats = root_.Avatar().LoadedVrmStatistics();
     if (!asset || !stats) {
-        avatarStatusText_->set_text(path.empty()
-            ? "Not loaded\nChoose a .vrm file from the headset."
-            : "Not loaded\n" + path.string());
+        if (path.empty()) {
+            avatarStatusText_->set_text("Not loaded\nChoose a .vrm file from the headset.");
+        } else if (!root_.Avatar().PlayerProfile().valid) {
+            avatarStatusText_->set_text(
+                "Calibration required\nRun Basic or Advanced Calibration before enabling this avatar.");
+        } else {
+            avatarStatusText_->set_text("Ready to load\n" + path.filename().string());
+        }
         return;
     }
     std::ostringstream text;
@@ -4523,10 +6758,244 @@ void MenuController::RefreshAvatarStatus() {
          << " renderers, " << stats->decodedTextureCount << " textures"
          << "\nParse " << std::fixed << std::setprecision(0) << stats->parseMilliseconds
          << " ms, Unity " << stats->unityConstructionMilliseconds << " ms";
+    if (!root_.Avatar().PlayerProfile().valid) text << "\nCalibration staging only; avatar hidden";
+    else if (!profile.enabled) text << "\nAvatar disabled";
     if (!root_.Avatar().IsBound()) text << ", solver not bound";
     else if (!root_.Avatar().Player().valid) text << ", solver waiting for tracking";
     else text << ", solver tracking";
     avatarStatusText_->set_text(text.str());
+}
+
+bool MenuController::LoadSelectedAvatar(bool calibrationOnly, std::string* error) {
+    const auto path = ConfiguredAvatarPath();
+    if (path.empty()) {
+        if (error) *error = "choose a VRM avatar file first";
+        return false;
+    }
+
+    const auto initialCalibration = !root_.Avatar().PlayerProfile().valid;
+    if (!calibrationOnly && initialCalibration) {
+        if (error) *error = "player calibration is required before this avatar can be enabled";
+        return false;
+    }
+
+    auto& avatarSettings = root_.Settings().Edit().avatar;
+    // This is the complete normal load workflow. Binding during load performs
+    // the humanoid rest-pose measurement before any saved fit is applied.
+    // Apply the selected player's avatar settings next, then perform one final
+    // neutral reset. Users no longer need to know or remember this order.
+    if (!root_.Avatar().LoadVrmAvatar(
+            path,
+            static_cast<std::uint32_t>(avatarSettings.maximumTextureDimension),
+            error,
+            true)) {
+        return false;
+    }
+    root_.Avatar().ApplyAvatarSettings(avatarSettings);
+    if (!root_.Avatar().RecalibrateNeutral()) {
+        Logging::Logger.info(
+            "Avatar loaded and bound; neutral reset is waiting for tracked HMD/controllers");
+    }
+
+    // Calibration needs a bound humanoid because the existing capture session
+    // consumes the same validated HMD/controller sources as the solver. For a
+    // brand-new player profile, stage that humanoid invisibly: it is loaded
+    // only as calibration infrastructure and is never presented as a usable,
+    // badly scaled avatar. Completing calibration activates it below.
+    if (calibrationOnly && initialCalibration) {
+        avatarSettings.enabled = false;
+        root_.Avatar().SetAvatarVisible(false);
+    } else {
+        avatarSettings.enabled = true;
+        root_.Avatar().SetAvatarVisible(avatarSettings.visible);
+    }
+
+    std::string saveError;
+    if (!root_.Settings().Save(&saveError)) {
+        // Do not leave a live avatar whose master switch cannot be restored on
+        // the next launch. Returning failure after keeping it loaded would
+        // also make the visible toggle disagree with the runtime state.
+        root_.Avatar().UnloadVrmAvatar();
+        avatarSettings.enabled = false;
+        if (error) *error = "avatar settings could not be saved: " + saveError;
+        return false;
+    }
+    return true;
+}
+
+void MenuController::SetAvatarMasterEnabled(bool enabled) {
+    if (refreshingAvatarSetupControls_) return;
+    if (!enabled) {
+        DestroyGripEditor(true);
+        DestroyAllStandinProxies();
+        root_.Avatar().UnloadVrmAvatar();
+        root_.Settings().Edit().avatar.enabled = false;
+        std::string error;
+        if (!root_.Settings().Save(&error)) {
+            Logging::Logger.error("Could not disable avatar system: {}", error);
+        }
+        RefreshAvatarStatus();
+        return;
+    }
+
+    if (!root_.Avatar().PlayerProfile().valid) {
+        // Enabling an uncalibrated profile starts the required setup instead
+        // of displaying a distorted avatar or leaving the toggle in a lying
+        // state. The master switch becomes active after calibration is saved.
+        refreshingAvatarSetupControls_ = true;
+        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
+        refreshingAvatarSetupControls_ = false;
+        BeginPlayerCalibration(false);
+        return;
+    }
+
+    std::string error;
+    if (!LoadSelectedAvatar(false, &error)) {
+        Logging::Logger.error("Could not enable selected avatar: {}", error);
+        refreshingAvatarSetupControls_ = true;
+        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
+        refreshingAvatarSetupControls_ = false;
+        RefreshAvatarStatus();
+        if (avatarStatusText_) {
+            avatarStatusText_->set_text("Avatar could not be enabled\n" + error);
+        }
+        return;
+    }
+    RefreshAvatarStatus();
+    RequestAvatarSettingsRebuild();
+}
+
+void MenuController::BeginPlayerCalibration(bool advanced) {
+    std::string error;
+    if (!root_.Avatar().HasLoadedVrmAvatar() || !root_.Avatar().IsBound()) {
+        if (!LoadSelectedAvatar(true, &error)) {
+            Logging::Logger.warn("Could not prepare avatar for player calibration: {}", error);
+            RefreshAvatarStatus();
+            RefreshCalibrationStatus();
+            if (avatarStatusText_) {
+                avatarStatusText_->set_text("Calibration could not start\n" + error);
+            }
+            return;
+        }
+    }
+    if (!root_.Avatar().PreparePlayerCalibration(
+            advanced ? avatar::calibration::CalibrationMode::Advanced
+                     : avatar::calibration::CalibrationMode::Basic,
+            &error)) {
+        Logging::Logger.warn("Could not open player calibration: {}", error);
+        RefreshAvatarStatus();
+        RefreshCalibrationStatus();
+        if (avatarStatusText_) {
+            avatarStatusText_->set_text("Calibration could not start\n" + error);
+        }
+        return;
+    }
+    RefreshAvatarStatus();
+    RefreshCalibrationStatus();
+}
+
+bool MenuController::CompletePlayerCalibrationWorkflow(std::string* error) {
+    if (!root_.Avatar().CompletePlayerCalibration(error)) return false;
+
+    auto& avatarSettings = root_.Settings().Edit().avatar;
+    avatarSettings.enabled = true;
+    root_.Avatar().ApplyAvatarSettings(avatarSettings);
+    root_.Avatar().SetAvatarVisible(avatarSettings.visible);
+    if (!root_.Avatar().RecalibrateNeutral()) {
+        Logging::Logger.info(
+            "Saved player calibration; neutral avatar reset is waiting for tracked HMD/controllers");
+    }
+    if (!root_.Settings().Save(error)) return false;
+
+    refreshingAvatarSetupControls_ = true;
+    if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(true);
+    refreshingAvatarSetupControls_ = false;
+    RefreshAvatarStatus();
+    RefreshCalibrationStatus();
+    return true;
+}
+
+void MenuController::CancelPlayerCalibrationWorkflow() noexcept {
+    root_.Avatar().CancelPlayerCalibration();
+    if (!root_.Avatar().PlayerProfile().valid) {
+        // A first-time calibration stage is deliberately invisible and has no
+        // useful runtime state once the wizard is cancelled.
+        root_.Avatar().UnloadVrmAvatar();
+        root_.Settings().Edit().avatar.enabled = false;
+        root_.Settings().Save(nullptr);
+        refreshingAvatarSetupControls_ = true;
+        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
+        refreshingAvatarSetupControls_ = false;
+    }
+    RefreshAvatarStatus();
+    RefreshCalibrationStatus();
+}
+
+void MenuController::ShowAvatarSetupConfirmation(int action) {
+    pendingAvatarSetupConfirmation_ = action;
+    if (!avatarSetupConfirmationModal_) {
+        if (!IsAlive(avatarSettingsView_)) return;
+        avatarSetupConfirmationModal_ = BSML::Lite::CreateModal(
+            avatarSettingsView_, {82.0F, 46.0F}, nullptr, true);
+        if (!avatarSetupConfirmationModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            avatarSetupConfirmationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        avatarSetupConfirmationText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "", 3.8F, {0.0F, 0.0F}, {74.0F, 27.0F});
+        avatarSetupConfirmationText_->set_enableWordWrapping(true);
+        avatarSetupConfirmationText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(avatarSetupConfirmationText_, 74.0F, 27.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 72.0F, 8.0F, 1.0F);
+        WithHint(BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveAvatarSetupConfirmation(false);
+        }), "Closes this confirmation without changing any saved data.");
+        WithHint(BSML::Lite::CreateUIButton(actions, "Confirm", [] {
+            if (active_) active_->ResolveAvatarSetupConfirmation(true);
+        }), "Performs the clearly described reset for the active player profile.");
+    }
+    if (!avatarSetupConfirmationModal_ || !avatarSetupConfirmationText_) return;
+    avatarSetupConfirmationText_->set_text(action == 1
+        ? "Reset this player profile's calibration? The saved body, reach, grip, and movement measurements will be deleted. Avatar files and avatar-specific settings will be kept. The avatar will remain disabled until calibration is completed again."
+        : "Clear all saved avatar data for this player profile? The selected avatar, fit, grip, display, material, and quality settings will return to defaults. The VRM file itself and the player's calibration measurements will not be deleted.");
+    avatarSetupConfirmationModal_->Show();
+}
+
+void MenuController::ResolveAvatarSetupConfirmation(bool accepted) {
+    const auto action = pendingAvatarSetupConfirmation_;
+    pendingAvatarSetupConfirmation_ = 0;
+    if (avatarSetupConfirmationModal_) avatarSetupConfirmationModal_->Hide();
+    if (!accepted || action == 0) return;
+
+    DestroyGripEditor(true);
+    DestroyAllStandinProxies();
+    root_.Avatar().CancelPlayerCalibration();
+    root_.Avatar().UnloadVrmAvatar();
+    std::string error;
+    if (action == 1) {
+        if (!root_.Avatar().ResetPlayerCalibration(&error)) {
+            Logging::Logger.warn("Could not reset player calibration: {}", error);
+            return;
+        }
+        root_.Settings().Edit().avatar.enabled = false;
+    } else {
+        root_.Settings().Edit().avatar = settings::AvatarSettings{};
+    }
+    if (!root_.Settings().Save(&error)) {
+        Logging::Logger.error("Could not save avatar setup reset: {}", error);
+        return;
+    }
+    RefreshAvatarStatus();
+    RefreshCalibrationStatus();
+    RequestAvatarSettingsRebuild();
 }
 
 void MenuController::EnsureCalibrationPanel() {
@@ -4704,7 +7173,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelIntroductionActions_ = introductionActions;
     auto* introductionCancel = WithHint(BSML::Lite::CreateUIButton(
         introductionActions->get_transform(), "Cancel", [] {
-            if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+            if (active_) active_->CancelPlayerCalibrationWorkflow();
         }), "Closes the guide without starting a countdown or changing the saved profile.");
     ConfigureCalibrationButton(introductionCancel, {25.0F, 7.0F});
     calibrationPanelAutomaticStartButton_ = WithHint(BSML::Lite::CreateUIButton(
@@ -4737,7 +7206,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelStepStartActions_ = stepStartActions;
     auto* stepStartCancel = WithHint(BSML::Lite::CreateUIButton(
         stepStartActions->get_transform(), "Cancel", [] {
-            if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+            if (active_) active_->CancelPlayerCalibrationWorkflow();
         }), "Stops calibration without replacing your previously saved player profile.");
     ConfigureCalibrationButton(stepStartCancel, {34.0F, 7.0F});
     auto* startStep = WithHint(BSML::Lite::CreateUIButton(
@@ -4759,7 +7228,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelContinueActions_ = continueActions;
     auto* continueCancel = WithHint(BSML::Lite::CreateUIButton(
         continueActions->get_transform(), "Cancel", [] {
-            if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+            if (active_) active_->CancelPlayerCalibrationWorkflow();
         }), "Stops calibration without replacing your previously saved player profile.");
     ConfigureCalibrationButton(continueCancel, {34.0F, 7.0F});
     auto* continueButton = WithHint(BSML::Lite::CreateUIButton(
@@ -4780,7 +7249,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelActiveActions_ = activeActions;
     auto* activeCancel = WithHint(BSML::Lite::CreateUIButton(
         activeActions->get_transform(), "Cancel", [] {
-        if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+        if (active_) active_->CancelPlayerCalibrationWorkflow();
     }), "Stops calibration without replacing your previously saved player profile.");
     ConfigureCalibrationButton(activeCancel, {34.0F, 7.0F});
 
@@ -4792,7 +7261,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelFailureActions_ = failureActions;
     auto* failureCancel = WithHint(BSML::Lite::CreateUIButton(
         failureActions->get_transform(), "Cancel", [] {
-        if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+        if (active_) active_->CancelPlayerCalibrationWorkflow();
     }), "Stops calibration without replacing your previously saved player profile.");
     ConfigureCalibrationButton(failureCancel, {34.0F, 7.0F});
     auto* failureRetry = WithHint(BSML::Lite::CreateUIButton(
@@ -4804,7 +7273,7 @@ void MenuController::EnsureCalibrationPanel() {
         if (status.phase == avatar::calibration::CalibrationPhase::AwaitingRetry) {
             succeeded = active_->root_.Avatar().RetryPlayerCalibration(&error);
         } else if (status.pendingProfileReady) {
-            succeeded = active_->root_.Avatar().CompletePlayerCalibration(&error);
+            succeeded = active_->CompletePlayerCalibrationWorkflow(&error);
         } else {
             succeeded = active_->root_.Avatar().RestartPlayerCalibration(&error);
         }
@@ -4820,7 +7289,7 @@ void MenuController::EnsureCalibrationPanel() {
     calibrationPanelReviewActions_ = reviewActions;
     auto* reviewCancel = WithHint(BSML::Lite::CreateUIButton(
         reviewActions->get_transform(), "Cancel", [] {
-        if (active_) active_->root_.Avatar().CancelPlayerCalibration();
+        if (active_) active_->CancelPlayerCalibrationWorkflow();
     }), "Discards these measurements and keeps your previously saved player profile.");
     ConfigureCalibrationButton(reviewCancel, {30.0F, 7.0F});
     auto* reviewRestart = WithHint(BSML::Lite::CreateUIButton(
@@ -4836,7 +7305,7 @@ void MenuController::EnsureCalibrationPanel() {
         reviewActions->get_transform(), "Complete", [] {
         if (!active_) return;
         std::string error;
-        if (!active_->root_.Avatar().CompletePlayerCalibration(&error)) {
+        if (!active_->CompletePlayerCalibrationWorkflow(&error)) {
             Logging::Logger.warn("Player calibration save failed: {}", error);
         }
     }), "Saves the reviewed measurements as your new player calibration profile.");
@@ -5094,9 +7563,29 @@ void MenuController::RefreshCalibrationPanel() {
 
 void MenuController::TickCalibrationPanel() noexcept {
     // This persistent driver also services the independent movable recording
-    // controls, display-clone handles, and the hand-placement IK target so
-    // those world-space controls keep updating outside the center panel.
+    // controls, Twitch channel/chat state, display-clone handles, and the
+    // hand-placement IK target so those world-space controls keep updating
+    // outside the center panel. Network workers never touch Unity directly;
+    // TwitchService::Tick is their main-thread handoff point.
+    root_.Twitch().Tick();
+    const auto twitch = root_.Twitch().Snapshot();
+    if (pendingLiveTwitchTitleUpdate_ && twitch.titleUpdateComplete) {
+        pendingLiveTwitchTitleUpdate_ = false;
+        if (!twitch.titleUpdateSucceeded) {
+            ShowLivestreamActionError(twitch.titleUpdateStatus, true);
+        }
+        // Success and failure text are both retained beneath the Twitch
+        // account controls; a failure additionally receives a topmost popup.
+        RefreshTwitchControls();
+    }
+    twitchUiRefreshSeconds_ += std::max(
+        0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+    if (twitchUiRefreshSeconds_ >= 0.5F) {
+        twitchUiRefreshSeconds_ = 0.0F;
+        RefreshTwitchControls();
+    }
     TickRecordingWorldPanel();
+    TickChatWorldPanel();
     TickAvatarStandinProxy();
     TickGripEditor();
     try {
@@ -5148,6 +7637,10 @@ void MenuController::RebuildAvatarSettingsPanel() {
     avatarTabContentRoots_.fill(nullptr);
     avatarStatusText_ = nullptr;
     calibrationStatusText_ = nullptr;
+    avatarEnabledToggle_ = nullptr;
+    avatarSetupConfirmationModal_ = nullptr;
+    avatarSetupConfirmationText_ = nullptr;
+    pendingAvatarSetupConfirmation_ = 0;
     matchPlayerHeightToggle_ = nullptr;
     heightAdjustmentBalanceSlider_ = nullptr;
     armSpanSizingToggle_ = nullptr;
@@ -5203,7 +7696,7 @@ void MenuController::RebuildAvatarSettingsPanel() {
     BuildSettingsPanel(avatarSettingsView_);
     // Rebuilding is used by avatar and player-profile changes. Preserve the
     // page the user was actually working on instead of silently jumping from
-    // Avatar or Calibration to Fit after every rebuild.
+    // Setup, Display, or Quality to Fit after every rebuild.
     selectedAvatarTab_ = std::clamp(selectedAvatarTab_, 0, 3);
     ShowAvatarTab(selectedAvatarTab_);
     if (avatarTabs_) avatarTabs_->SelectCellWithNumber(selectedAvatarTab_);
@@ -5220,7 +7713,7 @@ void MenuController::RefreshCalibrationStatus() {
                 text << "Saved player profile active\nQuality " << std::fixed << std::setprecision(0)
                      << profile.overallConfidence * 100.0F << "%";
             } else {
-                text << "No valid player profile\nGeneric solver defaults active";
+                text << "Calibration required\nAvatar loading remains disabled until setup is complete";
             }
         } else if (status.phase == avatar::calibration::CalibrationPhase::Introduction) {
             text << "Calibration guide open\nChoose Automatic or Step-by-Step on the floating panel";

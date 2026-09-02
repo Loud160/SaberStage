@@ -3,6 +3,7 @@
 #include "saberstage/Logging.hpp"
 #include "saberstage/avatar/AvatarManager.hpp"
 #include "saberstage/camera/CameraManager.hpp"
+#include "saberstage/broadcast/TwitchService.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
 #include "saberstage/recording/RecordingController.hpp"
 #include "saberstage/ui/MenuController.hpp"
@@ -39,8 +40,26 @@ bool ApplicationRoot::ApplyConfiguredAvatar(std::string* error) {
         return false;
     }
     avatar_->UnloadVrmAvatar();
-    const auto& avatarProfile = settings_.Get().avatar;
+    auto& avatarProfile = settings_.Edit().avatar;
     if (!avatarProfile.enabled) return true;
+
+    // A visible, solver-driven avatar without a saved player calibration can
+    // be wildly mis-scaled and makes a first install look broken. Do not
+    // silently present that state during startup or profile switching. The
+    // Setup tab can still stage the selected VRM invisibly while its guided
+    // calibration runs, then enable it after the profile is saved.
+    if (!avatar_->PlayerProfile().valid) {
+        avatarProfile.enabled = false;
+        std::string saveError;
+        if (!settings_.Save(&saveError)) {
+            Logging::Logger.error(
+                "Could not disable an uncalibrated configured avatar: {}",
+                saveError);
+        }
+        Logging::Logger.warn(
+            "Configured avatar was not auto-loaded because player calibration is required");
+        return true;
+    }
 
     const auto avatarDirectory = settings_.Path().parent_path() / "Avatars";
     const auto path = avatarProfile.selectedPath.empty()
@@ -54,6 +73,13 @@ bool ApplicationRoot::ApplyConfiguredAvatar(std::string* error) {
     }
     avatar_->SetAvatarVisible(avatarProfile.visible);
     avatar_->ApplyAvatarSettings(avatarProfile);
+    // LoadVrmAvatar binds the solver and performs its first neutral reset.
+    // Repeat after the saved fit is applied so the active avatar always enters
+    // the scene in the same fully initialized order used by the Setup menu.
+    if (!avatar_->RecalibrateNeutral()) {
+        Logging::Logger.info(
+            "Configured avatar loaded and bound; neutral reset is waiting for tracked HMD/controllers");
+    }
     return true;
 }
 
@@ -87,6 +113,7 @@ bool ApplicationRoot::Start() {
 
     recording_ = std::make_unique<recording::RecordingController>(
         settings_, *camera_, kQuestVideoShotsDirectory);
+    twitch_ = std::make_unique<broadcast::TwitchService>(settings_);
 
     // Avatar support is additive. A failure in the new framework must never
     // take the already-working camera, preview, or recording controls down
@@ -126,6 +153,8 @@ void ApplicationRoot::Stop() noexcept {
     preview_.reset();
     if (recording_) recording_->Shutdown();
     recording_.reset();
+    if (twitch_) twitch_->Shutdown();
+    twitch_.reset();
     if (avatar_) avatar_->Stop();
     avatar_.reset();
     if (camera_) camera_->Stop();
@@ -139,6 +168,7 @@ camera::CameraManager& ApplicationRoot::Camera() noexcept { return *camera_; }
 preview::PreviewManager& ApplicationRoot::Preview() noexcept { return *preview_; }
 recording::RecordingController& ApplicationRoot::Recording() noexcept { return *recording_; }
 avatar::AvatarManager& ApplicationRoot::Avatar() noexcept { return *avatar_; }
+broadcast::TwitchService& ApplicationRoot::Twitch() noexcept { return *twitch_; }
 
 bool ApplicationRoot::SwitchAvatarPlayerProfile(
     std::string_view profileId,

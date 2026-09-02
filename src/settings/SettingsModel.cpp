@@ -59,6 +59,60 @@ void RepairVector(camera::Vec3& value, camera::Vec3 fallback, ValidationResult& 
 
 SettingsDocument Defaults() { return {}; }
 
+bool TwitchTokenNeedsRefresh(
+    const TwitchAccountSettings& account,
+    std::int64_t nowUnixSeconds,
+    std::int64_t refreshLeadSeconds) noexcept {
+    if (account.accessToken.empty() || account.refreshToken.empty() ||
+            account.login.empty() || account.userId.empty()) {
+        return false;
+    }
+    const auto safeLead = std::max<std::int64_t>(0, refreshLeadSeconds);
+    return account.expiresAtUnixSeconds <= 0 ||
+        account.expiresAtUnixSeconds <= nowUnixSeconds + safeLead;
+}
+
+LivestreamDestinationSettings& DestinationForProvider(
+    LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept {
+    switch (provider) {
+        case LivestreamProvider::Twitch: return settings.twitch;
+        case LivestreamProvider::YouTube: return settings.youtube;
+        case LivestreamProvider::Kick: return settings.kick;
+        case LivestreamProvider::Custom: return settings.custom;
+    }
+    return settings.twitch;
+}
+
+const LivestreamDestinationSettings& DestinationForProvider(
+    const LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept {
+    switch (provider) {
+        case LivestreamProvider::Twitch: return settings.twitch;
+        case LivestreamProvider::YouTube: return settings.youtube;
+        case LivestreamProvider::Kick: return settings.kick;
+        case LivestreamProvider::Custom: return settings.custom;
+    }
+    return settings.twitch;
+}
+
+bool IsValidLivestreamServerUrl(std::string_view value) noexcept {
+    if (value.size() < 8 || value.size() > 2048 ||
+        (value.rfind("rtmp://", 0) != 0 && value.rfind("rtmps://", 0) != 0)) {
+        return false;
+    }
+    return std::none_of(value.begin(), value.end(), [](unsigned char character) {
+        return character <= 0x20 || character == 0x7F;
+    });
+}
+
+bool IsValidStreamKey(std::string_view value) noexcept {
+    if (value.size() < 4 || value.size() > 512) return false;
+    return std::none_of(value.begin(), value.end(), [](unsigned char character) {
+        return character <= 0x20 || character == 0x7F;
+    });
+}
+
 std::string AvatarRetargetingKey(const AvatarSettings& settings) {
     if (!settings.selectedPath.empty()) {
         return std::filesystem::path(settings.selectedPath).lexically_normal().generic_string();
@@ -507,16 +561,117 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         LivestreamProvider::Custom,
         defaults.broadcast.provider,
         result);
-    if (settings.broadcast.serverUrl.size() > 2048 ||
-        settings.broadcast.serverUrl.find('\0') != std::string::npos) {
-        settings.broadcast.serverUrl = defaults.broadcast.serverUrl;
+    for (const auto provider : {
+             LivestreamProvider::Twitch,
+             LivestreamProvider::YouTube,
+             LivestreamProvider::Kick,
+             LivestreamProvider::Custom}) {
+        auto& destination = DestinationForProvider(settings.broadcast, provider);
+        const auto& defaultDestination = DestinationForProvider(defaults.broadcast, provider);
+        if (!IsValidLivestreamServerUrl(destination.serverUrl)) {
+            destination.serverUrl = defaultDestination.serverUrl;
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        if (!destination.streamKey.empty() && !IsValidStreamKey(destination.streamKey)) {
+            // Invalid persisted credentials are discarded rather than repaired
+            // into a different key. Never include the rejected value in logs.
+            destination.streamKey.clear();
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        if (destination.streamTitle.size() > 140 ||
+                destination.streamTitle.find('\0') != std::string::npos) {
+            destination.streamTitle.clear();
+            result.changed = true;
+            ++result.repairedFields;
+        }
+    }
+    const auto safeIdentifier = [](std::string_view value, std::size_t maximum) {
+        return value.size() <= maximum &&
+            value.find('\0') == std::string_view::npos &&
+            std::none_of(value.begin(), value.end(), [](unsigned char character) {
+                return character < 0x20 || character == 0x7f;
+            });
+    };
+    auto& twitch = settings.broadcast.twitchAccount;
+    // The Client ID belongs to SaberStage, not to an individual player. Old
+    // alpha settings may contain an empty or developer-supplied ID; migrate
+    // every installation to the registered application automatically.
+    if (twitch.clientId != kSaberStageTwitchClientId) {
+        twitch.clientId = std::string(kSaberStageTwitchClientId);
         result.changed = true;
         ++result.repairedFields;
+    }
+    if (!safeIdentifier(twitch.accessToken, 2048) ||
+            !safeIdentifier(twitch.refreshToken, 2048)) {
+        twitch.accessToken.clear();
+        twitch.refreshToken.clear();
+        twitch.login.clear();
+        twitch.userId.clear();
+        twitch.expiresAtUnixSeconds = 0;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    if (!safeIdentifier(twitch.protectedTokenEnvelope, 8192)) {
+        twitch.protectedTokenEnvelope.clear();
+        twitch.accessToken.clear();
+        twitch.refreshToken.clear();
+        twitch.login.clear();
+        twitch.userId.clear();
+        twitch.expiresAtUnixSeconds = 0;
+        twitch.chatWriteAuthorized = false;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    if (!safeIdentifier(twitch.login, 64) || !safeIdentifier(twitch.userId, 64)) {
+        twitch.login.clear();
+        twitch.userId.clear();
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    if (settings.broadcast.afkMediaPath.size() > 4096 ||
+            settings.broadcast.afkMediaPath.find('\0') != std::string::npos) {
+        settings.broadcast.afkMediaPath.clear();
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    RepairVector(settings.chat.position, defaults.chat.position, result);
+    RepairFloat(settings.chat.width, 45.0F, 120.0F, defaults.chat.width, result);
+    RepairFloat(settings.chat.height, 32.0F, 100.0F, defaults.chat.height, result);
+    if (!camera::IsFinite(settings.chat.rotationDegrees)) {
+        settings.chat.rotationDegrees = defaults.chat.rotationDegrees;
+        result.changed = true;
+        ++result.repairedFields;
+    } else {
+        const auto normalized = camera::Vec3{
+            camera::NormalizeDegrees(settings.chat.rotationDegrees.x),
+            camera::NormalizeDegrees(settings.chat.rotationDegrees.y),
+            camera::NormalizeDegrees(settings.chat.rotationDegrees.z)};
+        if (normalized.x != settings.chat.rotationDegrees.x ||
+                normalized.y != settings.chat.rotationDegrees.y ||
+                normalized.z != settings.chat.rotationDegrees.z) {
+            settings.chat.rotationDegrees = normalized;
+            result.changed = true;
+            ++result.repairedFields;
+        }
     }
     RepairRange(settings.broadcast.reconnectAttempts, 0, 30,
                 defaults.broadcast.reconnectAttempts, result);
     RepairRange(settings.broadcast.reconnectInitialDelaySeconds, 1, 30,
                 defaults.broadcast.reconnectInitialDelaySeconds, result);
+    RepairFloat(
+        settings.broadcast.gameAudioVolumePercent,
+        0.0F,
+        200.0F,
+        defaults.broadcast.gameAudioVolumePercent,
+        result);
+    RepairFloat(
+        settings.broadcast.microphoneVolumePercent,
+        0.0F,
+        200.0F,
+        defaults.broadcast.microphoneVolumePercent,
+        result);
     return result;
 }
 
@@ -527,8 +682,39 @@ bool Migrate(SettingsDocument& settings, std::uint32_t sourceSchemaVersion) {
     if (sourceSchemaVersion == kCurrentSchemaVersion) {
         return true;
     }
-    // Earlier versions were unpublished scaffolds. Their recognized values map
-    // directly; newly introduced fields retain their safe defaults.
+    if (sourceSchemaVersion < 21) {
+        const auto near = [](float left, float right) {
+            return std::abs(left - right) <= 0.001F;
+        };
+        const auto isLegacyDefaultPose = [&](camera::Vec3 position, camera::Vec3 rotation,
+                                                 camera::Vec3 legacyPosition) {
+            return near(position.x, legacyPosition.x) &&
+                   near(position.y, legacyPosition.y) &&
+                   near(position.z, legacyPosition.z) &&
+                   near(rotation.x, 0.0F) && near(std::abs(rotation.y), 180.0F) &&
+                   near(rotation.z, 0.0F);
+        };
+
+        // Schema 20 incorrectly treated local +Z as FloatingScreen's visible
+        // face. Only rewrite untouched legacy default poses; any panel the user
+        // already grabbed and oriented is preserved exactly. The movable
+        // preview also recenters with the corrected HMD yaw whenever enabled.
+        if (isLegacyDefaultPose(
+                settings.preview.position,
+                settings.preview.rotationDegrees,
+                {0.0F, 1.15F, 2.1F})) {
+            settings.preview.rotationDegrees = {};
+        }
+        if (isLegacyDefaultPose(
+                settings.recording.worldControlsPosition,
+                settings.recording.worldControlsRotationDegrees,
+                {0.42F, 1.25F, 1.45F})) {
+            settings.recording.worldControlsRotationDegrees = {};
+        }
+    }
+
+    // Earlier versions otherwise map directly; newly introduced fields retain
+    // their safe defaults.
     settings.schemaVersion = kCurrentSchemaVersion;
     return true;
 }

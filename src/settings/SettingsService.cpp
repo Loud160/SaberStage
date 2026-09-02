@@ -37,6 +37,14 @@ std::int32_t Int(const Value& object, const char* name, std::int32_t fallback, b
     return fallback;
 }
 
+std::int64_t Int64(const Value& object, const char* name, std::int64_t fallback, bool& repaired) {
+    const auto* value = Member(object, name);
+    if (value == nullptr) return fallback;
+    if (value->IsInt64()) return value->GetInt64();
+    repaired = true;
+    return fallback;
+}
+
 float Float(const Value& object, const char* name, float fallback, bool& repaired) {
     const auto* value = Member(object, name);
     if (value == nullptr) return fallback;
@@ -105,6 +113,32 @@ void AddFeature(Value& root, const char* name, const FeatureSettings& feature, D
     Value object(rapidjson::kObjectType);
     object.AddMember("enabled", feature.enabled, allocator);
     root.AddMember(Value(name, allocator), object, allocator);
+}
+
+void DecodeLivestreamDestination(
+    const Value& destinations,
+    const char* name,
+    LivestreamDestinationSettings& destination,
+    bool& repaired) {
+    const auto* source = Member(destinations, name);
+    if (!source) return;
+    if (!source->IsObject()) {
+        repaired = true;
+        return;
+    }
+    destination.serverUrl = String(*source, "serverUrl", destination.serverUrl, repaired);
+    destination.streamKey = String(*source, "streamKey", destination.streamKey, repaired);
+    destination.streamTitle = String(*source, "streamTitle", destination.streamTitle, repaired);
+}
+
+Value EncodeLivestreamDestination(
+    const LivestreamDestinationSettings& destination,
+    Document::AllocatorType& allocator) {
+    Value value(rapidjson::kObjectType);
+    value.AddMember("serverUrl", Value(destination.serverUrl.c_str(), allocator), allocator);
+    value.AddMember("streamKey", Value(destination.streamKey.c_str(), allocator), allocator);
+    value.AddMember("streamTitle", Value(destination.streamTitle.c_str(), allocator), allocator);
+    return value;
 }
 
 AvatarControllerOffsetSettings AvatarControllerOffset(
@@ -418,6 +452,7 @@ void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bo
         camera::TryParseSubjectAnchor, repaired);
     profile.position = Vector(source, "position", profile.position, repaired);
     profile.rotationDegrees = Vector(source, "rotationDegrees", profile.rotationDegrees, repaired);
+    profile.keepLevel = Bool(source, "keepLevel", profile.keepLevel, repaired);
     profile.fovDegrees = Float(source, "fovDegrees", profile.fovDegrees, repaired);
     profile.requestedWidth = Int(source, "requestedWidth", profile.requestedWidth, repaired);
     profile.requestedHeight = Int(source, "requestedHeight", profile.requestedHeight, repaired);
@@ -463,6 +498,7 @@ Value EncodeCameraProfile(const camera::CameraProfile& profile, Document::Alloca
     result.AddMember("subjectAnchor", Value(subjectAnchor.data(), static_cast<rapidjson::SizeType>(subjectAnchor.size()), allocator), allocator);
     AddVector(result, "position", profile.position, allocator);
     AddVector(result, "rotationDegrees", profile.rotationDegrees, allocator);
+    result.AddMember("keepLevel", profile.keepLevel, allocator);
     result.AddMember("fovDegrees", profile.fovDegrees, allocator);
     result.AddMember("requestedWidth", profile.requestedWidth, allocator);
     result.AddMember("requestedHeight", profile.requestedHeight, allocator);
@@ -594,6 +630,11 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 "worldControlsShowFps",
                 settings.recording.worldControlsShowFps,
                 repaired);
+            settings.recording.worldControlsStreamMode = Bool(
+                *recording,
+                "worldControlsStreamMode",
+                settings.recording.worldControlsStreamMode,
+                repaired);
             settings.recording.worldControlsPosition = Vector(
                 *recording,
                 "worldControlsPosition",
@@ -656,8 +697,32 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.broadcast.provider = EnumValue(
                 *broadcast, "provider", settings.broadcast.provider,
                 [](std::string_view value, LivestreamProvider& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.broadcast.serverUrl = String(
-                *broadcast, "serverUrl", settings.broadcast.serverUrl, repaired);
+            if (const auto* destinations = Member(*broadcast, "destinations")) {
+                if (!destinations->IsObject()) {
+                    repaired = true;
+                } else {
+                    DecodeLivestreamDestination(
+                        *destinations, "twitch", settings.broadcast.twitch, repaired);
+                    DecodeLivestreamDestination(
+                        *destinations, "youtube", settings.broadcast.youtube, repaired);
+                    DecodeLivestreamDestination(
+                        *destinations, "kick", settings.broadcast.kick, repaired);
+                    DecodeLivestreamDestination(
+                        *destinations, "custom", settings.broadcast.custom, repaired);
+                }
+            } else {
+                // Schemas through 19 stored one endpoint for whichever service
+                // happened to be selected. Preserve that value in only that
+                // provider's destination while all other services keep their
+                // own safe defaults. The stream-key field is accepted solely
+                // to recover an unpublished schema-20 development build.
+                auto& legacyDestination = DestinationForProvider(
+                    settings.broadcast, settings.broadcast.provider);
+                legacyDestination.serverUrl = String(
+                    *broadcast, "serverUrl", legacyDestination.serverUrl, repaired);
+                legacyDestination.streamKey = String(
+                    *broadcast, "streamKey", legacyDestination.streamKey, repaired);
+            }
             settings.broadcast.reconnectEnabled = Bool(
                 *broadcast, "reconnectEnabled", settings.broadcast.reconnectEnabled, repaired);
             settings.broadcast.reconnectAttempts = Int(
@@ -667,9 +732,80 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 "reconnectInitialDelaySeconds",
                 settings.broadcast.reconnectInitialDelaySeconds,
                 repaired);
+            settings.broadcast.afkMediaPath = String(
+                *broadcast, "afkMediaPath", settings.broadcast.afkMediaPath, repaired);
+            settings.broadcast.keepHeadsetAwake = Bool(
+                *broadcast,
+                "keepHeadsetAwake",
+                settings.broadcast.keepHeadsetAwake,
+                repaired);
+            settings.broadcast.gameAudioEnabled = Bool(
+                *broadcast,
+                "gameAudioEnabled",
+                settings.broadcast.gameAudioEnabled,
+                repaired);
+            settings.broadcast.gameAudioVolumePercent = Float(
+                *broadcast,
+                "gameAudioVolumePercent",
+                settings.broadcast.gameAudioVolumePercent,
+                repaired);
+            settings.broadcast.microphoneEnabled = Bool(
+                *broadcast,
+                "microphoneEnabled",
+                settings.broadcast.microphoneEnabled,
+                repaired);
+            settings.broadcast.microphoneVolumePercent = Float(
+                *broadcast,
+                "microphoneVolumePercent",
+                settings.broadcast.microphoneVolumePercent,
+                repaired);
+            settings.broadcast.postMapInfoToChat = Bool(
+                *broadcast,
+                "postMapInfoToChat",
+                settings.broadcast.postMapInfoToChat,
+                repaired);
+            if (const auto* account = Member(*broadcast, "twitchAccount")) {
+                if (!account->IsObject()) {
+                    repaired = true;
+                } else {
+                    auto& twitch = settings.broadcast.twitchAccount;
+                    twitch.clientId = String(*account, "clientId", twitch.clientId, repaired);
+                    // Schema 25 and earlier stored both OAuth tokens as plain
+                    // JSON. They are decoded one final time so TwitchService
+                    // can migrate them into Android Keystore, but Encode below
+                    // intentionally never writes these legacy fields again.
+                    twitch.accessToken = String(*account, "accessToken", twitch.accessToken, repaired);
+                    twitch.refreshToken = String(*account, "refreshToken", twitch.refreshToken, repaired);
+                    twitch.protectedTokenEnvelope = String(
+                        *account,
+                        "protectedTokenEnvelope",
+                        twitch.protectedTokenEnvelope,
+                        repaired);
+                    twitch.login = String(*account, "login", twitch.login, repaired);
+                    twitch.userId = String(*account, "userId", twitch.userId, repaired);
+                    twitch.expiresAtUnixSeconds = Int64(
+                        *account, "expiresAtUnixSeconds", twitch.expiresAtUnixSeconds, repaired);
+                    twitch.chatWriteAuthorized = Bool(
+                        *account,
+                        "chatWriteAuthorized",
+                        twitch.chatWriteAuthorized,
+                        repaired);
+                }
+            }
         }
     }
-    settings.chat = Feature(document, "chat", settings.chat, repaired);
+    if (const auto* chat = Member(document, "chat")) {
+        if (!chat->IsObject()) {
+            repaired = true;
+        } else {
+            settings.chat.enabled = Bool(*chat, "enabled", settings.chat.enabled, repaired);
+            settings.chat.position = Vector(*chat, "position", settings.chat.position, repaired);
+            settings.chat.rotationDegrees = Vector(
+                *chat, "rotationDegrees", settings.chat.rotationDegrees, repaired);
+            settings.chat.width = Float(*chat, "width", settings.chat.width, repaired);
+            settings.chat.height = Float(*chat, "height", settings.chat.height, repaired);
+        }
+    }
     settings.schemaVersion = sourceVersion;
     return true;
 }
@@ -718,6 +854,7 @@ std::string Encode(const SettingsDocument& settings) {
     recording.AddMember("controllerShortcutEnabled", settings.recording.controllerShortcutEnabled, allocator);
     recording.AddMember("worldControlsVisible", settings.recording.worldControlsVisible, allocator);
     recording.AddMember("worldControlsShowFps", settings.recording.worldControlsShowFps, allocator);
+    recording.AddMember("worldControlsStreamMode", settings.recording.worldControlsStreamMode, allocator);
     AddVector(recording, "worldControlsPosition", settings.recording.worldControlsPosition, allocator);
     AddVector(
         recording,
@@ -746,15 +883,58 @@ std::string Encode(const SettingsDocument& settings) {
     Value broadcast(rapidjson::kObjectType);
     broadcast.AddMember("enabled", settings.broadcast.enabled, allocator);
     broadcast.AddMember("provider", Value(ToString(settings.broadcast.provider).data(), allocator), allocator);
-    broadcast.AddMember("serverUrl", Value(settings.broadcast.serverUrl.c_str(), allocator), allocator);
+    Value destinations(rapidjson::kObjectType);
+    destinations.AddMember(
+        "twitch", EncodeLivestreamDestination(settings.broadcast.twitch, allocator), allocator);
+    destinations.AddMember(
+        "youtube", EncodeLivestreamDestination(settings.broadcast.youtube, allocator), allocator);
+    destinations.AddMember(
+        "kick", EncodeLivestreamDestination(settings.broadcast.kick, allocator), allocator);
+    destinations.AddMember(
+        "custom", EncodeLivestreamDestination(settings.broadcast.custom, allocator), allocator);
+    broadcast.AddMember("destinations", destinations, allocator);
     broadcast.AddMember("reconnectEnabled", settings.broadcast.reconnectEnabled, allocator);
     broadcast.AddMember("reconnectAttempts", settings.broadcast.reconnectAttempts, allocator);
     broadcast.AddMember(
         "reconnectInitialDelaySeconds",
         settings.broadcast.reconnectInitialDelaySeconds,
         allocator);
+    broadcast.AddMember(
+        "afkMediaPath", Value(settings.broadcast.afkMediaPath.c_str(), allocator), allocator);
+    broadcast.AddMember("keepHeadsetAwake", settings.broadcast.keepHeadsetAwake, allocator);
+    broadcast.AddMember("gameAudioEnabled", settings.broadcast.gameAudioEnabled, allocator);
+    broadcast.AddMember(
+        "gameAudioVolumePercent", settings.broadcast.gameAudioVolumePercent, allocator);
+    broadcast.AddMember("microphoneEnabled", settings.broadcast.microphoneEnabled, allocator);
+    broadcast.AddMember(
+        "microphoneVolumePercent", settings.broadcast.microphoneVolumePercent, allocator);
+    broadcast.AddMember("postMapInfoToChat", settings.broadcast.postMapInfoToChat, allocator);
+    Value twitchAccount(rapidjson::kObjectType);
+    twitchAccount.AddMember(
+        "clientId", Value(settings.broadcast.twitchAccount.clientId.c_str(), allocator), allocator);
+    // Runtime plaintext tokens must never cross this serialization boundary.
+    // Only Android Keystore's versioned, authenticated ciphertext is durable.
+    twitchAccount.AddMember(
+        "protectedTokenEnvelope",
+        Value(settings.broadcast.twitchAccount.protectedTokenEnvelope.c_str(), allocator),
+        allocator);
+    twitchAccount.AddMember(
+        "login", Value(settings.broadcast.twitchAccount.login.c_str(), allocator), allocator);
+    twitchAccount.AddMember(
+        "userId", Value(settings.broadcast.twitchAccount.userId.c_str(), allocator), allocator);
+    twitchAccount.AddMember(
+        "expiresAtUnixSeconds", settings.broadcast.twitchAccount.expiresAtUnixSeconds, allocator);
+    twitchAccount.AddMember(
+        "chatWriteAuthorized", settings.broadcast.twitchAccount.chatWriteAuthorized, allocator);
+    broadcast.AddMember("twitchAccount", twitchAccount, allocator);
     document.AddMember("broadcast", broadcast, allocator);
-    AddFeature(document, "chat", settings.chat, allocator);
+    Value chat(rapidjson::kObjectType);
+    chat.AddMember("enabled", settings.chat.enabled, allocator);
+    AddVector(chat, "position", settings.chat.position, allocator);
+    AddVector(chat, "rotationDegrees", settings.chat.rotationDegrees, allocator);
+    chat.AddMember("width", settings.chat.width, allocator);
+    chat.AddMember("height", settings.chat.height, allocator);
+    document.AddMember("chat", chat, allocator);
 
     rapidjson::StringBuffer buffer;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(buffer);
