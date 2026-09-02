@@ -446,14 +446,19 @@ public:
 
     void Stop() noexcept {
         if (!started_) return;
-        camera_.SetBeforeRenderHandler({});
-        UnloadVrmAvatar();
-        UnbindAnimator();
-        UnbindAvatarRuntimeDriver(&owner_);
-        DestroyCalibrationAudio();
         try {
+            camera_.SetBeforeRenderHandler({});
+            UnloadVrmAvatar();
+            UnbindAnimator();
+            UnbindAvatarRuntimeDriver(&owner_);
+            DestroyCalibrationAudio();
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
+        } catch (const std::exception& exception) {
+            Logging::Logger.error("Avatar shutdown failed safely: {}", exception.what());
+            UnbindAvatarRuntimeDriver(&owner_);
         } catch (...) {
+            Logging::Logger.error("Avatar shutdown failed safely after an unknown error");
+            UnbindAvatarRuntimeDriver(&owner_);
         }
         driverObject_ = nullptr;
         started_ = false;

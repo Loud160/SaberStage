@@ -1,6 +1,5 @@
 # QPM restore/build output
 extern/
-qpm.shared.json
 qpm.lock
 *.backup
 *.corrupt-after-lockup

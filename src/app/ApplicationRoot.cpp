@@ -1,6 +1,7 @@
 #include "saberstage/app/ApplicationRoot.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/ErrorManager.hpp"
 #include "saberstage/avatar/AvatarManager.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
@@ -148,17 +149,38 @@ bool ApplicationRoot::Start() {
 
 void ApplicationRoot::Stop() noexcept {
     if (!started_) return;
-    menu_.reset();
-    if (preview_) preview_->Stop();
-    preview_.reset();
-    if (recording_) recording_->Shutdown();
-    recording_.reset();
-    if (twitch_) twitch_->Shutdown();
-    twitch_.reset();
-    if (avatar_) avatar_->Stop();
-    avatar_.reset();
-    if (camera_) camera_->Stop();
-    camera_.reset();
+    // Preserve dependency order while allowing every subsystem to release its
+    // own resources after an earlier teardown failure. The subsystem methods
+    // are noexcept by contract; these guards also protect ownership resets and
+    // future cleanup additions from escaping this destructor path.
+    auto& errors = ErrorManager::Instance();
+    errors.Guard("flushing deferred SaberStage settings", [this] {
+        std::string error;
+        if (!settings_.FlushPendingSave(&error)) {
+            Logging::Logger.error("Could not flush deferred SaberStage settings: {}", error);
+        }
+    });
+    errors.Guard("destroying the SaberStage menu", [this] { menu_.reset(); });
+    errors.Guard("stopping the preview manager", [this] {
+        if (preview_) preview_->Stop();
+        preview_.reset();
+    });
+    errors.Guard("stopping the recording controller", [this] {
+        if (recording_) recording_->Shutdown();
+        recording_.reset();
+    });
+    errors.Guard("stopping Twitch services", [this] {
+        if (twitch_) twitch_->Shutdown();
+        twitch_.reset();
+    });
+    errors.Guard("stopping the avatar manager", [this] {
+        if (avatar_) avatar_->Stop();
+        avatar_.reset();
+    });
+    errors.Guard("stopping the spectator camera", [this] {
+        if (camera_) camera_->Stop();
+        camera_.reset();
+    });
     started_ = false;
     Logging::Logger.info("Application root stopped");
 }

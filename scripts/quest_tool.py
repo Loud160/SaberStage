@@ -279,6 +279,19 @@ def collect_logs(adb: Adb, output_root: pathlib.Path | None) -> None:
             (work / name).write_text(result.stdout + result.stderr, encoding="utf-8", errors="replace")
 
         remote_commands = {
+            "saberstage-native.log": (
+                f"if [ -f '{MOD_DATA}/Mods/SaberStage/Logs/saberstage-native.log' ]; then "
+                f"cat '{MOD_DATA}/Mods/SaberStage/Logs/saberstage-native.log'; "
+                "else echo 'SaberStage native log is absent.'; fi"
+            ),
+            "saberstage-native.previous.log": (
+                f"if [ -f '{MOD_DATA}/Mods/SaberStage/Logs/saberstage-native.previous.log' ]; then "
+                f"cat '{MOD_DATA}/Mods/SaberStage/Logs/saberstage-native.previous.log'; "
+                "else echo 'Previous SaberStage native log is absent.'; fi"
+            ),
+            # SaberStage itself no longer uses Paper2. Keep this filtered file
+            # because transitive dependencies such as BSML may still explain a
+            # startup failure in the same support session.
             "saberstage-paperlog.txt": (
                 "for log in "
                 f"'{MOD_DATA}/logs2/Paperlog.log' '{MOD_DATA}/logs/PaperLog.log'; do "

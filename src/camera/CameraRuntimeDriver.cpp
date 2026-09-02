@@ -1,6 +1,7 @@
 #include "saberstage/camera/CameraRuntimeDriver.hpp"
 
 #include "saberstage/camera/CameraManager.hpp"
+#include "saberstage/ErrorManager.hpp"
 
 #include "custom-types/shared/register.hpp"
 
@@ -24,7 +25,11 @@ void UnbindCameraRuntimeDriver(CameraManager* manager) noexcept {
 }
 
 void CameraRuntimeDriver::LateUpdate() {
-    if (activeManager != nullptr) activeManager->Tick();
+    if (activeManager != nullptr) {
+        ErrorManager::Instance().Guard(
+            "updating the spectator camera",
+            [] { activeManager->Tick(); });
+    }
 }
 
 } // namespace saberstage::camera

@@ -4,6 +4,8 @@
 #include <rapidjson/prettywriter.h>
 #include <rapidjson/stringbuffer.h>
 
+#include <algorithm>
+#include <exception>
 #include <fstream>
 #include <sstream>
 #include <system_error>
@@ -989,60 +991,87 @@ LoadResult SettingsService::Load() {
     return result;
 }
 
-bool SettingsService::Save(std::string* error) {
-    // Avatar settings are edited through the established active working copy.
-    // Snapshot it immediately before every save so new and existing call sites
-    // cannot accidentally persist a stale player profile.
-    SyncActiveAvatarPlayerProfile(settings_);
-    std::error_code ec;
-    std::filesystem::create_directories(path_.parent_path(), ec);
-    if (ec) {
-        if (error) *error = "cannot create settings directory: " + ec.message();
-        return false;
-    }
-
-    const auto temporary = std::filesystem::path(path_.string() + ".tmp");
-    const auto backup = std::filesystem::path(path_.string() + ".bak");
-    std::filesystem::remove(temporary, ec);
-    ec.clear();
-
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        if (!output) {
-            if (error) *error = "cannot open temporary settings file";
-            return false;
-        }
-        const auto json = Encode(settings_);
-        output.write(json.data(), static_cast<std::streamsize>(json.size()));
-        output.flush();
-        if (!output) {
-            if (error) *error = "cannot write temporary settings file";
-            return false;
-        }
-    }
-
-    std::filesystem::remove(backup, ec);
-    ec.clear();
-    const bool hadTarget = std::filesystem::exists(path_, ec) && !ec;
-    if (hadTarget) {
-        std::filesystem::rename(path_, backup, ec);
+bool SettingsService::Save(std::string* error) noexcept {
+    try {
+        // Avatar settings are edited through the established active working
+        // copy. Snapshot it immediately before every save so new and existing
+        // call sites cannot accidentally persist a stale player profile.
+        SyncActiveAvatarPlayerProfile(settings_);
+        std::error_code ec;
+        std::filesystem::create_directories(path_.parent_path(), ec);
         if (ec) {
-            if (error) *error = "cannot stage previous settings: " + ec.message();
+            if (error) *error = "cannot create settings directory: " + ec.message();
             return false;
         }
-    }
 
-    std::filesystem::rename(temporary, path_, ec);
-    if (ec) {
-        if (hadTarget) {
-            std::error_code restoreError;
-            std::filesystem::rename(backup, path_, restoreError);
+        const auto temporary = std::filesystem::path(path_.string() + ".tmp");
+        const auto backup = std::filesystem::path(path_.string() + ".bak");
+        std::filesystem::remove(temporary, ec);
+        ec.clear();
+
+        {
+            std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+            if (!output) {
+                if (error) *error = "cannot open temporary settings file";
+                return false;
+            }
+            const auto json = Encode(settings_);
+            output.write(json.data(), static_cast<std::streamsize>(json.size()));
+            output.flush();
+            if (!output) {
+                if (error) *error = "cannot write temporary settings file";
+                return false;
+            }
         }
-        if (error) *error = "cannot promote new settings: " + ec.message();
+
+        std::filesystem::remove(backup, ec);
+        ec.clear();
+        const bool hadTarget = std::filesystem::exists(path_, ec) && !ec;
+        if (hadTarget) {
+            std::filesystem::rename(path_, backup, ec);
+            if (ec) {
+                if (error) *error = "cannot stage previous settings: " + ec.message();
+                return false;
+            }
+        }
+
+        std::filesystem::rename(temporary, path_, ec);
+        if (ec) {
+            if (hadTarget) {
+                std::error_code restoreError;
+                std::filesystem::rename(backup, path_, restoreError);
+            }
+            if (error) *error = "cannot promote new settings: " + ec.message();
+            return false;
+        }
+        std::filesystem::remove(backup, ec);
+        pendingSave_ = false;
+        return true;
+    } catch (const std::exception& exception) {
+        if (error) *error = std::string("unexpected settings save failure: ") + exception.what();
+        return false;
+    } catch (...) {
+        if (error) *error = "unexpected native exception while saving settings";
         return false;
     }
-    std::filesystem::remove(backup, ec);
-    return true;
+}
+
+void SettingsService::RequestSave(std::chrono::milliseconds delay) noexcept {
+    pendingSave_ = true;
+    pendingSaveDue_ = std::chrono::steady_clock::now() + std::max(delay, std::chrono::milliseconds::zero());
+}
+
+bool SettingsService::TickPendingSave(std::string* error) noexcept {
+    if (!pendingSave_ || std::chrono::steady_clock::now() < pendingSaveDue_) return true;
+    if (Save(error)) return true;
+    // A temporarily busy or unavailable filesystem should not trigger a write
+    // attempt and log entry every rendered frame.
+    pendingSaveDue_ = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    return false;
+}
+
+bool SettingsService::FlushPendingSave(std::string* error) noexcept {
+    return !pendingSave_ || Save(error);
 }
 
 bool SettingsService::Reset(Subsystem subsystem, std::string* error) {

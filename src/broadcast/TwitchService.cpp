@@ -28,6 +28,7 @@ extern "C" {
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 namespace saberstage::broadcast {
@@ -46,6 +47,33 @@ constexpr std::int64_t kViewerCountRefreshSeconds = 30;
 constexpr auto kChatTransportTimeout = std::chrono::seconds(20);
 constexpr auto kChatAuthenticationTimeout = std::chrono::seconds(15);
 constexpr std::size_t kMaximumBeatmapMetadataBytes = 32U * 1024U * 1024U;
+
+void JoinWorker(std::thread& worker, std::string_view name) noexcept {
+    if (!worker.joinable()) return;
+    try {
+        worker.join();
+    } catch (const std::system_error& error) {
+        Logging::Logger.error("Could not join the {} worker: {}", name, error.what());
+        // A joinable std::thread terminates the process in its destructor. If
+        // the platform rejects join after the worker is known to be complete,
+        // detach as a last-resort ownership release and retain the diagnostic.
+        try {
+            if (worker.joinable()) worker.detach();
+        } catch (const std::system_error& detachError) {
+            Logging::Logger.critical(
+                "Could not detach the failed {} worker: {}",
+                name,
+                detachError.what());
+        }
+    } catch (...) {
+        Logging::Logger.error("Could not join the {} worker because of an unknown error", name);
+        try {
+            if (worker.joinable()) worker.detach();
+        } catch (...) {
+            Logging::Logger.critical("Could not release the failed {} worker", name);
+        }
+    }
+}
 
 std::string FfmpegError(int code) {
     std::array<char, AV_ERROR_MAX_STRING_SIZE> buffer{};
@@ -1467,24 +1495,24 @@ void TwitchService::StopChatWorker() noexcept {
 
 void TwitchService::JoinCompletedWorkers() noexcept {
     if (authorizationWorker_.joinable() && authorizationDone_.load(std::memory_order_acquire)) {
-        authorizationWorker_.join();
+        JoinWorker(authorizationWorker_, "Twitch authorization");
     }
     if (refreshWorker_.joinable() && refreshDone_.load(std::memory_order_acquire)) {
-        refreshWorker_.join();
+        JoinWorker(refreshWorker_, "Twitch token refresh");
     }
     if (chatWorker_.joinable() && chatDone_.load(std::memory_order_acquire)) {
-        chatWorker_.join();
+        JoinWorker(chatWorker_, "Twitch chat");
     }
     if (titleWorker_.joinable() && titleDone_.load(std::memory_order_acquire)) {
-        titleWorker_.join();
+        JoinWorker(titleWorker_, "Twitch title update");
     }
     if (mapAnnouncementWorker_.joinable() &&
             mapAnnouncementDone_.load(std::memory_order_acquire)) {
-        mapAnnouncementWorker_.join();
+        JoinWorker(mapAnnouncementWorker_, "Twitch map announcement");
     }
     if (viewerCountWorker_.joinable() &&
             viewerCountDone_.load(std::memory_order_acquire)) {
-        viewerCountWorker_.join();
+        JoinWorker(viewerCountWorker_, "Twitch viewer count");
     }
 }
 
@@ -1571,9 +1599,8 @@ void TwitchService::Tick() noexcept {
                         pendingMapAnnouncementAfterRefresh_.reset();
                     }
                 }
-                // Paper requires the format string to be selected at compile
-                // time. Keep the two messages in separate calls instead of
-                // choosing a runtime string with the conditional operator.
+                // Keep authorization and refresh records distinct so support
+                // logs state whether a token was first stored or rotated.
                 if (credentials.refreshed && saved) {
                     Logging::Logger.info(
                         "Twitch account authorization refreshed and rotated for '{}'",
@@ -1717,29 +1744,34 @@ TwitchSnapshot TwitchService::Snapshot() const {
 void TwitchService::Shutdown() noexcept {
     if (shuttingDown_) return;
     shuttingDown_ = true;
-    authorizationStop_.store(true, std::memory_order_release);
-    refreshStop_.store(true, std::memory_order_release);
-    chatRequested_.store(false, std::memory_order_release);
-    chatStop_.store(true, std::memory_order_release);
-    if (authorizationWorker_.joinable()) authorizationWorker_.join();
-    if (refreshWorker_.joinable()) refreshWorker_.join();
-    if (chatWorker_.joinable()) chatWorker_.join();
-    if (titleWorker_.joinable()) titleWorker_.join();
-    if (mapAnnouncementWorker_.joinable()) mapAnnouncementWorker_.join();
-    if (viewerCountWorker_.joinable()) viewerCountWorker_.join();
-    {
-        std::lock_guard lock(mutex_);
-        ClearSensitiveString(pendingCredentials_.accessToken);
-        ClearSensitiveString(pendingCredentials_.refreshToken);
-        pendingCredentials_ = {};
+    try {
+        authorizationStop_.store(true, std::memory_order_release);
+        refreshStop_.store(true, std::memory_order_release);
+        chatRequested_.store(false, std::memory_order_release);
+        chatStop_.store(true, std::memory_order_release);
+        JoinWorker(authorizationWorker_, "Twitch authorization");
+        JoinWorker(refreshWorker_, "Twitch token refresh");
+        JoinWorker(chatWorker_, "Twitch chat");
+        JoinWorker(titleWorker_, "Twitch title update");
+        JoinWorker(mapAnnouncementWorker_, "Twitch map announcement");
+        JoinWorker(viewerCountWorker_, "Twitch viewer count");
+        {
+            std::lock_guard lock(mutex_);
+            ClearSensitiveString(pendingCredentials_.accessToken);
+            ClearSensitiveString(pendingCredentials_.refreshToken);
+            pendingCredentials_ = {};
+        }
+        auto& account = settings_.Edit().broadcast.twitchAccount;
+        ClearSensitiveString(account.accessToken);
+        ClearSensitiveString(account.refreshToken);
+        // FFmpeg networking is process-global. DirectLivestreamSink can still
+        // be draining while this provider is torn down, so Android process
+        // lifetime owns that global cleanup.
+    } catch (const std::exception& exception) {
+        Logging::Logger.error("Twitch shutdown failed safely: {}", exception.what());
+    } catch (...) {
+        Logging::Logger.error("Twitch shutdown failed safely after an unknown error");
     }
-    auto& account = settings_.Edit().broadcast.twitchAccount;
-    ClearSensitiveString(account.accessToken);
-    ClearSensitiveString(account.refreshToken);
-    // FFmpeg networking is process-global. DirectLivestreamSink can still be
-    // draining or reconnecting while this service is torn down, so this
-    // provider-specific object must not deinitialize networking underneath
-    // the media path. The process owns cleanup at Android unload.
 }
 
 } // namespace saberstage::broadcast

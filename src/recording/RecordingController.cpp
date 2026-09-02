@@ -545,35 +545,39 @@ bool RecordingController::Stop(std::string_view reason) {
 void RecordingController::Shutdown() noexcept {
     if (shuttingDown_) return;
     shuttingDown_ = true;
-    camera_.SetRuntimeCameraInvalidatedHandler({});
-    camera_.SetRuntimeCameraReadyHandler({});
-    camera_.SetAfterRenderHandler({});
-    if (state_.load() == RecordingState::Armed) {
-        SetState(RecordingState::Idle, "Armed recording canceled during shutdown.");
-    }
-    if (recording::CanStop(state_.load())) {
-        try {
+    try {
+        camera_.SetRuntimeCameraInvalidatedHandler({});
+        camera_.SetRuntimeCameraReadyHandler({});
+        camera_.SetAfterRenderHandler({});
+        if (state_.load() == RecordingState::Armed) {
+            SetState(RecordingState::Idle, "Armed recording canceled during shutdown.");
+        }
+        if (recording::CanStop(state_.load())) {
             Stop("SaberStage is shutting down.");
-        } catch (...) {
-            Logging::Logger.error("Recording shutdown stop failed");
         }
-    }
-    StopLivestream();
-    {
-        std::lock_guard lock(livestreamMutex_);
-        livestreamSink_.reset();
-        for (auto& key : streamKeyOverrides_) {
-            std::fill(key.begin(), key.end(), '\0');
-            key.clear();
+        StopLivestream();
+        {
+            std::lock_guard lock(livestreamMutex_);
+            livestreamSink_.reset();
+            for (auto& key : streamKeyOverrides_) {
+                std::fill(key.begin(), key.end(), '\0');
+                key.clear();
+            }
+            streamServerUrlOverrides_.fill({});
         }
-        streamServerUrlOverrides_.fill({});
+        if (finalizer_.joinable()) finalizer_.join();
+        CleanupCaptureObjects();
+        camera_.RemoveRenderDemand(kRecordingDemandId);
+        UnbindRecordingRuntimeDriver(this);
+        if (IsUnityObjectAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
+        driverObject_ = nullptr;
+    } catch (const std::exception& exception) {
+        Logging::Logger.error("Recording shutdown failed safely: {}", exception.what());
+        UnbindRecordingRuntimeDriver(this);
+    } catch (...) {
+        Logging::Logger.error("Recording shutdown failed safely after an unknown error");
+        UnbindRecordingRuntimeDriver(this);
     }
-    if (finalizer_.joinable()) finalizer_.join();
-    CleanupCaptureObjects();
-    camera_.RemoveRenderDemand(kRecordingDemandId);
-    UnbindRecordingRuntimeDriver(this);
-    if (IsUnityObjectAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
-    driverObject_ = nullptr;
 }
 
 bool RecordingController::HandleDirectCaptureHealth() noexcept {

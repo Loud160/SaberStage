@@ -1,6 +1,7 @@
 #include "saberstage/preview/PreviewRuntimeDriver.hpp"
 
 #include "saberstage/preview/PreviewManager.hpp"
+#include "saberstage/ErrorManager.hpp"
 
 #include "custom-types/shared/register.hpp"
 
@@ -24,7 +25,11 @@ void UnbindPreviewRuntimeDriver(PreviewManager* manager) noexcept {
 }
 
 void PreviewRuntimeDriver::LateUpdate() {
-    if (activeManager != nullptr) activeManager->Tick();
+    if (activeManager != nullptr) {
+        ErrorManager::Instance().Guard(
+            "updating camera previews",
+            [] { activeManager->Tick(); });
+    }
 }
 
 } // namespace saberstage::preview

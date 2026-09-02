@@ -1,6 +1,7 @@
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
 
 #include "saberstage/recording/RecordingController.hpp"
+#include "saberstage/ErrorManager.hpp"
 
 #include "custom-types/shared/register.hpp"
 
@@ -24,7 +25,11 @@ void UnbindRecordingRuntimeDriver(RecordingController* controller) noexcept {
 }
 
 void RecordingRuntimeDriver::Update() {
-    if (activeController != nullptr) activeController->Tick();
+    if (activeController != nullptr) {
+        ErrorManager::Instance().Guard(
+            "updating recording and livestream state",
+            [] { activeController->Tick(); });
+    }
 }
 
 } // namespace saberstage::recording

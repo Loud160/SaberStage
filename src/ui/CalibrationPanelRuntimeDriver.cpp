@@ -1,6 +1,7 @@
 #include "saberstage/ui/CalibrationPanelRuntimeDriver.hpp"
 
 #include "saberstage/ui/MenuController.hpp"
+#include "saberstage/ErrorManager.hpp"
 
 #include "custom-types/shared/register.hpp"
 
@@ -26,7 +27,11 @@ void UnbindCalibrationPanelRuntimeDriver(MenuController* controller) noexcept {
 }
 
 void CalibrationPanelRuntimeDriver::LateUpdate() {
-    if (activeController != nullptr) activeController->TickCalibrationPanel();
+    if (activeController != nullptr) {
+        ErrorManager::Instance().Guard(
+            "updating SaberStage world-space controls",
+            [] { activeController->TickCalibrationPanel(); });
+    }
 }
 
 } // namespace saberstage::ui

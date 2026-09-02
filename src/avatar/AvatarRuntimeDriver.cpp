@@ -1,6 +1,7 @@
 #include "saberstage/avatar/AvatarRuntimeDriver.hpp"
 
 #include "saberstage/avatar/AvatarManager.hpp"
+#include "saberstage/ErrorManager.hpp"
 
 #include "custom-types/shared/register.hpp"
 #include "UnityEngine/Time.hpp"
@@ -25,17 +26,25 @@ void UnbindAvatarRuntimeDriver(AvatarManager* manager) noexcept {
 }
 
 void AvatarRuntimeDriver::Update() {
-    if (activeManager != nullptr) activeManager->SampleTracking();
+    if (activeManager != nullptr) {
+        ErrorManager::Instance().Guard(
+            "sampling avatar tracking",
+            [] { activeManager->SampleTracking(); });
+    }
 }
 
 void AvatarRuntimeDriver::LateUpdate() {
     if (activeManager != nullptr) {
-        activeManager->SolveAndWrite();
-        // Secondary motion is intentionally applied after the trackerless body
-        // solve, exactly once per Unity LateUpdate. Spectator pre-render can
-        // request another body solve, but it must never advance hair/clothing
-        // physics a second time in the same rendered frame.
-        activeManager->UpdateSecondaryMotion(UnityEngine::Time::get_deltaTime());
+        ErrorManager::Instance().Guard(
+            "updating the avatar pose",
+            [] {
+                activeManager->SolveAndWrite();
+                // Secondary motion is intentionally applied after the
+                // trackerless body solve, exactly once per Unity LateUpdate.
+                // Spectator pre-render can request another body solve, but it
+                // must not advance hair/clothing physics twice in one frame.
+                activeManager->UpdateSecondaryMotion(UnityEngine::Time::get_deltaTime());
+            });
     }
 }
 

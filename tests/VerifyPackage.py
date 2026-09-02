@@ -21,6 +21,17 @@ FFMPEG_LIBRARIES = {
     "libavutil-saberstage9.so",
 }
 
+# The filename contains a hyphen, so load the canonical ELF verifier by path.
+import importlib.util
+
+_VERIFY_SPEC = importlib.util.spec_from_file_location(
+    "saberstage_verify_native_library", ROOT / "scripts/verify-native-library.py"
+)
+if _VERIFY_SPEC is None or _VERIFY_SPEC.loader is None:
+    raise RuntimeError("could not load the native library verifier")
+_VERIFY_MODULE = importlib.util.module_from_spec(_VERIFY_SPEC)
+_VERIFY_SPEC.loader.exec_module(_VERIFY_MODULE)
+
 
 def fail(message: str) -> None:
     raise RuntimeError(message)
@@ -59,9 +70,11 @@ def main() -> int:
         fail("QMOD contains an unexpected payload category")
 
     dependency_ids = {item.get("id") for item in manifest.get("dependencies", [])}
-    required = {"beatsaber-hook", "bsml", "custom-types", "hollywood", "paper2_scotland2"}
+    required = {"beatsaber-hook", "bsml", "custom-types", "hollywood"}
     if not required <= dependency_ids:
         fail(f"QMOD dependencies are missing: {sorted(required - dependency_ids)}")
+    if "paper2_scotland2" in dependency_ids:
+        fail("SaberStage must not declare Paper2 as a QMOD dependency")
 
     built_library = BUILT_LIBRARY.read_bytes()
     if packaged_library != built_library:
@@ -72,6 +85,7 @@ def main() -> int:
         fail("packaged ELF machine is not AArch64")
     if b"setup\x00" not in packaged_library or b"late_load\x00" not in packaged_library:
         fail("packaged library is missing Scotland2 entry-point names")
+    _VERIFY_MODULE.verify(BUILT_LIBRARY)
     for name, packaged in packaged_ffmpeg.items():
         built = (FFMPEG_LIBRARY_DIR / name).read_bytes()
         if packaged != built:

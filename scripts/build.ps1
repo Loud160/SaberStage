@@ -11,6 +11,8 @@ $ffmpegReady = Join-Path $repo '.cache\dependencies\ffmpeg-hardware\saberstage-f
 
 Push-Location $repo
 try {
+    & python (Join-Path $PSScriptRoot 'prepare-native-logger.py')
+    if ($LASTEXITCODE -ne 0) { throw "Native Logger Quest preparation failed with exit code $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $ffmpegReady)) {
         & (Join-Path $PSScriptRoot 'build-ffmpeg-hardware.ps1')
         if ($LASTEXITCODE -ne 0) { throw "private FFmpeg hardware runtime build failed with exit code $LASTEXITCODE" }
@@ -34,6 +36,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Quest configure failed with exit code $LASTEXITCODE" }
     & $cmake --build (Join-Path $repo 'build') --parallel 1
     if ($LASTEXITCODE -ne 0) { throw "Quest build failed with exit code $LASTEXITCODE" }
+    & python (Join-Path $PSScriptRoot 'verify-native-library.py') (Join-Path $repo 'build\libsaberstage.so')
+    if ($LASTEXITCODE -ne 0) { throw "native dependency validation failed with exit code $LASTEXITCODE" }
 }
 finally {
     Pop-Location

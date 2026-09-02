@@ -1,6 +1,7 @@
 #include "saberstage/ui/MenuController.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/ErrorManager.hpp"
 #include "saberstage/app/ApplicationRoot.hpp"
 #include "saberstage/avatar/AvatarManager.hpp"
 #include "saberstage/avatar/Math.hpp"
@@ -1149,21 +1150,46 @@ MenuController::MenuController(app::ApplicationRoot& root) : root_(root) {
         if (active_ != nullptr) active_->RefreshCalibrationStatus();
     });
 }
-MenuController::~MenuController() {
-    root_.Recording().SetStatusChangedHandler({});
-    root_.Avatar().SetCalibrationStatusChangedHandler({});
-    DestroyRecordingWorldPanel();
-    DestroyChatWorldPanel();
-    DestroyAllStandinProxies();
-    DestroyGripEditor(true);
-    DestroyCalibrationPanel();
-    UnbindCalibrationPanelRuntimeDriver(this);
-    if (IsAlive(calibrationPanelDriverObject_)) {
-        UnityEngine::Object::Destroy(calibrationPanelDriverObject_);
-    }
-    calibrationPanelDriverObject_ = nullptr;
-    root_.Preview().DetachDockedPreview();
+MenuController::~MenuController() noexcept {
+    // Stop callbacks from discovering a half-destroyed controller before any
+    // Unity object cleanup begins. Each independent cleanup is guarded because
+    // C++ destructors are noexcept and one invalid Unity reference must not
+    // terminate Beat Saber or skip the remaining releases.
     if (active_ == this) active_ = nullptr;
+    auto& errors = ErrorManager::Instance();
+    errors.Guard("clearing recording UI callbacks", [this] {
+        root_.Recording().SetStatusChangedHandler({});
+    });
+    errors.Guard("clearing avatar UI callbacks", [this] {
+        root_.Avatar().SetCalibrationStatusChangedHandler({});
+    });
+    errors.Guard("destroying floating recording controls", [this] {
+        DestroyRecordingWorldPanel();
+    });
+    errors.Guard("destroying Twitch chat controls", [this] {
+        DestroyChatWorldPanel();
+    });
+    errors.Guard("destroying avatar display proxies", [this] {
+        DestroyAllStandinProxies();
+    });
+    errors.Guard("closing avatar grip editor", [this] {
+        DestroyGripEditor(true);
+    });
+    errors.Guard("closing player calibration panel", [this] {
+        DestroyCalibrationPanel();
+    });
+    errors.Guard("unbinding the menu runtime driver", [this] {
+        UnbindCalibrationPanelRuntimeDriver(this);
+    });
+    errors.Guard("destroying the menu runtime driver", [this] {
+        if (IsAlive(calibrationPanelDriverObject_)) {
+            UnityEngine::Object::Destroy(calibrationPanelDriverObject_);
+        }
+    });
+    calibrationPanelDriverObject_ = nullptr;
+    errors.Guard("detaching the docked camera preview", [this] {
+        root_.Preview().DetachDockedPreview();
+    });
 }
 
 void MenuController::Register() {
@@ -1422,10 +1448,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         if (!active_) return;
         auto& avatarSettings = active_->root_.Settings().Edit().avatar;
         active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) {
-            Logging::Logger.error("Could not save avatar view settings: {}", error);
-        }
+        active_->root_.Settings().RequestSave();
     };
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Wear Avatar", avatar.wearAvatar, [applyAndSaveAvatar](bool enabled) {
         if (!active_) return;
@@ -1680,7 +1703,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             avatarSettings.*member = enabled;
             avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
             active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
+            active_->root_.Settings().RequestSave();
         }), hint));
     };
     addQualityToggle("Toon Lighting", avatar.toonLighting, &settings::AvatarSettings::toonLighting,
@@ -1783,7 +1806,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             auto& avatarSettings = active_->root_.Settings().Edit().avatar;
             avatarSettings.sideStepLeanLimitPercent = value;
             active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
+            active_->root_.Settings().RequestSave();
         }),
         "Maximum sideways lean before SaberStage shifts the body and steps. 100% keeps the previous behavior; lower values force an earlier side step."));
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
@@ -1801,7 +1824,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             auto& avatarSettings = active_->root_.Settings().Edit().avatar;
             avatarSettings.plantedLegLeanLimitPercent = value;
             active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
+            active_->root_.Settings().RequestSave();
         }),
         "Maximum sideways pelvis movement over planted feet before SaberStage forces a step. Lower values reduce whole-body leaning from the ankles without changing the torso lean setting."));
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
@@ -1819,7 +1842,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             auto& avatarSettings = active_->root_.Settings().Edit().avatar;
             avatarSettings.stanceWidthPercent = value;
             active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
+            active_->root_.Settings().RequestSave();
         }),
         "Scales the avatar's normal foot separation. 100% keeps the original stance; higher values create a wider, more stable baseline."));
     ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
@@ -1837,7 +1860,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             auto& avatarSettings = active_->root_.Settings().Edit().avatar;
             avatarSettings.backwardSpineCurveLimitPercent = value;
             active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
+            active_->root_.Settings().RequestSave();
         }),
         "Limits only backward spine bowing. 0% prevents rearward curve; forward attack and lunge bending remain available."));
 
@@ -1901,10 +1924,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         auto& avatarSettings = active_->root_.Settings().Edit().avatar;
         settings::ValidateAndRepair(active_->root_.Settings().Edit());
         active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) {
-            Logging::Logger.error("Could not save avatar fit setting: {}", error);
-        }
+        active_->root_.Settings().RequestSave();
     };
 
     CreateCenterPanelSubheader(container->get_transform(), "Sizing Mode and Height");
@@ -3414,11 +3434,10 @@ void MenuController::EditCamera(
     auto& settings = root_.Settings().Edit();
     edit(settings.camera.Primary());
     settings::ValidateAndRepair(settings);
-    std::string error;
-    if (!root_.Settings().Save(&error)) {
-        Logging::Logger.error("Could not save camera {} change: {}", reason, error);
-        return;
-    }
+    // Camera sliders can invoke this callback once per frame. Apply the value
+    // immediately, but coalesce persistence so UI input never waits on a full
+    // JSON encode, flush, backup rename, and atomic replacement for each tick.
+    root_.Settings().RequestSave();
     root_.Camera().NotifyProfileChanged();
     root_.Preview().RefreshRenderDemand();
     RefreshScriptStatus();
@@ -3914,7 +3933,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             [](float value) {
                 if (!active_) return;
                 active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
-                active_->root_.Settings().Save(nullptr);
+                active_->root_.Settings().RequestSave();
                 // Gain is mutable during a stream. RecordingController owns
                 // the synchronized worker-side cache, so the slider never
                 // reaches into the AAC callback or mixer directly.
@@ -3959,7 +3978,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
             [](float value) {
                 if (!active_) return;
                 active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
-                active_->root_.Settings().Save(nullptr);
+                active_->root_.Settings().RequestSave();
                 active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
                 active_->RefreshRecordingStatus();
             }),
@@ -7567,6 +7586,17 @@ void MenuController::TickCalibrationPanel() noexcept {
     // hand-placement IK target so those world-space controls keep updating
     // outside the center panel. Network workers never touch Unity directly;
     // TwitchService::Tick is their main-thread handoff point.
+    std::string deferredSaveError;
+    if (!root_.Settings().TickPendingSave(&deferredSaveError)) {
+        if (deferredSaveError != lastDeferredSettingsSaveError_) {
+            lastDeferredSettingsSaveError_ = deferredSaveError;
+            Logging::Logger.error(
+                "Could not persist deferred SaberStage settings; retrying in one second: {}",
+                deferredSaveError);
+        }
+    } else if (!deferredSaveError.empty() || !lastDeferredSettingsSaveError_.empty()) {
+        lastDeferredSettingsSaveError_.clear();
+    }
     root_.Twitch().Tick();
     const auto twitch = root_.Twitch().Snapshot();
     if (pendingLiveTwitchTitleUpdate_ && twitch.titleUpdateComplete) {

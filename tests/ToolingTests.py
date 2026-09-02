@@ -153,6 +153,72 @@ class ReceiptSafetyTests(unittest.TestCase):
 
 
 class RepositoryInvariantTests(unittest.TestCase):
+    def test_private_logger_is_pinned_isolated_and_collected(self):
+        lock = json.loads((ROOT / "dependencies/native-logger.json").read_text(encoding="utf-8"))
+        qpm = json.loads((ROOT / "qpm.json").read_text(encoding="utf-8"))
+        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        logging_header = (ROOT / "include/saberstage/Logging.hpp").read_text(encoding="utf-8")
+        logging_source = (ROOT / "src/Logging.cpp").read_text(encoding="utf-8")
+        build = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
+        collector = (ROOT / "scripts/quest_tool.py").read_text(encoding="utf-8")
+
+        self.assertEqual(lock["schemaVersion"], 1)
+        self.assertEqual(lock["version"], "1.0.0")
+        self.assertRegex(lock["revision"], r"^[0-9a-f]{40}$")
+        self.assertRegex(lock["archiveSha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            lock["archiveUrl"],
+            f"https://github.com/Loud160/NativeLoggerQuest/archive/{lock['revision']}.zip",
+        )
+        self.assertEqual(lock["sourceDirectory"], f"NativeLoggerQuest-{lock['revision']}")
+        self.assertNotIn("paper2_scotland2", {item["id"] for item in qpm["dependencies"]})
+        self.assertIn("NativeLoggerQuest::NativeLoggerQuest", cmake)
+        self.assertIn("native_logger_quest_enable_paper2_abort_bridge", cmake)
+        self.assertNotIn("paper2_scotland2", logging_header)
+        self.assertNotIn("paper2_scotland2", logging_source)
+        self.assertIn("saberstage-native.log", logging_source)
+        self.assertIn("saberstage-native.previous.log", logging_source)
+        self.assertIn("options.emitToLogcat = true", logging_source)
+        self.assertIn("prepare-native-logger.py", build)
+        self.assertIn("verify-native-library.py", build)
+        self.assertIn('"saberstage-native.log"', collector)
+        self.assertIn('"saberstage-native.previous.log"', collector)
+
+    def test_error_ui_is_main_thread_owned_and_frontmost(self):
+        manager = (ROOT / "src/ErrorManager.cpp").read_text(encoding="utf-8")
+        driver = (ROOT / "src/ErrorRuntimeDriver.cpp").read_text(encoding="utf-8")
+        main = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("std::scoped_lock lock(mutex_)", manager)
+        self.assertIn("pendingDialog_", manager)
+        self.assertIn("SetAsLastSibling", manager)
+        self.assertIn("get_isInTransition()", manager)
+        self.assertIn("SafePtrUnity<HMUI::FlowCoordinator>", manager)
+        self.assertIn("ErrorManager::Instance().TickMainThread()", driver)
+        self.assertIn("DontDestroyOnLoad", driver)
+        self.assertLess(
+            main.index("Logging::Logger.Initialize(VERSION)"),
+            main.index("il2cpp_functions::Init()"),
+        )
+        self.assertIn("PauseMenuManager::Start SaberStage UI creation", main)
+        self.assertIn("PauseMenuManager::OnDestroy SaberStage cleanup", main)
+
+    def test_continuous_ui_edits_use_coalesced_settings_persistence(self):
+        header = (ROOT / "include/saberstage/settings/SettingsService.hpp").read_text(encoding="utf-8")
+        service = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        application = (ROOT / "src/app/ApplicationRoot.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("void RequestSave(", header)
+        self.assertIn("bool TickPendingSave", header)
+        self.assertIn("bool FlushPendingSave", header)
+        self.assertIn("std::chrono::milliseconds(300)", header)
+        self.assertIn("pendingSaveDue_ = std::chrono::steady_clock::now()", service)
+        self.assertIn("std::chrono::seconds(1)", service)
+        self.assertIn("root_.Settings().RequestSave();", menu)
+        self.assertIn("root_.Settings().TickPendingSave", menu)
+        self.assertIn("settings_.FlushPendingSave", application)
+
     def test_twitch_uses_registered_public_app_and_rotating_token_refresh(self):
         settings = (ROOT / "include/saberstage/settings/SettingsModel.hpp").read_text(encoding="utf-8")
         service = (ROOT / "src/broadcast/TwitchService.cpp").read_text(encoding="utf-8")
@@ -350,7 +416,8 @@ class RepositoryInvariantTests(unittest.TestCase):
             {"libavformat-saberstage9.so", "libavcodec-saberstage9.so", "libavutil-saberstage9.so"},
         )
         dependencies = {item["id"] for item in qpm["dependencies"]}
-        self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types", "hollywood", "paper2_scotland2"} <= dependencies)
+        self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types", "hollywood"} <= dependencies)
+        self.assertNotIn("paper2_scotland2", dependencies)
 
     def test_device_reset_fixture_has_only_planned_nondefaults(self):
         fixture = json.loads((ROOT / "tests/fixtures/prompt2-device-settings.json").read_text(encoding="utf-8"))

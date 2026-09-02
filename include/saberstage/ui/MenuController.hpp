@@ -59,7 +59,7 @@ class MenuFlowCoordinator;
 class MenuController final {
 public:
     explicit MenuController(app::ApplicationRoot& root);
-    ~MenuController();
+    ~MenuController() noexcept;
 
     MenuController(const MenuController&) = delete;
     MenuController& operator=(const MenuController&) = delete;
@@ -434,6 +434,9 @@ private:
     // finish before a new Twitch stream is allowed to start.
     bool pendingLiveTwitchTitleUpdate_ = false;
     float twitchUiRefreshSeconds_ = 0.0F;
+    // Used to suppress one identical deferred-save error per frame while the
+    // settings service performs its bounded one-second retry cadence.
+    std::string lastDeferredSettingsSaveError_;
     bool refreshingRetargetingControls_ = false;
     bool refreshingAvatarSetupControls_ = false;
     bool avatarSettingsRebuildPending_ = false;

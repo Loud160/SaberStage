@@ -114,7 +114,26 @@ target_include_directories(${COMPILE_ID} PRIVATE
     ${SHARED_DIR}
     ${EXTERN_DIR}/includes/${CODEGEN_ID}/include
 )
-target_link_libraries(${COMPILE_ID} PRIVATE -llog)
+
+# SaberStage owns this statically linked logger instance. It is deliberately
+# prepared outside QPM so an incompatible shared Paper2 selected for another
+# mod cannot prevent SaberStage from loading its own diagnostic backend.
+set(SABERSTAGE_NATIVE_LOGGER_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/native-logger-quest/source")
+if(NOT EXISTS "${SABERSTAGE_NATIVE_LOGGER_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "Native Logger Quest source is missing. Run scripts/prepare-native-logger.py first.")
+endif()
+set(NATIVE_LOGGER_QUEST_TAG "SaberStage" CACHE STRING "" FORCE)
+set(NATIVE_LOGGER_QUEST_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+    "${SABERSTAGE_NATIVE_LOGGER_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/native-logger-quest"
+    EXCLUDE_FROM_ALL)
+target_link_libraries(${COMPILE_ID} PRIVATE
+    NativeLoggerQuest::NativeLoggerQuest
+    -llog)
+native_logger_quest_enable_paper2_abort_bridge(${COMPILE_ID})
 include(extern.cmake)
 
 set(SABERSTAGE_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/ffmpeg-hardware")

@@ -31,7 +31,6 @@
     {"id": "bsml", "versionRange": "^0.4.55", "additionalData": {"includeQmod": true}},
     {"id": "custom-types", "versionRange": "^0.18.4", "additionalData": {"includeQmod": true}},
     {"id": "hollywood", "versionRange": "^1.2.2", "additionalData": {"includeQmod": true}},
-    {"id": "paper2_scotland2", "versionRange": "^4.8.0", "additionalData": {}},
     {"id": "rapidjson", "versionRange": "^0.1.20250205132808", "additionalData": {}}
   ]
 }

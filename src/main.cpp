@@ -1,4 +1,6 @@
 #include "saberstage/Logging.hpp"
+#include "saberstage/ErrorManager.hpp"
+#include "saberstage/ErrorRuntimeDriver.hpp"
 #include "saberstage/app/ApplicationRoot.hpp"
 #include "saberstage/broadcast/LivestreamState.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
@@ -69,15 +71,12 @@ MAKE_HOOK_MATCH(
     void,
     GlobalNamespace::PauseMenuManager* self) {
     PauseMenuManager_Start(self);
-    try {
-        saberstage::ui::PauseMenuRecordingControls::Instance().CreateUi(self);
-    } catch (const std::exception& exception) {
-        saberstage::Logging::Logger.error(
-            "Could not create pause-menu recording controls: {}", exception.what());
-    } catch (...) {
-        saberstage::Logging::Logger.error(
-            "Could not create pause-menu recording controls because of an unknown failure");
-    }
+    saberstage::ErrorManager::Instance().Guard(
+        "PauseMenuManager::Start SaberStage UI creation",
+        [self] { saberstage::ui::PauseMenuRecordingControls::Instance().CreateUi(self); },
+        "SaberStage recording controls unavailable",
+        "SaberStage could not add its recording controls to the pause menu. "
+        "Gameplay can continue; details were written to the SaberStage log.");
 }
 
 MAKE_HOOK_MATCH(
@@ -86,7 +85,9 @@ MAKE_HOOK_MATCH(
     void,
     GlobalNamespace::PauseMenuManager* self) {
     PauseMenuManager_ShowMenu(self);
-    saberstage::ui::PauseMenuRecordingControls::Instance().MenuShown();
+    saberstage::ErrorManager::Instance().Guard(
+        "PauseMenuManager::ShowMenu SaberStage callback",
+        [] { saberstage::ui::PauseMenuRecordingControls::Instance().MenuShown(); });
 }
 
 MAKE_HOOK_MATCH(
@@ -94,7 +95,11 @@ MAKE_HOOK_MATCH(
     &GlobalNamespace::PauseMenuManager::OnDestroy,
     void,
     GlobalNamespace::PauseMenuManager* self) {
-    saberstage::ui::PauseMenuRecordingControls::Instance().ForgetUi();
+    // SaberStage cleanup is isolated so an invalid retained UI object cannot
+    // prevent Beat Saber's original PauseMenuManager teardown from running.
+    saberstage::ErrorManager::Instance().Guard(
+        "PauseMenuManager::OnDestroy SaberStage cleanup",
+        [] { saberstage::ui::PauseMenuRecordingControls::Instance().ForgetUi(); });
     PauseMenuManager_OnDestroy(self);
 }
 
@@ -204,23 +209,35 @@ MAKE_HOOK_MATCH(
 } // namespace
 
 extern "C" void setup(CModInfo* info) noexcept {
+    if (info == nullptr) return;
     info->id = MOD_ID;
     info->version = VERSION;
     info->version_long = 0;
 }
 
 extern "C" void late_load() noexcept {
+    // The private logger must exist before IL2CPP initialization, dependency
+    // APIs, subsystem construction, or hook installation can fail.
+    saberstage::Logging::Logger.Initialize(VERSION);
     try {
         saberstage::Logging::Logger.info(
             "Loading SaberStage {} (target Beat Saber {}, QPM {}, NDK {})",
             VERSION, SABERSTAGE_TARGET_GAME_VERSION, SABERSTAGE_QPM_VERSION, SABERSTAGE_NDK_VERSION);
         il2cpp_functions::Init();
+        saberstage::ErrorManager::Instance().Guard(
+            "starting the main-thread error dialog runtime",
+            [] { saberstage::StartErrorRuntimeDriver(); });
         const auto gameVersion = std::string(UnityEngine::Application::get_version());
         const auto unityVersion = std::string(UnityEngine::Application::get_unityVersion());
         saberstage::Logging::Logger.info("Runtime game version={}, Unity={}", gameVersion, unityVersion);
         g_application = std::make_unique<saberstage::app::ApplicationRoot>(std::filesystem::path(kSettingsPath));
         if (!g_application->Start()) {
             saberstage::Logging::Logger.error("Application root failed to start");
+            saberstage::ErrorManager::Instance().ReportUserVisible(
+                "SaberStage could not start",
+                "One of SaberStage's required runtime systems could not start. "
+                "The camera and recording UI was not loaded. Details are in "
+                "/sdcard/ModData/com.beatgames.beatsaber/Mods/SaberStage/Logs/saberstage-native.log.");
             g_application.reset();
             return;
         }
@@ -237,11 +254,18 @@ extern "C" void late_load() noexcept {
         INSTALL_HOOK(saberstage::Logging::Logger, AudioTimeSyncController_StartSong);
     } catch (const std::exception& exception) {
         saberstage::ui::PauseMenuRecordingControls::Instance().Bind(nullptr);
-        saberstage::Logging::Logger.error("Unhandled startup failure: {}", exception.what());
+        saberstage::Logging::Logger.critical("Unhandled startup failure: {}", exception.what());
+        saberstage::ErrorManager::Instance().ReportUserVisible(
+            "SaberStage could not start",
+            std::string("Startup stopped safely: ") + exception.what() +
+                "\n\nDetails are in SaberStage's native log.");
         g_application.reset();
     } catch (...) {
         saberstage::ui::PauseMenuRecordingControls::Instance().Bind(nullptr);
-        saberstage::Logging::Logger.error("Unhandled non-standard startup failure");
+        saberstage::Logging::Logger.critical("Unhandled non-standard startup failure");
+        saberstage::ErrorManager::Instance().ReportUserVisible(
+            "SaberStage could not start",
+            "Startup stopped safely after an unknown native error. Details are in SaberStage's native log.");
         g_application.reset();
     }
 }
