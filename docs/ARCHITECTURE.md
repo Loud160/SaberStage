@@ -101,7 +101,37 @@ Recording states: `Idle -> Starting -> Recording <-> RecordingPaused -> Stopping
 
 Settings use a versioned document written to the mod's `ModData` directory. Startup is load, parse, migrate, field-validate/repair, safe-save if changed, then runtime reconstruction after tracking is ready. Unknown future fields are preserved where practical. Every subsystem has a reset and a factory reset exists. Fragile Unity object references and absolute transient scene transforms are never serialized.
 
+Continuous slider edits update the in-memory model and live runtime
+immediately, but their durable writes are coalesced. The main-thread menu tick
+performs the delayed atomic save, retries a temporary failure at a bounded
+interval, and shutdown flushes any pending change before subsystem ownership is
+released. Explicit one-shot actions still save immediately. This preserves the
+set-it-and-forget-it contract without repeatedly flushing and renaming the
+settings file while a controller is moving a slider.
+
 Reconnections use saved nonsecret endpoint identity and pairing metadata plus bounded backoff. Stream and OAuth secrets use Android Keystore-backed encryption when the mod environment can access it safely; plaintext fallback is not acceptable for production. A user can clear or replace every secret. Chat panel placement and provider identity persist separately from credentials.
+
+## Diagnostics and error containment
+
+SaberStage statically links a private Native Logger Quest instance. It writes
+to logcat immediately and to a bounded asynchronous current/previous file pair;
+it neither declares nor intercepts Paper2. The logger starts before ordinary
+IL2CPP, dependency, subsystem, and hook setup so partial startup failures still
+have a SaberStage-owned diagnostic path.
+
+Native hook, runtime-driver, menu-flow, worker-completion, and teardown
+boundaries convert unexpected C++ exceptions into contextual records. Each
+record includes the operation, source file, line, function, exception detail,
+and recovery result where available. One central error manager accepts reports
+from any thread, but a process-lifetime main-thread driver is solely
+responsible for presenting Beat Saber's shared dialog. It waits for a stable
+front flow, retains Unity objects safely across frames, and reasserts frontmost
+sibling order so the prompt cannot become an invisible input blocker.
+
+This cannot recover faults that occur before Android loads
+`libsaberstage.so`, native memory corruption, or failures inside another mod.
+The build therefore validates SaberStage's ELF and package dependency boundary
+in addition to its runtime catches.
 
 ## Failure containment and rejected alternatives
 

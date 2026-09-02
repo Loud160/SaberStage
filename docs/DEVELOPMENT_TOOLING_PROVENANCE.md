@@ -9,4 +9,9 @@ The SaberStage variant is smaller because Prompt 2 deploys one late-mod library 
 - redeploy/remove requires the installed SHA-256 to match SaberStage's receipt;
 - removal targets only the exact receipt-owned library and never settings, logs, recordings, dependencies, or unrelated mods;
 - launchers stop ADB on completion so ModsBeforeFriday can connect later;
-- support logs are collected read-only into a ZIP containing device/package data, logcat, filtered SaberStage Paperlog lines, settings, source-receipt/hash state, and a crash-file listing.
+- support logs are collected read-only into a ZIP containing SaberStage's
+  current/previous private logs, device/package data, logcat, redacted settings,
+  source-receipt/hash state, and a crash-file listing;
+- a filtered SaberStage Paper2 excerpt remains in the archive only because
+  third-party dependencies may still use Paper2 and their loader output may
+  explain a startup failure.

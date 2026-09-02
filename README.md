@@ -1,5 +1,16 @@
 # SaberStage
 
+<p align="center">
+  <strong>A Quest-native third-person camera, avatar, recording, and broadcast stage for Beat Saber.</strong>
+</p>
+
+<p align="center">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Meta%20Quest%202%20%7C%203%20%7C%203S-00b2ff">
+  <img alt="Beat Saber" src="https://img.shields.io/badge/Beat%20Saber-1.40.8-orange">
+  <img alt="Language" src="https://img.shields.io/badge/language-C%2B%2B20-blue">
+  <img alt="Status" src="https://img.shields.io/badge/status-early%20development-yellow">
+</p>
+
 SaberStage is an early-development, clean-room native Quest camera, integrated-avatar, recording, and broadcast mod for Beat Saber by **Loud160 (AKA Whisp)**.
 
 It is **not ready for normal use**. The current development build has a real `primary` spectator-camera runtime and a Camera2-familiar editor in a native left-side menu: an HMD-independent Unity camera, persisted placement/FOV/output profile, numeric and controller-grab placement, player/head/static anchoring, smoothing, optional anchored float, Camera2-format movement-script evaluation, a movable preview, scene/recenter recovery, and consumer-driven off-screen rendering. Local recording starts immediately, keeps the Primary camera and game audio recording continuously through menus, loading, gameplay, and results until stopped, and finalizes a uniquely named MP4 through Hollywood's FFmpeg muxer. Prompt 7 adds explicit pause/resume state, native pause-menu controls, and an opt-in both-thumbsticks gameplay shortcut. An optional Gameplay Only mode arms from the menu and records only the song.
@@ -21,13 +32,21 @@ The product goal and gated build sequence are in [`docs/planning/00_PROJECT_CHAR
 - BSML `^0.4.55`
 - custom-types `^0.18.4`
 - Hollywood `^1.2.2`
-- paper2_scotland2 `^4.8.0`
+- [Native Logger Quest](https://github.com/Loud160/NativeLoggerQuest) `1.0.0`
+  (SHA-pinned, statically linked; no separately installed logger runtime)
 - QPM CLI `1.5.11`
 - Android NDK r27d (`27.3.13750724`)
 
 ## Build and test
 
 See [`docs/BUILD_AND_DEPLOY.md`](docs/BUILD_AND_DEPLOY.md). No final project license has been selected.
+
+SaberStage writes its own current and previous logs under
+`/sdcard/ModData/com.beatgames.beatsaber/Mods/SaberStage/Logs/`. Windows users
+can run `Collect-SaberStage-Logs.bat`; Linux users can run
+`./Collect-SaberStage-Logs-Linux.sh`. The generated support ZIP also retains a
+filtered Paper2 excerpt because third-party dependencies may still use Paper2,
+but SaberStage itself neither declares nor dynamically links Paper2.
 
 The current camera/preview implementation and its device-test boundary are documented in [`docs/PROMPT_4_IMPLEMENTATION.md`](docs/PROMPT_4_IMPLEMENTATION.md).
 
@@ -42,3 +61,36 @@ Completed recordings are stored beside the Quest's built-in captures under `/sdc
 [`examples/MovementScripts/AvatarBodyInspectionOrbit.json`](examples/MovementScripts/AvatarBodyInspectionOrbit.json) is a song-synchronized diagnostic orbit for evaluating trackerless avatar movement. It circles the player once every 60 seconds at a three-meter radius, rises from 0.42 m to 2.05 m over two minutes, retraces the orbit in reverse while descending for the next two minutes, and loops. Every keyframe is aimed at a 1.10 m torso focus point; the low view looks upward and the high view looks downward.
 
 For a headset test, copy the file to `/sdcard/ModData/com.beatgames.beatsaber/Mods/SaberStage/MovementScripts/`, use a Player Relative camera with Player follow, select `AvatarBodyInspectionOrbit.json`, enable the movement script, and disable Anchored Float so it does not offset the diagnostic orbit. The current script selector still accepts a filename rather than presenting a file browser.
+
+## Project layout
+
+```text
+include/saberstage/    Public declarations and platform-neutral interfaces
+src/                   Quest runtime, UI, camera, avatar, recording, and streaming
+tests/                 Host C++ tests and repository/package invariant tests
+scripts/               Dependency, build, package, deploy, removal, and support tools
+assets/                Embedded Quest shader and default AFK assets
+docs/                  Architecture, feature, test, and development records
+tools/                  Shader build project and PC pose-analysis tooling
+```
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [Lifetime and threading rules](docs/LIFETIME_AND_THREADING.md)
+- [Build, package, and development deployment](docs/BUILD_AND_DEPLOY.md)
+- [Test and device gates](docs/TEST_PLAN.md)
+- [Player calibration](docs/PLAYER_CALIBRATION.md)
+- [Recording pipeline](docs/RECORDING_PIPELINE.md)
+- [Streaming architecture](docs/STREAMING_ARCHITECTURE.md)
+- [VRM runtime](docs/VRM_RUNTIME.md)
+- [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security reporting](SECURITY.md)
+
+## Development status
+
+SaberStage is not release-ready. Host tests, an ARM64 link, and package checks
+prove build invariants; they do not prove headset visuals, interaction,
+performance, or long-session reliability. Device claims remain gated by
+[`docs/TEST_PLAN.md`](docs/TEST_PLAN.md).

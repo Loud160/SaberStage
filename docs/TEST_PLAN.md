@@ -9,6 +9,10 @@
 - state-machine illegal transitions and failure recovery;
 - protocol version/packet/parser/fuzz limits and credential-redaction tests.
 - player calibration: five-second countdown/tone/shutter cue sequencing, explicit neck-only versus whole-body instructions, guided retry/cancel behavior, pending Review versus explicit Complete persistence, actionable per-capture diagnostics, Basic-only confidence accounting, robust multi-pose grip/reach fitting, controller-versus-saber source provenance, profile serialization/refit/version/incomplete fallback, personalized lean/step/crouch classification, and zero-allocation profile-aware solves.
+- private logger dependency: immutable revision/SHA lock validation, safe archive
+  extraction, cached-input verification, no direct Paper2 QMOD dependency, no
+  Paper2 `DT_NEEDED` entry or leaked wrapper symbols, and support-bundle
+  inclusion of current/previous native logs.
 
 ## Player calibration device gate
 
@@ -16,7 +20,7 @@ After explicit confirmation that no other workflow is using the Quest: install t
 
 ## Prompt 2 device smoke gate
 
-After host build/package succeeds: install on the explicitly connected development Quest; verify Beat Saber starts, SaberStage load/version/toolchain lines appear, its menu entry appears, a settings document is created, restart reads it, subsystem/factory reset paths work, and repeated restart/exit does not crash. Prompt 2 contains no camera/media behavior.
+After host build/package succeeds: install on the explicitly connected development Quest; verify Beat Saber starts, SaberStage load/version/toolchain lines appear in `saberstage-native.log`, its menu entry appears, a settings document is created, restart reads it, subsystem/factory reset paths work, and repeated restart/exit does not crash. Trigger one recoverable internal test failure where available and verify the prompt appears in front of the active menu, remains clickable, and records context/source detail. Collect a support ZIP and verify both native log slots are present. Prompt 2 contains no camera/media behavior.
 
 ## Stage 1 device/media gates
 

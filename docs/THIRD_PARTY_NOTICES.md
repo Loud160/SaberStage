@@ -1,5 +1,20 @@
 # Third-party notices
 
+## Native Logger Quest
+
+SaberStage statically builds [Native Logger Quest](https://github.com/Loud160/NativeLoggerQuest)
+version `1.0.0` from immutable revision
+`b83b21bbafa1b33c3f36640ded3c2933b5e88085`. The expected official archive
+SHA-256 is recorded in `dependencies/native-logger.json`. It provides the
+private asynchronous file/logcat backend and the target-local beatsaber-hook
+abort bridge; it does not install a shared logger or replace Paper2 used by
+other mods.
+
+Native Logger Quest is distributed under GPL-3.0-only with its preserved
+GPLv3 section 7 terms. Its complete license, additional terms, and notice are
+available in the upstream repository at the pinned revision. This notice does
+not select a final license for SaberStage's remaining first-party source.
+
 ## Camera2
 
 SaberStage's menu screen topology and left camera-list presentation are adapted from [Camera2](https://github.com/kinsi55/CS_BeatSaber_Camera2), inspected at commit `ee82cfdccf432a00692fad46d32489768942571a`.

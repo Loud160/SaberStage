@@ -12,8 +12,8 @@ Run this checklist only after the complete host/build/package gate passes. The g
 ## First launch
 
 1. Beat Saber reaches the main menu and remains running.
-2. Paperlog shows final SaberStage `0.1.0`, target/runtime game versions, QPM/NDK versions, schema-1 settings load, main-menu registration, and application-root startup.
-3. Paperlog shows exactly one explicit registration for `saberstage::ui::MenuFlowCoordinator` and does not show SaberStage initiating a broad `custom_types::AutoRegister()` pass.
+2. SaberStage's private native log shows final SaberStage `0.1.0`, target/runtime game versions, QPM/NDK versions, schema-1 settings load, main-menu registration, and application-root startup.
+3. The private native log shows exactly one explicit registration for `saberstage::ui::MenuFlowCoordinator` and does not show SaberStage initiating a broad `custom_types::AutoRegister()` pass.
 4. The left mod menu contains exactly one `SaberStage` entry.
 5. Opening SaberStage matches Camera2's topology: a `Cameras` panel on the left containing `Primary`, and `SaberStage | Primary` selected-camera settings in the center with Beat Saber's normal Back button. The bottom and right screens remain unused in Prompt 2.
 6. The complete eight-line description is visible without horizontal/vertical clipping or overlap with either reset button.
@@ -23,10 +23,10 @@ Run this checklist only after the complete host/build/package gate passes. The g
 
 1. Press `Reset general settings` once.
 2. Read back the settings file: `general.diagnosticsEnabled` must become `true`, while `camera.fovDegrees` must remain `92.0`.
-3. Confirm Paperlog contains `General settings reset` and no save error.
+3. Confirm the private native log contains `General settings reset` and no save error.
 4. Press `Factory reset SaberStage` once.
 5. Read back the settings file: the camera FOV must return to `70.0` and all other fields must match safe defaults.
-6. Confirm Paperlog contains `Factory reset completed` and no save error.
+6. Confirm the private native log contains `Factory reset completed` and no save error.
 
 ## Restart and exit
 
