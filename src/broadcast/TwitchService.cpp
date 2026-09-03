@@ -11,6 +11,7 @@
 // - Tokens remain behind the secure-settings boundary and network results are marshalled to callers.
 
 #include "saberstage/broadcast/TwitchService.hpp"
+#include "saberstage/broadcast/ChatNetwork.hpp"
 
 #include "saberstage/Logging.hpp"
 #include "saberstage/security/AndroidKeystore.hpp"
@@ -167,7 +168,7 @@ bool HttpRequest(
     // to read a nonexistent body only makes Quest's mbedTLS path return EIO.
     // Close immediately so an already-applied title never produces a false
     // failure popup. Other methods still read and validate their JSON bodies.
-    if (method == "PATCH") {
+    if (method == "PATCH" || method == "DELETE") {
         avio_closep(&context);
         return true;
     }
@@ -344,36 +345,6 @@ std::string BuildMapAnnouncementMessage(const MapAnnouncement& announcement) {
     return SanitizeChatText(message.str(), 480);
 }
 
-std::string TagValue(std::string_view tags, std::string_view name) {
-    const auto marker = std::string(name) + "=";
-    auto cursor = tags.find(marker);
-    if (cursor == std::string_view::npos) return {};
-    cursor += marker.size();
-    const auto end = tags.find(';', cursor);
-    return std::string(tags.substr(cursor, end == std::string_view::npos ? tags.size() - cursor : end - cursor));
-}
-
-bool ParsePrivmsg(std::string_view line, std::string& author, std::string& text) {
-    const auto command = line.find(" PRIVMSG #");
-    if (command == std::string_view::npos) return false;
-    const auto body = line.find(" :", command + 10);
-    if (body == std::string_view::npos) return false;
-    text = SanitizeChatText(std::string(line.substr(body + 2)), 320);
-    if (!line.empty() && line.front() == '@') {
-        const auto tagsEnd = line.find(' ');
-        author = TagValue(line.substr(1, tagsEnd - 1), "display-name");
-    }
-    if (author.empty()) {
-        const auto prefix = line.find(':');
-        const auto bang = line.find('!', prefix == std::string_view::npos ? 0 : prefix);
-        if (prefix != std::string_view::npos && bang != std::string_view::npos && bang > prefix + 1) {
-            author = std::string(line.substr(prefix + 1, bang - prefix - 1));
-        }
-    }
-    author = SanitizeChatText(std::move(author), 64);
-    return !text.empty();
-}
-
 // FFmpeg's AVIO write functions buffer protocol output and return no status.
 // Flush immediately and inspect AVIOContext::error so each IRC handshake stage
 // can report an actionable transport error without ever logging credentials.
@@ -482,6 +453,36 @@ void ClearAccountAuthorization(settings::TwitchAccountSettings& account) noexcep
 TwitchService::TwitchService(settings::SettingsService& settings)
     : settings_(settings) {
     avformat_network_init();
+    requests_ = std::make_unique<SongRequestService>(settings_.Path().parent_path() / "ChatRequests", LookupRequestedMap);
+    notices_ = std::make_unique<TwitchNotices>(
+        [](std::string type, std::string session, std::string channel, std::string client, std::string token, std::string& error) {
+            Document body(rapidjson::kObjectType); auto& a = body.GetAllocator();
+            body.AddMember("type", rapidjson::Value(type.c_str(), a), a);
+            body.AddMember("version", rapidjson::Value(type == "channel.follow" ? "2" : "1", a), a);
+            rapidjson::Value condition(rapidjson::kObjectType);
+            condition.AddMember("broadcaster_user_id", rapidjson::Value(channel.c_str(), a), a);
+            if (type == "channel.follow") condition.AddMember("moderator_user_id", rapidjson::Value(channel.c_str(), a), a);
+            body.AddMember("condition", condition, a);
+            rapidjson::Value transport(rapidjson::kObjectType);
+            transport.AddMember("method", "websocket", a); transport.AddMember("session_id", rapidjson::Value(session.c_str(), a), a);
+            body.AddMember("transport", transport, a);
+            rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer); body.Accept(writer);
+            std::string response;
+            if (!HttpRequest("POST", "https://api.twitch.tv/helix/eventsub/subscriptions",
+                    "Authorization: Bearer " + token + "\r\nClient-Id: " + client + "\r\nContent-Type: application/json\r\n",
+                    {buffer.GetString(), buffer.GetSize()}, response, error))
+                return error.find("401") != std::string::npos || error.find("403") != std::string::npos
+                    ? NoticeSubscriptionResult::PermissionDenied : NoticeSubscriptionResult::TransientFailure;
+            Document result; result.Parse(response.data(), response.size());
+            if (result.HasParseError() || !result.IsObject() || !result.HasMember("data") || !result["data"].IsArray() || result["data"].Empty()) {
+                error = "Twitch did not confirm the notice subscription."; return NoticeSubscriptionResult::TransientFailure;
+            }
+            return NoticeSubscriptionResult::Connected;
+        },
+        [this](ChatEvent event) {
+            std::lock_guard lock(mutex_);
+            if (ApplyChatEvent(snapshot_.messages, std::move(event), nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
+        });
     auto& account = settings_.Edit().broadcast.twitchAccount;
     std::string secureStorageError;
     if (!account.protectedTokenEnvelope.empty()) {
@@ -624,7 +625,7 @@ void TwitchService::AuthorizationWorker(
     try {
         const auto body = "client_id=" + UrlEncode(clientId) +
             "&scopes=" + UrlEncode(
-                "chat:read channel:manage:broadcast user:write:chat");
+                "chat:read channel:manage:broadcast user:write:chat moderator:manage:chat_messages moderator:manage:banned_users moderator:read:followers channel:read:redemptions");
         std::string response;
         std::string error;
         if (!HttpRequest(
@@ -670,7 +671,7 @@ void TwitchService::AuthorizationWorker(
             error.clear();
             const auto tokenBody = "client_id=" + UrlEncode(clientId) +
                 "&scopes=" + UrlEncode(
-                    "chat:read channel:manage:broadcast user:write:chat") +
+                    "chat:read channel:manage:broadcast user:write:chat moderator:manage:chat_messages moderator:manage:banned_users moderator:read:followers channel:read:redemptions") +
                 "&device_code=" + UrlEncode(deviceCode) +
                 "&grant_type=urn:ietf:params:oauth:grant-type:device_code";
             if (!HttpRequest(
@@ -1096,12 +1097,12 @@ bool TwitchService::BeginMapAnnouncement(
         clientId = account.clientId,
         accessToken = account.accessToken,
         userId = account.userId,
-        announcement = std::move(announcement)]() mutable {
+        announcement = std::move(announcement), generation = credentialGeneration_.load()]() mutable {
         MapAnnouncementWorker(
             std::move(clientId),
             std::move(accessToken),
             std::move(userId),
-            std::move(announcement));
+            std::move(announcement), generation);
     });
     return true;
 }
@@ -1110,7 +1111,7 @@ void TwitchService::MapAnnouncementWorker(
     std::string clientId,
     std::string accessToken,
     std::string userId,
-    MapAnnouncement announcement) noexcept {
+    MapAnnouncement announcement, std::uint64_t generation) noexcept {
     try {
         const auto message = BuildMapAnnouncementMessage(announcement);
         if (message.empty()) throw std::runtime_error("No usable map information was available.");
@@ -1138,6 +1139,7 @@ void TwitchService::MapAnnouncementWorker(
             "\r\nContent-Type: application/json\r\n";
         std::string response;
         std::string requestError;
+        if (!AcquireChatSendSlot() || generation != credentialGeneration_) { mapAnnouncementDone_ = true; return; }
         bool succeeded = HttpRequest(
             "POST",
             "https://api.twitch.tv/helix/chat/messages",
@@ -1256,17 +1258,32 @@ void TwitchService::ViewerCountWorker(
 }
 
 void TwitchService::SetChatEnabled(bool enabled) noexcept {
+    // Visibility is only one consumer. Closing the display must not silently
+    // disable request intake configured in the independent control panel.
+    enabled = enabled || settings_.Get().chat.requests.enabled;
     const auto wasEnabled = chatRequested_.exchange(enabled, std::memory_order_acq_rel);
     if (!enabled) {
         chatStop_.store(true, std::memory_order_release);
         chatRetryBlocked_.store(false, std::memory_order_release);
     } else if (!wasEnabled) {
-        // Only an intentional off/on transition retries a failed connection.
+        // Explicit retry clears an authentication rejection; transient failures
+        // use bounded backoff instead of reconnecting on every HMD frame.
+        chatAuthenticationRejected_ = false; chatRetryAttempts_ = 0; nextChatRetry_ = {};
         chatRetryBlocked_.store(false, std::memory_order_release);
     }
 }
+void TwitchService::RetryChatConnections() {
+    // Explicit chat-only retry. It neither stops the stream nor discards the
+    // request queue, and permits retry while requests keep IRC enabled.
+    chatStop_ = true; restartChatAfterCredentialUpdate_ = true;
+    chatAuthenticationRejected_ = false; chatRetryAttempts_ = 0; nextChatRetry_ = {};
+    assets_.Configure({}, {}, {}, false);
+    notices_->Configure({}, {}, {}, false, false);
+    Logging::Logger.info("User requested Twitch chat/assets/notices reconnect");
+}
 
 void TwitchService::StartChatIfReady() noexcept {
+    try {
     if (!chatRequested_.load(std::memory_order_acquire) ||
             chatRetryBlocked_.load(std::memory_order_acquire) ||
             chatWorker_.joinable() || refreshWorker_.joinable()) return;
@@ -1287,6 +1304,11 @@ void TwitchService::StartChatIfReady() noexcept {
                                login = account.login] {
         ChatWorker(token, login);
     });
+    } catch (const std::exception& error) {
+        chatDone_ = true; chatRetryBlocked_ = true;
+        std::lock_guard lock(mutex_); snapshot_.chatState = TwitchChatState::Failed; snapshot_.status = "Chat worker could not start; see log.";
+        Logging::Logger.error("Twitch chat worker start failed: {}", error.what());
+    } catch (...) { chatDone_ = true; chatRetryBlocked_ = true; Logging::Logger.error("Twitch chat worker start failed unexpectedly"); }
 }
 
 void TwitchService::ChatWorker(std::string accessToken, std::string login) noexcept {
@@ -1440,6 +1462,7 @@ void TwitchService::ChatWorker(std::string accessToken, std::string login) noexc
                     continue;
                 }
                 if (line.find(" NOTICE * :") != std::string::npos) {
+                    chatAuthenticationRejected_ = true;
                     const auto marker = line.find(" :");
                     disconnectReason = marker == std::string::npos
                         ? "Twitch rejected the chat login. Reconnect the Twitch account and retry."
@@ -1451,17 +1474,12 @@ void TwitchService::ChatWorker(std::string accessToken, std::string login) noexc
                     disconnectReason = "Twitch requested a chat reconnection.";
                     break;
                 }
-                std::string author;
-                std::string text;
-                if (!ParsePrivmsg(line, author, text)) continue;
+                auto event = ParseTwitchChatLine(line);
+                if (!event) continue;
+                if (event->mutation == ChatMutation::Append && requests_) requests_->Receive(event->message);
                 std::lock_guard lock(mutex_);
-                snapshot_.messages.push_back({nextMessageSequence_++, std::move(author), std::move(text)});
-                if (snapshot_.messages.size() > kMaximumChatMessages) {
-                    snapshot_.messages.erase(
-                        snapshot_.messages.begin(),
-                        snapshot_.messages.begin() +
-                            static_cast<std::ptrdiff_t>(snapshot_.messages.size() - kMaximumChatMessages));
-                }
+                if (ApplyChatEvent(snapshot_.messages, std::move(*event),
+                        nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
             }
             if (!disconnectReason.empty()) break;
             if (pending.size() > 16U * 1024U) pending.clear();
@@ -1506,6 +1524,8 @@ void TwitchService::StopChatWorker() noexcept {
 }
 
 void TwitchService::JoinCompletedWorkers() noexcept {
+    if (replyWorker_.joinable() && replyDone_) JoinWorker(replyWorker_, "Twitch reply");
+    if (moderationWorker_.joinable() && moderationDone_) JoinWorker(moderationWorker_, "Twitch moderation");
     if (authorizationWorker_.joinable() && authorizationDone_.load(std::memory_order_acquire)) {
         JoinWorker(authorizationWorker_, "Twitch authorization");
     }
@@ -1683,9 +1703,57 @@ void TwitchService::Tick() noexcept {
                 Logging::Logger.warn("Automatic Twitch token refresh deferred: {}", error);
             }
         }
+        requests_->SetChannel(account.userId);
+        requests_->Configure(settings_.Get().chat.requests);
+        assets_.Configure(account.userId, account.clientId, account.accessToken,
+            settings_.Get().chat.enabled && (settings_.Get().chat.showEmotes || settings_.Get().chat.showBadges));
+        if (observedChatAccount_ != account.userId) {
+            observedChatAccount_ = account.userId;
+            std::lock_guard lock(mutex_); snapshot_.messages.clear(); ++snapshot_.messagesRevision;
+        }
+        notices_->Configure(account.userId, account.clientId, account.accessToken,
+            settings_.Get().chat.enabled && settings_.Get().chat.showFollows,
+            settings_.Get().chat.enabled && settings_.Get().chat.showRedemptions);
+        const auto noticeStatus = notices_->Status();
+        { std::lock_guard lock(mutex_); snapshot_.noticeStatus = noticeStatus; }
+        SetChatEnabled(settings_.Get().chat.enabled);
+        for (auto& reply : requests_->TakeReplies()) QueueReply(std::move(reply.channelId), std::move(reply.text));
+        if (!replyWorker_.joinable() && !account.accessToken.empty() && account.chatWriteAuthorized &&
+                !settings::TwitchTokenNeedsRefresh(account, now, kTokenRefreshLeadSeconds)) {
+            std::optional<RequestReply> next;
+            {
+                std::lock_guard lock(mutex_);
+                while (!outgoingReplies_.empty()) {
+                    auto candidate = std::move(outgoingReplies_.front()); outgoingReplies_.pop_front();
+                    if (candidate.channelId == account.userId) { next = std::move(candidate); break; }
+                }
+            }
+            if (next) {
+                replyDone_ = false;
+                replyWorker_ = std::thread([this, client = account.clientId, token = account.accessToken,
+                    channel = account.userId, text = std::move(next->text), generation = credentialGeneration_.load()] { ReplyWorker(client, token, channel, text, generation); });
+            }
+        }
         if (!chatRequested_.load(std::memory_order_acquire)) {
             StopChatWorker();
         } else {
+            bool connected = false;
+            { std::lock_guard lock(mutex_); connected = snapshot_.chatState == TwitchChatState::Connected; }
+            const auto monotonicNow = std::chrono::steady_clock::now();
+            if (!connected) chatHealthySince_ = {};
+            else if (chatHealthySince_ == std::chrono::steady_clock::time_point{}) chatHealthySince_ = monotonicNow;
+            else if (monotonicNow - chatHealthySince_ >= std::chrono::minutes(1)) chatRetryAttempts_ = 0;
+            if (chatRetryBlocked_ && !chatAuthenticationRejected_ && !chatWorker_.joinable() &&
+                    !account.accessToken.empty() && (chatRetryAttempts_ < 6 || nextChatRetry_ != std::chrono::steady_clock::time_point{})) {
+                const auto now = std::chrono::steady_clock::now();
+                if (nextChatRetry_ == std::chrono::steady_clock::time_point{}) {
+                    nextChatRetry_ = now + std::chrono::seconds(std::min(60U, 3U << chatRetryAttempts_));
+                    ++chatRetryAttempts_;
+                } else if (now >= nextChatRetry_) {
+                    chatRetryBlocked_ = false; nextChatRetry_ = {};
+                    Logging::Logger.info("Retrying Twitch chat transport attempt={}", chatRetryAttempts_);
+                }
+            }
             if (restartChatAfterCredentialUpdate_ && !chatWorker_.joinable()) {
                 chatRetryBlocked_.store(false, std::memory_order_release);
                 restartChatAfterCredentialUpdate_ = false;
@@ -1717,11 +1785,129 @@ void TwitchService::Tick() noexcept {
     }
 }
 
+bool TwitchService::AcquireChatSendSlot() {
+    // One limiter covers map announcements AND request replies. The queue
+    // drains below Twitch's ordinary 20 messages/30 seconds allowance. Waiting
+    // happens on sender workers, never the Unity tick.
+    std::chrono::steady_clock::time_point slot;
+    {
+        std::lock_guard lock(sendRateMutex_);
+        slot = std::max(nextChatSend_, std::chrono::steady_clock::now());
+        nextChatSend_ = slot + std::chrono::seconds(2);
+    }
+    while (!controlStop_ && std::chrono::steady_clock::now() < slot)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    return !controlStop_;
+}
+
+bool TwitchService::QueueReply(std::string channelId, std::string text) {
+    const auto& account = settings_.Get().broadcast.twitchAccount;
+    if (channelId != account.userId || !account.chatWriteAuthorized || account.accessToken.empty()) return false;
+    std::lock_guard lock(mutex_);
+    if (outgoingReplies_.size() >= 32) return false;
+    text = SanitizeChatText(ClipChatUtf8(text, 480), 480);
+    if (text.empty()) return false;
+    outgoingReplies_.push_back({std::move(channelId), std::move(text)});
+    return true;
+}
+
+void TwitchService::ReplyWorker(std::string clientId, std::string token, std::string channel, std::string text, std::uint64_t generation) noexcept {
+    try {
+        if (!AcquireChatSendSlot() || generation != credentialGeneration_) { replyDone_ = true; return; }
+        Document body(rapidjson::kObjectType);
+        auto& allocator = body.GetAllocator();
+        body.AddMember("broadcaster_id", rapidjson::Value(channel.c_str(), allocator), allocator);
+        body.AddMember("sender_id", rapidjson::Value(channel.c_str(), allocator), allocator);
+        body.AddMember("message", rapidjson::Value(text.c_str(), allocator), allocator);
+        rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer); body.Accept(writer);
+        std::string response, error;
+        const bool succeeded = HttpRequest("POST", "https://api.twitch.tv/helix/chat/messages",
+            "Authorization: Bearer " + token + "\r\nClient-Id: " + clientId + "\r\nContent-Type: application/json\r\n",
+            {buffer.GetString(), buffer.GetSize()}, response, error);
+        Document result; result.Parse(response.data(), response.size());
+        const bool sent = succeeded && !result.HasParseError() && result.IsObject() && result.HasMember("data") &&
+            result["data"].IsArray() && !result["data"].Empty() && result["data"][0].IsObject() &&
+            result["data"][0].HasMember("is_sent") && result["data"][0]["is_sent"].IsBool() && result["data"][0]["is_sent"].GetBool();
+        if (!sent) Logging::Logger.error("Twitch request reply was not delivered channel={}: {}", channel,
+            error.empty() ? "provider did not confirm is_sent" : error);
+    } catch (const std::exception& e) { Logging::Logger.error("Twitch reply worker failed: {}", e.what()); }
+    catch (...) { Logging::Logger.error("Twitch reply worker failed unexpectedly"); }
+    replyDone_ = true;
+}
+
+bool TwitchService::Moderate(std::string userId, std::string messageId, int timeoutSeconds, bool deleteMessage) {
+    JoinCompletedWorkers();
+    const auto& account = settings_.Get().broadcast.twitchAccount;
+    const auto safeId = [](std::string_view id) { return !id.empty() && id.size() <= 128 &&
+        std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isalnum(c) || c == '-'; }); };
+    if (moderationWorker_.joinable() || account.accessToken.empty() || account.userId.empty() ||
+        !safeId(deleteMessage ? messageId : userId) || (!deleteMessage && userId == account.userId)) return false;
+    {
+        std::lock_guard lock(mutex_); snapshot_.moderationPending = true;
+        snapshot_.moderationStatus = "Waiting for Twitch to confirm moderation...";
+    }
+    moderationDone_ = false;
+    try {
+    moderationWorker_ = std::thread([this, client = account.clientId, token = account.accessToken, channel = account.userId,
+        user = std::move(userId), message = std::move(messageId), timeout = std::clamp(timeoutSeconds, 0, 1209600),
+        deleteMessage, generation = credentialGeneration_.load()] {
+        std::string response, error;
+        bool succeeded = false;
+        try {
+            const auto headers = "Authorization: Bearer " + token + "\r\nClient-Id: " + client + "\r\nContent-Type: application/json\r\n";
+            if (generation != credentialGeneration_ || controlStop_) { moderationDone_ = true; return; }
+            if (deleteMessage) succeeded = HttpRequest("DELETE",
+                "https://api.twitch.tv/helix/moderation/chat?broadcaster_id=" + channel + "&moderator_id=" + channel + "&message_id=" + message,
+                headers, {}, response, error);
+            else {
+                Document body(rapidjson::kObjectType); auto& a = body.GetAllocator(); rapidjson::Value data(rapidjson::kObjectType);
+                data.AddMember("user_id", rapidjson::Value(user.c_str(), a), a);
+                if (timeout > 0) data.AddMember("duration", timeout, a);
+                body.AddMember("data", data, a);
+                rapidjson::StringBuffer buffer; rapidjson::Writer<rapidjson::StringBuffer> writer(buffer); body.Accept(writer);
+                succeeded = HttpRequest("POST", "https://api.twitch.tv/helix/moderation/bans?broadcaster_id=" + channel + "&moderator_id=" + channel,
+                    headers, {buffer.GetString(), buffer.GetSize()}, response, error);
+            }
+        } catch (const std::exception& e) { error = e.what(); }
+        catch (...) { error = "Unexpected native error"; }
+        std::lock_guard lock(mutex_);
+        if (generation == credentialGeneration_) {
+            snapshot_.moderationPending = false;
+            snapshot_.moderationStatus = succeeded ? "Twitch confirmed the moderation action." :
+                "Twitch rejected moderation. Reconnect to grant moderation permissions if needed. " + error;
+            if (succeeded) {
+                ChatEvent event; event.message.channelId = channel;
+                event.mutation = deleteMessage ? ChatMutation::DeleteMessage : ChatMutation::ClearUser;
+                event.targetId = deleteMessage ? message : user;
+                if (ApplyChatEvent(snapshot_.messages, std::move(event), nextMessageSequence_)) ++snapshot_.messagesRevision;
+            }
+        }
+        if (!succeeded) Logging::Logger.error("Twitch moderation failed operation={} channel={} target={}: {}",
+            deleteMessage ? "delete" : timeout > 0 ? "timeout" : "ban", channel, deleteMessage ? message : user, error);
+        moderationDone_ = true;
+    });
+    } catch (const std::exception& exception) {
+        // Thread creation can fail before its worker runs; do not leave the
+        // confirmation UI permanently pending in that case.
+        std::lock_guard lock(mutex_);
+        snapshot_.moderationPending = false;
+        snapshot_.moderationStatus = "Could not start moderation. See SaberStage log.";
+        moderationDone_ = true;
+        Logging::Logger.error("Twitch moderation worker could not start: {}", exception.what());
+        return false;
+    }
+    return true;
+}
+
 void TwitchService::DisconnectAccount() {
     credentialGeneration_.fetch_add(1, std::memory_order_acq_rel);
     CancelDeviceAuthorization();
     refreshStop_.store(true, std::memory_order_release);
     SetChatEnabled(false);
+    chatStop_ = true;
+    requests_->SetChannel({});
+    notices_->Configure({}, {}, {}, false, false);
+    assets_.Configure({}, {}, {}, false);
     {
         std::lock_guard lock(mutex_);
         ClearSensitiveString(pendingCredentials_.accessToken);
@@ -1741,6 +1927,8 @@ void TwitchService::DisconnectAccount() {
     snapshot_.status = "Twitch account disconnected";
     snapshot_.login.clear();
     snapshot_.messages.clear();
+    outgoingReplies_.clear();
+    ++snapshot_.messagesRevision;
     snapshot_.viewerCount = 0;
     snapshot_.viewerCountKnown = false;
     snapshot_.mapAnnouncementPending = false;
@@ -1758,6 +1946,10 @@ void TwitchService::Shutdown() noexcept {
     shuttingDown_ = true;
     try {
         authorizationStop_.store(true, std::memory_order_release);
+        controlStop_ = true;
+        if (requests_) requests_->Shutdown();
+        assets_.Shutdown(); downloads_.Cancel();
+        if (notices_) notices_->Shutdown();
         refreshStop_.store(true, std::memory_order_release);
         chatRequested_.store(false, std::memory_order_release);
         chatStop_.store(true, std::memory_order_release);
@@ -1767,6 +1959,8 @@ void TwitchService::Shutdown() noexcept {
         JoinWorker(titleWorker_, "Twitch title update");
         JoinWorker(mapAnnouncementWorker_, "Twitch map announcement");
         JoinWorker(viewerCountWorker_, "Twitch viewer count");
+        JoinWorker(replyWorker_, "Twitch replies");
+        JoinWorker(moderationWorker_, "Twitch moderation");
         {
             std::lock_guard lock(mutex_);
             ClearSensitiveString(pendingCredentials_.accessToken);

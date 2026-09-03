@@ -90,12 +90,20 @@ struct RuntimeStatistics {
     std::size_t activeGeneratedArmColliderCount = 0;
     double springSolverMilliseconds = 0.0;
     double springUpdatesPerSecond = 0.0;
+    // One-second totals normalized by elapsed time, not a single frame that
+    // may have run zero steps. Useful for comparable collider benchmarks.
+    double springMillisecondsPerSecond = 0.0;
+    double springColliderCenterReadsPerSecond = 0.0;
+    double springCollisionTestsPerSecond = 0.0;
+    double springSubstepsPerSecond = 0.0;
 };
 
 struct RuntimeAnchor {
     Float3 position{};
     Float4 rotation{};
 };
+
+enum class RuntimeLoadState { Pending, Ready, Failed };
 
 // The embedded SaberStage/VideoPreview shader from the avatar shader bundle,
 // or nullptr when the bundle (or that asset) is unavailable. Built with the
@@ -114,6 +122,10 @@ UnityEngine::Shader* EmbeddedGripTargetShader() noexcept;
 // match without producing Beat Saber's alpha-weighted bloom haze.
 UnityEngine::Shader* EmbeddedNonBloomUiShader() noexcept;
 
+// Shared bundle lookup only; this does not alter avatar rendering. Chat's
+// separate shader includes native stencil/rect clipping and multiview variants.
+UnityEngine::Shader* EmbeddedChatSpriteShader() noexcept;
+
 // Owns every Unity object created for one VRM. Destruction is centralized so
 // AvatarManager can unbind the humanoid first and then unload without leaving
 // meshes, materials, textures, or a hidden Animator behind.
@@ -124,10 +136,15 @@ public:
     VrmUnityRuntime(const VrmUnityRuntime&) = delete;
     VrmUnityRuntime& operator=(const VrmUnityRuntime&) = delete;
 
-    static std::unique_ptr<VrmUnityRuntime> Load(
-        const std::filesystem::path& path,
-        const RuntimeOptions& options,
-        std::string* error = nullptr);
+    // Parsing owns only native data on a worker. Construction is cooperatively
+    // advanced on Unity's thread, one bounded slice per frame. Callers publish
+    // the runtime only after Ready and retain cancelled jobs until TickRelease
+    // completes, so cancelling a parse never joins its worker from a UI click.
+    static std::unique_ptr<VrmUnityRuntime> BeginLoad(const std::filesystem::path& path, const RuntimeOptions& options);
+    RuntimeLoadState TickLoad(std::string* error = nullptr) noexcept;
+    [[nodiscard]] const char* LoadPhase() const noexcept;
+    void BeginRelease() noexcept;
+    bool TickRelease() noexcept;
 
     void Destroy() noexcept;
     void SetVisible(bool visible) noexcept;
@@ -145,7 +162,7 @@ public:
         float neckBaseWidthScale,
         float headSizeScale,
         float legWidthScale) noexcept;
-    void ApplyOptions(const RuntimeOptions& options) noexcept;
+    bool ApplyOptions(const RuntimeOptions& options) noexcept;
     void UpdateSecondaryMotion(float deltaTime) noexcept;
     void ResetSecondaryMotion() noexcept;
     // Optional fixed-size world-space arm colliders are supplied from the
@@ -164,6 +181,9 @@ public:
     // Runtime animation uses the same validated blend-shape path without
     // producing a diagnostic line for every blink animation sample.
     bool SetExpressionQuiet(std::string_view presetName, float weight) noexcept;
+    // Readback only, called from the existing five-second performance sample.
+    // Reports actual renderer weights, not just requested animation values.
+    void LogFaceDiagnostics() const noexcept;
 
     // First-person "wear the avatar" view. When enabled, renderers the player
     // may see on their own body move to bothViewsLayer (rendered by both the

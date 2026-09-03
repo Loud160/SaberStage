@@ -32,6 +32,7 @@ The product goal and gated build sequence are in [`docs/planning/00_PROJECT_CHAR
 - BSML `^0.4.55`
 - custom-types `^0.18.4`
 - Hollywood `^1.2.2`
+- Quest SongCore `1.1.26` (request downloads/library selection; pinned for 1.40.8)
 - [Native Logger Quest](https://github.com/Loud160/NativeLoggerQuest) `1.0.0`
   (SHA-pinned, statically linked; no separately installed logger runtime)
 - QPM CLI `1.5.11`
@@ -83,6 +84,7 @@ tools/                  Shader build project and PC pose-analysis tooling
 - [Player calibration](docs/PLAYER_CALIBRATION.md)
 - [Recording pipeline](docs/RECORDING_PIPELINE.md)
 - [Streaming architecture](docs/STREAMING_ARCHITECTURE.md)
+- [Twitch rich chat and song requests](docs/TWITCH_CHAT_AND_REQUESTS.md)
 - [VRM runtime](docs/VRM_RUNTIME.md)
 - [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
 - [Contributing](CONTRIBUTING.md)

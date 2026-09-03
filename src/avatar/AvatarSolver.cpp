@@ -2229,18 +2229,18 @@ bool StaticTrackerlessAvatarSolver::Solve(
     bool manualGripAdjusted[2]{};
     for (int side = 0; side < 2; ++side) {
         const auto& authoritative = side == 0 ? tracking.leftHand : tracking.rightHand;
-        const auto& controller = tracking.controllerHand[side].valid
-            ? tracking.controllerHand[side] : authoritative;
         const auto gripFitTrusted = profile.valid &&
             profile.gripConfidence[side] >= kDefaultBodySolverTuning.minimumGripFitConfidence;
         if (tracking.handIsSaberGrip[side]) {
             handTarget[side] = authoritative.pose;
-            sourceToCanonicalHand[side] = gripFitTrusted && profile.gripFitUsesSaber[side]
-                ? profile.gripToCanonicalHand[side]
-                : gripFitTrusted ? Multiply(
-                    Inverse(authoritative.pose.rotation),
-                    Multiply(controller.pose.rotation, profile.gripToCanonicalHand[side]))
-                : Quaternion{};
+            // Menu pointers and gameplay sabers are the same logical grip
+            // reference. The calibrated hand relationship is local to that
+            // reference, not to the raw controller behind it. Converting via
+            // the live controller here canceled the saber's rotation on scene
+            // handoff, rotating both the palm and its saved translation away
+            // from the handle the user had already aligned in the menu.
+            sourceToCanonicalHand[side] = gripFitTrusted
+                ? profile.gripToCanonicalHand[side] : Quaternion{};
         } else {
             const auto controllerToTarget = gripFitTrusted && profile.controllerToGripObserved[side]
                 ? profile.controllerToGrip[side]
@@ -2276,13 +2276,15 @@ bool StaticTrackerlessAvatarSolver::Solve(
                 // gives the arm IK a stable desired hand rotation before it
                 // chooses an elbow and avoids the old circular dependency.
                 const auto neutralSourceRotation = fittedPlayer.neutralHand[side].rotation;
-                auto currentSourceRotation = handTarget[side].rotation;
-                if (tracking.handIsSaberGrip[side] && controller.valid) {
-                    currentSourceRotation = Compose(
-                        controller.pose, fittedPlayer.controllerToWrist[side]).rotation;
-                }
+                // This correction must be constant in grip space. Rebuilding
+                // it from live controller/saber rotations made the saved grip
+                // depend on which scene and wrist pose first seeded the solve.
+                // The stored wrist basis preserves the existing menu placement
+                // without canceling rotation of a gameplay saber.
+                const auto sourceToNeutralWrist = tracking.handIsSaberGrip[side]
+                    ? fittedPlayer.controllerToWrist[side].rotation : Quaternion{};
                 state.gripToHandRotation[side] = Multiply(
-                    Multiply(Inverse(handTarget[side].rotation), currentSourceRotation),
+                    sourceToNeutralWrist,
                     Multiply(Inverse(neutralSourceRotation), neutralHand.rotation));
             }
             state.gripToHandRotationValid[side] = true;

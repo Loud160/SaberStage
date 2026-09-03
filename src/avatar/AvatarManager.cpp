@@ -14,6 +14,7 @@
 
 #include "saberstage/Logging.hpp"
 #include "saberstage/avatar/AvatarRuntimeDriver.hpp"
+#include "saberstage/avatar/AvatarUpdateSchedule.hpp"
 #include "saberstage/avatar/Calibration.hpp"
 #include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
@@ -308,48 +309,6 @@ TrackedPose SamplePose(UnityEngine::Transform* transform, const TrackedPose& pre
     return result;
 }
 
-TrackedPose SampleSaberGripPose(
-    GlobalNamespace::Saber* saber,
-    UnityEngine::Transform* handleTransform,
-    const TrackedPose& previous,
-    double timestamp) {
-    auto result = SamplePose(handleTransform, previous, timestamp);
-    if (!result.valid || !IsAlive(saber)) return result;
-
-    // Saber.handleTransform is the controller-side handle reference used by
-    // Beat Saber, but its origin is not guaranteed to be the visual center of
-    // the grip. Some stock/custom saber models place it at the blade-side hilt,
-    // which puts an avatar's palm against the guard. Derive a bounded grip
-    // center from the live blade axis instead. When the handle-to-blade span is
-    // usable, retain its authored length; otherwise use a conservative Quest
-    // saber handle depth. This changes only the avatar wrist target—the saber
-    // itself remains the authoritative tracked object.
-    const auto handle = FromUnity(saber->get_handlePos());
-    const auto bladeBottom = FromUnity(saber->get_saberBladeBottomPos());
-    const auto bladeTop = FromUnity(saber->get_saberBladeTopPos());
-    const auto bladeVector = bladeTop - bladeBottom;
-    if (!IsFinite(handle) || !IsFinite(bladeBottom) || !IsFinite(bladeTop) ||
-        LengthSquared(bladeVector) < 1.0e-5F) {
-        return result;
-    }
-    const auto bladeAxis = Normalize(bladeVector, Rotate(result.pose.rotation, {0.0F, 0.0F, 1.0F}));
-    const auto authoredHandleDepth = Dot(bladeBottom - handle, bladeAxis);
-    const auto gripDepth = authoredHandleDepth >= 0.04F && authoredHandleDepth <= 0.30F
-        ? Clamp(authoredHandleDepth * 0.55F, 0.055F, 0.11F)
-        : 0.085F;
-    const auto centeredGrip = bladeBottom - bladeAxis * gripDepth;
-    if (Length(centeredGrip - result.pose.position) > 0.25F) return result;
-
-    result.pose.position = centeredGrip;
-    const auto delta = static_cast<float>(timestamp - previous.timestampSeconds);
-    if (previous.valid && delta > 0.0F && delta <= 0.25F) {
-        result.linearVelocity = (result.pose.position - previous.pose.position) / delta;
-    } else {
-        result.linearVelocity = {};
-    }
-    return result;
-}
-
 TrackedPose SampleControllerPose(
     GlobalNamespace::VRController* controller,
     const TrackedPose& previous,
@@ -435,7 +394,9 @@ public:
         std::filesystem::path playerCalibrationPath)
         : owner_(owner),
           camera_(camera),
-          calibrationSession_(std::move(playerCalibrationPath)) {}
+          calibrationSession_(std::move(playerCalibrationPath)) {
+        retiredRuntimes_.reserve(3); // bounded live + pending + retired lifecycle
+    }
 
     bool Start() {
         if (started_) return true;
@@ -465,6 +426,9 @@ public:
             UnloadVrmAvatar();
             UnbindAnimator();
             UnbindAvatarRuntimeDriver(&owner_);
+            // Application shutdown has no future driver frames. Interactive
+            // unload uses staged retirement; final shutdown drains ownership.
+            retiredRuntimes_.clear();
             DestroyCalibrationAudio();
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
         } catch (const std::exception& exception) {
@@ -696,6 +660,10 @@ public:
     }
 
     bool PreparePlayerCalibration(calibration::CalibrationMode mode, std::string* error) noexcept {
+        if (pendingRuntime_) {
+            if (error) *error = "wait for avatar loading to finish before starting calibration";
+            return false;
+        }
         // Preparing only opens the explanatory calibration wizard. It does not
         // begin a countdown or record a pose, so tracking is intentionally not
         // a prerequisite here. StartPreparedPlayerCalibration remains the hard
@@ -856,29 +824,24 @@ public:
             // can select the visible handle nearest each controller instead of
             // accidentally retaining a stale gameplay Saber from Resources.
             RefreshSaberGripTransforms(frame);
-            const auto leftGripReady = SaberGripReady(0);
-            const auto rightGripReady = SaberGripReady(1);
-            sample_.saberGrip[0] = leftGripReady
-                ? SampleSaberGripPose(sabers_[0], saberGripTransforms_[0], previous.saberGrip[0], timestamp)
-                : TrackedPose{};
-            sample_.saberGrip[1] = rightGripReady
-                ? SampleSaberGripPose(sabers_[1], saberGripTransforms_[1], previous.saberGrip[1], timestamp)
-                : TrackedPose{};
-            // Menu saber components can be disabled even while their visible
-            // controller-attached handle remains on screen. If no usable Saber
-            // component was exposed, still close the VRM fingers around the
-            // live menu controller instead of displaying an open palm beside
-            // the visible grip.
-            sample_.handIsSaberGrip[0] = leftGripReady ||
-                (!IsAlive(tracking_) && sample_.controllerHand[0].valid);
-            sample_.handIsSaberGrip[1] = rightGripReady ||
-                (!IsAlive(tracking_) && sample_.controllerHand[1].valid);
-            sample_.leftHand = leftGripReady
-                ? sample_.saberGrip[0]
-                : sample_.controllerHand[0];
-            sample_.rightHand = rightGripReady
-                ? sample_.saberGrip[1]
-                : sample_.controllerHand[1];
+            for (int side = 0; side < 2; ++side) {
+                // Manual hand calibration already defines the palm's placement
+                // on the grip. Sample the handle reference as authored: deriving
+                // a second center from blade length applied a gameplay-only
+                // translation on top of the placement saved in the menu.
+                sample_.saberGrip[side] = SaberGripReady(side)
+                    ? SamplePose(saberGripTransforms_[side], previous.saberGrip[side], timestamp)
+                    : TrackedPose{};
+                auto& hand = side == 0 ? sample_.leftHand : sample_.rightHand;
+                hand = sample_.saberGrip[side].valid
+                    ? sample_.saberGrip[side] : sample_.controllerHand[side];
+                // A menu pointer and a gameplay controller awaiting Saber
+                // discovery use the same grip-local calibration. Do not switch
+                // to the separate controller-to-wrist target during discovery.
+                // Keep saberGrip.valid separate: calibration must still know
+                // whether a real Saber pose was actually observed.
+                sample_.handIsSaberGrip[side] = hand.valid;
+            }
             sample_.renderFrame = frame;
             ++sample_.sequence;
             const auto trackingValid = sample_.head.valid && sample_.leftHand.valid && sample_.rightHand.valid;
@@ -971,15 +934,34 @@ public:
         }
     }
 
-    void SolveAndWrite() noexcept {
+    bool PoseAtHeadsetRate() const noexcept {
+        // A non-VRM bound preview retains its original frame-driven behavior.
+        return !vrmRuntime_ || AvatarUpdateSchedule::HeadsetConsumer(
+            lastWearAvatar_, standinVisibleToHmd_, gripEditingPreviewSide_ >= 0);
+    }
+
+    void SolveAndWrite(bool cameraRender = false) noexcept {
         if (!bound_ || !player_.valid || !trackingWasReady_) return;
         try {
+            const bool headsetRate = PoseAtHeadsetRate();
+            if (!lastPoseCadence_ || *lastPoseCadence_ != headsetRate) {
+                lastPoseCadence_ = headsetRate;
+                Logging::Logger.info("Avatar posing at {} rate (wear={} headsetClone={} gripArm={})",
+                    headsetRate ? "headset" : "camera", lastWearAvatar_,
+                    standinVisibleToHmd_, gripEditingPreviewSide_ >= 0);
+            }
+            // The pre-render path explicitly bypasses this gate. Putting an
+            // unconditional early return in the shared method freezes avatars.
+            if (!cameraRender && !headsetRate) return;
             SolverDiagnostics current{};
             const auto solveStart = std::chrono::steady_clock::now();
             if (!solver_.Solve(
                     sample_, calibration_, player_, calibrationSession_.RuntimeProfile(),
                     persistent_, solved_, &current)) {
-                if (current.duplicateSequenceSkipped) diagnostics_.duplicateSequenceSkipped = true;
+                if (current.duplicateSequenceSkipped) {
+                    diagnostics_.duplicateSequenceSkipped = true;
+                    ++duplicateSolveCount_;
+                }
                 return;
             }
             const auto solveEnd = std::chrono::steady_clock::now();
@@ -994,6 +976,9 @@ public:
                 vrmRuntime_->SetUniformScale(current.retargeting.uniformScale);
             }
             current.transformWrites = WritePose();
+            current.poseWriteMicroseconds = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - solveEnd).count();
+            ++actualSolveCount_;
             diagnostics_ = current;
         } catch (...) {
             Logging::Logger.error("Avatar solve/write failed safely");
@@ -1005,7 +990,11 @@ public:
         // The SaberStage camera owns this render, so sample immediately before
         // culling instead of relying on MonoBehaviour LateUpdate ordering.
         SampleTracking();
-        SolveAndWrite();
+        SolveAndWrite(true);
+        if (!PoseAtHeadsetRate()) {
+            UpdateSecondaryMotion(UnityEngine::Time::get_deltaTime(), true);
+            return; // Secondary motion also synchronizes the display clones.
+        }
         // Keep the display clone on the same sub-frame pose the spectator is
         // about to render instead of one solve behind.
         if (vrmRuntime_) vrmRuntime_->SyncStandin();
@@ -1015,19 +1004,84 @@ public:
         const std::filesystem::path& path,
         std::uint32_t maximumTextureDimension,
         std::string* error,
+        bool bindSolver,
+        AvatarManager::LoadCompleted completed) noexcept {
+        try {
+            if (pendingRuntime_) {
+                if (error) *error = "an avatar is already loading; unload it to cancel first";
+                return false;
+            }
+            // Bound the sum of live, pending and retired runtimes to three.
+            // Rapid clicks cannot create unbounded decoder/GPU memory pressure.
+            if (retiredRuntimes_.size() > 1) {
+                if (error) *error = "the previous avatars are still being released; try again shortly";
+                return false;
+            }
+            vrm::RuntimeOptions options{};
+            options.maximumTextureDimension = std::clamp(maximumTextureDimension, 256U, 4096U);
+            options.avatarLayer = camera::kAvatarLayer;
+            pendingRuntime_ = vrm::VrmUnityRuntime::BeginLoad(path, options);
+            pendingLoadPath_ = path;
+            pendingLoadTextureLimit_ = maximumTextureDimension;
+            pendingLoadBind_ = bindSolver;
+            pendingLoadCompleted_ = std::move(completed);
+            Logging::Logger.info("VRM load queued: '{}' textureLimit={} (native parser worker, staged Unity construction)", path.string(), maximumTextureDimension);
+            return true;
+        } catch (const std::exception& failure) {
+            if (error) *error = failure.what();
+            Logging::Logger.error("Could not queue avatar load: {}", failure.what());
+            return false;
+        }
+    }
+
+    void RetireRuntime(std::unique_ptr<vrm::VrmUnityRuntime> runtime) {
+        if (!runtime) return;
+        runtime->BeginRelease();
+        retiredRuntimes_.push_back(std::move(runtime));
+    }
+
+    void TickAvatarLifecycle() noexcept {
+        try {
+            for (auto iterator = retiredRuntimes_.begin(); iterator != retiredRuntimes_.end();) {
+                if ((*iterator)->TickRelease()) iterator = retiredRuntimes_.erase(iterator);
+                else ++iterator;
+            }
+            if (!pendingRuntime_) return;
+            // Finish old teardown before allocating another model's Unity
+            // resources. The parser can already be working independently.
+            if (!retiredRuntimes_.empty()) return;
+            std::string error;
+            const auto status = pendingRuntime_->TickLoad(&error);
+            if (status == vrm::RuntimeLoadState::Pending) return;
+            auto completed = std::move(pendingLoadCompleted_);
+            bool success = false;
+            if (status == vrm::RuntimeLoadState::Ready) {
+                success = FinishVrmAvatar(std::move(pendingRuntime_), pendingLoadPath_,
+                    pendingLoadTextureLimit_, &error, pendingLoadBind_);
+            } else RetireRuntime(std::move(pendingRuntime_));
+            if (completed) completed(success, error);
+        } catch (const std::exception& failure) {
+            Logging::Logger.error("Avatar lifecycle update failed: {}", failure.what());
+        } catch (...) { Logging::Logger.error("Avatar lifecycle update failed unexpectedly"); }
+    }
+
+    bool IsLoadingVrmAvatar() const noexcept { return pendingRuntime_ != nullptr; }
+    const char* AvatarLoadPhase() const noexcept {
+        if (!pendingRuntime_) return "idle";
+        return retiredRuntimes_.empty() ? pendingRuntime_->LoadPhase() : "releasing previous avatar";
+    }
+
+    bool FinishVrmAvatar(
+        std::unique_ptr<vrm::VrmUnityRuntime> candidate,
+        const std::filesystem::path& path,
+        std::uint32_t maximumTextureDimension,
+        std::string* error,
         bool bindSolver) noexcept {
         try {
             vrm::RuntimeOptions options{};
             options.maximumTextureDimension = std::clamp(maximumTextureDimension, 256U, 4096U);
             options.avatarLayer = camera::kAvatarLayer;
             options.visible = true;
-            std::string loadError;
-            auto candidate = vrm::VrmUnityRuntime::Load(path, options, &loadError);
-            if (!candidate) {
-                if (error) *error = loadError;
-                Logging::Logger.error("VRM load failed for '{}': {}", path.string(), loadError);
-                return false;
-            }
 
             auto previous = std::move(vrmRuntime_);
             const auto previousRuntimeOptions = lastRuntimeOptions_;
@@ -1049,14 +1103,16 @@ public:
                         FirstPersonAnchor(vrmRuntime_.get()));
                 }
                 if (error) *error = "VRM constructed, but its humanoid Animator could not bind to the SaberStage solver";
+                RetireRuntime(std::move(candidate));
                 return false;
             }
             if (!bindSolver) UnbindAnimator();
             vrmRuntime_ = std::move(candidate);
+            secondarySchedule_.Reset();
+            lastPoseCadence_.reset();
             lastRuntimeOptions_ = options;
             ResetAutomaticExpressionState();
-            if (previous) previous->SetVisible(false);
-            previous.reset();
+            RetireRuntime(std::move(previous));
             const auto& stats = vrmRuntime_->Statistics();
             const auto& asset = vrmRuntime_->Asset();
             std::unordered_set<std::size_t> uniqueJoints;
@@ -1133,6 +1189,10 @@ public:
     }
 
     bool BindLoadedVrmAvatar(std::string* error) noexcept {
+        if (pendingRuntime_) {
+            if (error) *error = "wait for avatar loading to finish before rebinding tracking";
+            return false;
+        }
         if (!vrmRuntime_ || !IsAlive(vrmRuntime_->Animator())) {
             if (error) *error = "no loaded VRM humanoid is available to bind";
             return false;
@@ -1151,13 +1211,21 @@ public:
     }
 
     void UnloadVrmAvatar() noexcept {
+        // Cancelling is immediate from the user's perspective, but retirement
+        // owns the parser future and Unity resources until safe release frames.
+        pendingLoadCompleted_ = {};
+        RetireRuntime(std::move(pendingRuntime_));
+        gripEditingPreviewSide_ = -1;
         if (!vrmRuntime_) return;
-        ClearAutomaticExpressions();
+        // The hierarchy is going away: clearing every facial morph first only
+        // adds synchronous writes to an object nobody should render again.
         UnbindAnimator();
-        vrmRuntime_.reset();
+        RetireRuntime(std::move(vrmRuntime_));
+        secondarySchedule_.Reset();
+        lastPoseCadence_.reset();
         lastRuntimeOptions_.reset();
         ResetAutomaticExpressionState();
-        Logging::Logger.info("Unloaded SaberStage VRM avatar and released its Unity assets");
+        Logging::Logger.info("Unbound and hid SaberStage VRM avatar; staged asset release queued");
     }
 
     void SetAvatarVisible(bool visible) noexcept {
@@ -1214,6 +1282,8 @@ public:
                 fit.manualAvatarScalePercent / 100.0F);
         }
         lastWearAvatar_ = settings.wearAvatar;
+        standinVisibleToHmd_ = settings.standinEnabled &&
+            settings.standinVisibility != settings::AvatarStandinVisibility::CameraOnly;
         lastWearHideFace_ = settings.wearHideFace;
         lastWearHideHair_ = settings.wearHideHair;
         lastWearHideNeckAccessories_ = settings.wearHideNeckAccessories;
@@ -1231,8 +1301,8 @@ public:
             // callbacks must not re-walk every material/renderer when none of
             // the rendering or SpringBone settings changed.
             if (!lastRuntimeOptions_ || !SameRuntimeOptions(*lastRuntimeOptions_, runtimeOptions)) {
-                vrmRuntime_->ApplyOptions(runtimeOptions);
-                lastRuntimeOptions_ = runtimeOptions;
+                if (vrmRuntime_->ApplyOptions(runtimeOptions)) lastRuntimeOptions_ = runtimeOptions;
+                else lastRuntimeOptions_.reset();
             }
             vrmRuntime_->SetDebugHairHidden(debugHairHidden_);
             // First-person wear view: body renderers become visible to the HMD
@@ -1298,8 +1368,17 @@ public:
     std::size_t StandinCount() const noexcept { return vrmRuntime_ ? vrmRuntime_->StandinCount() : 0; }
     bool StandinActive() const noexcept { return vrmRuntime_ && vrmRuntime_->StandinActive(); }
 
-    void UpdateSecondaryMotion(float deltaTime) noexcept {
+    void UpdateSecondaryMotion(float deltaTime, bool cameraRender = false) noexcept {
         if (!vrmRuntime_) return;
+        if (!cameraRender && !PoseAtHeadsetRate()) return;
+        // Sampling scaled time instead of adding frame deltas works whether
+        // pre-render runs before or after LateUpdate, and with multiple renders.
+        deltaTime = secondarySchedule_.Consume(UnityEngine::Time::get_frameCount(),
+            UnityEngine::Time::get_time(), deltaTime);
+        if (deltaTime <= 0.0F) {
+            if (cameraRender) vrmRuntime_->SyncStandin();
+            return;
+        }
         UpdateAutomaticExpressions(deltaTime);
         std::array<vrm::Float3, 6> centers{};
         std::array<float, 6> radii{};
@@ -1339,6 +1418,19 @@ public:
         // The display clones copy the final frame pose (solver + expressions
         // + SpringBones) once everything above has written it.
         vrmRuntime_->SyncStandin();
+        const double now = UnityEngine::Time::get_unscaledTime();
+        if (now - lastPerformanceLogTime_ >= 5.0) {
+            const auto& stats = vrmRuntime_->Statistics();
+            Logging::Logger.info(
+                "Avatar performance: elapsed={:.2f}s solves={} duplicateSkips={} lastSolve={:.1f}us lastWrite={:.1f}us springs={:.2f}ms/s substeps={:.1f}/s colliderCenterReads={:.1f}/s collisionTests={:.1f}/s",
+                now - lastPerformanceLogTime_, actualSolveCount_, duplicateSolveCount_,
+                diagnostics_.nativeSolveMicroseconds, diagnostics_.poseWriteMicroseconds,
+                stats.springMillisecondsPerSecond, stats.springSubstepsPerSecond,
+                stats.springColliderCenterReadsPerSecond, stats.springCollisionTestsPerSecond);
+            LogFaceAndGripReadback();
+            actualSolveCount_ = duplicateSolveCount_ = 0;
+            lastPerformanceLogTime_ = now;
+        }
     }
 
     // Chooses what the display clones hold: the live gameplay sabers when a
@@ -1883,6 +1975,67 @@ private:
         }
     }
 
+    void LogFaceAndGripReadback() const noexcept {
+        try {
+            // Reuse the performance log's five-second gate. Only actual Unity
+            // readbacks can distinguish closed morphs from an eye/face geometry
+            // mismatch, or a menu/game grip-frame change from finger curl.
+            Logging::Logger.info(
+                "AvatarFaceDiag manager sequence={} gameplayTracking={} automatic={} blinkRequested={:.3f} "
+                "blinkElapsed={:.3f} nextBlink={:.3f} emotionRequested=({:.3f},{:.3f},{:.3f},{:.3f})",
+                sample_.sequence, IsAlive(tracking_), automaticExpressionsEnabled_, lastBlinkWeight_,
+                blinkElapsedSeconds_, blinkCountdownSeconds_, expressionWeights_[0], expressionWeights_[1],
+                expressionWeights_[2], expressionWeights_[3]);
+            auto* head = transforms_[BoneIndex(HumanoidBone::Head)];
+            if (IsAlive(head)) {
+                const auto headPose = ReadPose(head);
+                for (const auto eye : {HumanoidBone::LeftEye, HumanoidBone::RightEye}) {
+                    auto* transform = transforms_[BoneIndex(eye)];
+                    if (!IsAlive(transform)) continue;
+                    const auto eyePose = ReadPose(transform);
+                    const auto local = RelativeTo(headPose, eyePose);
+                    const auto& target = solved_.bones[BoneIndex(eye)];
+                    const auto error = Length(eyePose.position - target.position);
+                    Logging::Logger.info(
+                        "AvatarFaceDiag bone={} headRelative=({:.5f},{:.5f},{:.5f}) solverPositionError={:.6f} "
+                        "headRelativeRotation=({:.4f},{:.4f},{:.4f},{:.4f})",
+                        BoneName(eye), local.position.x, local.position.y, local.position.z, error,
+                        local.rotation.x, local.rotation.y, local.rotation.z, local.rotation.w);
+                }
+            }
+            if (vrmRuntime_) vrmRuntime_->LogFaceDiagnostics();
+            for (int side = 0; side < 2; ++side) {
+                const auto& controller = sample_.controllerHand[side];
+                const auto& source = side == 0 ? sample_.leftHand : sample_.rightHand;
+                if (!controller.valid || !source.valid) continue;
+                auto* hand = transforms_[BoneIndex(side == 0 ? HumanoidBone::LeftHand : HumanoidBone::RightHand)];
+                if (!IsAlive(hand)) continue;
+                const auto handPose = ReadPose(hand);
+                const auto sourceLocal = RelativeTo(controller.pose, source.pose);
+                const auto handLocal = RelativeTo(controller.pose, handPose);
+                const auto gripAnchor = RelativeTo(source.pose, handPose);
+                const auto handError = Length(handPose.position - diagnostics_.finalHand[side].position);
+                Logging::Logger.info(
+                    "AvatarGripDiag side={} realSaber={} gripFlag={} sourceInController=({:.4f},{:.4f},{:.4f}) "
+                    "sourceRotation=({:.4f},{:.4f},{:.4f},{:.4f}) handInController=({:.4f},{:.4f},{:.4f}) "
+                    "handRotation=({:.4f},{:.4f},{:.4f},{:.4f}) handInGrip=({:.4f},{:.4f},{:.4f}) "
+                    "gripLocalRotation=({:.4f},{:.4f},{:.4f},{:.4f}) solverPositionError={:.6f} fingers={:.2f} thumb={:.2f}",
+                    side, sample_.saberGrip[side].valid, sample_.handIsSaberGrip[side],
+                    sourceLocal.position.x, sourceLocal.position.y, sourceLocal.position.z,
+                    sourceLocal.rotation.x, sourceLocal.rotation.y, sourceLocal.rotation.z, sourceLocal.rotation.w,
+                    handLocal.position.x, handLocal.position.y, handLocal.position.z,
+                    handLocal.rotation.x, handLocal.rotation.y, handLocal.rotation.z, handLocal.rotation.w,
+                    gripAnchor.position.x, gripAnchor.position.y, gripAnchor.position.z,
+                    gripAnchor.rotation.x, gripAnchor.rotation.y, gripAnchor.rotation.z, gripAnchor.rotation.w,
+                    handError, gripClosureScale_[side], thumbCurveScale_[side]);
+            }
+        } catch (const std::exception& exception) {
+            Logging::Logger.warn("Avatar face/grip readback failed: {}", exception.what());
+        } catch (...) {
+            Logging::Logger.warn("Avatar face/grip readback failed with unknown exception");
+        }
+    }
+
     void ResetAutomaticExpressionState() noexcept {
         comboController_ = nullptr;
         energyCounter_ = nullptr;
@@ -1997,7 +2150,11 @@ private:
             targets[0] = 0.0F;
         }
         if (!vrmRuntime_->HasExpression("fun") && vrmRuntime_->HasExpression("joy")) {
-            targets[0] = std::max(targets[0], targets[1]);
+            // Fold fun into joy at low strength when a model has no fun
+            // preset: joy is the closed-eye ^_^ preset, and eyes visibly
+            // closing from an expression reads as broken. 0.30 keeps a hint
+            // of the smile while the lids stay essentially open.
+            targets[0] = std::max(targets[0], std::min(targets[1] * 0.35F, 0.30F));
             targets[1] = 0.0F;
         }
         if (!vrmRuntime_->HasExpression("angry") && vrmRuntime_->HasExpression("sorrow")) {
@@ -2054,6 +2211,22 @@ private:
                 weight = 0.0F;
             }
         }
+
+        // Emotion presets that already close the eyes (VRoid's joy is the ^_^
+        // smile; angry and sorrow partially lower the lids) must attenuate the
+        // procedural blink. Stacking blink's lid morphs on top of an
+        // already-closed lid drives the combined delta past 1.0 and the eyelid
+        // geometry overshoots through the closed position — which on VRoid
+        // models visually reads as the eye popping OPEN during the blink
+        // (the "inverted blink during maps" bug). This mirrors UniVRM's
+        // ignore-blink behavior for eye-closing presets. fun is excluded: it
+        // is the open-eyed smile.
+        const auto eyeClosure = std::clamp(
+            expressionWeights_[0] +          // joy
+            0.4F * expressionWeights_[2] +   // angry
+            0.3F * expressionWeights_[3],    // sorrow
+            0.0F, 1.0F);
+        weight *= 1.0F - eyeClosure;
 
         // Only touch Unity blend-shape state while a blink is changing. Idle
         // frames incur the timer arithmetic above but no renderer writes.
@@ -2143,8 +2316,10 @@ private:
             targets[2] = 0.38F;
             targets[3] = 0.92F;
         } else if (completionReactionSeconds_ > 0.0F) {
-            targets[0] = 0.82F;
-            targets[1] = 0.30F;
+            // Celebration also stays on fun: joy is VRoid's closed-eye ^_^
+            // preset and any held joy weight visibly shuts the avatar's eyes,
+            // which reads as broken rather than happy.
+            targets[1] = 0.85F;
         } else if (angryReactionSeconds_ > 0.0F) {
             targets[2] = 0.66F + 0.10F * static_cast<float>(std::max(missBurstCount_ - 1, 0));
         } else if (inGameplay && energy < 0.28F) {
@@ -2152,11 +2327,14 @@ private:
         } else if (!inGameplay) {
             // The menu face is intentionally subtle: it removes the unnerving
             // blank stare without forcing a full open-mouth laugh expression.
-            targets[0] = 0.20F;
+            targets[1] = 0.20F;
         } else if (combo >= 14) {
-            targets[0] = 0.82F; // x8 multiplier: confident/happy
+            // All happiness rides on fun, VRoid's OPEN-eyed smile. joy (the
+            // closed-eye ^_^ preset) is never held by the automatic system:
+            // any sustained joy weight visibly closes the avatar's eyes.
+            targets[1] = 0.75F; // x8 multiplier: confident/happy, eyes open
         } else if (combo >= 6) {
-            targets[0] = 0.34F; // x4 multiplier: slight smile
+            targets[1] = 0.32F; // x4 multiplier: slight smile, eyes open
         }
         // x1/x2 and a zero combo retain the avatar's authored focused face.
         BlendExpressionTargets(targets, deltaTime);
@@ -2568,6 +2746,18 @@ private:
     // the HMD by the grip editor. This never changes the persisted Wear Avatar
     // state and never exposes the torso/head around the player's viewpoint.
     int gripEditingPreviewSide_ = -1;
+    std::unique_ptr<vrm::VrmUnityRuntime> pendingRuntime_;
+    std::vector<std::unique_ptr<vrm::VrmUnityRuntime>> retiredRuntimes_;
+    std::filesystem::path pendingLoadPath_;
+    std::uint32_t pendingLoadTextureLimit_ = 1024;
+    bool pendingLoadBind_ = true;
+    AvatarManager::LoadCompleted pendingLoadCompleted_;
+    bool standinVisibleToHmd_ = false;
+    std::optional<bool> lastPoseCadence_;
+    AvatarUpdateSchedule secondarySchedule_;
+    std::uint64_t actualSolveCount_ = 0;
+    std::uint64_t duplicateSolveCount_ = 0;
+    double lastPerformanceLogTime_ = 0.0;
     bool debugHairHidden_ = false;
     bool armSpringBoneInteraction_ = false;
     // Per-hand closure is deliberately runtime-owned rather than part of the
@@ -2654,8 +2844,15 @@ bool AvatarManager::LoadVrmAvatar(
     const std::filesystem::path& path,
     std::uint32_t maximumTextureDimension,
     std::string* error,
-    bool bindSolver) noexcept {
-    return impl_->LoadVrmAvatar(path, maximumTextureDimension, error, bindSolver);
+    bool bindSolver,
+    LoadCompleted completed) noexcept {
+    return impl_->LoadVrmAvatar(path, maximumTextureDimension, error, bindSolver, std::move(completed));
+}
+
+void AvatarManager::TickAvatarLifecycle() noexcept { impl_->TickAvatarLifecycle(); }
+bool AvatarManager::IsLoadingVrmAvatar() const noexcept { return impl_->IsLoadingVrmAvatar(); }
+const char* AvatarManager::AvatarLoadPhase() const noexcept {
+    return impl_->AvatarLoadPhase();
 }
 bool AvatarManager::BindLoadedVrmAvatar(std::string* error) noexcept { return impl_->BindLoadedVrmAvatar(error); }
 void AvatarManager::UnloadVrmAvatar() noexcept { impl_->UnloadVrmAvatar(); }

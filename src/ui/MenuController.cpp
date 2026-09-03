@@ -11,6 +11,10 @@
 // - Worker results are marshalled back to Unity before any UI object is touched.
 
 #include "saberstage/ui/MenuController.hpp"
+#include "saberstage/ui/ChatControls.hpp"
+#include "saberstage/ui/RichChatRenderer.hpp"
+#include "saberstage/ui/SliderLifetime.hpp"
+#include "TMPro/TMP_SpriteAnimator.hpp"
 
 #include "saberstage/Logging.hpp"
 #include "saberstage/ErrorManager.hpp"
@@ -23,6 +27,7 @@
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
+#include "saberstage/preview/PreviewRenderPolicy.hpp"
 #include "saberstage/recording/RecordingController.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/settings/SettingsService.hpp"
@@ -1542,6 +1547,14 @@ MenuController::~MenuController() noexcept {
     // terminate Beat Saber or skip the remaining releases.
     if (active_ == this) active_ = nullptr;
     auto& errors = ErrorManager::Instance();
+    errors.Guard("releasing main-menu slider registrations", [this] {
+        if (IsAlive(avatarSettingsView_))
+            (void)ReleaseSliderRegistrations(avatarSettingsView_->get_gameObject(), "avatar menu shutdown");
+        if (IsAlive(recordingView_))
+            (void)ReleaseSliderRegistrations(recordingView_->get_gameObject(), "recording menu shutdown");
+        for (auto* page : tabViewRoots_)
+            if (IsAlive(page)) (void)ReleaseSliderRegistrations(page, "camera menu shutdown");
+    });
     errors.Guard("clearing recording UI callbacks", [this] {
         root_.Recording().SetStatusChangedHandler({});
     });
@@ -1552,6 +1565,7 @@ MenuController::~MenuController() noexcept {
         DestroyRecordingWorldPanel();
     });
     errors.Guard("destroying Twitch chat controls", [this] {
+        chatControls_.reset();
         DestroyChatWorldPanel();
     });
     errors.Guard("destroying avatar display proxies", [this] {
@@ -1601,6 +1615,7 @@ void MenuController::Register() {
 
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
+    Logging::Logger.info("AvatarSettingsBuild begin selectedTab={}", active_->selectedAvatarTab_);
     active_->avatarSettingsView_ = view;
     static std::array<std::string_view, 4> tabNames{"Setup", "Display", "Quality", "Fit"};
     active_->avatarTabViewRoots_.fill(nullptr);
@@ -2303,6 +2318,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
 
     container = pages[3];
+    Logging::Logger.info("AvatarSettingsBuild phase=fit-controls");
     const auto fitSettings = settings::RetargetingForSelectedAvatar(avatar);
     const auto applyFitAndSave = [] {
         if (!active_) return;
@@ -2719,6 +2735,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         rect->set_anchoredPosition({0.0F, 0.75F});
         rect->set_sizeDelta({82.0F, 3.5F});
     }
+    Logging::Logger.info("AvatarSettingsBuild complete");
 }
 
 void MenuController::BuildAvatarFilePicker(HMUI::ViewController* view) {
@@ -3584,6 +3601,10 @@ void MenuController::MirrorGripEditorToOtherHand() {
 }
 
 void MenuController::DestroyGripEditor(bool restoreOriginal) noexcept {
+    // This panel's controls may have been hidden throughout their lifetime.
+    // Remove their BSML lookup entries before Unity releases their addresses.
+    if (IsAlive(gripEditorScreen_) && !ReleaseSliderRegistrations(
+            gripEditorScreen_->get_gameObject(), "grip editor teardown")) return;
     if (gripEditorSide_ >= 0 && restoreOriginal) {
         const camera::Pose original{
             gripEditorOriginalPosition_,
@@ -4904,6 +4925,54 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     }), "Turns off smoothing, Anchored Float, and scripted movement without changing camera placement.");
 
     auto* previewContainer = pages[3];
+    const auto addPreviewQuality = [&](bool floor) {
+        using namespace saberstage::preview;
+        const auto width = floor ? preview.floorResolutionWidth : preview.floatingResolutionWidth;
+        const auto fps = floor ? preview.floorFramesPerSecond : preview.floatingFramesPerSecond;
+        const auto resolutionIndex = static_cast<std::size_t>(std::distance(kPreviewWidths.begin(),
+            std::find(kPreviewWidths.begin(), kPreviewWidths.end(), width)));
+        const auto fpsIndex = static_cast<std::size_t>(std::distance(kPreviewFrameRates.begin(),
+            std::find(kPreviewFrameRates.begin(), kPreviewFrameRates.end(), fps)));
+        // BSML accepts a mutable span of labels; keep its UI storage separate
+        // from the immutable presets shared with settings validation and tests.
+        static auto resolutionLabels = kPreviewResolutionLabels;
+        static auto frameRateLabels = kPreviewFrameRateLabels;
+        // Reuse the proven camera row geometry and update preview demand only.
+        ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(
+            previewContainer, "Preview Resolution",
+            std::string(kPreviewResolutionLabels[resolutionIndex < kPreviewWidths.size() ? resolutionIndex : 0]),
+            resolutionLabels, [floor](StringW value) {
+                if (!active_) return;
+                const auto selected = static_cast<std::string>(value);
+                const auto found = std::find(kPreviewResolutionLabels.begin(), kPreviewResolutionLabels.end(), selected);
+                if (found == kPreviewResolutionLabels.end()) return;
+                auto& config = active_->root_.Settings().Edit().preview;
+                auto& target = floor ? config.floorResolutionWidth : config.floatingResolutionWidth;
+                target = kPreviewWidths[std::distance(kPreviewResolutionLabels.begin(), found)];
+                active_->root_.Settings().RequestSave();
+                active_->root_.Preview().RefreshRenderDemand();
+            }), floor
+                ? "Resolution requested by the floor preview while SaberStage's menu is open. Higher values may reduce game performance. This does not change recording or stream quality. Visible previews share the higher requested quality; captures reuse the encoder's output."
+                : "Resolution requested by the movable preview, including outside SaberStage's menu. Higher values may reduce game performance. It shares one render with other previews and reuses the encoder output during recording or streaming."));
+        ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown(
+            previewContainer, "Preview FPS",
+            std::string(kPreviewFrameRateLabels[fpsIndex < kPreviewFrameRates.size() ? fpsIndex : 2]),
+            frameRateLabels, [floor](StringW value) {
+                if (!active_) return;
+                const auto selected = static_cast<std::string>(value);
+                const auto found = std::find(kPreviewFrameRateLabels.begin(), kPreviewFrameRateLabels.end(), selected);
+                if (found == kPreviewFrameRateLabels.end()) return;
+                auto& config = active_->root_.Settings().Edit().preview;
+                auto& target = floor ? config.floorFramesPerSecond : config.floatingFramesPerSecond;
+                target = kPreviewFrameRates[std::distance(kPreviewFrameRateLabels.begin(), found)];
+                active_->root_.Settings().RequestSave();
+                active_->root_.Preview().RefreshRenderDemand();
+            }), floor
+                ? "Refresh rate requested by the floor preview. Lower FPS reduces its rendering cost; higher FPS looks smoother but may reduce game performance. The floor preview stops when SaberStage's menu closes."
+                : "Refresh rate requested by the movable preview. Higher FPS may reduce game performance. With both previews visible the higher rate is shared; during capture the preview follows the encoder's existing output."));
+    };
+    addHeading(previewContainer, "Floor Preview (Menu Only)");
+    addPreviewQuality(true);
     addHeading(previewContainer, "Movable Preview");
     auto* previewHint = BSML::Lite::CreateText(
         previewContainer->get_transform(),
@@ -4914,6 +4983,7 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(previewContainer, "Show Movable Preview", preview.visible, [](bool value) {
         if (active_) active_->root_.Preview().SetFloatingVisible(value);
     }), "Shows a movable world panel containing the third-person camera view. Turning it on always places it directly in front of you; it is hidden from recordings."));
+    addPreviewQuality(false);
     rememberSlider(3, ConstrainRightPanelRow(WithHint(BSML::Lite::CreateSliderSetting(previewContainer, "Preview Scale", 0.1F, preview.scale, 0.25F, 4.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
         if (active_) active_->root_.Preview().SetFloatingScale(value);
     }), "Changes the physical size of the movable preview panel without changing camera resolution.")));
@@ -6351,7 +6421,7 @@ void MenuController::EnsureChatWorldPanel() {
     ConfigureWorldPanelImage(
         chatWorldPanelBackground_, {0.0F, 0.0F},
         {panelSize.x - 1.0F, panelSize.y - 1.0F},
-        {0.0F, 0.0F, 0.0F, 1.0F});
+        {settings.backgroundColor.x, settings.backgroundColor.y, settings.backgroundColor.z, 1.0F});
     const UnityEngine::Color panelAccent{0.0F, 0.55F, 1.0F, 1.0F};
     chatWorldPanelBorderMaterial_ =
         CreateNonBloomWorldPanelMaterial("SaberStage Chat Panel Non-Bloom Accent");
@@ -6372,22 +6442,19 @@ void MenuController::EnsureChatWorldPanel() {
             if (active_) active_->ToggleChatWorldPanelResize();
         });
     chatWorldPanelControlButton_ = BSML::Lite::CreateUIButton(
-        parent, "Chat Control", "PlayButton", {0.0F, 0.0F}, {18.0F, 7.0F}, [] {});
+        parent, "Chat Control", "PlayButton", {0.0F, 0.0F}, {18.0F, 7.0F}, [] {
+            if (!active_) return;
+            ErrorManager::Instance().Guard("opening chat controls", [] {
+                if (!active_->chatControls_) active_->chatControls_ = std::make_unique<ChatControls>(active_->root_);
+                active_->chatControls_->Show();
+            });
+        });
     if (IsAlive(chatWorldPanelResizeButton_)) {
         BSML::Lite::SetButtonTextSize(chatWorldPanelResizeButton_, 2.6F);
     }
     if (IsAlive(chatWorldPanelControlButton_)) {
         BSML::Lite::SetButtonTextSize(chatWorldPanelControlButton_, 2.6F);
-        // Reserved for the provider-control popup. Keeping this visibly
-        // disabled is safer than presenting a button that silently does
-        // nothing while that popup is still being designed. Match the
-        // disabled tint to PlayButton's normal tint so both header buttons
-        // retain the requested blue appearance without making this future
-        // action interactive before it has an implementation.
-        auto colors = chatWorldPanelControlButton_->get_colors();
-        colors.set_disabledColor(colors.get_normalColor());
-        chatWorldPanelControlButton_->set_colors(colors);
-        chatWorldPanelControlButton_->set_interactable(false);
+        chatWorldPanelControlButton_->set_interactable(true);
     }
     chatWorldPanelViewerText_ = BSML::Lite::CreateText(
         parent, "♟ --", TMPro::FontStyles::Bold, 3.4F);
@@ -6455,7 +6522,7 @@ void MenuController::EnsureChatWorldPanel() {
         for (std::size_t index = 0; index < kChatVirtualRowPoolSize; ++index) {
             auto* row = BSML::Lite::CreateText(
                 scrollContent->get_transform(), "",
-                TMPro::FontStyles::Normal, 3.3F);
+                TMPro::FontStyles::Normal, settings.fontSize);
             if (!IsAlive(row)) continue;
             row->get_gameObject()->set_name(
                 "SaberStage Virtual Twitch Chat Row " + std::to_string(index));
@@ -6658,12 +6725,15 @@ void MenuController::ReflowChatWorldPanelText() {
     // it to the correct visible/inactive state in the same update.
     chatWorldPanelDiagnostics_.SetOperation("activate chat measurement probe");
     chatWorldPanelText_->get_gameObject()->set_active(true);
+    // Atlas changes enter through the same revision-driven reflow as messages.
+    // Bind before measuring emotes, never from the per-frame idle chat tick.
+    if (richChat_) richChat_->BindSpriteAsset(chatWorldPanelText_);
     float offset = 0.0F;
     for (auto& entry : chatWorldPanelEntries_) {
         if (widthChanged || entry.height <= 0.0F) {
             chatWorldPanelDiagnostics_.SetOperation("measure wrapped chat text");
             const auto preferred = chatWorldPanelText_->GetPreferredValues(
-                StringW(entry.text), textWidth, 1000.0F);
+                StringW(entry.text), std::max(1.0F, textWidth - 2.0F), 1000.0F);
             entry.height = std::max(
                 kChatVirtualRowMinimumHeight,
                 preferred.y + kChatVirtualRowPadding);
@@ -6770,6 +6840,8 @@ void MenuController::RefreshVirtualizedChatRows() {
                 chatWorldPanelRowGenerations_[poolIndex] !=
                     chatWorldPanelEntryGeneration_) {
             chatWorldPanelDiagnostics_.SetOperation("assign pooled chat row text", static_cast<int>(poolIndex));
+            if (auto animator = row->m_spriteAnimator) animator->StopAllAnimations();
+            if (richChat_) richChat_->BindSpriteAsset(row);
             row->set_text(entry.text);
             if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
                 chatWorldPanelRowEntryIndices_[poolIndex] = entryIndex;
@@ -6787,8 +6859,9 @@ void MenuController::RefreshVirtualizedChatRows() {
         rect->set_anchorMin({0.5F, 1.0F});
         rect->set_anchorMax({0.5F, 1.0F});
         rect->set_pivot({0.5F, 1.0F});
-        rect->set_anchoredPosition({0.0F, -entry.offset});
-        rect->set_sizeDelta({textWidth, entry.height});
+        rect->set_anchoredPosition({1.0F, -entry.offset});
+        rect->set_sizeDelta({textWidth - 2.0F, entry.height});
+        if (richChat_) richChat_->Decorate(row, textWidth - 2.0F, entry.height, root_.Settings().Get().chat.platformAccent);
         ++poolIndex;
     }
 
@@ -6798,7 +6871,12 @@ void MenuController::RefreshVirtualizedChatRows() {
     for (; poolIndex < chatWorldPanelRows_.size(); ++poolIndex) {
         chatWorldPanelDiagnostics_.SetOperation("deactivate unused chat row", static_cast<int>(poolIndex));
         auto* row = chatWorldPanelRows_[poolIndex];
-        if (IsAlive(row)) row->get_gameObject()->set_active(false);
+        if (IsAlive(row)) {
+            if (row->get_gameObject()->get_activeSelf()) {
+                if (auto animator = row->m_spriteAnimator) animator->StopAllAnimations();
+                row->get_gameObject()->set_active(false);
+            }
+        }
         if (poolIndex < chatWorldPanelRowEntryIndices_.size()) {
             chatWorldPanelRowEntryIndices_[poolIndex] =
                 std::numeric_limits<std::size_t>::max();
@@ -6954,6 +7032,9 @@ void MenuController::DestroyChatWorldPanel() noexcept {
     chatWorldPanelDisplayedViewerKnown_ = false;
     chatWorldPanelDisplayedChatState_ = -1;
     chatWorldPanelLastMessageSequence_ = 0;
+    // A recreated pool has no text even when IRC's retained revision did not
+    // change while the window was hidden. Force a data bind on reopening.
+    chatWorldPanelLastMessageRevision_ = std::numeric_limits<std::uint64_t>::max();
 }
 
 void MenuController::ResetChatWorldPanelPose() {
@@ -6999,11 +7080,38 @@ void MenuController::TickChatWorldPanel() noexcept {
         chatWorldPanelDiagnostics_.SetOperation("read chat settings");
         if (!root_.Settings().Get().chat.enabled) {
             DestroyChatWorldPanel();
+            richChat_.reset();
             return;
         }
         chatWorldPanelDiagnostics_.SetOperation("create or initialize chat panel");
         EnsureChatWorldPanel();
         if (!IsAlive(chatWorldPanelScreen_)) return;
+        const auto& chatSettings = root_.Settings().Get().chat;
+        if (!richChat_) richChat_ = std::make_unique<RichChatRenderer>(root_.Twitch().Assets());
+        if (richChat_->Tick(UnityEngine::Time::get_unscaledDeltaTime()))
+            chatWorldPanelLastMessageRevision_ = std::numeric_limits<std::uint64_t>::max();
+        const auto shownSize = chatWorldPanelScreen_->get_ScreenSize();
+        if (std::abs(shownSize.x - chatSettings.width) > 0.05F || std::abs(shownSize.y - chatSettings.height) > 0.05F)
+            UpdateChatWorldPanelLayout();
+        const std::uint32_t style = (chatSettings.showBadges ? 1U : 0U) | (chatSettings.filterCommands ? 2U : 0U) |
+            (chatSettings.filterBroadcasterCommands ? 4U : 0U) | (chatSettings.showSubscriptions ? 8U : 0U) | (chatSettings.showBits ? 16U : 0U) |
+            (chatSettings.showEmotes ? 32U : 0U) | (chatSettings.animateEmotes ? 64U : 0U) | (chatSettings.reverseOrder ? 128U : 0U) |
+            (chatSettings.platformAccent ? 256U : 0U) | (chatSettings.showFollows ? 512U : 0U) | (chatSettings.showRedemptions ? 1024U : 0U);
+        const std::array<float, 12> colors{chatSettings.backgroundColor.x, chatSettings.backgroundColor.y, chatSettings.backgroundColor.z,
+            chatSettings.textColor.x, chatSettings.textColor.y, chatSettings.textColor.z, chatSettings.highlightColor.x,
+            chatSettings.highlightColor.y, chatSettings.highlightColor.z, chatSettings.pingColor.x, chatSettings.pingColor.y, chatSettings.pingColor.z};
+        if (colors != chatWorldPanelColors_) {
+            chatWorldPanelColors_ = colors;
+            if (IsAlive(chatWorldPanelBackground_)) chatWorldPanelBackground_->set_color({colors[0], colors[1], colors[2], 1});
+            chatWorldPanelLastMessageRevision_ = std::numeric_limits<std::uint64_t>::max();
+        }
+        if (style != chatWorldPanelStyle_ || chatSettings.fontSize != chatWorldPanelFontSize_) {
+            chatWorldPanelStyle_ = style; chatWorldPanelFontSize_ = chatSettings.fontSize;
+            for (auto* row : chatWorldPanelRows_) if (IsAlive(row)) row->set_fontSize(chatWorldPanelFontSize_);
+            for (auto& entry : chatWorldPanelEntries_) entry.height = 0;
+            chatWorldPanelLastMessageRevision_ = std::numeric_limits<std::uint64_t>::max();
+        }
+        if (IsAlive(chatWorldPanelViewerText_)) chatWorldPanelViewerText_->get_gameObject()->set_active(chatSettings.showViewerCount);
         // Sample the previous frame's settled state before resize or message
         // reflow can hide a competing native layout writer's changes.
         chatWorldPanelDiagnostics_.Tick(
@@ -7088,14 +7196,16 @@ void MenuController::TickChatWorldPanel() noexcept {
                 chatWorldPanelContentOverflows_) {
             chatWorldPanelDiagnostics_.SetOperation("update native chat follow-live scroll");
             if (chatWorldPanelScrollToEndFrames_ > 0) {
-                chatWorldPanelScrollView_->ScrollToEnd(false);
+                if (chatSettings.reverseOrder) chatWorldPanelScrollView_->ScrollTo(0, false);
+                else chatWorldPanelScrollView_->ScrollToEnd(false);
                 --chatWorldPanelScrollToEndFrames_;
             } else {
                 const float end = std::max(
                     0.0F,
                     chatWorldPanelScrollView_->get_contentSize() -
                         chatWorldPanelScrollView_->get_scrollPageSize());
-                const bool atEnd = chatWorldPanelScrollView_->get_position() >= end - 0.75F;
+                const bool atEnd = chatSettings.reverseOrder ? chatWorldPanelScrollView_->get_position() < 0.75F :
+                    chatWorldPanelScrollView_->get_position() >= end - 0.75F;
                 if (chatWorldPanelFollowLive_ && !atEnd) {
                     chatWorldPanelFollowLive_ = false;
                 } else if (!chatWorldPanelFollowLive_ && atEnd) {
@@ -7133,70 +7243,68 @@ void MenuController::TickChatWorldPanel() noexcept {
             ? 0 : twitch.messages.back().sequence;
         const int chatState = static_cast<int>(twitch.chatState);
         if (newestSequence == chatWorldPanelLastMessageSequence_ &&
+                twitch.messagesRevision == chatWorldPanelLastMessageRevision_ &&
                 chatState == chatWorldPanelDisplayedChatState_) {
             return;
         }
         chatWorldPanelDiagnostics_.SetOperation("update bounded chat message history");
-        const int previousChatState = chatWorldPanelDisplayedChatState_;
         chatWorldPanelLastMessageSequence_ = newestSequence;
+        chatWorldPanelLastMessageRevision_ = twitch.messagesRevision;
         chatWorldPanelDisplayedChatState_ = chatState;
+        // Anchor the first surviving visible message, not a pixel count. Late
+        // emotes can change wrapping above it without changing the user's place.
+        std::uint64_t anchor = 0;
+        float anchorOffset = 0;
+        const auto readingPosition = IsAlive(chatWorldPanelScrollView_) ? chatWorldPanelScrollView_->get_position() : 0;
+        if (!chatWorldPanelFollowLive_) for (auto it = chatWorldPanelEntries_.rbegin(); it != chatWorldPanelEntries_.rend(); ++it) {
+            const auto& entry = *it;
+            if (entry.offset <= readingPosition && std::any_of(twitch.messages.begin(), twitch.messages.end(),
+                    [&](const auto& m) { return m.sequence == entry.sequence; })) {
+                anchor = entry.sequence; anchorOffset = readingPosition - entry.offset; break;
+            }
+        }
 
         const auto replaceWithStatus = [this](std::string status) {
             chatWorldPanelEntries_.clear();
             chatWorldPanelEntries_.push_back({0, std::move(status), 0.0F, 0.0F});
         };
-        if (twitch.chatState == broadcast::TwitchChatState::Connecting) {
+        if (twitch.messages.empty() && twitch.chatState == broadcast::TwitchChatState::Connecting) {
             replaceWithStatus("Connecting to chat...");
-        } else if (twitch.chatState == broadcast::TwitchChatState::Failed) {
+        } else if (twitch.messages.empty() && twitch.chatState == broadcast::TwitchChatState::Failed) {
             replaceWithStatus(
                 EscapeTmpText(twitch.status) +
-                "\n\nTurn the chat panel off and on to retry.");
-        } else if (twitch.chatState != broadcast::TwitchChatState::Connected) {
+                "\n\nUse Chat Control > Retry connections if automatic retries do not recover.");
+        } else if (twitch.messages.empty() && twitch.chatState != broadcast::TwitchChatState::Connected) {
             replaceWithStatus("Connect a Twitch account in the Live Stream tab.");
         } else if (twitch.messages.empty()) {
             replaceWithStatus("Connected. Waiting for chat messages...");
         } else {
-            const bool needsFreshHistory =
-                previousChatState != chatState ||
-                chatWorldPanelEntries_.empty() ||
-                chatWorldPanelEntries_.front().sequence == 0 ||
-                chatWorldPanelEntries_.back().sequence > newestSequence;
-            if (needsFreshHistory) chatWorldPanelEntries_.clear();
-
-            // TwitchService already retains at most 128 messages. Mirror that
-            // moving window without rebuilding strings or TMP measurements for
-            // entries that are still present. If the reader is scrolled up,
-            // compensate for retired rows so the same message stays in view.
-            const auto oldestSequence = twitch.messages.front().sequence;
-            float removedHeight = 0.0F;
-            while (!chatWorldPanelEntries_.empty() &&
-                    chatWorldPanelEntries_.front().sequence < oldestSequence) {
-                removedHeight += chatWorldPanelEntries_.front().height;
-                chatWorldPanelEntries_.pop_front();
-            }
-            const auto retainedNewest = chatWorldPanelEntries_.empty()
-                ? std::uint64_t{0}
-                : chatWorldPanelEntries_.back().sequence;
+            std::deque<ChatWorldPanelEntry> entries;
+            richChat_->BeginPass();
             for (const auto& message : twitch.messages) {
-                if (message.sequence <= retainedNewest) continue;
-                chatWorldPanelEntries_.push_back({
-                    message.sequence,
-                    "<b><color=#66D9FF>" + EscapeTmpText(message.author) +
-                        ":</color></b> " + EscapeTmpText(message.text),
-                    0.0F,
-                    0.0F});
+                if ((message.text.starts_with('!') && (message.broadcaster ? chatSettings.filterBroadcasterCommands : chatSettings.filterCommands)) ||
+                    (message.kind == broadcast::ChatKind::Subscription && !chatSettings.showSubscriptions) ||
+                    (message.kind == broadcast::ChatKind::Bits && !chatSettings.showBits) ||
+                    (message.kind == broadcast::ChatKind::Follow && !chatSettings.showFollows) ||
+                    (message.kind == broadcast::ChatKind::Redemption && !chatSettings.showRedemptions)) continue;
+                auto text = richChat_->Format(message, chatSettings, root_.Settings().Get().broadcast.twitchAccount.login);
+                auto old = std::find_if(chatWorldPanelEntries_.begin(), chatWorldPanelEntries_.end(),
+                    [&](const auto& e) { return e.sequence == message.sequence; });
+                const float height = old != chatWorldPanelEntries_.end() && old->text == text ? old->height : 0;
+                entries.push_back({message.sequence, std::move(text), height, 0});
             }
-            if (!chatWorldPanelFollowLive_ && removedHeight > 0.0F &&
-                    IsAlive(chatWorldPanelScrollView_)) {
-                chatWorldPanelScrollView_->ScrollTo(
-                    std::max(
-                        0.0F,
-                        chatWorldPanelScrollView_->get_position() - removedHeight),
-                    false);
-            }
+            if (chatSettings.reverseOrder) std::reverse(entries.begin(), entries.end());
+            chatWorldPanelEntries_ = std::move(entries);
         }
         ++chatWorldPanelEntryGeneration_;
         ReflowChatWorldPanelText();
+        if (anchor && !chatWorldPanelFollowLive_ && IsAlive(chatWorldPanelScrollView_)) {
+            const auto entry = std::find_if(chatWorldPanelEntries_.begin(), chatWorldPanelEntries_.end(), [&](const auto& e) { return e.sequence == anchor; });
+            if (entry != chatWorldPanelEntries_.end()) {
+                chatWorldPanelScrollView_->ScrollTo(std::clamp(entry->offset + anchorOffset, 0.0F, chatWorldPanelScrollGeometry_.scrollEnd), false);
+                chatWorldPanelRowsDirty_ = true; RefreshVirtualizedChatRows();
+            }
+        }
     } catch (const std::exception& exception) {
         chatWorldPanelDiagnostics_.ReportUpdateFailure(exception.what());
     } catch (...) {
@@ -7359,6 +7467,11 @@ void MenuController::RefreshAvatarStatus() {
     if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(profile.enabled);
     refreshingAvatarSetupControls_ = false;
     if (!avatarStatusText_) return;
+    if (root_.Avatar().IsLoadingVrmAvatar()) {
+        avatarStatusText_->set_text(std::string("Loading avatar: ") + root_.Avatar().AvatarLoadPhase() +
+            "\nConstruction is spread across frames. Unload cancels the request.");
+        return;
+    }
     const auto path = ConfiguredAvatarPath();
     if (avatarSelectionText_) {
         avatarSelectionText_->set_text(path.empty()
@@ -7392,7 +7505,7 @@ void MenuController::RefreshAvatarStatus() {
     avatarStatusText_->set_text(text.str());
 }
 
-bool MenuController::LoadSelectedAvatar(bool calibrationOnly, std::string* error) {
+bool MenuController::LoadSelectedAvatar(bool calibrationOnly, std::string* error, std::function<void()> ready) {
     const auto path = ConfiguredAvatarPath();
     if (path.empty()) {
         if (error) *error = "choose a VRM avatar file first";
@@ -7414,9 +7527,30 @@ bool MenuController::LoadSelectedAvatar(bool calibrationOnly, std::string* error
             path,
             static_cast<std::uint32_t>(avatarSettings.maximumTextureDimension),
             error,
-            true)) {
+            true,
+            [menu = this, calibrationOnly, initialCalibration, ready = std::move(ready)](bool success, const std::string& loadError) {
+                // MenuController may have been torn down while the native
+                // parser ran. Profile switches/unload also cancel this callback.
+                if (active_ != menu) return;
+                std::string completionError = loadError;
+                if (success) success = menu->FinishSelectedAvatarLoad(calibrationOnly, initialCalibration, &completionError);
+                menu->RefreshAvatarStatus();
+                if (!success) {
+                    Logging::Logger.error("Avatar load failed: {}", completionError);
+                    if (menu->avatarStatusText_) menu->avatarStatusText_->set_text("Avatar load failed\n" + completionError);
+                    ErrorManager::Instance().ReportUserVisible("Avatar load failed", completionError);
+                    return;
+                }
+                menu->RequestAvatarSettingsRebuild();
+                if (ready) ready();
+            })) {
         return false;
     }
+    return true;
+}
+
+bool MenuController::FinishSelectedAvatarLoad(bool calibrationOnly, bool initialCalibration, std::string* error) {
+    auto& avatarSettings = root_.Settings().Edit().avatar;
     root_.Avatar().ApplyAvatarSettings(avatarSettings);
     if (!root_.Avatar().RecalibrateNeutral()) {
         Logging::Logger.info(
@@ -7494,7 +7628,9 @@ void MenuController::SetAvatarMasterEnabled(bool enabled) {
 void MenuController::BeginPlayerCalibration(bool advanced) {
     std::string error;
     if (!root_.Avatar().HasLoadedVrmAvatar() || !root_.Avatar().IsBound()) {
-        if (!LoadSelectedAvatar(true, &error)) {
+        if (!LoadSelectedAvatar(true, &error, [menu = this, advanced] {
+                if (active_ == menu) menu->BeginPlayerCalibration(advanced);
+            })) {
             Logging::Logger.warn("Could not prepare avatar for player calibration: {}", error);
             RefreshAvatarStatus();
             RefreshCalibrationStatus();
@@ -7503,6 +7639,8 @@ void MenuController::BeginPlayerCalibration(bool advanced) {
             }
             return;
         }
+        RefreshAvatarStatus();
+        return; // The ready callback opens calibration after binding finishes.
     }
     if (!root_.Avatar().PreparePlayerCalibration(
             advanced ? avatar::calibration::CalibrationMode::Advanced
@@ -8220,9 +8358,11 @@ void MenuController::TickCalibrationPanel() noexcept {
     if (twitchUiRefreshSeconds_ >= 0.5F) {
         twitchUiRefreshSeconds_ = 0.0F;
         RefreshTwitchControls();
+        if (root_.Avatar().IsLoadingVrmAvatar()) RefreshAvatarStatus();
     }
     TickRecordingWorldPanel();
     TickChatWorldPanel();
+    if (chatControls_) chatControls_->Tick();
     TickAvatarStandinProxy();
     TickGripEditor();
     try {
@@ -8267,6 +8407,10 @@ void MenuController::RequestAvatarSettingsRebuild() noexcept {
 void MenuController::RebuildAvatarSettingsPanel() {
     avatarSettingsRebuildPending_ = false;
     if (!IsAlive(avatarSettingsView_)) return;
+    Logging::Logger.info("AvatarSettingsRebuild begin selectedTab={}", selectedAvatarTab_);
+    // Do this before clearing fields or destroying any children. In particular,
+    // unopened Fit/Quality tabs are not guaranteed to receive OnDestroy.
+    if (!ReleaseSliderRegistrations(avatarSettingsView_->get_gameObject(), "avatar settings rebuild")) return;
     DestroyGripEditor(true);
     DestroyCalibrationPanel();
     avatarTabs_ = nullptr;
@@ -8337,7 +8481,7 @@ void MenuController::RebuildAvatarSettingsPanel() {
     selectedAvatarTab_ = std::clamp(selectedAvatarTab_, 0, 3);
     ShowAvatarTab(selectedAvatarTab_);
     if (avatarTabs_) avatarTabs_->SelectCellWithNumber(selectedAvatarTab_);
-    Logging::Logger.info("Rebuilt Avatar settings UI after player-profile change");
+    Logging::Logger.info("AvatarSettingsRebuild complete selectedTab={}", selectedAvatarTab_);
 }
 
 void MenuController::RefreshCalibrationStatus() {

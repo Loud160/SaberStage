@@ -76,14 +76,16 @@ internal static class BuildSaberStageAvatarShaders
                 "Assets/SaberStageMToonOutline.shader",
                 "Assets/SaberStageVideoPreview.shader",
                 "Assets/SaberStageGripTarget.shader",
-                "Assets/SaberStageNonBloomUI.shader"
+                "Assets/SaberStageNonBloomUI.shader",
+                "Assets/SaberStageChatSprite.shader"
             },
             addressableNames = new[] {
                 "saberstage-mtoon",
                 "saberstage-mtoon-outline",
                 "saberstage-video-preview",
                 "saberstage-grip-target",
-                "saberstage-non-bloom-ui"
+                "saberstage-non-bloom-ui",
+                "saberstage-chat-sprite"
             }
         };
         var manifest = BuildPipeline.BuildAssetBundles(output, new[] { build },
@@ -93,5 +95,17 @@ internal static class BuildSaberStageAvatarShaders
             BuildAssetBundleOptions.StrictMode, BuildTarget.Android);
         if (manifest == null || !File.Exists(Path.Combine(output, "saberstage_avatar_shaders")))
             throw new InvalidOperationException("Unity did not create the SaberStage Android avatar shader bundle.");
+        // Inspect the actual produced archive, not just the input list. A
+        // missing address otherwise silently leaves optional chat in fallback.
+        var bundle = AssetBundle.LoadFromFile(Path.Combine(output, "saberstage_avatar_shaders"));
+        if (bundle == null) throw new InvalidOperationException("Built shader bundle could not be inspected.");
+        try {
+            var names = bundle.GetAllAssetNames();
+            foreach (var required in build.addressableNames)
+                if (!names.Contains(required, StringComparer.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("Built shader bundle is missing " + required);
+            Debug.Log("Verified shader bundle addresses: " + string.Join(", ", names));
+        }
+        finally { bundle.Unload(true); }
     }
 }

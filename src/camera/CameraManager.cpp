@@ -18,6 +18,7 @@
 #include "saberstage/camera/CameraPreRenderDriver.hpp"
 #include "saberstage/camera/MotionPipeline.hpp"
 #include "saberstage/camera/MovementScript.hpp"
+#include "saberstage/camera/RuntimeWorkPolicy.hpp"
 #include "saberstage/camera/SpectatorRenderGuard.hpp"
 #include "saberstage/settings/SettingsService.hpp"
 
@@ -100,6 +101,7 @@ public:
         UnityEngine::Object::DontDestroyOnLoad(driverObject_);
         driverObject_->AddComponent<CameraRuntimeDriver*>();
         RegisterSceneEvents();
+        RefreshGameplayScene();
         // Quest's IL2CPP image does not contain a callable concrete generic
         // SubsystemManager<XRInputSubsystem> instantiation. Detect abrupt
         // tracking-space discontinuities from the live HMD pose instead of
@@ -139,16 +141,19 @@ public:
     void Tick() noexcept {
         if (!started_) return;
         try {
+            runtimeTimeSeconds_ = UnityEngine::Time::get_unscaledTime();
             if (sceneChangePending_) {
                 sceneChangePending_ = false;
                 sessionTimeSeconds_ = 0.0F;
                 forwardAnchorValid_ = false;
                 previousHeadPoseValid_ = false;
-                audioTimeSync_ = nullptr;
-                playerTransforms_ = nullptr;
+                ResetGameplaySources();
+                RefreshGameplayScene();
                 movement_.Reset();
                 scheduler_.Reset();
-                ReloadMovementScript();
+                // The scene changes the clock, not the selected file. Keep
+                // parsed frames and restart telemetry without disk I/O.
+                ResetScriptPlayback();
                 if (!externalOutputActive_) {
                     DestroyRuntimeCamera();
                 } else {
@@ -191,6 +196,12 @@ public:
                     renderDiagnostics_.maximumUnityFrameSeconds, static_cast<double>(deltaSeconds));
             }
             sessionTimeSeconds_ += deltaSeconds;
+            const bool measureWork = settings_.Get().general.diagnosticsEnabled;
+            const auto workStarted = measureWork ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            // Retry a late-spawned gameplay rig even in static-camera mode.
+            // Discovery itself is scene-gated and backs off on a cache miss.
+            if (settings_.Get().camera.Primary().enabled) FindPlayerTransforms();
             const auto headPose = CurrentHeadPose();
             ObserveTrackingPose(headPose, deltaSeconds);
             if (!forwardAnchorValid_ || trackingOriginChangePending_) {
@@ -198,7 +209,9 @@ public:
                 BindForwardAnchor(headPose, false);
             }
             ApplyMotion(headPose, deltaSeconds);
+            const auto motionFinished = measureWork ? std::chrono::steady_clock::now() : workStarted;
             ApplyRenderDemand(deltaSeconds);
+            RecordWorkTimings(deltaSeconds, measureWork, workStarted, motionFinished);
         } catch (const std::exception& exception) {
             Logging::Logger.error("Spectator camera tick failed: {}", exception.what());
             DestroyRuntimeCamera();
@@ -427,6 +440,48 @@ public:
     void HandleTrackingOriginChanged() noexcept { trackingOriginChangePending_ = true; }
 
 private:
+    void ResetGameplaySources() noexcept {
+        audioTimeSync_ = nullptr;
+        playerTransforms_ = nullptr;
+        songClockRetry_.Reset();
+        playerRootRetry_.Reset();
+    }
+
+    void RefreshGameplayScene() {
+        auto scene = UnityEngine::SceneManagement::SceneManager::GetActiveScene();
+        gameplayScene_ = scene.IsValid() && static_cast<std::string>(scene.get_name()) == "GameCore";
+    }
+
+    void RecordWorkTimings(float deltaSeconds, bool enabled,
+        std::chrono::steady_clock::time_point started,
+        std::chrono::steady_clock::time_point motionFinished) {
+        if (!enabled) { workWindow_ = {}; return; }
+        const auto motionUs = std::chrono::duration<double, std::micro>(motionFinished - started).count();
+        const auto renderUs = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - motionFinished).count();
+        ++workWindow_.ticks;
+        workWindow_.seconds += deltaSeconds;
+        workWindow_.motionUs += motionUs;
+        workWindow_.motionMaxUs = std::max(workWindow_.motionMaxUs, motionUs);
+        workWindow_.renderUs += renderUs;
+        workWindow_.renderMaxUs = std::max(workWindow_.renderMaxUs, renderUs);
+        if (workWindow_.seconds < 5.0) return;
+        const auto demand = demands_.Combined(kPrimaryCameraId);
+        // Low-frequency CPU wall times include synchronous driver waits, not
+        // asynchronous GPU execution. Counts prove that menu cache misses do
+        // not turn back into one global discovery scan per headset frame.
+        Logging::Logger.info(
+            "CameraWork window={:.2f}s gameplay={} ticks={} script={} songLookups={} playerLookups={} fileLoads={} "
+            "motionAvgUs={:.1f} motionMaxUs={:.1f} renderScheduleAvgUs={:.1f} renderScheduleMaxUs={:.1f} "
+            "previewRenders={} demand={}x{}@{} externalEncoder={}",
+            workWindow_.seconds, gameplayScene_, workWindow_.ticks, script_.has_value(),
+            workWindow_.songLookups, workWindow_.playerLookups, workWindow_.fileLoads,
+            workWindow_.motionUs / workWindow_.ticks, workWindow_.motionMaxUs,
+            workWindow_.renderUs / workWindow_.ticks, workWindow_.renderMaxUs,
+            workWindow_.previewRenders, demand.width, demand.height, demand.framesPerSecond, externalOutputActive_);
+        workWindow_ = {};
+    }
+
     void RegisterSceneEvents() {
         using UnityEngine::SceneManagement::Scene;
         using UnityEngine::SceneManagement::SceneManager;
@@ -523,6 +578,9 @@ private:
 
     void RefreshRuntimeCameraFromMain() {
         if (!IsUnityObjectAlive(mainCamera_) || !IsUnityObjectAlive(spectatorCamera_)) return;
+        // An encoder camera can survive while the game's main camera/rig does
+        // not. Never keep a cached gameplay source from that previous rig.
+        ResetGameplaySources();
         const auto& profile = settings_.Get().camera.Primary();
         spectatorCamera_->CopyFrom(mainCamera_);
         spectatorCamera_->set_enabled(false);
@@ -565,8 +623,7 @@ private:
         cameraObject_ = nullptr;
         spectatorCamera_ = nullptr;
         mainCamera_ = nullptr;
-        audioTimeSync_ = nullptr;
-        playerTransforms_ = nullptr;
+        ResetGameplaySources();
         forwardAnchorValid_ = false;
         currentWorldPoseValid_ = false;
         previousHeadPoseValid_ = false;
@@ -596,16 +653,22 @@ private:
     }
 
     void FindPlayerTransforms() {
+        if (IsUnityObjectAlive(playerTransforms_) && playerTransforms_->get_isActiveAndEnabled()) return;
         playerTransforms_ = nullptr;
+        if (!playerRootRetry_.TryBegin(gameplayScene_, runtimeTimeSeconds_)) return;
+        ++workWindow_.playerLookups;
         auto* mainTransform = mainCamera_ != nullptr ? mainCamera_->get_transform().ptr() : nullptr;
         for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::PlayerTransforms*>()) {
-            if (candidate == nullptr || !candidate->get_isActiveAndEnabled()) continue;
+            if (!IsUnityObjectAlive(candidate) || !candidate->get_isActiveAndEnabled()) continue;
             if (candidate->__cordl_internal_get__headTransform().ptr() == mainTransform) {
                 playerTransforms_ = candidate;
-                return;
+                break;
             }
             if (playerTransforms_ == nullptr) playerTransforms_ = candidate;
         }
+        // If startup initially used the head fallback, adopt the real rig's
+        // origin when it arrives rather than keeping a stale static anchor.
+        if (playerTransforms_ != nullptr && forwardAnchorValid_) trackingOriginChangePending_ = true;
     }
 
     Pose CurrentPlayerAnchor(Pose headPose) {
@@ -664,10 +727,13 @@ private:
         if (!script_) return std::nullopt;
         float clock = sessionTimeSeconds_;
         if (script_->syncToSong) {
-            if (!IsUnityObjectAlive(audioTimeSync_)) {
+            if (!gameplayScene_) return std::nullopt;
+            if (!IsUnityObjectAlive(audioTimeSync_) || !audioTimeSync_->get_isActiveAndEnabled()) {
                 audioTimeSync_ = nullptr;
+                if (!songClockRetry_.TryBegin(gameplayScene_, runtimeTimeSeconds_)) return std::nullopt;
+                ++workWindow_.songLookups;
                 for (auto* candidate : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::AudioTimeSyncController*>()) {
-                    if (candidate != nullptr && candidate->get_isActiveAndEnabled()) {
+                    if (IsUnityObjectAlive(candidate) && candidate->get_isActiveAndEnabled()) {
                         audioTimeSync_ = candidate;
                         break;
                     }
@@ -772,6 +838,7 @@ private:
     }
 
     void RenderSpectatorFrame() {
+        ++workWindow_.previewRenders;
         spectatorCamera_->ResetCullingMatrix();
         if (!captureExclusionHandler_) {
             spectatorCamera_->Render();
@@ -873,12 +940,19 @@ private:
         scheduler_.Reset();
     }
 
-    void ReloadMovementScript() {
-        script_.reset();
+    void ResetScriptPlayback() noexcept {
         scriptClockValid_ = false;
         scriptTelemetryWasActive_ = false;
         scriptTelemetryElapsedSeconds_ = 0.0F;
+    }
+
+    void ReloadMovementScript() {
         const auto& profile = settings_.Get().camera.Primary();
+        if (!scriptSelection_.Update(profile.movementScriptEnabled, profile.movementScriptFile)) return;
+        script_.reset();
+        ResetScriptPlayback();
+        audioTimeSync_ = nullptr;
+        songClockRetry_.Reset();
         if (profile.movementScriptFile.empty()) {
             movementScriptStatus_ = "No movement script selected.";
             return;
@@ -887,13 +961,14 @@ private:
             movementScriptStatus_ = "Movement script selected but disabled.";
             return;
         }
-        const auto loaded = LoadMovementScript(scriptDirectory_, profile.movementScriptFile);
+        ++workWindow_.fileLoads;
+        auto loaded = LoadMovementScript(scriptDirectory_, profile.movementScriptFile);
         if (!loaded) {
             movementScriptStatus_ = "Script error: " + loaded.error;
             Logging::Logger.error("Movement script '{}' rejected: {}", profile.movementScriptFile, loaded.error);
             return;
         }
-        script_ = *loaded.script;
+        script_ = std::move(*loaded.script);
         movementScriptStatus_ = "Compatible script loaded (" + std::to_string(script_->frames.size()) + " frames).";
         Logging::Logger.info(
             "Loaded movement script '{}' (frames={}, syncToSong={}, loop={}, duration={:.3f}s)",
@@ -904,6 +979,15 @@ private:
     settings::SettingsService& settings_;
     std::filesystem::path scriptDirectory_;
     bool started_ = false;
+    bool gameplayScene_ = false;
+    double runtimeTimeSeconds_ = 0.0;
+    GameplaySourceRetry songClockRetry_;
+    GameplaySourceRetry playerRootRetry_;
+    MovementScriptSelection scriptSelection_;
+    struct WorkWindow {
+        std::uint64_t ticks = 0, songLookups = 0, playerLookups = 0, fileLoads = 0, previewRenders = 0;
+        double seconds = 0.0, motionUs = 0.0, motionMaxUs = 0.0, renderUs = 0.0, renderMaxUs = 0.0;
+    } workWindow_;
     CameraRenderDiagnostics renderDiagnostics_{};
     std::chrono::steady_clock::time_point renderStarted_{};
     bool renderTimingActive_ = false;

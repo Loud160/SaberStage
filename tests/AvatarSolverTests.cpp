@@ -161,6 +161,135 @@ PlayerCalibration BuildPlayer(const TrackingSample& tracking) {
     return player;
 }
 
+void TestEyeOffsetsStayAttachedAcrossSizingAndMotion() {
+    // Exercise actual eye-bone positions, not just the virtual HMD eye anchor.
+    // This rules out a neutral-world-position regression in the native solver;
+    // Unity skinning and facial morph weights require separate runtime evidence.
+    for (const bool includeEyes : {false, true}) {
+        const auto avatar = BuildAvatar(std::nullopt, includeEyes);
+        for (const bool armSpan : {false, true}) {
+            for (const float finalScale : {0.7F, 1.0F, 1.6F}) {
+                const auto neutral = BuildTracking();
+                auto player = BuildPlayer(neutral);
+                StaticTrackerlessAvatarSolver solver;
+                AvatarFitOptions fit;
+                fit.armSpanAvatarSizing = armSpan;
+                fit.manualAvatarScaleEnabled = true;
+                fit.manualAvatarScale = finalScale;
+                (void)solver.SetFitOptions(fit);
+                SolverPersistentState state;
+                SolvedHumanoidPose pose;
+                auto tracking = neutral;
+                for (int frame = 0; frame < 5; ++frame) {
+                    tracking = NextFrame(tracking, {0.08F * frame, 1.7F - 0.12F * frame, 0.06F + 0.05F * frame},
+                                         0.18F * frame);
+                    tracking.head.pose.rotation = Multiply(tracking.head.pose.rotation,
+                        AxisAngle({1.0F, 0.0F, 0.0F}, -0.09F * frame));
+                    SolverDiagnostics diagnostics;
+                    Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics),
+                          "head motion solves with optional eyes in either sizing mode");
+                    Check(pose.valid[BoneIndex(HumanoidBone::Head)], "head remains a tracked solver target");
+                    for (const auto eye : {HumanoidBone::LeftEye, HumanoidBone::RightEye}) {
+                        Check(pose.valid[BoneIndex(eye)] == includeEyes,
+                              "optional eye-bone validity is preserved");
+                        if (!includeEyes) continue;
+                        const auto authored = RelativeTo(avatar.rest.bones[BoneIndex(HumanoidBone::Head)].world,
+                                                         avatar.rest.bones[BoneIndex(eye)].world);
+                        const auto actual = RelativeTo(pose.bones[BoneIndex(HumanoidBone::Head)],
+                                                       pose.bones[BoneIndex(eye)]);
+                        Check(Length(actual.position - authored.position * diagnostics.retargeting.uniformScale) < 0.0001F &&
+                                  SameRotation(actual.rotation, authored.rotation, 0.0001F),
+                              "eye bones follow translated/rotated Head at the fitted scale");
+                    }
+                    Check(Length(pose.bones[BoneIndex(HumanoidBone::Head)].position -
+                                     diagnostics.headTarget.position) < 0.0001F,
+                          "eye-bone solving does not displace the tracked head");
+                }
+            }
+        }
+    }
+}
+
+void TestGripCalibrationSurvivesPointerSaberTransition() {
+    const auto avatar = BuildAvatar();
+    auto menu = BuildTracking();
+    for (int side = 0; side < 2; ++side) {
+        menu.controllerHand[side] = side == 0 ? menu.leftHand : menu.rightHand;
+        menu.handIsSaberGrip[side] = true; // visible menu pointer, no Saber component
+    }
+    const auto player = BuildPlayer(menu);
+    // Cover basic, controller-fitted and saber-fitted profiles without changing
+    // any of their saved offsets. A smaller avatar must also retain the anchor
+    // when Keep Hands On Sabers extends the arm to meet the handle.
+    for (int fitMode = 0; fitMode < 3; ++fitMode) {
+        for (const bool armSpan : {false, true}) {
+            for (const auto finalScale : {0.68F, 1.0F}) {
+                StaticTrackerlessAvatarSolver solver;
+                AvatarFitOptions fit;
+                fit.armSpanAvatarSizing = armSpan;
+                fit.manualAvatarScaleEnabled = true;
+                fit.manualAvatarScale = finalScale;
+                fit.gripAdjustment[0] = {{0.014F, -0.023F, 0.037F}, AxisAngle({0, 0, 1}, 0.3F)};
+                fit.gripAdjustment[1] = {{-0.018F, -0.020F, 0.031F}, AxisAngle({0, 1, 0}, -0.2F)};
+                (void)solver.SetFitOptions(fit);
+                calibration::RuntimePlayerProfile profile;
+                profile.valid = fitMode != 0;
+                for (int side = 0; side < 2; ++side) {
+                    profile.gripConfidence[side] = profile.valid ? 0.9F : 0.0F;
+                    profile.gripFitUsesSaber[side] = fitMode == 2;
+                    profile.gripToCanonicalHand[side] = AxisAngle({1, 0, 0}, 0.15F);
+                }
+                Pose calibrated[2]{};
+                for (int scene = 0; scene < 4; ++scene) {
+                    // The runtime reseeds at a menu/game rig handoff. The saved
+                    // grip must not be reinterpreted when that happens.
+                    SolverPersistentState state;
+                    SolvedHumanoidPose pose;
+                    // Menu -> gameplay before saber discovery -> acquired sabers
+                    // -> menu. Rotate about all three axes while preserving the
+                    // exact grip-relative transform, not just a single still pose.
+                    for (int frame = 0; frame < 24; ++frame) {
+                        auto sample = menu;
+                        sample.sequence = scene * 24 + frame + 1;
+                        sample.renderFrame = static_cast<int>(sample.sequence);
+                        const auto amount = static_cast<float>(frame) / 23.0F;
+                        sample.head.timestampSeconds = 1.0 + sample.sequence / 72.0;
+                        for (int side = 0; side < 2; ++side) {
+                            auto& source = side == 0 ? sample.leftHand : sample.rightHand;
+                            const auto sign = side == 0 ? -1.0F : 1.0F;
+                            source.pose.position += Vec3{sign * 0.25F * amount, 0.12F * amount, 0.15F * amount};
+                            source.pose.rotation = Multiply(
+                                AxisAngle({1, 0, 0}, 0.6F * amount),
+                                Multiply(AxisAngle({0, 1, 0}, sign * 0.8F * amount),
+                                         AxisAngle({0, 0, 1}, sign * 0.7F * amount)));
+                            source.timestampSeconds = sample.head.timestampSeconds;
+                            sample.controllerHand[side] = source;
+                            if (scene == 2) {
+                                source.pose = Compose(source.pose,
+                                    {{0.0F, 0.008F, 0.012F}, AxisAngle({0, 0, 1}, side == 0 ? 0.45F : -0.35F)});
+                                sample.saberGrip[side] = source;
+                            }
+                        }
+                        if (frame == 12) solver.Reset(state); // reacquire with already-rotated controllers
+                        SolverDiagnostics diagnostics;
+                        Check(solver.Solve(sample, avatar, player, profile, state, pose, &diagnostics),
+                              "calibrated hands solve through menu-map-menu with tracker reacquisition");
+                        for (int side = 0; side < 2; ++side) {
+                            const auto source = side == 0 ? sample.leftHand.pose : sample.rightHand.pose;
+                            const auto handBone = side == 0 ? HumanoidBone::LeftHand : HumanoidBone::RightHand;
+                            const auto anchor = RelativeTo(source, pose.bones[BoneIndex(handBone)]);
+                            if (scene == 0 && frame == 0) calibrated[side] = anchor;
+                            Check(Length(anchor.position - calibrated[side].position) < 0.0001F &&
+                                      SameRotation(anchor.rotation, calibrated[side].rotation, 0.0001F),
+                                  "one calibrated pointer-to-hand anchor must also hold the gameplay saber identically");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void TestTrackingOriginRebase() {
     const auto neutral = BuildTracking();
     auto player = BuildPlayer(neutral);
@@ -789,11 +918,18 @@ void TestRuntimePlayerProfileIntegration() {
           solver.Solve(saberB, avatar, player, controllerFitProfile,
               sourceStateB, sourcePoseB, &sourceDiagnosticsB),
           "controller-fitted profiles solve with gameplay saber sources");
-    Check(SameRotation(sourceDiagnosticsA.finalHand[0].rotation,
-              sourceDiagnosticsB.finalHand[0].rotation, 0.001F) &&
-          SameRotation(sourceDiagnosticsA.finalHand[1].rotation,
-              sourceDiagnosticsB.finalHand[1].rotation, 0.001F),
-          "controller-derived anatomical correction is converted through live controller-to-saber rotation");
+    // The hand follows the visible grip, even when a gameplay saber has a
+    // different rotation from its raw controller. Keeping the hand's world
+    // rotation unchanged here used to twist it away from the actual handle.
+    for (int side = 0; side < 2; ++side) {
+        const auto sourceA = side == 0 ? saberA.leftHand.pose : saberA.rightHand.pose;
+        const auto sourceB = side == 0 ? saberB.leftHand.pose : saberB.rightHand.pose;
+        const auto anchorA = RelativeTo(sourceA, sourceDiagnosticsA.finalHand[side]);
+        const auto anchorB = RelativeTo(sourceB, sourceDiagnosticsB.finalHand[side]);
+        Check(SameRotation(anchorA.rotation, anchorB.rotation, 0.001F) &&
+                  Length(anchorA.position - anchorB.position) < 0.001F,
+              "controller-fitted calibration stays fixed relative to the visible saber grip");
+    }
 
     bool sawLeanClassification = false;
     float strongestLeanMargin = -1.0F;
@@ -1694,6 +1830,8 @@ void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); 
 
 int main() {
     TestCalibration();
+    TestEyeOffsetsStayAttachedAcrossSizingAndMotion();
+    TestGripCalibrationSurvivesPointerSaberTransition();
     TestTrackingOriginRebase();
     TestSameFrameTrackingDeduplication();
     TestSpineRotationFollowsSolvedChainAfterTurning();

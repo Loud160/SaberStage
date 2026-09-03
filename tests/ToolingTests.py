@@ -165,6 +165,36 @@ class ReceiptSafetyTests(unittest.TestCase):
 
 
 class RepositoryInvariantTests(unittest.TestCase):
+    def test_owned_slider_cleanup_precedes_ui_destruction_and_rebuild(self):
+        lifetime = (ROOT / "src/ui/SliderLifetime.cpp").read_text(encoding="utf-8")
+        policy = (ROOT / "include/saberstage/ui/SliderRegistration.hpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        chat = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        self.assertIn("GetComponentsInChildren(csTypeOf(Wrapper*), true)", lifetime)
+        self.assertIn("BSML::SliderSetting::remappers", lifetime)
+        self.assertIn("BSML::ListSliderSetting::remappers", lifetime)
+        self.assertIn("EraseOwnedSliderRegistration(registry, slider, wrapper)", lifetime)
+        self.assertIn("if (found->second != owner)", policy)
+        self.assertNotIn("found->second->", policy)
+        self.assertNotIn("registry.clear()", policy)
+        self.assertNotIn("FindObjectsOfTypeAll", lifetime)
+        self.assertIn("ownership mismatch", lifetime)
+        self.assertIn("wrappers={} removed={} unregistered={} mismatches={}", lifetime)
+        rebuild = menu.split("void MenuController::RebuildAvatarSettingsPanel()", 1)[1].split(
+            "void MenuController::RefreshCalibrationStatus()", 1)[0]
+        self.assertLess(rebuild.index("ReleaseSliderRegistrations"), rebuild.index("DestroyImmediate"))
+        self.assertLess(rebuild.index("ReleaseSliderRegistrations"), rebuild.index("avatarTabs_ = nullptr"))
+        self.assertLess(rebuild.index("DestroyImmediate"), rebuild.index("BuildSettingsPanel"))
+        self.assertIn("AvatarSettingsRebuild begin", rebuild)
+        self.assertIn("AvatarSettingsRebuild complete", rebuild)
+        grip = menu.split("void MenuController::DestroyGripEditor(bool restoreOriginal)", 1)[1].split(
+            "void MenuController::RecenterGripEditor()", 1)[0]
+        self.assertLess(grip.index("ReleaseSliderRegistrations"), grip.index("Object::Destroy"))
+        navigation = chat.split("void BuildControls()", 1)[1].split("controls.content = Content", 1)[0]
+        self.assertLess(navigation.index("ReleaseSliderRegistrations"), navigation.index("Object::Destroy"))
+        surface = chat.split("void Destroy(Surface &surface)", 1)[1].split("void FitHandle", 1)[0]
+        self.assertLess(surface.index("ReleaseSliderRegistrations"), surface.index("Object::Destroy"))
+
     def test_private_logger_is_pinned_isolated_and_collected(self):
         lock = json.loads((ROOT / "dependencies/native-logger.json").read_text(encoding="utf-8"))
         qpm = json.loads((ROOT / "qpm.json").read_text(encoding="utf-8"))
@@ -269,7 +299,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("BinaryOptionHex(body)", service)
         self.assertIn('av_dict_set(&options, "post_data", binaryPostData.c_str(), 0);', service)
         self.assertNotIn('av_dict_set(&options, "post_data", std::string(body).c_str(), 0);', service)
-        self.assertIn('if (method == "PATCH")', service)
+        self.assertIn('if (method == "PATCH" || method == "DELETE")', service)
         self.assertIn(
             "HTTP 4xx/5xx responses make that call\n"
             "    // fail. Once a PATCH reaches this point",
@@ -317,9 +347,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         )
         self.assertIn("The stream started, but Twitch could not apply its saved title", implementation)
         self.assertNotIn("pendingTwitchStreamStart_", implementation)
-        self.assertIn('if (method == "PATCH")', service)
+        self.assertIn('if (method == "PATCH" || method == "DELETE")', service)
         self.assertLess(
-            service.index('if (method == "PATCH")'),
+            service.index('if (method == "PATCH" || method == "DELETE")'),
             service.index("while (response.size() < kMaximumHttpResponseBytes)"),
         )
         self.assertNotIn('"http_code"', service)
@@ -389,7 +419,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("void MenuController::RefreshVirtualizedChatRows()", menu)
         self.assertIn("rect->set_anchorMin({0.5F, 1.0F})", menu)
         self.assertIn("rect->set_anchorMax({0.5F, 1.0F})", menu)
-        self.assertIn("rect->set_sizeDelta({textWidth, entry.height})", menu)
+        # Two units are reserved for the optional per-message platform accent;
+        # text measurement and the recycled row use the same remaining width.
+        self.assertIn("rect->set_sizeDelta({textWidth - 2.0F, entry.height})", menu)
         self.assertIn("chatWorldPanelRowsDirty_", menu)
         self.assertIn("chatWorldPanelRenderedScrollPosition_", menu)
         self.assertIn("kChatDataRefreshIntervalSeconds = 0.10F", menu)
@@ -469,6 +501,80 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("set_interactable(true)", controls)
         self.assertIn("setRect(chatWorldPanelBackground_, {0.0F, 0.0F}", chat)
         self.assertNotIn("set_localPosition({})", chat)
+
+    def test_idle_chat_does_not_reassign_sprite_assets_at_headset_rate(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
+                    menu.index("void MenuController::EnsureStandinProxy(")]
+        # TMP's setter dirties geometry/layout even when the pointer is unchanged.
+        # Atlas revision changes already enter the bounded reflow/reuse path.
+        self.assertNotIn("set_spriteAsset(", tick)
+        self.assertNotIn("BindSpriteAsset(", tick)
+        reflow = menu[menu.index("void MenuController::ReflowChatWorldPanelText()"):
+                      menu.index("void MenuController::RefreshVirtualizedChatRows()")]
+        self.assertLess(reflow.index("BindSpriteAsset(chatWorldPanelText_)"),
+                        reflow.index("GetPreferredValues("))
+        renderer = (ROOT / "src/ui/RichChatRenderer.cpp").read_text(encoding="utf-8")
+        binding = renderer[renderer.index("void RichChatRenderer::BindSpriteAsset("):
+                           renderer.index("bool RichChatRenderer::Tick(")]
+        self.assertIn("if (current != desired)", binding)
+        self.assertEqual(renderer.count("set_spriteAsset("), 1)
+
+    def test_chat_control_backdrop_preserves_native_ui_draw_order(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        surface = source[source.index("Surface CreateSurface("):
+                         source.index("struct ChatControls::Impl")]
+        # A full-panel accent pass at queue 3020 covers native queue-3000 UI
+        # even when it is the first sibling and does not intercept raycasts.
+        self.assertNotIn("background->set_material(", surface)
+        self.assertNotIn("EmbeddedNonBloomUiShader", surface)
+        self.assertIn("background->get_transform()->SetAsFirstSibling()", surface)
+        self.assertIn("background->set_raycastTarget(false)", surface)
+        self.assertIn("controls.closeButton = Button(parent, \"Close\"", source)
+        self.assertIn("requests.closeButton = Button(parent, \"Close\"", source)
+        self.assertIn("LogSurfaceLayers(controls)", source)
+        self.assertIn("LogSurfaceLayers(requests)", source)
+        # Layer logging is event-only; no scans or diagnostics in the idle tick.
+        tick = source[source.index("    void Tick() {"):
+                      source.index("ChatControls::ChatControls(")]
+        self.assertNotIn("LogSurfaceLayers(", tick)
+        diagnostic = source[source.index("void LogSurfaceLayers("):
+                            source.index("void Destroy(Surface")]
+        self.assertNotIn("->set_", diagnostic)
+        self.assertNotIn("get_materialForRendering", diagnostic)
+        self.assertNotIn("get_text()", diagnostic)
+        self.assertIn("get_renderQueue()", diagnostic)
+
+    def test_face_and_grip_readback_is_bounded_and_observational(self):
+        manager = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
+        runtime = (ROOT / "src/avatar/vrm/VrmUnityRuntime.cpp").read_text(encoding="utf-8")
+        gate = manager[manager.index("if (now - lastPerformanceLogTime_ >= 5.0)"):
+                       manager.index("lastPerformanceLogTime_ = now;")]
+        self.assertIn("LogFaceAndGripReadback();", gate)
+        self.assertEqual(manager.count("LogFaceAndGripReadback();"), 1)
+        readback = manager[manager.index("void LogFaceAndGripReadback()"):
+                           manager.index("void ResetAutomaticExpressionState()")]
+        weights = runtime[runtime.index("void LogFaceDiagnostics() const noexcept"):
+                          runtime.index("bool SupportsAlphaToMask() const noexcept")]
+        for diagnostic in (readback, weights):
+            self.assertNotIn("SetBlendShapeWeight", diagnostic)
+            self.assertNotIn("SetExpression", diagnostic)
+            self.assertNotIn("->set_", diagnostic)
+            self.assertNotIn("FindObjectsOfTypeAll", diagnostic)
+        self.assertIn("GetBlendShapeWeight", weights)
+        self.assertIn("sample_.saberGrip[side].valid", readback)
+        self.assertIn("automaticExpressionsEnabled_", readback)
+        self.assertIn("RelativeTo(source.pose, handPose)", readback)
+
+    def test_pointer_and_saber_sampling_preserves_the_calibrated_grip_reference(self):
+        manager = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
+        # Runtime sampling complements the native pose tests: do not insert a
+        # blade-derived palm translation before the solver sees the real handle.
+        self.assertNotIn("SampleSaberGripPose", manager)
+        self.assertNotIn("get_saberBladeBottomPos", manager)
+        self.assertIn("SamplePose(saberGripTransforms_[side], previous.saberGrip[side], timestamp)", manager)
+        self.assertIn("sample_.handIsSaberGrip[side] = hand.valid;", manager)
+        self.assertIn("? sample_.saberGrip[side] : sample_.controllerHand[side]", manager)
 
     def test_chat_missing_pointer_does_not_abort_message_processing(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -1033,7 +1139,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("RestoreCaptureRoots()", preview)
         self.assertIn('Shader::Find("Unlit/Texture")', preview)
         self.assertIn("previewMaterial_->set_mainTexture(texture)", preview)
-        self.assertIn("image->set_material(previewMaterial_)", preview)
+        self.assertIn("image->set_material(previewMaterial_.ptr())", preview)
         self.assertIn("kFirstPersonLayerMask", profile)
         self.assertNotIn("(1 << 6) |  // first-person avatar", profile)
         self.assertIn("set_depth(1.0F)", camera)
@@ -1045,6 +1151,53 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("RestoreTransitioningViewControllers()", guard)
         self.assertNotIn("set_enabled(false)", guard)
 
+    def test_preview_material_cache_is_rooted_and_closed_panels_do_not_bind(self):
+        source = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
+        # Scene cleanup must not reclaim cached wrappers or unused assets when
+        # both previews are off. Null checks alone missed the map-exit crash.
+        for name in ("previewMaterial_", "floatingMaterial_", "floatingBorderMaterial_"):
+            self.assertIn(f"SafePtrUnity<UnityEngine::Material> {name};", source)
+            self.assertNotIn(f"UnityEngine::Material* {name}", source)
+            self.assertNotIn(f"IsAlive({name})", source)
+            self.assertIn(f"ReleasePreviewMaterial({name},", source)
+            self.assertNotIn(f"DontDestroyOnLoad({name})", source)
+        factory = source[source.index("bool CreateOpaquePreviewMaterial("):
+                         source.index("void ReleasePreviewMaterial(")]
+        self.assertIn("SafePtrUnity<UnityEngine::Material>& material", factory)
+        self.assertLess(factory.index("material = UnityEngine::Material::New_ctor(shader)"),
+                        factory.index("material->set_hideFlags"))
+        self.assertIn("HideFlags::DontUnloadUnusedAsset", factory)
+        self.assertNotIn("DontDestroyOnLoad(material)", factory)
+        border = source[source.index("bool EnsureFloatingBorderMaterial()"):
+                        source.index("void ApplyPreviewMaterial(")]
+        self.assertIn("HideFlags::DontUnloadUnusedAsset", border)
+        release = source[source.index("void ReleasePreviewMaterial("):
+                         source.index("bool EnsurePreviewMaterial()")]
+        self.assertLess(release.index("if (material)"), release.index("material.ptr()"))
+        self.assertIn("Object::Destroy(material.ptr())", release)
+        self.assertIn("material = nullptr", release)
+
+        bind = source[source.index("void SetPreviewTexture("):
+                      source.index("PreviewManager& owner_")]
+        for image, material in (("dockedImage_", "previewMaterial_"),
+                                ("floatingImage_", "floatingMaterial_")):
+            # Each setter belongs inside a live/active, changed-feed branch;
+            # a nullptr feed must still be allowed to clear a displayed panel.
+            self.assertRegex(bind, rf"if \(IsAlive\({image}\) && {image}->get_isActiveAndEnabled\(\) && {material} &&\s*"
+                                   rf"{image}->get_texture\(\) != texture\) \{{\s*{material}->set_mainTexture\(texture\);")
+        detach = source[source.index("void DetachDockedPreview()"):
+                        source.index("void SetFloatingVisible(")]
+        self.assertIn("previewMaterial_->set_mainTexture(nullptr)", detach)
+        close = source[source.index("void DestroyFloatingPreview()"):
+                       source.index("void ApplyFloatingScale()")]
+        self.assertIn("floatingMaterial_->set_mainTexture(nullptr)", close)
+        self.assertIn("floatingImage_ = nullptr", close)
+        visibility = source[source.index("void ApplyVisibility()"):
+                            source.index("UnityEngine::UI::RawImage* BuildMovablePreviewVisuals()")]
+        self.assertIn("else if (floatingScreen_ || floatingImage_)", visibility)
+        self.assertIn("PreviewMaterial retained", source)
+        self.assertIn("PreviewMaterial released", source)
+
     def test_floating_ui_waits_for_bsml_menu_services(self):
         source = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
         self.assertIn("FloatingUiServicesReady", source)
@@ -1052,6 +1205,75 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("BSML::Helpers::GetDiContainer() != nullptr", source)
         self.assertIn("if (!existed && FloatingUiServicesReady()) CreateFloatingPreview();", source)
         self.assertIn("if (!FloatingUiServicesReady()) return;", source)
+
+    def test_camera_runtime_discovery_is_gated_and_script_reload_is_keyed(self):
+        source = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
+        song = source[source.index("std::optional<ScriptSample> SampleMovementScript()"):
+                      source.index("void LogScriptTelemetry(")]
+        self.assertLess(song.index("if (!gameplayScene_) return std::nullopt;"), song.index("FindObjectsOfTypeAll"))
+        self.assertLess(song.index("songClockRetry_.TryBegin"), song.index("FindObjectsOfTypeAll"))
+        player = source[source.index("void FindPlayerTransforms()"):
+                        source.index("Pose CurrentPlayerAnchor(")]
+        self.assertLess(player.index("playerRootRetry_.TryBegin"), player.index("FindObjectsOfTypeAll"))
+        tick = source[source.index("void Tick() noexcept"):
+                      source.index("bool SetRenderDemand(")]
+        self.assertIn("ResetGameplaySources();", tick)
+        self.assertIn("RefreshGameplayScene();", tick)
+        self.assertIn("ResetScriptPlayback();", tick)
+        self.assertNotIn("ReloadMovementScript();", tick)
+        reload = source[source.index("void ReloadMovementScript()"):
+                        source.index("CameraManager& owner_;")]
+        self.assertLess(reload.index("scriptSelection_.Update"), reload.index("LoadMovementScript("))
+        diagnostic = source[source.index("void RecordWorkTimings("):
+                            source.index("void RegisterSceneEvents()")]
+        self.assertIn("if (workWindow_.seconds < 5.0) return;", diagnostic)
+        self.assertIn("songLookups={}", diagnostic)
+        self.assertIn("playerLookups={}", diagnostic)
+        self.assertIn("motionMaxUs={:.1f}", diagnostic)
+
+    def test_floor_preview_releases_demand_before_unity_cleanup(self):
+        source = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
+        flow = (ROOT / "src/ui/MenuFlowCoordinator.cpp").read_text(encoding="utf-8")
+        detach = source[source.index("void DetachDockedPreview() noexcept"):
+                        source.index("void RegisterCaptureExcludedRoot(")]
+        self.assertLess(detach.index("editorActive_ = false;"), detach.index("RestoreCaptureRoots();"))
+        self.assertLess(detach.index("camera_.RemoveRenderDemand(kDockedDemand)"), detach.index("RestoreCaptureRoots();"))
+        self.assertIn("image->get_gameObject()->SetActive(false)", detach)
+        self.assertNotIn("RemoveRenderDemand(kFloatingDemand)", detach)
+        self.assertGreaterEqual(flow.count("MenuController::SetEditorPreviewActive(false);"), 2)
+        tick = source[source.index("void Tick() noexcept"):
+                      source.index("void AttachDockedPreview(")]
+        self.assertIn("if (editorActive_ && !IsAlive(dockedImage_)) DetachDockedPreview();", tick)
+        self.assertIn("floorVisible != floorVisible_", tick)
+        self.assertIn("RefreshRenderDemand();", tick)
+        self.assertIn("dockedImage_->get_isActiveAndEnabled()", tick)
+        attach = source[source.index("void AttachDockedPreview("):
+                        source.index("void DetachDockedPreview() noexcept")]
+        self.assertIn("dockedImage_->get_gameObject()->SetActive(true)", attach)
+
+    def test_preview_quality_dropdowns_are_independent_and_use_native_camera_rows(self):
+        source = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
+        settings = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        controls = menu[menu.index("const auto addPreviewQuality ="):
+                        menu.index("active_->ShowSettingsTab(0);")]
+        self.assertIn("ConstrainRightPanelRow(WithHint(BSML::Lite::CreateDropdown", controls)
+        self.assertIn("addPreviewQuality(true);", controls)
+        self.assertIn("addPreviewQuality(false);", controls)
+        self.assertIn('"Floor Preview (Menu Only)"', controls)
+        self.assertIn('"Preview Resolution"', controls)
+        self.assertIn('"Preview FPS"', controls)
+        self.assertIn("RefreshRenderDemand();", controls)
+        self.assertNotIn("EditCamera(", controls)
+        self.assertNotIn("NotifyProfileChanged", controls)
+        for field in ("floorResolutionWidth", "floorFramesPerSecond", "floatingResolutionWidth", "floatingFramesPerSecond"):
+            self.assertIn(field, source)
+            self.assertIn(field, controls)
+            self.assertIn(f'Int(*preview, "{field}"', settings)
+            self.assertIn(f'preview.AddMember("{field}"', settings)
+        reset = source[source.index("bool ResetFloatingPreview("):
+                       source.index("void ApplySettings()")]
+        self.assertIn("auto reset = settings_.Get().preview;", reset)
 
     def test_calibration_wizard_uses_bigscreen_panel_and_is_review_gated(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")

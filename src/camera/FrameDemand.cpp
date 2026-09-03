@@ -22,7 +22,7 @@ bool FrameDemandRegistry::Set(std::string consumerId, RenderDemand demand) {
     // identifiers now rather than accepting demand the renderer cannot satisfy.
     if (consumerId.empty() || consumerId.size() > 64 || demand.cameraId != "primary" ||
         demand.width < 320 || demand.width > 4096 || demand.height < 240 || demand.height > 4096 ||
-        demand.framesPerSecond < 15 || demand.framesPerSecond > 60) return false;
+        demand.framesPerSecond < 5 || demand.framesPerSecond > 60) return false;
     // YUV encoders require even dimensions. Rounding down stays within the
     // requested maximum and avoids a later per-frame resize.
     demand.width &= ~1;
@@ -57,7 +57,13 @@ bool FrameScheduler::Advance(float deltaSeconds, std::int32_t framesPerSecond) n
     // would worsen the hitch; the scheduler resumes cadence from current time.
     accumulatorSeconds_ = std::min(accumulatorSeconds_ + deltaSeconds, interval * 2.0F);
     if (accumulatorSeconds_ + 0.000001F < interval) return false;
-    accumulatorSeconds_ = std::fmod(accumulatorSeconds_, interval);
+    // The tolerance above can accept a deadline a fraction early. fmod on
+    // that still-below-interval value would keep nearly a full frame of debt,
+    // causing another render on the next HMD tick. Consume that deadline
+    // completely; only retain a remainder when we actually reached/passed it.
+    accumulatorSeconds_ = accumulatorSeconds_ < interval
+        ? 0.0F
+        : std::fmod(accumulatorSeconds_, interval);
     return true;
 }
 

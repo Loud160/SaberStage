@@ -17,6 +17,7 @@
 #include "saberstage/ui/ChatPanelScrollGeometry.hpp"
 
 #include <functional>
+#include <memory>
 #include <array>
 #include <cstdint>
 #include <deque>
@@ -70,6 +71,8 @@ class ApplicationRoot;
 namespace saberstage::ui {
 
 class MenuFlowCoordinator;
+class ChatControls;
+class RichChatRenderer;
 
 class MenuController final {
 public:
@@ -83,6 +86,8 @@ public:
     void TickCalibrationPanel() noexcept;
 
 private:
+    std::unique_ptr<ChatControls> chatControls_;
+    std::unique_ptr<RichChatRenderer> richChat_;
     friend class MenuFlowCoordinator;
     static void BuildSettingsPanel(HMUI::ViewController* view);
     static void BuildCameraListPanel(HMUI::ViewController* view);
@@ -139,7 +144,8 @@ private:
     void TickChatWorldPanel() noexcept;
     void RefreshAvatarStatus();
     void RefreshCalibrationStatus();
-    bool LoadSelectedAvatar(bool calibrationOnly, std::string* error = nullptr);
+    bool LoadSelectedAvatar(bool calibrationOnly, std::string* error = nullptr, std::function<void()> ready = {});
+    bool FinishSelectedAvatarLoad(bool calibrationOnly, bool initialCalibration, std::string* error);
     void SetAvatarMasterEnabled(bool enabled);
     void BeginPlayerCalibration(bool advanced);
     bool CompletePlayerCalibrationWorkflow(std::string* error = nullptr);
@@ -429,6 +435,10 @@ private:
     bool chatWorldPanelDisplayedViewerKnown_ = false;
     int chatWorldPanelDisplayedChatState_ = -1;
     std::uint64_t chatWorldPanelLastMessageSequence_ = 0;
+    std::uint64_t chatWorldPanelLastMessageRevision_ = 0;
+    float chatWorldPanelFontSize_ = 3.3F;
+    std::uint32_t chatWorldPanelStyle_ = 0;
+    std::array<float, 12> chatWorldPanelColors_{};
     bool chatWorldPanelCreationFailureLogged_ = false;
     // Invisible body-sized grab handles for the free-standing avatar display
     // clones, one per slot (up to three), each driving its clone's placement.

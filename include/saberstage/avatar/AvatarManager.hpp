@@ -73,11 +73,18 @@ public:
         std::string* error = nullptr) noexcept;
     void SetCalibrationStatusChangedHandler(std::function<void()> handler);
 
+    // Returns whether the request was queued, not whether Unity construction
+    // finished. Completion runs on the game thread; unload cancels it.
+    using LoadCompleted = std::function<void(bool, const std::string&)>;
     bool LoadVrmAvatar(
         const std::filesystem::path& path,
         std::uint32_t maximumTextureDimension = 1024,
         std::string* error = nullptr,
-        bool bindSolver = true) noexcept;
+        bool bindSolver = true,
+        LoadCompleted completed = {}) noexcept;
+    void TickAvatarLifecycle() noexcept;
+    [[nodiscard]] bool IsLoadingVrmAvatar() const noexcept;
+    [[nodiscard]] const char* AvatarLoadPhase() const noexcept;
     bool BindLoadedVrmAvatar(std::string* error = nullptr) noexcept;
     void UnloadVrmAvatar() noexcept;
     void SetAvatarVisible(bool visible) noexcept;

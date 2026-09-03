@@ -28,6 +28,7 @@
 #include "bsml/shared/BSML/Tags/RawImageTag.hpp"
 #include "bsml/shared/Helpers/getters.hpp"
 #include "bsml/shared/Helpers/utilities.hpp"
+#include "beatsaber-hook/shared/utils/typedefs-wrappers.hpp"
 #include "HMUI/ImageView.hpp"
 #include "TMPro/FontStyles.hpp"
 #include "TMPro/TextAlignmentOptions.hpp"
@@ -37,6 +38,7 @@
 #include "UnityEngine/CanvasRenderer.hpp"
 #include "UnityEngine/Color.hpp"
 #include "UnityEngine/GameObject.hpp"
+#include "UnityEngine/HideFlags.hpp"
 #include "UnityEngine/Material.hpp"
 #include "UnityEngine/MeshRenderer.hpp"
 #include "UnityEngine/Object.hpp"
@@ -265,12 +267,9 @@ public:
             SetDockedImageTexture(nullptr);
             DestroyFloatingPreview();
             DestroyPlacementPreview();
-            if (IsAlive(previewMaterial_)) UnityEngine::Object::Destroy(previewMaterial_);
-            previewMaterial_ = nullptr;
-            if (IsAlive(floatingMaterial_)) UnityEngine::Object::Destroy(floatingMaterial_);
-            floatingMaterial_ = nullptr;
-            if (IsAlive(floatingBorderMaterial_)) UnityEngine::Object::Destroy(floatingBorderMaterial_);
-            floatingBorderMaterial_ = nullptr;
+            ReleasePreviewMaterial(previewMaterial_, "floor");
+            ReleasePreviewMaterial(floatingMaterial_, "movable feed");
+            ReleasePreviewMaterial(floatingBorderMaterial_, "movable border");
             UnbindPreviewRuntimeDriver(&owner_);
             if (IsAlive(driverObject_)) UnityEngine::Object::Destroy(driverObject_);
             driverObject_ = nullptr;
@@ -292,6 +291,17 @@ public:
     void Tick() noexcept {
         if (!started_) return;
         try {
+            // Native menu deactivation normally detaches immediately. Also
+            // release a destroyed view and follow actual view visibility, so
+            // a missed callback cannot leave a hidden floor render running.
+            // Do not detach an initially inactive view: HMUI can activate its
+            // children after the coordinator's DidActivate has attached it.
+            if (editorActive_ && !IsAlive(dockedImage_)) DetachDockedPreview();
+            const bool floorVisible = editorActive_ && IsAlive(dockedImage_) && dockedImage_->get_isActiveAndEnabled();
+            if (floorVisible != floorVisible_) {
+                floorVisible_ = floorVisible;
+                RefreshRenderDemand();
+            }
             // Camera rendering is synchronous on Unity's main thread. If an
             // interrupted or exceptional render ever misses its matching
             // post-render callback, recover HMD UI before the next ordinary
@@ -335,9 +345,10 @@ public:
 
     void AttachDockedPreview(UnityEngine::UI::RawImage* image) {
         RestoreCaptureRoots();
-        dockedImage_ = image;
+        dockedImage_ = IsAlive(image) ? image : nullptr;
         dockedCaptureRoot_ = nullptr;
         if (IsAlive(dockedImage_)) {
+            dockedImage_->get_gameObject()->SetActive(true);
             // Exclude only the video graphic. The enclosing center preview
             // view is ordinary menu UI and remains visible to the spectator.
             dockedCaptureRoot_ = dockedImage_->get_gameObject().ptr();
@@ -350,24 +361,42 @@ public:
             }
         }
         RefreshCaptureRendererCache();
-        editorActive_ = image != nullptr;
+        editorActive_ = dockedImage_ != nullptr;
+        floorVisible_ = editorActive_ && dockedImage_->get_isActiveAndEnabled();
         RefreshRenderDemand();
         EnsurePlacementPreview();
         Logging::Logger.info("Camera editor preview {}", editorActive_ ? "attached" : "detached");
     }
 
     void DetachDockedPreview() noexcept {
+        // Release demand BEFORE touching Unity objects. A stale canvas or an
+        // exception restoring render visibility must not strand a full-size
+        // floor preview behind the menu. Floating/capture demands are separate.
+        const bool wasAttached = editorActive_;
+        editorActive_ = false;
+        floorVisible_ = false;
+        try { camera_.RemoveRenderDemand(kDockedDemand); }
+        catch (...) { Logging::Logger.warn("Floor render demand removed; render-target release failed"); }
+        auto* image = dockedImage_;
+        dockedImage_ = nullptr;
+        dockedCaptureRoot_ = nullptr;
         try {
             RestoreCaptureRoots();
-            SetDockedImageTexture(nullptr);
-            dockedImage_ = nullptr;
-            dockedCaptureRoot_ = nullptr;
-            RefreshCaptureRendererCache();
-            editorActive_ = false;
-            camera_.RemoveRenderDemand(kDockedDemand);
-            DestroyPlacementPreview();
+            if (IsAlive(image)) {
+                image->set_texture(nullptr);
+                image->get_gameObject()->SetActive(false);
+            }
+            // The cached material survives the menu, but its old camera target
+            // does not belong to it. Detach both references before scene cleanup.
+            if (previewMaterial_) previewMaterial_->set_mainTexture(nullptr);
         } catch (...) {
+            Logging::Logger.warn("Floor preview visual cleanup failed; its render demand was already released");
         }
+        try { RefreshCaptureRendererCache(); }
+        catch (...) { Logging::Logger.warn("Floor preview capture-cache cleanup failed after detaching"); }
+        try { DestroyPlacementPreview(); }
+        catch (...) { Logging::Logger.warn("Floor preview placement gizmo cleanup failed after detaching"); }
+        if (wasAttached) Logging::Logger.info("Floor preview detached; floor render demand removed");
     }
 
     void RegisterCaptureExcludedRoot(UnityEngine::GameObject* root) {
@@ -437,9 +466,11 @@ public:
     }
 
     bool ResetFloatingPreview(std::string* error) {
-        auto reset = settings::Defaults().preview;
+        // This button resets panel placement/size, not either monitor's image
+        // quality. Keeping those separate also keeps the dropdowns truthful.
+        auto reset = settings_.Get().preview;
+        reset.scale = settings::Defaults().preview.scale;
         MovePreviewPoseInFrontOfPlayer(reset);
-        reset.visible = settings_.Get().preview.visible;
         settings_.Edit().preview = reset;
         if (!settings_.Save(error)) return false;
         DestroyFloatingPreview();
@@ -465,12 +496,15 @@ public:
     }
 
     void RefreshRenderDemand() {
-        if (editorActive_) {
-            camera_.SetRenderDemand(std::string(kDockedDemand), DockedPreviewRenderDemand());
+        const auto& preview = settings_.Get().preview;
+        if (editorActive_ && IsAlive(dockedImage_) && dockedImage_->get_isActiveAndEnabled()) {
+            camera_.SetRenderDemand(std::string(kDockedDemand), DockedPreviewRenderDemand(
+                preview.floorResolutionWidth, preview.floorFramesPerSecond));
         }
         else camera_.RemoveRenderDemand(kDockedDemand);
-        if (settings_.Get().preview.visible && IsAlive(floatingScreen_)) {
-            camera_.SetRenderDemand(std::string(kFloatingDemand), FloatingPreviewRenderDemand());
+        if (preview.visible && IsAlive(floatingScreen_)) {
+            camera_.SetRenderDemand(std::string(kFloatingDemand), FloatingPreviewRenderDemand(
+                preview.floatingResolutionWidth, preview.floatingFramesPerSecond));
         }
         else camera_.RemoveRenderDemand(kFloatingDemand);
     }
@@ -577,7 +611,7 @@ private:
         captureMeshSnapshot_.reserve(cachedCaptureMeshRenderers_.size());
     }
 
-    UnityEngine::Material* CreateOpaquePreviewMaterial(const char* name) {
+    bool CreateOpaquePreviewMaterial(SafePtrUnity<UnityEngine::Material>& material, const char* name) {
         // The camera's post-effect texture contains correct RGB (Hollywood
         // records it correctly) but its alpha channel is Beat Saber's bloom
         // weight, not ordinary image opacity. UI materials alpha-blend with
@@ -600,10 +634,16 @@ private:
                 previewMaterialFailureLogged_ = true;
                 Logging::Logger.error("No opaque texture shader is available for camera previews");
             }
-            return nullptr;
+            return false;
         }
-        auto* material = UnityEngine::Material::New_ctor(shader);
-        if (!IsAlive(material)) return nullptr;
+        // Root the managed wrapper immediately, including while no RawImage
+        // references it. A pointer in this native Impl is not a GC root.
+        material = UnityEngine::Material::New_ctor(shader);
+        if (!material) return false;
+        // Native asset lifetime is separate from managed wrapper lifetime.
+        // Keep the small cache through UnloadUnusedAssets when a map exits;
+        // Stop explicitly destroys it. DontDestroyOnLoad is not this contract.
+        material->set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset);
         material->set_name(name);
         material->set_color(UnityEngine::Color::get_white());
         if (embedded == nullptr) {
@@ -611,34 +651,44 @@ private:
             material->SetInt("_Cull", 0);
             material->set_renderQueue(3000);
         }
-        UnityEngine::Object::DontDestroyOnLoad(material);
         Logging::Logger.info(
             "Camera preview material '{}' uses {} shader",
             name, embedded != nullptr ? "embedded multiview VideoPreview" : "stock Unlit/Texture fallback");
-        return material;
+        Logging::Logger.info("PreviewMaterial retained name='{}' id={} managedRoot=true dontUnloadUnused=true",
+            name, material->GetInstanceID());
+        return true;
+    }
+
+    void ReleasePreviewMaterial(SafePtrUnity<UnityEngine::Material>& material, const char* surface) {
+        // bool checks the rooted wrapper; ptr() must never be called first on
+        // an object Unity has explicitly destroyed. Shutdown owns destruction.
+        if (material) {
+            const auto id = material->GetInstanceID();
+            UnityEngine::Object::Destroy(material.ptr());
+            Logging::Logger.info("PreviewMaterial released surface='{}' id={}", surface, id);
+        }
+        material = nullptr;
     }
 
     bool EnsurePreviewMaterial() {
-        if (IsAlive(previewMaterial_)) return true;
-        previewMaterial_ = CreateOpaquePreviewMaterial("SaberStage Opaque Camera Preview");
-        if (!IsAlive(previewMaterial_)) return false;
+        if (previewMaterial_) return true;
+        if (!CreateOpaquePreviewMaterial(previewMaterial_, "SaberStage Opaque Camera Preview")) return false;
         Logging::Logger.info("Using alpha-independent opaque RGB material for camera previews");
         return true;
     }
 
     bool EnsureFloatingPreviewMaterial() {
-        if (IsAlive(floatingMaterial_)) return true;
+        if (floatingMaterial_) return true;
         // The movable popout gets its OWN material instance. Sharing one
         // material between the HMUI docked canvas and the world-space
         // FloatingScreen canvas lets one canvas's UI pipeline (masking /
         // material-modifier state) leak into the other's draw; per-surface
         // instances keep the two monitors fully independent.
-        floatingMaterial_ = CreateOpaquePreviewMaterial("SaberStage Opaque Popout Preview");
-        return IsAlive(floatingMaterial_);
+        return CreateOpaquePreviewMaterial(floatingMaterial_, "SaberStage Opaque Popout Preview");
     }
 
     bool EnsureFloatingBorderMaterial() {
-        if (IsAlive(floatingBorderMaterial_)) return true;
+        if (floatingBorderMaterial_) return true;
         auto* shader = avatar::vrm::EmbeddedNonBloomUiShader();
         if (!IsAlive(shader)) {
             Logging::Logger.warn(
@@ -646,25 +696,29 @@ private:
             return false;
         }
         floatingBorderMaterial_ = UnityEngine::Material::New_ctor(shader);
-        if (!IsAlive(floatingBorderMaterial_)) return false;
+        if (!floatingBorderMaterial_) return false;
+        floatingBorderMaterial_->set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset);
         floatingBorderMaterial_->set_name("SaberStage Preview Panel Non-Bloom Accent");
         floatingBorderMaterial_->set_color(UnityEngine::Color::get_white());
         floatingBorderMaterial_->set_renderQueue(3020);
-        UnityEngine::Object::DontDestroyOnLoad(floatingBorderMaterial_);
+        Logging::Logger.info("PreviewMaterial retained name='movable border' id={} managedRoot=true dontUnloadUnused=true",
+            floatingBorderMaterial_->GetInstanceID());
         return true;
     }
 
     void ApplyPreviewMaterial(UnityEngine::UI::RawImage* image) {
         if (!IsAlive(image) || !EnsurePreviewMaterial()) return;
         image->set_color(UnityEngine::Color::get_white());
-        image->set_material(previewMaterial_);
+        image->set_material(previewMaterial_.ptr());
     }
 
     void ApplyVisibility() {
         const bool existed = IsAlive(floatingScreen_);
         if (settings_.Get().preview.visible) {
             if (!existed && FloatingUiServicesReady()) CreateFloatingPreview();
-        } else {
+        } else if (floatingScreen_ || floatingImage_) {
+            // Closing an absent panel used to rebuild the capture cache every
+            // frame. Teardown (and clearing the cached feed) is an event only.
             DestroyFloatingPreview();
         }
         if (existed != IsAlive(floatingScreen_)) RefreshRenderDemand();
@@ -702,15 +756,15 @@ private:
             parent,
             {0.0F, bodyCenter},
             previewInteriorSize,
-            floatingMaterial_);
+            floatingMaterial_.ptr());
         if (!IsAlive(preview)) return nullptr;
 
         EnsureFloatingBorderMaterial();
         const auto addBorder = [&](UnityEngine::Vector2 position, UnityEngine::Vector2 size) {
             auto* image = BSML::Lite::CreateImage(parent, whitePixel);
             ConfigureImage(image, position, size, borderColor);
-            if (IsAlive(image) && IsAlive(floatingBorderMaterial_)) {
-                image->set_material(floatingBorderMaterial_);
+            if (IsAlive(image) && floatingBorderMaterial_) {
+                image->set_material(floatingBorderMaterial_.ptr());
             }
         };
         addBorder({0.0F, bodyTop - 0.5F}, {kPreviewWidth, border});
@@ -864,6 +918,7 @@ private:
     }
 
     void DestroyFloatingPreview() noexcept {
+        const bool hadSurface = floatingScreen_ || floatingImage_;
         RestoreCaptureRoots();
         if (IsAlive(floatingScreen_)) UnityEngine::Object::Destroy(floatingScreen_->get_gameObject());
         floatingScreen_ = nullptr;
@@ -875,6 +930,10 @@ private:
         RefreshCaptureRendererCache();
         floatingPoseDirty_ = false;
         floatingStableSeconds_ = 0.0F;
+        // Keep the rooted material for the next opening, not the old feed.
+        // It must not retain a RenderTexture after the last consumer closes.
+        if (floatingMaterial_) floatingMaterial_->set_mainTexture(nullptr);
+        if (hadSurface) Logging::Logger.info("Movable preview closed; feed cleared and materials retained safely");
     }
 
     void ApplyFloatingScale() {
@@ -926,7 +985,7 @@ private:
     }
 
     void EnsurePlacementPreview() {
-        if (!editorActive_) {
+        if (!editorActive_ || !floorVisible_) {
             DestroyPlacementPreview();
             return;
         }
@@ -1072,13 +1131,20 @@ private:
     }
 
     void SetPreviewTexture(UnityEngine::RenderTexture* texture) {
-        // Rebind on both the material and the RawImage. The camera recreates
-        // its RenderTexture whenever the combined render demand changes size
-        // (for example when the mod menu closes and only the popout demand
-        // remains), so this runs every tick and must survive stale pointers.
-        if (IsAlive(previewMaterial_)) previewMaterial_->set_mainTexture(texture);
-        if (IsAlive(floatingMaterial_)) floatingMaterial_->set_mainTexture(texture);
-        if (IsAlive(floatingImage_) && floatingImage_->get_texture() != texture) {
+        // Only live, displayed surfaces consume a feed. Previously even a
+        // closed popout wrote to its unrooted cached material every LateUpdate,
+        // crashing after map-exit GC recycled the wrapper. Rooting fixes that
+        // lifetime bug; gating here also avoids pointless hidden material work.
+        // The pixels change in-place, so rebinding is needed only when the
+        // camera replaces/releases its RenderTexture, not for every new frame.
+        if (IsAlive(dockedImage_) && dockedImage_->get_isActiveAndEnabled() && previewMaterial_ &&
+            dockedImage_->get_texture() != texture) {
+            previewMaterial_->set_mainTexture(texture);
+            dockedImage_->set_texture(texture);
+        }
+        if (IsAlive(floatingImage_) && floatingImage_->get_isActiveAndEnabled() && floatingMaterial_ &&
+            floatingImage_->get_texture() != texture) {
+            floatingMaterial_->set_mainTexture(texture);
             floatingImage_->set_texture(texture);
             floatingImage_->SetMaterialDirty();
             if (texture != nullptr && !floatingFirstFrameLogged_) {
@@ -1088,13 +1154,13 @@ private:
                     texture->get_width(), texture->get_height());
             }
         }
-        SetDockedImageTexture(texture);
     }
 
     PreviewManager& owner_;
     settings::SettingsService& settings_;
     camera::CameraManager& camera_;
     bool started_ = false;
+    bool floorVisible_ = false;
     bool editorActive_ = false;
     bool tickFailureLogged_ = false;
     bool floatingPoseDirty_ = false;
@@ -1115,13 +1181,16 @@ private:
     bool floatingFirstFrameLogged_ = false;
     bool floatingAlphaHealLogged_ = false;
     UnityEngine::GameObject* driverObject_ = nullptr;
-    UnityEngine::Material* previewMaterial_ = nullptr;
+    // These caches outlive their panels. Protect both their managed wrappers
+    // (these roots) and standalone native assets (DontUnloadUnusedAsset).
+    // Always test bool before .ptr(); a raw-pointer null check cannot do this.
+    SafePtrUnity<UnityEngine::Material> previewMaterial_;
     // Dedicated material for the movable popout; see EnsureFloatingPreviewMaterial.
-    UnityEngine::Material* floatingMaterial_ = nullptr;
+    SafePtrUnity<UnityEngine::Material> floatingMaterial_;
     // Bright blue accent shared by this preview's frame/header/footer only.
     // Its shader writes zero framebuffer alpha so the panel matches the other
     // popouts without contributing to Beat Saber's bloom mask.
-    UnityEngine::Material* floatingBorderMaterial_ = nullptr;
+    SafePtrUnity<UnityEngine::Material> floatingBorderMaterial_;
     BSML::FloatingScreen* floatingScreen_ = nullptr;
     UnityEngine::UI::RawImage* floatingImage_ = nullptr;
     // Footer text on the popout that doubles as a live feed-status readout.

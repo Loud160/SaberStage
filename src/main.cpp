@@ -28,6 +28,7 @@
 #include "GlobalNamespace/FileSystemBeatmapLevelData.hpp"
 #include "GlobalNamespace/GameplayCoreSceneSetupData.hpp"
 #include "GlobalNamespace/MainFlowCoordinator.hpp"
+#include "GlobalNamespace/LevelCompletionResults.hpp"
 #include "GlobalNamespace/OverrideEnvironmentSettings.hpp"
 #include "GlobalNamespace/PauseMenuManager.hpp"
 #include "GlobalNamespace/StandardLevelScenesTransitionSetupDataSO.hpp"
@@ -147,6 +148,10 @@ MAKE_HOOK_MATCH(
         if (!level) return;
         const auto key = self->get_beatmapKey();
         saberstage::broadcast::MapAnnouncement announcement;
+        if (level->levelID) {
+            auto id = static_cast<std::string>(level->levelID);
+            if (id.starts_with("custom_level_") && id.size() >= 53) announcement.levelHash = id.substr(13, 40);
+        }
         if (level->songName) announcement.songName = static_cast<std::string>(level->songName);
         if (level->songAuthorName) {
             announcement.songAuthorName = static_cast<std::string>(level->songAuthorName);
@@ -215,6 +220,7 @@ MAKE_HOOK_MATCH(
             g_pendingMapAnnouncement.reset();
         }
         if (!announcement || !g_application) return;
+        g_application->Twitch().Requests().GameplayStarted(announcement->levelHash);
         const auto& broadcastSettings = g_application->Settings().Get().broadcast;
         if (!broadcastSettings.postMapInfoToChat ||
                 broadcastSettings.provider != saberstage::settings::LivestreamProvider::Twitch ||
@@ -234,6 +240,24 @@ MAKE_HOOK_MATCH(
         saberstage::Logging::Logger.warn(
             "Twitch map announcement was skipped safely after an unknown failure");
     }
+}
+
+MAKE_HOOK_MATCH(
+    StandardLevelScenesTransitionSetupDataSO_Finish,
+    &GlobalNamespace::StandardLevelScenesTransitionSetupDataSO::Finish,
+    void,
+    GlobalNamespace::StandardLevelScenesTransitionSetupDataSO* self,
+    GlobalNamespace::LevelCompletionResults* results) {
+    // Preserve Beat Saber's completion even if request persistence fails.
+    saberstage::ErrorManager::Instance().Guard("recording requested-map outcome", [results] {
+        if (!g_application || !results) return;
+        using Action = saberstage::broadcast::RequestAction;
+        const auto state = results->levelEndStateType;
+        g_application->Twitch().Requests().GameplayFinished(
+            state == GlobalNamespace::LevelCompletionResults::LevelEndStateType::Cleared ? Action::Completed :
+            state == GlobalNamespace::LevelCompletionResults::LevelEndStateType::Failed ? Action::Failed : Action::Quit);
+    });
+    StandardLevelScenesTransitionSetupDataSO_Finish(self, results);
 }
 
 } // namespace
@@ -261,6 +285,7 @@ extern "C" void late_load() noexcept {
         // an error raised during partial startup can remain queued and appear
         // once Beat Saber's main menu is genuinely ready.
         INSTALL_HOOK(saberstage::Logging::Logger, MainFlowCoordinator_DidActivate);
+        INSTALL_HOOK(saberstage::Logging::Logger, StandardLevelScenesTransitionSetupDataSO_Finish);
         const auto gameVersion = std::string(UnityEngine::Application::get_version());
         const auto unityVersion = std::string(UnityEngine::Application::get_unityVersion());
         saberstage::Logging::Logger.info("Runtime game version={}, Unity={}", gameVersion, unityVersion);

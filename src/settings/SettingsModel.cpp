@@ -11,6 +11,7 @@
 // - The model contains no Unity objects so settings can be migrated and tested on the host.
 
 #include "saberstage/settings/SettingsModel.hpp"
+#include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -286,6 +287,20 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         }
     }
     RepairFloat(settings.preview.scale, 0.25F, 4.0F, defaults.preview.scale, result);
+    const auto repairPreviewChoice = [&result](int& value, int fallback, bool valid) {
+        if (valid) return;
+        value = fallback;
+        result.changed = true;
+        ++result.repairedFields;
+    };
+    repairPreviewChoice(settings.preview.floorResolutionWidth, defaults.preview.floorResolutionWidth,
+        preview::ValidPreviewWidth(settings.preview.floorResolutionWidth));
+    repairPreviewChoice(settings.preview.floatingResolutionWidth, defaults.preview.floatingResolutionWidth,
+        preview::ValidPreviewWidth(settings.preview.floatingResolutionWidth));
+    repairPreviewChoice(settings.preview.floorFramesPerSecond, defaults.preview.floorFramesPerSecond,
+        preview::ValidPreviewFrameRate(settings.preview.floorFramesPerSecond));
+    repairPreviewChoice(settings.preview.floatingFramesPerSecond, defaults.preview.floatingFramesPerSecond,
+        preview::ValidPreviewFrameRate(settings.preview.floatingFramesPerSecond));
     RepairEnum(
         settings.recording.backend,
         RecordingBackend::Hollywood,
@@ -649,6 +664,16 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         ++result.repairedFields;
     }
     RepairVector(settings.chat.position, defaults.chat.position, result);
+    RepairFloat(settings.chat.fontSize, 2.5F, 6.0F, 3.3F, result);
+    for (auto* color : {&settings.chat.backgroundColor, &settings.chat.textColor, &settings.chat.highlightColor, &settings.chat.pingColor}) {
+        RepairFloat(color->x, 0, 1, 1, result); RepairFloat(color->y, 0, 1, 1, result); RepairFloat(color->z, 0, 1, 1, result);
+    }
+    RepairFloat(settings.chat.requestsScale, 0.6F, 2.0F, 1.0F, result);
+    RepairVector(settings.chat.controlsPosition, defaults.chat.controlsPosition, result);
+    RepairVector(settings.chat.controlsRotation, defaults.chat.controlsRotation, result);
+    RepairVector(settings.chat.requestsPosition, defaults.chat.requestsPosition, result);
+    RepairVector(settings.chat.requestsRotation, defaults.chat.requestsRotation, result);
+    settings.chat.requests = broadcast::ValidateRequestPolicy(settings.chat.requests);
     RepairFloat(settings.chat.width, ChatSettings::kMinimumWidth,
                 ChatSettings::kMaximumWidth, defaults.chat.width, result);
     RepairFloat(settings.chat.height, ChatSettings::kMinimumHeight,

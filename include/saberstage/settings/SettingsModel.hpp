@@ -11,6 +11,7 @@
 // - The model contains no Unity objects so settings can be migrated and tested on the host.
 
 #pragma once
+#include "saberstage/broadcast/SongRequests.hpp"
 
 #include "saberstage/camera/CameraProfile.hpp"
 
@@ -21,7 +22,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 27;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 28;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.
@@ -172,6 +173,12 @@ struct CameraSettings {
 struct PreviewSettings {
     bool visible = false;
     std::string selectedCameraId = std::string(camera::kPrimaryCameraId);
+    // Width selects a validated 16:9 preset; height is derived, not a second
+    // independently corruptible value. These never change encoder settings.
+    std::int32_t floorResolutionWidth = 1920;
+    std::int32_t floorFramesPerSecond = 15;
+    std::int32_t floatingResolutionWidth = 512;
+    std::int32_t floatingFramesPerSecond = 15;
     camera::Vec3 position{0.0F, 1.15F, 2.1F};
     // FloatingScreen's visible UI face points along local -Z. At the default
     // positive-Z position, zero yaw faces the panel toward the player.
@@ -302,6 +309,31 @@ struct ChatSettings {
     // the same saved size can be restored without changing text/button scale.
     float width = 70.0F;
     float height = 58.0F;
+    bool showBadges = true;
+    bool showEmotes = true;
+    bool animateEmotes = false;
+    bool platformAccent = true;
+    bool filterCommands = false;
+    bool filterBroadcasterCommands = false;
+    bool showSubscriptions = true;
+    bool showBits = true;
+    bool showFollows = false;
+    bool showRedemptions = false;
+    bool showViewerCount = true;
+    bool reverseOrder = false;
+    float fontSize = 3.3F;
+    camera::Vec3 backgroundColor{0, 0, 0};
+    camera::Vec3 textColor{1, 1, 1};
+    camera::Vec3 highlightColor{0.2F, 0.3F, 0.5F};
+    camera::Vec3 pingColor{1, 0.8F, 0.2F};
+    broadcast::RequestPolicy requests;
+    camera::Vec3 controlsPosition{0.0F, 1.3F, 1.5F};
+    camera::Vec3 controlsRotation{};
+    bool controlsPlaced = false;
+    camera::Vec3 requestsPosition{0.7F, 1.3F, 1.5F};
+    camera::Vec3 requestsRotation{};
+    bool requestsPlaced = false;
+    float requestsScale = 1.0F;
 };
 
 struct AvatarControllerOffsetSettings {

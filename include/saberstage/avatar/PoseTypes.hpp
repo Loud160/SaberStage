@@ -393,6 +393,7 @@ struct SolverDiagnostics {
     std::uint32_t transformReads = 0;
     std::uint32_t transformWrites = 0;
     double nativeSolveMicroseconds = 0.0;
+    double poseWriteMicroseconds = 0.0;
     bool duplicateSequenceSkipped = false;
     AvatarRetargeting retargeting{};
 };

@@ -9,11 +9,15 @@
 // File responsibility:
 // - Builds and manages Unity avatar objects from validated VrmAsset data.
 // - Material conversion, visibility, bone binding, and destruction are kept behind one runtime boundary.
+// - Import/release are cooperatively stepped; owned Unity wrappers remain GC-rooted.
 
 #include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 
 #include "saberstage/Logging.hpp"
+#include "saberstage/ErrorManager.hpp"
 #include "saberstage/avatar/vrm/Vrm0Parser.hpp"
+#include "saberstage/avatar/vrm/SpringMath.hpp"
+#include "saberstage/avatar/CooperativeWork.hpp"
 
 #include "UnityEngine/Animator.hpp"
 #include "UnityEngine/AssetBundle.hpp"
@@ -61,8 +65,10 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <future>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -177,20 +183,19 @@ bool Finite(UnityEngine::Vector3 value) noexcept {
 }
 
 UnityEngine::Vector3 Add(UnityEngine::Vector3 a, UnityEngine::Vector3 b) noexcept {
-    return UnityEngine::Vector3::op_Addition(a, b);
+    return spring::Add(a, b);
 }
 
 UnityEngine::Vector3 Subtract(UnityEngine::Vector3 a, UnityEngine::Vector3 b) noexcept {
-    return UnityEngine::Vector3::op_Subtraction(a, b);
+    return spring::Subtract(a, b);
 }
 
 UnityEngine::Vector3 Scale(UnityEngine::Vector3 value, float scale) noexcept {
-    return UnityEngine::Vector3::op_Multiply(value, scale);
+    return spring::Scale(value, scale);
 }
 
 UnityEngine::Vector3 SafeDirection(UnityEngine::Vector3 value, UnityEngine::Vector3 fallback) noexcept {
-    if (!Finite(value) || value.get_sqrMagnitude() < 1.0e-8F) return fallback;
-    return UnityEngine::Vector3::Normalize(value);
+    return spring::Direction(value, fallback);
 }
 
 struct AvatarShaderResources {
@@ -209,6 +214,7 @@ struct AvatarShaderResources {
     // Optional non-bloom world-panel accent shader. Older bundles can still
     // load avatars; callers fall back to their ordinary UI material.
     SafePtrUnity<UnityEngine::Shader> nonBloomUi;
+    SafePtrUnity<UnityEngine::Shader> chatSprite;
     bool attempted = false;
 };
 
@@ -274,6 +280,9 @@ bool LoadAvatarShaders() {
                 "Embedded bundle has no saberstage-non-bloom-ui shader; panel accents use the stock fallback");
         }
         resources.bundle = bundle;
+        auto* chatSprite = static_cast<UnityEngine::Shader*>(bundle->LoadAsset<UnityEngine::Shader*>("saberstage-chat-sprite"));
+        if (RetainShader(chatSprite)) resources.chatSprite = chatSprite;
+        else Logging::Logger.warn("Embedded bundle has no saberstage-chat-sprite shader; rich chat uses text fallback");
         resources.mtoon = mtoon;
         resources.outline = outline;
         Logging::Logger.info("Loaded Quest MToon and outline shaders from the embedded SaberStage bundle");
@@ -291,44 +300,189 @@ bool LoadAvatarShaders() {
 
 class VrmUnityRuntime::Impl final {
 public:
+    // Native std::vectors are not IL2CPP GC roots. DontDestroyOnLoad protects
+    // the engine object, NOT its managed wrapper. Pin every cached wrapper for
+    // this runtime's lifetime; otherwise a later SetFloat/Destroy can receive
+    // reclaimed memory even though the avatar is still visibly rendering.
+    template<class T> T* Retain(T* object) {
+        if (object) {
+            managedRoots_.emplace_back(static_cast<UnityEngine::Object*>(object));
+            if constexpr (std::is_same_v<T, UnityEngine::Material> ||
+                          std::is_same_v<T, UnityEngine::Texture2D> ||
+                          std::is_same_v<T, UnityEngine::Mesh> ||
+                          std::is_same_v<T, UnityEngine::Avatar>) {
+                // Unused outline materials and hidden arm meshes still belong
+                // to us. Scene asset sweeps must not reclaim them while their
+                // feature is off; explicit teardown remains authoritative.
+                const auto flags = static_cast<std::int32_t>(object->get_hideFlags()) |
+                    static_cast<std::int32_t>(UnityEngine::HideFlags::DontUnloadUnusedAsset);
+                object->set_hideFlags(static_cast<UnityEngine::HideFlags>(flags));
+            }
+        }
+        return object;
+    }
     struct GripArmRenderer {
         UnityEngine::Renderer* source = nullptr;
         UnityEngine::Renderer* filtered = nullptr;
     };
 
-    ~Impl() { Destroy(); }
+    ~Impl() {
+        // Cancel suspended frames before clearing the data they reference.
+        // A normal interactive release has already drained all owned assets.
+        releaseWork_.Reset();
+        Destroy();
+    }
 
-    bool Build(VrmAsset parsed, const RuntimeOptions& options, std::string* error) {
+    RuntimeLoadState TickLoad(std::string* error) noexcept {
+        if (loadReady_) return RuntimeLoadState::Ready;
+        if (loadFailed_ || releasing_) return RuntimeLoadState::Failed;
         try {
-            asset_ = std::move(parsed);
-            options_ = options;
-            stats_.asset = asset_.statistics;
-            root_ = UnityEngine::GameObject::New_ctor("SaberStage VRM Avatar");
-            if (!IsAlive(root_)) throw std::runtime_error("Unity could not create the avatar root");
-            root_->set_layer(options.avatarLayer);
-            UnityEngine::Object::DontDestroyOnLoad(root_);
-            root_->SetActive(false);
-            BuildNodes();
-            BuildTextures();
-            BuildMaterials();
-            BuildMeshes();
-            BuildHumanoidAvatar();
-            BuildSpringBones();
-            ApplyOptions(options);
-            SetVisible(options.visible);
+            if (parseFuture_.valid()) {
+                if (parseFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return RuntimeLoadState::Pending;
+                auto result = parseFuture_.get();
+                if (!result.parsed) throw std::runtime_error(result.parsed.error);
+                for (const auto& warning : result.parsed.warnings) Logging::Logger.warn("VRM parser: {}", warning);
+                stats_.parseMilliseconds = result.milliseconds;
+                buildWork_ = Build(std::move(*result.parsed.asset), options_);
+            }
+            const auto started = std::chrono::steady_clock::now();
+            // Never pump the UI or call Unity from the parser worker. Each
+            // yield is an owned construction unit; an indivisible Unity call
+            // may exceed this budget, and is explicitly logged below.
+            bool pending = true;
+            do { pending = buildWork_.Resume(); }
+            while (pending && std::chrono::steady_clock::now() - started < std::chrono::milliseconds(3));
+            const auto milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            constructionMilliseconds_ += milliseconds;
+            if (milliseconds > 15.0) Logging::Logger.warn("VRM construction slice: phase={} {:.2f}ms (indivisible Unity work)", phase_, milliseconds);
+            if (!pending) {
+                buildWork_.Reset();
+                stats_.unityConstructionMilliseconds = constructionMilliseconds_;
+                loadReady_ = true;
+                return RuntimeLoadState::Ready;
+            }
+            return RuntimeLoadState::Pending;
+        } catch (const std::exception& failure) {
+            if (error) *error = std::string(phase_) + ": " + failure.what();
+            Logging::Logger.error("VRM staged load failed in {}: {}", phase_, failure.what());
+        } catch (...) {
+            if (error) *error = std::string(phase_) + ": unexpected construction failure";
+            Logging::Logger.error("VRM staged load failed in {}", phase_);
+        }
+        loadFailed_ = true;
+        return RuntimeLoadState::Failed;
+    }
+
+    void BeginRelease() noexcept {
+        if (releasing_) return;
+        releasing_ = true;
+        // Hide now, but let Unity finish the frame before freeing resources
+        // referenced by this frame's renderers. Coroutine storage stays owned.
+        try {
+            if (IsAlive(root_)) root_->SetActive(false);
+            for (auto& clone : standins_) if (IsAlive(clone.root)) clone.root->SetActive(false);
+        } catch (...) { Logging::Logger.error("VRM could not hide before staged release"); }
+    }
+
+    CooperativeWork Release() {
+        buildWork_.Reset();
+        Logging::Logger.info("VRM staged release begin: retained={} meshes={} materials={} textures={}",
+            managedRoots_.size(), meshes_.size(), materials_.size(), ownedTextures_.size());
+        DestroyStandin();
+        if (IsAlive(root_)) UnityEngine::Object::Destroy(root_);
+        root_ = nullptr;
+        animator_ = nullptr;
+        co_yield nullptr; // resource deletion starts on the next driver frame
+        std::size_t count = 0;
+        for (auto* mesh : meshes_) {
+            if (IsAlive(mesh)) UnityEngine::Object::Destroy(mesh);
+            if (++count % 8 == 0) co_yield nullptr;
+        }
+        meshes_.clear();
+        for (auto* material : materials_) {
+            if (IsAlive(material)) UnityEngine::Object::Destroy(material);
+            if (++count % 8 == 0) co_yield nullptr;
+        }
+        materials_.clear();
+        for (auto* texture : ownedTextures_) {
+            if (IsAlive(texture)) UnityEngine::Object::Destroy(texture);
+            if (++count % 8 == 0) co_yield nullptr;
+        }
+        ownedTextures_.clear();
+        if (IsAlive(humanoidAvatar_)) UnityEngine::Object::Destroy(humanoidAvatar_);
+        humanoidAvatar_ = nullptr;
+        co_yield nullptr; // retain wrappers through the last deferred destruction
+        Destroy();
+        Logging::Logger.info("VRM staged release complete");
+    }
+
+    bool TickRelease() noexcept {
+        BeginRelease();
+        try {
+            // A cancelled parse is allowed to finish off-thread. Destroying a
+            // still-running std::async future would join from the UI thread.
+            if (parseFuture_.valid()) {
+                if (parseFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return false;
+                parseFuture_.get();
+            }
+            if (!releaseStarted_) { releaseWork_ = Release(); releaseStarted_ = true; }
+            if (releaseWork_.Resume()) return false;
+            releaseWork_.Reset();
             return true;
         } catch (const std::exception& failure) {
-            if (error) *error = failure.what();
-            Destroy();
-            return false;
-        } catch (...) {
-            if (error) *error = "unexpected Unity VRM construction failure";
-            Destroy();
-            return false;
-        }
+            Logging::Logger.error("VRM staged release failed: {}", failure.what());
+        } catch (...) { Logging::Logger.error("VRM staged release failed unexpectedly"); }
+        releaseWork_.Reset();
+        Destroy();
+        return true;
+    }
+
+    void SetBuildPhase(const char* phase) {
+        phase_ = phase;
+        Logging::Logger.info("VRM build phase: {}", phase);
+    }
+
+    CooperativeWork Build(VrmAsset parsed, RuntimeOptions options) {
+        asset_ = std::move(parsed);
+        options_ = options;
+        stats_.asset = asset_.statistics;
+        root_ = Retain(UnityEngine::GameObject::New_ctor("SaberStage VRM Avatar"));
+        if (!IsAlive(root_)) throw std::runtime_error("Unity could not create the avatar root");
+        root_->set_layer(options.avatarLayer);
+        UnityEngine::Object::DontDestroyOnLoad(root_);
+        root_->SetActive(false);
+        SetBuildPhase("nodes");
+        for (auto work = BuildNodes(); work.Resume();) co_yield nullptr;
+        SetBuildPhase("textures");
+        for (auto work = BuildTextures(); work.Resume();) co_yield nullptr;
+        SetBuildPhase("materials");
+        BuildMaterials();
+        co_yield nullptr;
+        SetBuildPhase("meshes");
+        for (auto work = BuildMeshes(); work.Resume();) co_yield nullptr;
+        SetBuildPhase("humanoid");
+        BuildHumanoidAvatar();
+        co_yield nullptr;
+        SetBuildPhase("springs");
+        BuildSpringBones();
+        co_yield nullptr;
+        SetBuildPhase("quality");
+        if (!ApplyOptions(options)) throw std::runtime_error("initial avatar material options failed");
+        SetVisible(options.visible);
+        SetBuildPhase("ready");
+        co_return;
     }
 
     void Destroy() noexcept {
+        buildWork_.Reset();
+        const auto started = std::chrono::steady_clock::now();
+        const bool hadRoot = root_ != nullptr;
+        // Disable all consumers before queuing deferred Unity destruction.
+        // Keep wrapper roots until the final Destroy call has returned.
+        if (hadRoot) Logging::Logger.info("VRM release begin: roots={} meshes={} materials={} textures={}",
+            managedRoots_.size(), meshes_.size(), materials_.size(), ownedTextures_.size());
+        try { if (IsAlive(root_)) root_->SetActive(false); }
+        catch (...) { Logging::Logger.error("Could not deactivate VRM before release"); }
         DestroyStandin();
         try {
             if (IsAlive(root_)) UnityEngine::Object::Destroy(root_);
@@ -348,9 +502,20 @@ public:
             for (auto* material : materials_) if (IsAlive(material)) UnityEngine::Object::Destroy(material);
             for (auto* texture : ownedTextures_) if (IsAlive(texture)) UnityEngine::Object::Destroy(texture);
             if (IsAlive(humanoidAvatar_)) UnityEngine::Object::Destroy(humanoidAvatar_);
+        } catch (const std::exception& failure) {
+            Logging::Logger.error("VRM release failed: {}", failure.what());
         } catch (...) {
+            Logging::Logger.error("VRM release failed with a non-standard exception");
         }
         meshes_.clear();
+        root_ = nullptr;
+        animator_ = nullptr;
+        nodeObjects_.clear();
+        nodeTransforms_.clear();
+        allRenderers_.clear();
+        renderers_.clear();
+        springChains_.clear();
+        springColliders_.clear();
         materials_.clear();
         outlineMaterials_.clear();
         baseMaterialsUseMtoon_.clear();
@@ -374,17 +539,27 @@ public:
         bodyNeckBaseWidthScale_ = 1.0F;
         bodyHeadSizeScale_ = 1.0F;
         bodyLegWidthScale_ = 1.0F;
+        managedRoots_.clear();
+        standinPropSources_ = {};
+        for (auto& handle : standinPropSourceRoots_) handle.clear();
+        springColliderCache_.clear();
+        if (hadRoot) Logging::Logger.info("VRM release complete: {:.2f}ms",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     }
 
-    void BuildNodes() {
+    CooperativeWork BuildNodes() {
         nodeObjects_.resize(asset_.nodes.size());
         nodeTransforms_.resize(asset_.nodes.size());
         for (std::size_t i = 0; i < asset_.nodes.size(); ++i) {
-            auto* object = UnityEngine::GameObject::New_ctor(UniqueNodeName(asset_.nodes[i], i));
+            auto* object = Retain(UnityEngine::GameObject::New_ctor(UniqueNodeName(asset_.nodes[i], i)));
             if (!IsAlive(object)) throw std::runtime_error("Unity could not create VRM node " + std::to_string(i));
             object->set_layer(options_.avatarLayer);
             nodeObjects_[i] = object;
-            nodeTransforms_[i] = object->get_transform().ptr();
+            nodeTransforms_[i] = Retain(object->get_transform().ptr());
+            // Parent immediately so cancellation halfway through node creation
+            // cannot strand unparented GameObjects in the active scene.
+            nodeTransforms_[i]->SetParent(root_->get_transform().ptr(), false);
+            co_yield nullptr;
         }
         for (std::size_t i = 0; i < asset_.nodes.size(); ++i) {
             const auto& node = asset_.nodes[i];
@@ -393,6 +568,7 @@ public:
             nodeTransforms_[i]->set_localPosition(ToUnityPosition(node.translation));
             nodeTransforms_[i]->set_localRotation(ToUnityRotation(node.rotation));
             nodeTransforms_[i]->set_localScale(ToUnityScale(node.scale));
+            co_yield nullptr;
         }
     }
 
@@ -440,9 +616,10 @@ public:
         // shade, rim, matcap and emission images are authored color and remain
         // sRGB. Normal/grade/width maps are GPU data and must bypass sRGB
         // sampling or their vectors and thresholds become numerically wrong.
-        auto* source = UnityEngine::Texture2D::New_ctor(
-            2, 2, UnityEngine::TextureFormat::RGBA32, true, linear);
+        auto* source = Retain(UnityEngine::Texture2D::New_ctor(
+            2, 2, UnityEngine::TextureFormat::RGBA32, true, linear));
         if (!IsAlive(source)) throw std::runtime_error("Unity could not allocate a texture decoder target");
+        ownedTextures_.push_back(source); // also cleaned up if decoding throws
         auto encoded = ConvertArray<std::uint8_t>(image.encoded.size(), [&](std::size_t i) { return image.encoded[i]; });
         if (!UnityEngine::ImageConversion::LoadImage(source, encoded, false)) {
             UnityEngine::Object::Destroy(source);
@@ -487,13 +664,14 @@ public:
                         blendChannel(a.r, b.r, c.r, d.r), blendChannel(a.g, b.g, c.g, d.g),
                         blendChannel(a.b, b.b, c.b, d.b), blendChannel(a.a, b.a, c.a, d.a)};
                 });
-            result = UnityEngine::Texture2D::New_ctor(
+            result = Retain(UnityEngine::Texture2D::New_ctor(
                 static_cast<int>(width), static_cast<int>(height),
-                UnityEngine::TextureFormat::RGBA32, true, linear);
+                UnityEngine::TextureFormat::RGBA32, true, linear));
             if (!IsAlive(result)) {
                 UnityEngine::Object::Destroy(source);
                 throw std::runtime_error("Unity could not allocate a capped VRM texture");
             }
+            ownedTextures_.push_back(result);
             result->SetPixels32(resized);
             result->Apply(true, true);
             UnityEngine::Object::Destroy(source);
@@ -505,7 +683,7 @@ public:
         return result;
     }
 
-    void BuildTextures() {
+    CooperativeWork BuildTextures() {
         textureObjects_.resize(asset_.textures.size());
         std::unordered_map<std::uint64_t, UnityEngine::Texture2D*> decoded;
         for (std::size_t i = 0; i < asset_.textures.size(); ++i) {
@@ -533,6 +711,7 @@ public:
                 continue;
             }
             auto& image = asset_.images[textureDefinition.source];
+            Logging::Logger.debug("VRM texture decode begin: index={} source={}x{}", i, image.encodedWidth, image.encodedHeight);
             auto* texture = DecodeTexture(image, linear);
             texture->set_name(textureDefinition.name.empty()
                 ? (image.name.empty() ? "SaberStage VRM Texture" : image.name)
@@ -546,7 +725,6 @@ public:
             texture->set_anisoLevel(4);
             UnityEngine::Object::DontDestroyOnLoad(texture);
             textureObjects_[i] = texture;
-            ownedTextures_.push_back(texture);
             decoded.emplace(key, texture);
             ++stats_.decodedTextureCount;
             Logging::Logger.info(
@@ -559,6 +737,7 @@ public:
                 texture->get_height(),
                 usage.roles,
                 linear ? "linear-data" : "sRGB-color");
+            co_yield nullptr;
         }
         for (auto& image : asset_.images) {
             image.encoded.clear();
@@ -592,8 +771,9 @@ public:
             if (!IsAlive(shader)) shader = UnityEngine::Shader::Find(shaderName);
             if (!shader) shader = UnityEngine::Shader::Find("Unlit/Texture");
             if (!shader) throw std::runtime_error("Unity has no compatible first-pass avatar shader");
-            auto* material = UnityEngine::Material::New_ctor(shader);
+            auto* material = Retain(UnityEngine::Material::New_ctor(shader));
             if (!IsAlive(material)) throw std::runtime_error("Unity could not create a VRM material");
+            materials_.push_back(material); // register ownership before configuring
             material->set_name(source.name.empty() ? "SaberStage VRM Material " + std::to_string(i) : source.name);
             const auto defaultQueue = blend >= 2.0F ? (blend >= 3.0F ? 2501 : 3000) : blend >= 1.0F ? 2450 : 2000;
             material->set_renderQueue(source.renderQueue >= 0 ? source.renderQueue : defaultQueue);
@@ -714,7 +894,6 @@ public:
                 material->set_mainTextureScale({transform->second.z, transform->second.w});
             }
             UnityEngine::Object::DontDestroyOnLoad(material);
-            materials_.push_back(material);
             baseMaterialsUseMtoon_.push_back(useMtoon);
             const auto color = vectorOr(source, "_Color", {1, 1, 1, 1});
             const auto shade = vectorOr(source, "_ShadeColor", {1, 1, 1, 1});
@@ -749,8 +928,9 @@ public:
                 const auto width = source.floatProperties.contains("_OutlineWidth")
                     ? source.floatProperties.at("_OutlineWidth") : 0.0F;
                 if (widthMode <= 0.0F || width <= 0.0F) continue;
-                auto* outline = UnityEngine::Material::New_ctor(AvatarShaders().outline.ptr());
+                auto* outline = Retain(UnityEngine::Material::New_ctor(AvatarShaders().outline.ptr()));
                 if (!IsAlive(outline)) continue;
+                materials_.push_back(outline);
                 outline->set_name((source.name.empty() ? "SaberStage VRM Material " + std::to_string(i) : source.name) + " Outline");
                 // MToon authors _OutlineWidth in hundredths of a world unit:
                 // the reference shader displaces by width * 0.01, so a typical
@@ -808,7 +988,6 @@ public:
                 }
                 UnityEngine::Object::DontDestroyOnLoad(outline);
                 outlineMaterials_[i] = outline;
-                materials_.push_back(outline);
             }
         }
         stats_.runtimeMaterialCount = materials_.size();
@@ -829,19 +1008,20 @@ public:
         if (IsAlive(fallbackMaterial_)) return fallbackMaterial_;
         auto shader = UnityEngine::Shader::Find("Unlit/Texture");
         if (!shader) throw std::runtime_error("Unity has no shader for a default VRM material");
-        fallbackMaterial_ = UnityEngine::Material::New_ctor(shader);
+        fallbackMaterial_ = Retain(UnityEngine::Material::New_ctor(shader));
         if (!IsAlive(fallbackMaterial_)) throw std::runtime_error("Unity could not create a default VRM material");
+        materials_.push_back(fallbackMaterial_);
         fallbackMaterial_->set_name("SaberStage VRM Default Material");
         fallbackMaterial_->SetColor("_Color", UnityEngine::Color::get_white());
         UnityEngine::Object::DontDestroyOnLoad(fallbackMaterial_);
-        materials_.push_back(fallbackMaterial_);
         stats_.runtimeMaterialCount = materials_.size();
         return fallbackMaterial_;
     }
 
     UnityEngine::Mesh* BuildPrimitiveMesh(const Mesh& sourceMesh, const Primitive& primitive, const Skin* skin) {
-        auto* mesh = UnityEngine::Mesh::New_ctor();
+        auto* mesh = Retain(UnityEngine::Mesh::New_ctor());
         if (!IsAlive(mesh)) throw std::runtime_error("Unity could not create a VRM mesh");
+        meshes_.push_back(mesh);
         mesh->set_name(sourceMesh.name);
         if (primitive.positions.size() > 65535) mesh->set_indexFormat(UnityEngine::Rendering::IndexFormat::UInt32);
         mesh->set_vertices(ConvertArray<UnityEngine::Vector3>(primitive.positions.size(), [&](std::size_t i) {
@@ -909,7 +1089,6 @@ public:
         }
         mesh->RecalculateBounds();
         UnityEngine::Object::DontDestroyOnLoad(mesh);
-        meshes_.push_back(mesh);
         return mesh;
     }
 
@@ -1051,7 +1230,7 @@ public:
         return nodes;
     }
 
-    void BuildMeshes() {
+    CooperativeWork BuildMeshes() {
         // Head subtree covers face/hair/head accessories (VRoid parents hair
         // spring bones under the head). The neck subtree additionally catches
         // collar-height accessories for the strictest wear coverage.
@@ -1078,17 +1257,18 @@ public:
             const Skin* skin = node.skin ? &asset_.skins[*node.skin] : nullptr;
             for (std::size_t primitiveIndex = 0; primitiveIndex < sourceMesh.primitives.size(); ++primitiveIndex) {
                 const auto& primitive = sourceMesh.primitives[primitiveIndex];
+                Logging::Logger.debug("VRM mesh build: node={} primitive={} vertices={}", nodeIndex, primitiveIndex, primitive.positions.size());
                 rendererHeadFraction_.push_back(SubtreeWeightFraction(primitive, skin, nodeIndex, headNodes));
                 rendererNeckFraction_.push_back(SubtreeWeightFraction(primitive, skin, nodeIndex, neckNodes));
                 rendererIsHair_.push_back(meshNameLower.find("hair") != std::string::npos);
-                auto* object = UnityEngine::GameObject::New_ctor(sourceMesh.name + "__primitive_" + std::to_string(primitiveIndex));
+                auto* object = Retain(UnityEngine::GameObject::New_ctor(sourceMesh.name + "__primitive_" + std::to_string(primitiveIndex)));
                 if (!IsAlive(object)) throw std::runtime_error("Unity could not create a VRM renderer object");
                 object->set_layer(options_.avatarLayer);
                 object->get_transform()->SetParent(nodeTransforms_[nodeIndex], false);
                 auto* mesh = BuildPrimitiveMesh(sourceMesh, primitive, skin);
                 UnityEngine::Renderer* renderer = nullptr;
                 if (skin) {
-                    auto* skinned = object->AddComponent<UnityEngine::SkinnedMeshRenderer*>();
+                    auto* skinned = Retain(object->AddComponent<UnityEngine::SkinnedMeshRenderer*>());
                     skinned->set_sharedMesh(mesh);
                     skinned->set_bones(ConvertArray<UnityEngine::Transform*>(skin->joints.size(), [&](std::size_t i) {
                         return nodeTransforms_[skin->joints[i]];
@@ -1102,9 +1282,9 @@ public:
                         skinned->SetBlendShapeWeight(static_cast<int>(target), sourceMesh.initialMorphWeights[target] * 100.0F);
                     }
                 } else {
-                    auto* filter = object->AddComponent<UnityEngine::MeshFilter*>();
+                    auto* filter = Retain(object->AddComponent<UnityEngine::MeshFilter*>());
                     filter->set_sharedMesh(mesh);
-                    renderer = object->AddComponent<UnityEngine::MeshRenderer*>();
+                    renderer = Retain(object->AddComponent<UnityEngine::MeshRenderer*>());
                 }
                 const auto materialIndex = primitive.material && *primitive.material < asset_.materials.size()
                     ? *primitive.material : asset_.materials.size();
@@ -1122,12 +1302,13 @@ public:
                         sourceMesh.name + (side == 0 ? "__grip_left_" : "__grip_right_") +
                         std::to_string(primitiveIndex));
                     if (!IsAlive(armObject)) throw std::runtime_error("Unity could not create grip-editor arm renderer");
+                    Retain(armObject);
                     armObject->set_layer(options_.avatarLayer);
                     armObject->get_transform()->SetParent(nodeTransforms_[nodeIndex], false);
                     auto* armMesh = BuildPrimitiveMesh(sourceMesh, *armPrimitive, skin);
                     UnityEngine::Renderer* armRenderer = nullptr;
                     if (skin) {
-                        auto* skinned = armObject->AddComponent<UnityEngine::SkinnedMeshRenderer*>();
+                        auto* skinned = Retain(armObject->AddComponent<UnityEngine::SkinnedMeshRenderer*>());
                         skinned->set_sharedMesh(armMesh);
                         skinned->set_bones(ConvertArray<UnityEngine::Transform*>(skin->joints.size(), [&](std::size_t i) {
                             return nodeTransforms_[skin->joints[i]];
@@ -1142,15 +1323,16 @@ public:
                         skinned->set_updateWhenOffscreen(true);
                         armRenderer = skinned;
                     } else {
-                        auto* filter = armObject->AddComponent<UnityEngine::MeshFilter*>();
+                        auto* filter = Retain(armObject->AddComponent<UnityEngine::MeshFilter*>());
                         filter->set_sharedMesh(armMesh);
-                        armRenderer = armObject->AddComponent<UnityEngine::MeshRenderer*>();
+                        armRenderer = Retain(armObject->AddComponent<UnityEngine::MeshRenderer*>());
                     }
                     armRenderer->set_sharedMaterial(renderer->get_sharedMaterial());
                     armRenderer->set_enabled(false);
                     gripArmRenderers_[side].push_back({renderer, armRenderer});
                 }
                 ++stats_.rendererCount;
+                co_yield nullptr;
             }
         }
         // Unity now owns all render data. Keep neutral metadata, morph target
@@ -1218,13 +1400,13 @@ public:
             UnityEngine::Avatar*, UnityEngine::GameObject*, UnityEngine::HumanDescription*>(
                 "UnityEngine.AvatarBuilder::BuildHumanAvatarInternal_Injected");
         if (!build) throw std::runtime_error("Unity humanoid AvatarBuilder entry point is unavailable");
-        humanoidAvatar_ = build(root_, &description);
+        humanoidAvatar_ = Retain(build(root_, &description));
         if (!IsAlive(humanoidAvatar_) || !humanoidAvatar_->get_isValid() || !humanoidAvatar_->get_isHuman()) {
             throw std::runtime_error("Unity rejected the VRM humanoid skeleton");
         }
         humanoidAvatar_->set_name("SaberStage VRM Humanoid");
         UnityEngine::Object::DontDestroyOnLoad(humanoidAvatar_);
-        animator_ = root_->AddComponent<UnityEngine::Animator*>();
+        animator_ = Retain(root_->AddComponent<UnityEngine::Animator*>());
         animator_->set_avatar(humanoidAvatar_);
         if (!animator_->get_isHuman()) throw std::runtime_error("constructed VRM Animator is not humanoid");
     }
@@ -1345,6 +1527,13 @@ public:
         UnityEngine::Transform* transform = nullptr;
         UnityEngine::Vector3 localOffset{};
         float radius = 0.0F;
+        std::size_t node = 0;
+    };
+
+    struct SpringColliderCache {
+        UnityEngine::Vector3 center{};
+        bool alive = false;
+        bool dynamic = false;
     };
 
     struct SpringJointRuntime {
@@ -1420,7 +1609,7 @@ public:
                 springColliders_.push_back({
                     nodeTransforms_[group.node],
                     ToUnityPosition(collider.offset),
-                    collider.radius});
+                    collider.radius, group.node});
             }
         }
         stats_.springColliderCount = springColliders_.size();
@@ -1436,10 +1625,38 @@ public:
         });
         stats_.springChainCount = springChains_.size();
         for (const auto& chain : springChains_) stats_.springJointCount += chain.joints.size();
+        // Only colliders outside simulated branches can be hoisted without
+        // changing sequential math. This classification uses import metadata.
+        std::vector<std::size_t> parents(asset_.nodes.size());
+        std::vector<std::uint8_t> simulated(asset_.nodes.size(), 0);
+        for (std::size_t i = 0; i < parents.size(); ++i) {
+            parents[i] = asset_.nodes[i].parent.value_or(parents.size());
+        }
+        for (const auto& group : asset_.springBoneGroups) {
+            for (auto node : group.roots) if (node < simulated.size()) simulated[node] = 1;
+        }
+        springColliderCache_.resize(springColliders_.size());
+        std::size_t dynamicCount = 0;
+        for (std::size_t i = 0; i < springColliders_.size(); ++i) {
+            springColliderCache_[i].dynamic = spring::HasSimulatedAncestor(
+                springColliders_[i].node, parents, simulated);
+            dynamicCount += springColliderCache_[i].dynamic ? 1 : 0;
+        }
+        Logging::Logger.info("VRM collider cache: {} fixed centers, {} simulated-branch centers",
+            springColliders_.size() - dynamicCount, dynamicCount);
         ResetSecondaryMotion();
     }
 
-    void ApplyOptions(const RuntimeOptions& options) noexcept {
+    static bool SameMaterialOptions(const RuntimeOptions& a, const RuntimeOptions& b) noexcept {
+        return a.toonLighting == b.toonLighting && a.normalMaps == b.normalMaps &&
+            a.rimLighting == b.rimLighting && a.matcap == b.matcap && a.emission == b.emission &&
+            a.cutoutSmoothing == b.cutoutSmoothing && a.alphaToMaskEnabled == b.alphaToMaskEnabled &&
+            a.outlineMode == b.outlineMode && a.materialStage == b.materialStage && a.lightingMode == b.lightingMode;
+    }
+
+    bool ApplyOptions(const RuntimeOptions& options) noexcept {
+        const auto oldOptions = options_;
+        const bool materialsChanged = !materialOptionsApplied_ || !SameMaterialOptions(options_, options);
         options_ = options;
         const auto quality = std::clamp(options.springQuality, 0, 6);
         if (quality != 6) {
@@ -1452,8 +1669,11 @@ public:
             options_.maximumSpringChains = chains[static_cast<std::size_t>(quality)];
             options_.maximumSpringJoints = joints[static_cast<std::size_t>(quality)];
         }
-        if (!options_.springBones || quality == 0) ResetSecondaryMotion();
-        ApplyMaterialOptions();
+        if ((!options_.springBones || quality == 0) && oldOptions.springBones && oldOptions.springQuality != 0) ResetSecondaryMotion();
+        // Collider/physics sliders must not rewrite all shader keywords and
+        // renderer material arrays. Besides cost, that obscures the failing
+        // operation in logs when unrelated controls are adjusted.
+        if (materialsChanged) materialOptionsApplied_ = ApplyMaterialOptions();
         UpdateActiveSpringStatistics();
         Logging::Logger.info(
             "Avatar material controls applied: stage={} lighting={} toon={} normal={} rim={} matcap={} emission={} outlines={} cutoutSmoothing={} alphaToMask={} supported={}",
@@ -1461,21 +1681,30 @@ public:
             options_.rimLighting, options_.matcap, options_.emission, options_.outlineMode,
             options_.cutoutSmoothing, options_.alphaToMaskEnabled,
             stats_.mtoonCutoutMaterialCount > 0);
+        return materialOptionsApplied_;
     }
 
-    void SetKeyword(UnityEngine::Material* material, const char* keyword, bool enabled) noexcept {
+    void SetKeyword(UnityEngine::Material* material, const char* keyword, bool enabled) {
         if (!IsAlive(material)) return;
         if (enabled) material->EnableKeyword(keyword);
         else material->DisableKeyword(keyword);
     }
 
-    void ApplyMaterialOptions() noexcept {
+    bool ApplyMaterialOptions() noexcept {
+        std::size_t currentMaterial = 0;
+        bool materialSlotsChanged = false;
+        const auto started = std::chrono::steady_clock::now();
         try {
             const auto baseCount = asset_.materials.size();
-            if (materials_.size() < baseCount) return;
+            if (materials_.size() < baseCount) throw std::runtime_error("material table is incomplete");
+            Logging::Logger.info("VRM live material update begin: count={} stage={} outlines={} retainedObjects={}",
+                baseCount, options_.materialStage, options_.outlineMode, managedRoots_.size());
             stats_.outlinedMaterialCount = 0;
             for (std::size_t index = 0; index < baseCount; ++index) {
                 auto* material = materials_[index];
+                currentMaterial = index;
+                if (!IsAlive(material)) throw std::runtime_error("owned material was destroyed before a live update");
+                Logging::Logger.debug("VRM live material update: index={} name='{}'", index, asset_.materials[index].name);
                 const auto& source = asset_.materials[index];
                 const auto stage = std::clamp(options_.materialStage, 0, 9);
                 const auto configured = stage == 0;
@@ -1535,6 +1764,7 @@ public:
                 }
                 if (includeOutline) {
                     if (rendererIndex >= rendererOutlineEnabled_.size() || !rendererOutlineEnabled_[rendererIndex]) {
+                        materialSlotsChanged = true;
                         renderer->set_sharedMaterials(ConvertArray<UnityEngine::Material*>(2, [&](std::size_t slot) {
                             return slot == 0 ? base : outline;
                         }));
@@ -1545,6 +1775,7 @@ public:
                     // remove the second outline slot. Always restore a one-item
                     // array so disabling outlines cannot leave stale geometry.
                     if (rendererIndex >= rendererOutlineEnabled_.size() || rendererOutlineEnabled_[rendererIndex]) {
+                        materialSlotsChanged = true;
                         renderer->set_sharedMaterials(ConvertArray<UnityEngine::Material*>(1, [&](std::size_t) {
                             return base;
                         }));
@@ -1554,9 +1785,32 @@ public:
                     rendererOutlineEnabled_[rendererIndex] = includeOutline;
                 }
             }
+            // Clones share material objects but not the renderer's material
+            // SLOT array. An outline toggle must replace their arrays too;
+            // changing only the source leaves a previously enabled shell.
+            if (materialSlotsChanged) {
+                for (auto& clone : standins_) {
+                    for (const auto& [source, target] : clone.materialPairs) {
+                        if (!IsAlive(source) || !IsAlive(target)) continue;
+                        auto slots = source->get_sharedMaterials();
+                        target->set_sharedMaterials(ConvertArray<UnityEngine::Material*>(slots.size(), [&](std::size_t i) {
+                            return slots[static_cast<il2cpp_array_size_t>(i)].ptr();
+                        }));
+                    }
+                }
+            }
+            Logging::Logger.info("VRM live material update complete: {:.2f}ms outlinedRenderers={}",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(),
+                stats_.outlinedMaterialCount);
+            return true;
+        } catch (const std::exception& failure) {
+            Logging::Logger.error("VRM live material update failed at material {}: {}", currentMaterial, failure.what());
         } catch (...) {
-            Logging::Logger.warn("Could not apply one or more live avatar material quality options");
+            Logging::Logger.error("VRM live material update failed at material {}: non-standard exception", currentMaterial);
         }
+        ErrorManager::Instance().ReportUserVisible("Avatar quality update failed",
+            "A material could not be updated. Details are in the SaberStage log. Your avatar file has not been changed.");
+        return false;
     }
 
     void UpdateActiveSpringStatistics() noexcept {
@@ -1588,6 +1842,10 @@ public:
         } catch (...) {
         }
         springAccumulator_ = 0.0F;
+        springWindowSeconds_ = springWindowMilliseconds_ = 0.0;
+        springWindowUpdates_ = springWindowCenterReads_ = springWindowCollisionTests_ = springWindowSubsteps_ = 0;
+        stats_.springSolverMilliseconds = stats_.springMillisecondsPerSecond = stats_.springUpdatesPerSecond = 0.0;
+        stats_.springColliderCenterReadsPerSecond = stats_.springCollisionTestsPerSecond = stats_.springSubstepsPerSecond = 0.0;
     }
 
     void SetArmSpringColliders(
@@ -1629,7 +1887,17 @@ public:
     void SimulateSpringStep(float deltaTime) {
         const auto maximumChains = static_cast<std::size_t>(std::max(0, options_.maximumSpringChains));
         const auto maximumJoints = static_cast<std::size_t>(std::max(0, options_.maximumSpringJoints));
-        const auto colliderCount = stats_.activeSpringColliderCount;
+        const auto colliderCount = std::min(stats_.activeSpringColliderCount, springColliders_.size());
+        for (std::size_t i = 0; i < colliderCount; ++i) {
+            auto& cached = springColliderCache_[i];
+            const auto& collider = springColliders_[i];
+            cached.alive = IsAlive(collider.transform);
+            if (cached.alive && !cached.dynamic) {
+                cached.center = collider.transform->TransformPoint(collider.localOffset);
+                ++springWindowCenterReads_;
+            }
+        }
+        ++springWindowSubsteps_;
         std::size_t usedChains = 0;
         std::size_t usedJoints = 0;
         for (auto& chain : springChains_) {
@@ -1644,34 +1912,31 @@ public:
             for (auto& joint : chain.joints) {
                 if (!IsAlive(joint.transform) || !IsAlive(joint.child)) continue;
                 joint.transform->set_localRotation(joint.restLocalRotation);
-                const auto origin = joint.transform->get_position();
-                const auto restDirection = SafeDirection(joint.transform->TransformDirection(joint.localAxis), {0.0F, -1.0F, 0.0F});
+                UnityEngine::Vector3 origin{};
+                UnityEngine::Quaternion worldRotation{};
+                joint.transform->GetPositionAndRotation(byref(origin), byref(worldRotation));
+                const auto restDirection = SafeDirection(spring::Rotate(worldRotation, joint.localAxis), {0.0F, -1.0F, 0.0F});
                 const auto velocity = Scale(Subtract(joint.currentTail, joint.previousTail), 1.0F - drag);
                 const auto stiffness = Scale(restDirection, group.stiffness * deltaTime);
                 auto next = Add(Add(joint.currentTail, velocity), Add(stiffness, gravity));
                 next = Add(origin, Scale(SafeDirection(Subtract(next, origin), restDirection), joint.length));
                 for (std::size_t colliderIndex = 0; colliderIndex < colliderCount; ++colliderIndex) {
                     const auto& collider = springColliders_[colliderIndex];
-                    if (!IsAlive(collider.transform)) continue;
-                    const auto center = collider.transform->TransformPoint(collider.localOffset);
+                    const auto& cached = springColliderCache_[colliderIndex];
+                    if (!cached.alive) continue;
+                    const auto center = cached.dynamic
+                        ? collider.transform->TransformPoint(collider.localOffset) : cached.center;
+                    springWindowCenterReads_ += cached.dynamic ? 1 : 0;
+                    ++springWindowCollisionTests_;
                     const auto radius = std::max(0.0F, collider.radius + group.hitRadius);
-                    auto fromCenter = Subtract(next, center);
-                    if (fromCenter.get_sqrMagnitude() < radius * radius) {
-                        next = Add(center, Scale(SafeDirection(fromCenter, restDirection), radius));
-                        next = Add(origin, Scale(SafeDirection(Subtract(next, origin), restDirection), joint.length));
-                    }
+                    next = spring::Collide(next, origin, restDirection, joint.length, center, radius);
                 }
                 for (std::size_t colliderIndex = 0;
                         colliderIndex < generatedArmColliderCount_; ++colliderIndex) {
                     const auto center = generatedArmColliderCenters_[colliderIndex];
                     const auto radius = std::max(
                         0.0F, generatedArmColliderRadii_[colliderIndex] + group.hitRadius);
-                    auto fromCenter = Subtract(next, center);
-                    if (fromCenter.get_sqrMagnitude() < radius * radius) {
-                        next = Add(center, Scale(SafeDirection(fromCenter, restDirection), radius));
-                        next = Add(origin, Scale(
-                            SafeDirection(Subtract(next, origin), restDirection), joint.length));
-                    }
+                    next = spring::Collide(next, origin, restDirection, joint.length, center, radius);
                 }
                 if (!Finite(next)) {
                     joint.currentTail = joint.child->get_position();
@@ -1683,7 +1948,7 @@ public:
                 const auto rotation = UnityEngine::Quaternion::FromToRotation(
                     restDirection,
                     SafeDirection(Subtract(next, origin), restDirection));
-                joint.transform->set_rotation(UnityEngine::Quaternion::op_Multiply(rotation, joint.transform->get_rotation()));
+                joint.transform->set_rotation(spring::Multiply(rotation, worldRotation));
             }
         }
     }
@@ -1698,24 +1963,30 @@ public:
         try {
             const auto start = std::chrono::steady_clock::now();
             const auto interval = 1.0F / static_cast<float>(std::clamp(options_.springUpdateRateHz, 12, 90));
-            springAccumulator_ = std::min(springAccumulator_ + deltaTime, interval * 2.0F);
-            std::size_t updates = 0;
-            while (springAccumulator_ >= interval && updates < 2) {
+            // 30Hz camera dispatch must not discard 90Hz custom spring steps.
+            // Preserve the remainder; the existing 250ms reset bounds catch-up.
+            const auto updates = spring::ConsumeFixedSteps(springAccumulator_, deltaTime, interval);
+            for (std::size_t update = 0; update < updates; ++update) {
                 const auto substeps = std::clamp(options_.springSubsteps, 1, 4);
                 for (int substep = 0; substep < substeps; ++substep) {
                     SimulateSpringStep(interval / static_cast<float>(substeps));
                 }
-                springAccumulator_ -= interval;
-                ++updates;
             }
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             stats_.springSolverMilliseconds = elapsed;
+            springWindowMilliseconds_ += elapsed;
             springWindowSeconds_ += deltaTime;
             springWindowUpdates_ += updates;
             if (springWindowSeconds_ >= 1.0) {
                 stats_.springUpdatesPerSecond = static_cast<double>(springWindowUpdates_) / springWindowSeconds_;
+                stats_.springMillisecondsPerSecond = springWindowMilliseconds_ / springWindowSeconds_;
+                stats_.springColliderCenterReadsPerSecond = springWindowCenterReads_ / springWindowSeconds_;
+                stats_.springCollisionTestsPerSecond = springWindowCollisionTests_ / springWindowSeconds_;
+                stats_.springSubstepsPerSecond = springWindowSubsteps_ / springWindowSeconds_;
                 springWindowSeconds_ = 0.0;
                 springWindowUpdates_ = 0;
+                springWindowMilliseconds_ = 0.0;
+                springWindowCenterReads_ = springWindowCollisionTests_ = springWindowSubsteps_ = 0;
             }
         } catch (...) {
             ResetSecondaryMotion();
@@ -1732,6 +2003,39 @@ public:
 
     bool HasExpression(std::string_view presetName) const noexcept {
         return FindExpression(presetName) != nullptr;
+    }
+
+    void LogFaceDiagnostics() const noexcept {
+        try {
+            // Compare the actual skinned-renderer weights with the manager's
+            // requested weights. Off-state symptoms cannot be attributed to
+            // the blink timer without knowing what Unity is really rendering.
+            // This is sampled at five-second intervals, not per frame, and
+            // never changes a mesh, material, or blend-shape weight.
+            Logging::Logger.info("AvatarFaceDiag runtime rootScale={:.3f} torsoWidth={:.3f} neckWidth={:.3f} headSize={:.3f}",
+                rootUniformScale_, bodyTorsoWidthScale_, bodyNeckBaseWidthScale_, bodyHeadSizeScale_);
+            for (const auto name : {"blink", "joy", "fun", "angry", "sorrow"}) {
+                const auto* preset = FindExpression(name);
+                if (!preset) continue;
+                std::size_t count = 0;
+                float minimum = 0.0F, maximum = 0.0F;
+                for (const auto& bind : preset->binds) {
+                    for (std::size_t i = 0; i < renderers_.size(); ++i) {
+                        if (rendererMeshIndices_[i] != bind.mesh || !IsAlive(renderers_[i])) continue;
+                        const auto value = renderers_[i]->GetBlendShapeWeight(static_cast<int>(bind.target));
+                        minimum = count == 0 ? value : std::min(minimum, value);
+                        maximum = count == 0 ? value : std::max(maximum, value);
+                        ++count;
+                    }
+                }
+                Logging::Logger.info("AvatarFaceDiag preset={} rendererBindings={} actualWeightRange=({:.2f},{:.2f})",
+                    name, count, minimum, maximum);
+            }
+        } catch (const std::exception& exception) {
+            Logging::Logger.warn("AvatarFaceDiag readback failed: {}", exception.what());
+        } catch (...) {
+            Logging::Logger.warn("AvatarFaceDiag readback failed with unknown exception");
+        }
     }
 
     bool SupportsAlphaToMask() const noexcept {
@@ -1910,6 +2214,9 @@ public:
     // One free-standing display clone. Everything Unity-owned lives on root;
     // pairs/rendererPairs are cached lookups into the shared hierarchy copy.
     struct StandinInstance {
+        std::vector<SafePtrUnity<UnityEngine::Object>> managedRoots;
+        std::array<std::vector<SafePtrUnity<UnityEngine::Object>>, 2> propRoots;
+        std::vector<std::pair<UnityEngine::Renderer*, UnityEngine::Renderer*>> materialPairs;
         UnityEngine::GameObject* root = nullptr;
         std::vector<std::pair<UnityEngine::Transform*, UnityEngine::Transform*>> pairs;
         std::vector<std::pair<UnityEngine::SkinnedMeshRenderer*, UnityEngine::SkinnedMeshRenderer*>> rendererPairs;
@@ -1965,6 +2272,8 @@ public:
             auto* cloneChild = clone->GetChild(child).ptr();
             if (!IsAlive(sourceChild) || !IsAlive(cloneChild)) continue;
             instance.pairs.emplace_back(sourceChild, cloneChild);
+            instance.managedRoots.emplace_back(sourceChild);
+            instance.managedRoots.emplace_back(cloneChild);
             CollectStandinPairs(instance, sourceChild, cloneChild);
         }
     }
@@ -1997,6 +2306,7 @@ public:
         }
         instance.propReplicas[hand] = nullptr;
         instance.propSources[hand] = nullptr;
+        instance.propRoots[hand].clear();
     }
 
     void CreateStandinProp(StandinInstance& instance, std::size_t hand, UnityEngine::Transform* source) {
@@ -2005,6 +2315,8 @@ public:
         auto* replica = UnityEngine::Object::Instantiate<UnityEngine::GameObject*>(
             source->get_gameObject().ptr());
         if (!IsAlive(replica)) return;
+        instance.propRoots[hand].emplace_back(replica);
+        instance.propRoots[hand].emplace_back(source);
         replica->set_name(hand == 0 ? "SaberStage Clone Prop L" : "SaberStage Clone Prop R");
         StripReplicaToVisuals(replica);
         auto* replicaTransform = replica->get_transform().ptr();
@@ -2061,6 +2373,7 @@ public:
         if (!IsAlive(root_)) return false;
         auto* clone = UnityEngine::Object::Instantiate<UnityEngine::GameObject*>(root_);
         if (!IsAlive(clone)) return false;
+        instance.managedRoots.emplace_back(clone);
         clone->set_name("SaberStage Avatar Display Clone " + std::to_string(slot + 1));
         UnityEngine::Object::DontDestroyOnLoad(clone);
         // The clone must not keep a second humanoid Animator: Unity would
@@ -2072,6 +2385,13 @@ public:
         instance.root = clone;
         instance.pairs.clear();
         CollectStandinPairs(instance, root_->get_transform().ptr(), clone->get_transform().ptr());
+        auto sourceMaterials = root_->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+        auto cloneMaterials = clone->GetComponentsInChildren<UnityEngine::Renderer*>(true);
+        for (il2cpp_array_size_t i = 0; i < std::min(sourceMaterials.size(), cloneMaterials.size()); ++i) {
+            instance.materialPairs.emplace_back(sourceMaterials[i], cloneMaterials[i]);
+            instance.managedRoots.emplace_back(sourceMaterials[i]);
+            instance.managedRoots.emplace_back(cloneMaterials[i]);
+        }
         // Blend-shape pairs: GetComponentsInChildren returns hierarchy order
         // and both hierarchies are structurally identical, so the arrays pair
         // by index. Only renderers with morph targets matter.
@@ -2088,6 +2408,8 @@ public:
             const auto blendShapes = IsAlive(mesh.ptr()) ? mesh->get_blendShapeCount() : 0;
             if (blendShapes <= 0) continue;
             instance.rendererPairs.emplace_back(sourceRenderer, cloneRenderer);
+            instance.managedRoots.emplace_back(sourceRenderer);
+            instance.managedRoots.emplace_back(cloneRenderer);
             instance.blendShapeCounts.push_back(blendShapes);
         }
         // Resolve the clone-side hand bones once: find the pair whose source
@@ -2116,7 +2438,10 @@ public:
 
     void DestroyStandinInstance(StandinInstance& instance) noexcept {
         try {
-            if (IsAlive(instance.root)) UnityEngine::Object::Destroy(instance.root);
+            if (IsAlive(instance.root)) {
+                instance.root->SetActive(false);
+                UnityEngine::Object::Destroy(instance.root);
+            }
         } catch (...) {
         }
         instance.root = nullptr;
@@ -2124,14 +2449,20 @@ public:
         instance.rendererPairs.clear();
         instance.blendShapeCounts.clear();
         // Prop replicas are children of root and die with it; just clear.
+        instance.materialPairs.clear();
         instance.handBones = {};
         instance.propSources = {};
         instance.propReplicas = {};
+        for (auto& roots : instance.propRoots) roots.clear();
+        instance.managedRoots.clear();
     }
 
     bool SetStandinCount(std::size_t count) noexcept {
         try {
             count = std::min<std::size_t>(count, 3);
+            // Unrelated quality/fit controls also call this setter. Do not
+            // recopy every bone and facial morph when no clone count changed.
+            if (standins_.size() == count) return true;
             while (standins_.size() > count) {
                 DestroyStandinInstance(standins_.back());
                 standins_.pop_back();
@@ -2174,6 +2505,7 @@ public:
     }
 
     void SetStandinLayer(std::int32_t layer) noexcept {
+        if (standinLayer_ == layer) return;
         standinLayer_ = layer;
         try {
             for (auto& instance : standins_) ApplyStandinLayer(instance, layer);
@@ -2185,8 +2517,12 @@ public:
         UnityEngine::Transform* leftSource, UnityEngine::Transform* rightSource) noexcept {
         // Stored only; SyncStandin reconciles replicas against these each
         // frame so source death or scene changes are handled in one place.
-        standinPropSources_[0] = leftSource;
-        standinPropSources_[1] = rightSource;
+        const std::array<UnityEngine::Transform*, 2> sources{leftSource, rightSource};
+        for (std::size_t side = 0; side < sources.size(); ++side) {
+            if (standinPropSources_[side] == sources[side]) continue;
+            standinPropSourceRoots_[side] = sources[side];
+            standinPropSources_[side] = sources[side];
+        }
     }
 
     void SetStandinPose(
@@ -2195,11 +2531,14 @@ public:
         float yawDegrees, float scale) noexcept {
         if (index >= standins_.size()) return;
         auto& instance = standins_[index];
+        scale = std::clamp(scale, 0.05F, 10.0F);
+        if (instance.positionX == worldX && instance.positionY == worldY && instance.positionZ == worldZ &&
+            instance.yawDegrees == yawDegrees && instance.scale == scale) return;
         instance.positionX = worldX;
         instance.positionY = worldY;
         instance.positionZ = worldZ;
         instance.yawDegrees = yawDegrees;
-        instance.scale = std::clamp(scale, 0.05F, 10.0F);
+        instance.scale = scale;
         try {
             ApplyStandinRootPose(instance);
         } catch (...) {
@@ -2280,6 +2619,18 @@ public:
         }
     }
 
+    struct ParsedLoad { ParseResult parsed; double milliseconds = 0.0; };
+    std::future<ParsedLoad> parseFuture_;
+    CooperativeWork buildWork_;
+    CooperativeWork releaseWork_;
+    const char* phase_ = "parsing";
+    bool releasing_ = false;
+    bool releaseStarted_ = false;
+    bool loadFailed_ = false;
+    bool loadReady_ = false;
+    double constructionMilliseconds_ = 0.0;
+    std::vector<SafePtrUnity<UnityEngine::Object>> managedRoots_;
+    bool materialOptionsApplied_ = false;
     VrmAsset asset_;
     RuntimeOptions options_;
     RuntimeStatistics stats_;
@@ -2303,12 +2654,17 @@ public:
     std::vector<bool> rendererOutlineEnabled_;
     std::vector<SpringChainRuntime> springChains_;
     std::vector<SpringColliderRuntime> springColliders_;
+    std::vector<SpringColliderCache> springColliderCache_;
     std::array<UnityEngine::Vector3, 6> generatedArmColliderCenters_{};
     std::array<float, 6> generatedArmColliderRadii_{};
     std::size_t generatedArmColliderCount_ = 0;
     float springAccumulator_ = 0.0F;
     double springWindowSeconds_ = 0.0;
     std::size_t springWindowUpdates_ = 0;
+    double springWindowMilliseconds_ = 0.0;
+    std::uint64_t springWindowCenterReads_ = 0;
+    std::uint64_t springWindowCollisionTests_ = 0;
+    std::uint64_t springWindowSubsteps_ = 0;
     // Per-renderer wear classification, parallel to allRenderers_. Computed in
     // BuildMeshes while skin weights are still in CPU memory.
     std::vector<float> rendererHeadFraction_;
@@ -2336,6 +2692,7 @@ public:
     // Desired hand-prop sources (0 = left, 1 = right); set by the manager,
     // consumed by SyncStandin.
     std::array<UnityEngine::Transform*, 2> standinPropSources_{};
+    std::array<SafePtrUnity<UnityEngine::Transform>, 2> standinPropSourceRoots_{};
     bool standinBlendShapesDirty_ = false;
     bool standinSyncFailureLogged_ = false;
 };
@@ -2370,31 +2727,35 @@ UnityEngine::Shader* EmbeddedNonBloomUiShader() noexcept {
     }
 }
 
-VrmUnityRuntime::~VrmUnityRuntime() = default;
-
-std::unique_ptr<VrmUnityRuntime> VrmUnityRuntime::Load(
-    const std::filesystem::path& path,
-    const RuntimeOptions& options,
-    std::string* error) {
-    const auto parseStart = std::chrono::steady_clock::now();
-    auto parsed = ParseVrm0File(path);
-    const auto parseEnd = std::chrono::steady_clock::now();
-    if (!parsed) {
-        if (error) *error = parsed.error;
+UnityEngine::Shader* EmbeddedChatSpriteShader() noexcept {
+    try {
+        LoadAvatarShaders();
+        auto& resources = AvatarShaders();
+        return resources.chatSprite ? resources.chatSprite.ptr() : nullptr;
+    } catch (...) {
+        // Optional rich chat fails back to text; avatar loading is independent.
         return nullptr;
     }
-    for (const auto& warning : parsed.warnings) {
-        Logging::Logger.warn("VRM parser: {}", warning);
-    }
+}
+
+VrmUnityRuntime::~VrmUnityRuntime() = default;
+
+std::unique_ptr<VrmUnityRuntime> VrmUnityRuntime::BeginLoad(const std::filesystem::path& path, const RuntimeOptions& options) {
     auto runtime = std::unique_ptr<VrmUnityRuntime>(new VrmUnityRuntime());
     runtime->impl_ = std::make_unique<Impl>();
-    const auto buildStart = std::chrono::steady_clock::now();
-    if (!runtime->impl_->Build(std::move(*parsed.asset), options, error)) return nullptr;
-    const auto buildEnd = std::chrono::steady_clock::now();
-    runtime->impl_->stats_.parseMilliseconds = std::chrono::duration<double, std::milli>(parseEnd - parseStart).count();
-    runtime->impl_->stats_.unityConstructionMilliseconds = std::chrono::duration<double, std::milli>(buildEnd - buildStart).count();
+    runtime->impl_->options_ = options;
+    runtime->impl_->parseFuture_ = std::async(std::launch::async, [path] {
+        const auto start = std::chrono::steady_clock::now();
+        auto parsed = ParseVrm0File(path);
+        return Impl::ParsedLoad{std::move(parsed), std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count()};
+    });
     return runtime;
 }
+RuntimeLoadState VrmUnityRuntime::TickLoad(std::string* error) noexcept { return impl_->TickLoad(error); }
+const char* VrmUnityRuntime::LoadPhase() const noexcept { return impl_->phase_; }
+void VrmUnityRuntime::BeginRelease() noexcept { impl_->BeginRelease(); }
+bool VrmUnityRuntime::TickRelease() noexcept { return impl_->TickRelease(); }
 
 void VrmUnityRuntime::Destroy() noexcept { if (impl_) impl_->Destroy(); }
 void VrmUnityRuntime::SetVisible(bool visible) noexcept { if (impl_) impl_->SetVisible(visible); }
@@ -2408,7 +2769,7 @@ void VrmUnityRuntime::SetBodyProportionScales(
     if (impl_) impl_->SetBodyProportionScales(
         torsoWidthScale, lowerTorsoWidthScale, neckBaseWidthScale, headSizeScale, legWidthScale);
 }
-void VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { if (impl_) impl_->ApplyOptions(options); }
+bool VrmUnityRuntime::ApplyOptions(const RuntimeOptions& options) noexcept { return impl_ && impl_->ApplyOptions(options); }
 void VrmUnityRuntime::UpdateSecondaryMotion(float deltaTime) noexcept { if (impl_) impl_->UpdateSecondaryMotion(deltaTime); }
 void VrmUnityRuntime::ResetSecondaryMotion() noexcept { if (impl_) impl_->ResetSecondaryMotion(); }
 void VrmUnityRuntime::SetArmSpringColliders(
@@ -2431,6 +2792,10 @@ bool VrmUnityRuntime::SetExpression(std::string_view preset, float weight, std::
 }
 bool VrmUnityRuntime::SetExpressionQuiet(std::string_view preset, float weight) noexcept {
     return impl_ && impl_->SetExpressionQuiet(preset, weight);
+}
+
+void VrmUnityRuntime::LogFaceDiagnostics() const noexcept {
+    if (impl_) impl_->LogFaceDiagnostics();
 }
 void VrmUnityRuntime::ApplyViewMode(
     bool wearAvatar,

@@ -58,6 +58,18 @@ int main() {
     Check(defaults.camera.Primary().multisampleCount == 1,
           "third-person MSAA defaults off to protect Quest 2 gameplay performance");
     Check(defaults.preview.selectedCameraId == "primary", "preview targets the stable primary camera");
+    Check(defaults.preview.floorResolutionWidth == 1920 && defaults.preview.floatingResolutionWidth == 512 &&
+              defaults.preview.floorFramesPerSecond == 15 && defaults.preview.floatingFramesPerSecond == 15,
+          "preview defaults preserve the previous floor and movable quality");
+    auto invalidPreview = defaults;
+    invalidPreview.preview.floorResolutionWidth = 4096;
+    invalidPreview.preview.floatingResolutionWidth = -1;
+    invalidPreview.preview.floorFramesPerSecond = 0;
+    invalidPreview.preview.floatingFramesPerSecond = 500;
+    ValidateAndRepair(invalidPreview);
+    Check(invalidPreview.preview.floorResolutionWidth == 1920 && invalidPreview.preview.floatingResolutionWidth == 512 &&
+              invalidPreview.preview.floorFramesPerSecond == 15 && invalidPreview.preview.floatingFramesPerSecond == 15,
+          "corrupt preview choices repair independently to supported defaults");
     Check(defaults.preview.rotationDegrees.y == 0.0F &&
               defaults.recording.worldControlsRotationDegrees.y == 0.0F,
           "world panels default to the visible FloatingScreen face");
@@ -335,6 +347,10 @@ int main() {
     first.Edit().preview.position = {0.25F, 1.4F, 2.25F};
     first.Edit().preview.rotationDegrees = {5.0F, 175.0F, 0.0F};
     first.Edit().preview.scale = 1.5F;
+    first.Edit().preview.floorResolutionWidth = 960;
+    first.Edit().preview.floorFramesPerSecond = 10;
+    first.Edit().preview.floatingResolutionWidth = 1280;
+    first.Edit().preview.floatingFramesPerSecond = 24;
     first.Edit().recording.gameplayOnly = true;
     first.Edit().recording.controllerShortcutEnabled = true;
     first.Edit().recording.worldControlsVisible = true;
@@ -465,6 +481,9 @@ int main() {
     Check(second.Get().preview.visible && second.Get().preview.position.x == 0.25F &&
               second.Get().preview.rotationDegrees.y == 175.0F && second.Get().preview.scale == 1.5F,
           "floating preview pose, scale, and visibility survive restart");
+    Check(second.Get().preview.floorResolutionWidth == 960 && second.Get().preview.floorFramesPerSecond == 10 &&
+              second.Get().preview.floatingResolutionWidth == 1280 && second.Get().preview.floatingFramesPerSecond == 24,
+          "independent preview resolution and FPS settings survive restart");
     Check(second.Get().recording.gameplayOnly, "gameplay-only recording preference survives restart");
     Check(second.Get().recording.controllerShortcutEnabled,
           "controller recording shortcut preference survives restart");
@@ -613,9 +632,15 @@ int main() {
           "preview angles normalize into the supported range");
 
     Write(path, R"({"schemaVersion":0,"camera":{"fovDegrees":105.0}})");
+    // Old documents have no preview quality fields; decoding must retain each
+    // monitor's prior effective defaults instead of sharing recording values.
     SettingsService migration(path);
     const auto migrated = migration.Load();
     Check(migrated.migrated, "schema zero runs migration hook");
+    Check(migration.Get().preview.floorResolutionWidth == 1920 &&
+              migration.Get().preview.floatingResolutionWidth == 512 &&
+              migration.Get().preview.floorFramesPerSecond == 15 && migration.Get().preview.floatingFramesPerSecond == 15,
+          "settings without preview quality fields retain their old effective defaults");
     Check(migration.Get().schemaVersion == kCurrentSchemaVersion, "migration writes current schema");
     Check(migration.Get().camera.Primary().fovDegrees == 105.0F, "migration preserves recognized valid value");
     Check(!migration.Get().recording.gameplayOnly, "older settings migrate to continuous recording by default");
@@ -669,6 +694,23 @@ int main() {
     SettingsService repairedReload(path);
     const auto repairedReloadResult = repairedReload.Load();
     Check(!repairedReloadResult.repaired, "repaired JSON is persisted in normalized form");
+
+    auto& rich = repairedReload.Edit().chat;
+    rich.showEmotes = true; rich.animateEmotes = true; rich.reverseOrder = true;
+    rich.backgroundColor = {0.1F, 0.2F, 0.3F}; rich.fontSize = 4.5F;
+    rich.controlsPlaced = true; rich.requestsPlaced = true; rich.requestsScale = 1.5F;
+    rich.requests.enabled = true; rich.requests.maximumPending = 81;
+    rich.requests.cooldownPerUser = false; rich.requests.queueCooldownSeconds = 35;
+    rich.requests.commands[0] = saberstage::broadcast::CommandPermission::SubscribersAndVips;
+    Check(repairedReload.Save(&error), "rich chat configuration persists");
+    SettingsService richReload(path); richReload.Load();
+    const auto& loadedChat = richReload.Get().chat;
+    Check(loadedChat.animateEmotes && loadedChat.reverseOrder && loadedChat.fontSize == 4.5F && loadedChat.backgroundColor.z == 0.3F,
+        "rich chat appearance roundtrips");
+    Check(loadedChat.controlsPlaced && loadedChat.requestsPlaced && loadedChat.requestsScale == 1.5F,
+        "independent chat control/request panel placement persists");
+    Check(loadedChat.requests.maximumPending == 81 && !loadedChat.requests.cooldownPerUser && loadedChat.requests.queueCooldownSeconds == 35 &&
+        loadedChat.requests.commands[0] == saberstage::broadcast::CommandPermission::SubscribersAndVips, "request policy and permissions roundtrip");
 
     const std::string futureJson = R"({"schemaVersion":99,"futureOnly":{"keepMe":true}})";
     Write(path, futureJson);

@@ -11,10 +11,17 @@ Decision update: incorporates the user's numbered answers following checkpoint
 workflow, design, and layout. That latest instruction supersedes the earlier
 custom screen/grouping proposals; it is not merely a request for similar styling.
 
-**Status: planning only; implementation is NOT authorized yet.** The user
-requested this document and a commit, followed by discussion. Do not interpret
-the implementation steps below as permission to start changing code, build a
-new feature, deploy, connect an account, or send chat messages.
+**Status: implementation authorized by the user on 2026-09-02.** Starting
+checkpoint: `7628a89`. The user is testing the preceding recording/avatar build;
+do not deploy, stop the game, or perform live account actions without a new
+go-ahead. Track implementation and verification in
+[the implementation record](../ai-assisted-development/reviews/TWITCH_CHAT_IMPLEMENTATION.md).
+
+Build update, 2026-09-03: the source implementation is packaged for headset
+acceptance. See the [usage guide](../TWITCH_CHAT_AND_REQUESTS.md) and the linked
+record for exact functionality, standalone UI adaptations, passed host/build
+checks and outstanding runtime/PC-layout comparison. No new device deployment
+or full UI-parity claim is implied by this update.
 
 ## 1. Agreed direction and boundaries
 

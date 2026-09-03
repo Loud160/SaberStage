@@ -41,7 +41,10 @@ void AvatarRuntimeDriver::Update() {
     if (activeManager != nullptr) {
         ErrorManager::Instance().Guard(
             "sampling avatar tracking",
-            [] { activeManager->SampleTracking(); });
+            [] {
+                activeManager->TickAvatarLifecycle();
+                activeManager->SampleTracking();
+            });
     }
 }
 
@@ -51,10 +54,9 @@ void AvatarRuntimeDriver::LateUpdate() {
             "updating the avatar pose",
             [] {
                 activeManager->SolveAndWrite();
-                // Secondary motion is intentionally applied after the
-                // trackerless body solve, exactly once per Unity LateUpdate.
-                // Spectator pre-render can request another body solve, but it
-                // must not advance hair/clothing physics twice in one frame.
+                // HMD consumers run here; camera-only avatars run in the
+                // pre-render callback. The manager accounts for elapsed time
+                // once even if several consumers render in the same frame.
                 activeManager->UpdateSecondaryMotion(UnityEngine::Time::get_deltaTime());
             });
     }

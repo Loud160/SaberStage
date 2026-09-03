@@ -15,6 +15,7 @@
 #include "saberstage/camera/Math.hpp"
 #include "saberstage/camera/MotionPipeline.hpp"
 #include "saberstage/camera/MovementScript.hpp"
+#include "saberstage/camera/RuntimeWorkPolicy.hpp"
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include <cmath>
@@ -237,6 +238,36 @@ int main() {
     }
 
     FrameDemandRegistry demands;
+    GameplaySourceRetry clockDiscovery;
+    GameplaySourceRetry playerDiscovery;
+    int menuLookups = 0;
+    for (int frame = 0; frame < 900; ++frame) {
+        const auto now = frame / 90.0;
+        menuLookups += clockDiscovery.TryBegin(false, now);
+        menuLookups += playerDiscovery.TryBegin(false, now);
+    }
+    Check(menuLookups == 0, "enabled song scripts and player-follow perform zero discovery scans in menus");
+    Check(clockDiscovery.TryBegin(true, 10.0), "entering gameplay permits immediate clock discovery");
+    int gameplayRetries = 1;
+    for (int frame = 1; frame < 900; ++frame) {
+        gameplayRetries += clockDiscovery.TryBegin(true, 10.0 + frame / 90.0);
+    }
+    Check(gameplayRetries >= 35 && gameplayRetries <= 41,
+          "missing gameplay clocks retry at most four times per second instead of every frame");
+    clockDiscovery.Reset();
+    Check(clockDiscovery.TryBegin(true, 0.0), "scene/camera recreation resets the retry deadline");
+    Check(!clockDiscovery.TryBegin(true, 0.1), "duplicate same-startup requests reuse the miss cooldown");
+
+    MovementScriptSelection scriptSelection;
+    Check(scriptSelection.Update(true, "orbit.json"), "initial enabled script loads once");
+    bool redundantLoad = false;
+    for (int callback = 0; callback < 1000; ++callback) {
+        redundantLoad = redundantLoad || scriptSelection.Update(true, "orbit.json");
+    }
+    Check(!redundantLoad, "unrelated camera settings never reload the selected file");
+    Check(scriptSelection.Update(false, "orbit.json") && scriptSelection.Update(true, "orbit.json"),
+          "toggle off/on explicitly reloads an edited or previously failed file");
+    Check(scriptSelection.Update(true, "other.json"), "selecting another filename reloads the script");
     const auto dockedPreviewDemand = saberstage::preview::DockedPreviewRenderDemand();
     Check(dockedPreviewDemand.width == 1920 && dockedPreviewDemand.height == 1080 &&
               dockedPreviewDemand.framesPerSecond == 15,
@@ -245,6 +276,46 @@ int main() {
     Check(floatingPreviewDemand.width == 512 && floatingPreviewDemand.height == 288 &&
               floatingPreviewDemand.framesPerSecond == 15,
           "the movable preview retains its lower-cost standalone profile");
+    using namespace saberstage::preview;
+    for (const auto width : kPreviewWidths) {
+        for (const auto fps : kPreviewFrameRates) {
+            const auto floor = DockedPreviewRenderDemand(width, fps);
+            const auto floating = FloatingPreviewRenderDemand(width, fps);
+            Check(floor.width == width && floor.height == width * 9 / 16 && floor.framesPerSecond == fps &&
+                      floating.width == width && floating.height == width * 9 / 16 && floating.framesPerSecond == fps,
+                  "both monitors honor each supported preview resolution and cadence");
+            Check(demands.Set("preview.floor", floor) && demands.Set("preview.floating", floating),
+                  "all preview dropdown choices produce valid camera demands");
+        }
+    }
+    Check(DockedPreviewRenderDemand(-1, 0).width == 1920 &&
+              FloatingPreviewRenderDemand(999999, 999).width == 512 &&
+              FloatingPreviewRenderDemand(512, 999).framesPerSecond == 15,
+          "invalid runtime quality falls back to each monitor's own safe defaults");
+    demands.Clear();
+    Check(demands.Set("preview.floor", DockedPreviewRenderDemand(1920, 30)) &&
+              demands.Set("preview.floating", FloatingPreviewRenderDemand(512, 5)),
+          "opening the menu combines independent monitor requests");
+    auto remaining = demands.Combined("primary");
+    Check(remaining.width == 1920 && remaining.height == 1080 && remaining.framesPerSecond == 30,
+          "two previews share one render at the higher requested quality");
+    demands.Remove("preview.floor");
+    remaining = demands.Combined("primary");
+    Check(remaining.active && remaining.width == 512 && remaining.height == 288 && remaining.framesPerSecond == 5,
+          "closing the menu leaves only the movable preview's smaller/slower demand");
+    Check(demands.Set("preview.floor", DockedPreviewRenderDemand(960, 10)),
+          "reopening the menu restores its latest floor quality");
+    remaining = demands.Combined("primary");
+    Check(remaining.width == 960 && remaining.framesPerSecond == 10,
+          "reopened floor preview combines with the unchanged movable preview");
+    Check(demands.Set("capture", {"primary", 1920, 1080, 60}), "capture can coexist with previews");
+    demands.Remove("preview.floor"); // repeated deactivation is harmless
+    demands.Remove("preview.floating");
+    remaining = demands.Combined("primary");
+    Check(remaining.active && remaining.width == 1920 && remaining.framesPerSecond == 60,
+          "closing both previews never removes the capture demand");
+    demands.Remove("capture");
+    Check(!demands.Combined("primary").active, "no output consumer means no camera render request");
     Check(demands.Set("preview", {"primary", 640, 360, 30}), "preview demand is accepted");
     Check(demands.Set("capture", {"primary", 1920, 1080, 60}), "capture demand is accepted");
     const auto combined = demands.Combined("primary");
@@ -256,6 +327,24 @@ int main() {
     FrameScheduler scheduler;
     Check(!scheduler.Advance(1.0F / 60.0F, 30), "30 FPS demand does not render every 60 Hz update");
     Check(scheduler.Advance(1.0F / 60.0F, 30), "30 FPS demand renders on its own cadence");
+    scheduler.Reset();
+    int slowPreviewFrames = 0;
+    for (int frame = 0; frame < 90; ++frame) slowPreviewFrames += scheduler.Advance(1.0F / 90.0F, 5);
+    Check(slowPreviewFrames == 5, "5 FPS preview cadence stays independent of headset FPS");
+    // Exact-rate cases alone miss early-deadline floating-point residue, which
+    // can cause an extra render on the very next HMD frame. Exercise every
+    // preview choice against the common Quest display rates for ten seconds.
+    for (const auto headsetFps : {72, 80, 90, 120}) {
+        for (const auto previewFps : kPreviewFrameRates) {
+            scheduler.Reset();
+            int renderedFrames = 0;
+            for (int frame = 0; frame < headsetFps * 10; ++frame) {
+                renderedFrames += scheduler.Advance(1.0F / headsetFps, previewFps);
+            }
+            Check(std::abs(renderedFrames - previewFps * 10) <= 1,
+                  "each preview FPS remains capped across Quest headset refresh rates");
+        }
+    }
     scheduler.Reset();
     Check(!scheduler.Advance(1.0F / 90.0F, 60) && scheduler.Advance(1.0F / 90.0F, 60),
           "60 FPS demand is scheduled independently from a 90 Hz HMD update");

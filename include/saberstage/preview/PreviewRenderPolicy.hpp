@@ -7,20 +7,21 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Defines which preview surfaces are visible to headset and spectator cameras.
-// - The policy is data-only so render filtering can be tested without Unity.
+// - Defines independent floor/movable preview quality and render demand.
+// - Shared choices keep persistence, UI and runtime validation consistent.
 
 #pragma once
 
 #include "saberstage/camera/FrameDemand.hpp"
 
-#include <string>
+#include <algorithm>
+#include <array>
+#include <string_view>
 
 namespace saberstage::preview {
 
-// The large docked preview is the user's primary camera monitor and needs a
-// full-resolution image for checking avatar and scene detail. Keep its cadence
-// bounded so opening SaberStage does not also add a 60 FPS spectator pass.
+// Preserve the previous effective defaults when loading older settings.
+// Users can now lower either surface's cost without changing capture quality.
 inline constexpr std::int32_t kDockedPreviewRenderWidth = 1920;
 inline constexpr std::int32_t kDockedPreviewRenderHeight = 1080;
 inline constexpr std::int32_t kPreviewRenderFramesPerSecond = 15;
@@ -31,21 +32,44 @@ inline constexpr std::int32_t kPreviewRenderFramesPerSecond = 15;
 inline constexpr std::int32_t kFloatingPreviewRenderWidth = 512;
 inline constexpr std::int32_t kFloatingPreviewRenderHeight = 288;
 
-inline camera::RenderDemand DockedPreviewRenderDemand() {
+inline constexpr std::array<std::int32_t, 4> kPreviewWidths{512, 960, 1280, 1920};
+inline constexpr std::array<std::string_view, 4> kPreviewResolutionLabels{
+    "512 x 288", "960 x 540", "1280 x 720", "1920 x 1080"};
+inline constexpr std::array<std::int32_t, 6> kPreviewFrameRates{5, 10, 15, 24, 30, 60};
+inline constexpr std::array<std::string_view, 6> kPreviewFrameRateLabels{
+    "5 FPS", "10 FPS", "15 FPS", "24 FPS", "30 FPS", "60 FPS"};
+
+inline bool ValidPreviewWidth(std::int32_t value) noexcept {
+    return std::find(kPreviewWidths.begin(), kPreviewWidths.end(), value) != kPreviewWidths.end();
+}
+
+inline bool ValidPreviewFrameRate(std::int32_t value) noexcept {
+    return std::find(kPreviewFrameRates.begin(), kPreviewFrameRates.end(), value) != kPreviewFrameRates.end();
+}
+
+inline camera::RenderDemand DockedPreviewRenderDemand(
+    std::int32_t width = kDockedPreviewRenderWidth,
+    std::int32_t framesPerSecond = kPreviewRenderFramesPerSecond) {
+    if (!ValidPreviewWidth(width)) width = kDockedPreviewRenderWidth;
+    if (!ValidPreviewFrameRate(framesPerSecond)) framesPerSecond = kPreviewRenderFramesPerSecond;
     return {
         "primary",
-        kDockedPreviewRenderWidth,
-        kDockedPreviewRenderHeight,
-        kPreviewRenderFramesPerSecond,
+        width,
+        width * 9 / 16,
+        framesPerSecond,
     };
 }
 
-inline camera::RenderDemand FloatingPreviewRenderDemand() {
+inline camera::RenderDemand FloatingPreviewRenderDemand(
+    std::int32_t width = kFloatingPreviewRenderWidth,
+    std::int32_t framesPerSecond = kPreviewRenderFramesPerSecond) {
+    if (!ValidPreviewWidth(width)) width = kFloatingPreviewRenderWidth;
+    if (!ValidPreviewFrameRate(framesPerSecond)) framesPerSecond = kPreviewRenderFramesPerSecond;
     return {
         "primary",
-        kFloatingPreviewRenderWidth,
-        kFloatingPreviewRenderHeight,
-        kPreviewRenderFramesPerSecond,
+        width,
+        width * 9 / 16,
+        framesPerSecond,
     };
 }
 

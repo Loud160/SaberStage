@@ -39,6 +39,14 @@ downloaded dependency sources, generated manifests, binaries, and QMODs are
 ignored by Git. `qpm.shared.json` is intentionally tracked so the QPM-resolved
 dependency graph can be reviewed and reproduced.
 
+Rich chat adds the pinned Quest SongCore 1.1.26 dependency for this game version.
+It also adds a viewport-clipped chat sprite shader to the shared Android bundle.
+After editing shader source, run `scripts/build-avatar-shaders.ps1` before the
+native build. Unity verifies all six addressable shaders in the produced bundle;
+the existing avatar/preview shaders remain in the same archive. A source-only
+deployment must not substitute an unverified SongCore build or overwrite another
+mod's dependencies; use the normal QMOD dependency installation when needed.
+
 ## Development install and smoke test
 
 Confirm one intended headset with:

@@ -597,6 +597,10 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.preview.rotationDegrees = Vector(
                 *preview, "rotationDegrees", settings.preview.rotationDegrees, repaired);
             settings.preview.scale = Float(*preview, "scale", settings.preview.scale, repaired);
+            settings.preview.floorResolutionWidth = Int(*preview, "floorResolutionWidth", settings.preview.floorResolutionWidth, repaired);
+            settings.preview.floorFramesPerSecond = Int(*preview, "floorFramesPerSecond", settings.preview.floorFramesPerSecond, repaired);
+            settings.preview.floatingResolutionWidth = Int(*preview, "floatingResolutionWidth", settings.preview.floatingResolutionWidth, repaired);
+            settings.preview.floatingFramesPerSecond = Int(*preview, "floatingFramesPerSecond", settings.preview.floatingFramesPerSecond, repaired);
         }
     }
     if (const auto* recording = Member(document, "recording")) {
@@ -818,6 +822,51 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 *chat, "rotationDegrees", settings.chat.rotationDegrees, repaired);
             settings.chat.width = Float(*chat, "width", settings.chat.width, repaired);
             settings.chat.height = Float(*chat, "height", settings.chat.height, repaired);
+            settings.chat.showBadges = Bool(*chat, "showBadges", settings.chat.showBadges, repaired);
+            settings.chat.showEmotes = Bool(*chat, "showEmotes", settings.chat.showEmotes, repaired);
+            settings.chat.animateEmotes = Bool(*chat, "animateEmotes", settings.chat.animateEmotes, repaired);
+            settings.chat.platformAccent = Bool(*chat, "platformAccent", settings.chat.platformAccent, repaired);
+            settings.chat.filterCommands = Bool(*chat, "filterCommands", settings.chat.filterCommands, repaired);
+            settings.chat.filterBroadcasterCommands = Bool(*chat, "filterBroadcasterCommands", settings.chat.filterBroadcasterCommands, repaired);
+            settings.chat.showSubscriptions = Bool(*chat, "showSubscriptions", settings.chat.showSubscriptions, repaired);
+            settings.chat.showBits = Bool(*chat, "showBits", settings.chat.showBits, repaired);
+            settings.chat.showFollows = Bool(*chat, "showFollows", settings.chat.showFollows, repaired);
+            settings.chat.showRedemptions = Bool(*chat, "showRedemptions", settings.chat.showRedemptions, repaired);
+            settings.chat.showViewerCount = Bool(*chat, "showViewerCount", settings.chat.showViewerCount, repaired);
+            settings.chat.reverseOrder = Bool(*chat, "reverseOrder", settings.chat.reverseOrder, repaired);
+            settings.chat.fontSize = Float(*chat, "fontSize", settings.chat.fontSize, repaired);
+            settings.chat.backgroundColor = Vector(*chat, "backgroundColor", settings.chat.backgroundColor, repaired);
+            settings.chat.textColor = Vector(*chat, "textColor", settings.chat.textColor, repaired);
+            settings.chat.highlightColor = Vector(*chat, "highlightColor", settings.chat.highlightColor, repaired);
+            settings.chat.pingColor = Vector(*chat, "pingColor", settings.chat.pingColor, repaired);
+            settings.chat.controlsPosition = Vector(*chat, "controlsPosition", settings.chat.controlsPosition, repaired);
+            settings.chat.controlsPlaced = Bool(*chat, "controlsPlaced", settings.chat.controlsPlaced, repaired);
+            settings.chat.requestsPlaced = Bool(*chat, "requestsPlaced", settings.chat.requestsPlaced, repaired);
+            settings.chat.controlsRotation = Vector(*chat, "controlsRotation", settings.chat.controlsRotation, repaired);
+            settings.chat.requestsPosition = Vector(*chat, "requestsPosition", settings.chat.requestsPosition, repaired);
+            settings.chat.requestsRotation = Vector(*chat, "requestsRotation", settings.chat.requestsRotation, repaired);
+            settings.chat.requestsScale = Float(*chat, "requestsScale", settings.chat.requestsScale, repaired);
+            if (const auto* requests = Member(*chat, "requests"); requests && requests->IsObject()) {
+                auto& p = settings.chat.requests;
+                p.enabled = Bool(*requests, "enabled", p.enabled, repaired);
+                p.maximumPending = Int(*requests, "maximumPending", p.maximumPending, repaired);
+                p.perViewer = Int(*requests, "perViewer", p.perViewer, repaired);
+                p.vipBonus = Int(*requests, "vipBonus", p.vipBonus, repaired);
+                p.subscriberBonus = Int(*requests, "subscriberBonus", p.subscriberBonus, repaired);
+                p.cooldownSeconds = Int(*requests, "cooldownSeconds", p.cooldownSeconds, repaired);
+                p.cooldownPerUser = Bool(*requests, "cooldownPerUser", p.cooldownPerUser, repaired);
+                p.queueCooldownSeconds = Int(*requests, "queueCooldownSeconds", p.queueCooldownSeconds, repaired);
+                p.queueCooldownPerUser = Bool(*requests, "queueCooldownPerUser", p.queueCooldownPerUser, repaired);
+                if (const auto* permissions = Member(*requests, "commands"); permissions && permissions->IsObject())
+                    for (std::size_t i = 0; i < p.commands.size(); ++i)
+                        p.commands[i] = static_cast<broadcast::CommandPermission>(Int(*permissions,
+                            broadcast::kRequestCommandNames[i].data(), static_cast<int>(p.commands[i]), repaired));
+                p.maximumDurationSeconds = Int(*requests, "maximumDurationSeconds", p.maximumDurationSeconds, repaired);
+                p.historySize = Int(*requests, "historySize", p.historySize, repaired);
+                p.subscribersOnly = Bool(*requests, "subscribersOnly", p.subscribersOnly, repaired);
+                p.blockUnsupported = Bool(*requests, "blockUnsupported", p.blockUnsupported, repaired);
+                p.duplicateHistory = Bool(*requests, "duplicateHistory", p.duplicateHistory, repaired);
+            }
         }
     }
     settings.schemaVersion = sourceVersion;
@@ -850,6 +899,10 @@ std::string Encode(const SettingsDocument& settings) {
     AddVector(preview, "position", settings.preview.position, allocator);
     AddVector(preview, "rotationDegrees", settings.preview.rotationDegrees, allocator);
     preview.AddMember("scale", settings.preview.scale, allocator);
+    preview.AddMember("floorResolutionWidth", settings.preview.floorResolutionWidth, allocator);
+    preview.AddMember("floorFramesPerSecond", settings.preview.floorFramesPerSecond, allocator);
+    preview.AddMember("floatingResolutionWidth", settings.preview.floatingResolutionWidth, allocator);
+    preview.AddMember("floatingFramesPerSecond", settings.preview.floatingFramesPerSecond, allocator);
     document.AddMember("preview", preview, allocator);
 
     Value recording(rapidjson::kObjectType);
@@ -948,6 +1001,51 @@ std::string Encode(const SettingsDocument& settings) {
     AddVector(chat, "rotationDegrees", settings.chat.rotationDegrees, allocator);
     chat.AddMember("width", settings.chat.width, allocator);
     chat.AddMember("height", settings.chat.height, allocator);
+    chat.AddMember("showBadges", settings.chat.showBadges, allocator);
+    chat.AddMember("showEmotes", settings.chat.showEmotes, allocator);
+    chat.AddMember("animateEmotes", settings.chat.animateEmotes, allocator);
+    chat.AddMember("platformAccent", settings.chat.platformAccent, allocator);
+    chat.AddMember("filterCommands", settings.chat.filterCommands, allocator);
+    chat.AddMember("filterBroadcasterCommands", settings.chat.filterBroadcasterCommands, allocator);
+    chat.AddMember("showSubscriptions", settings.chat.showSubscriptions, allocator);
+    chat.AddMember("showBits", settings.chat.showBits, allocator);
+    chat.AddMember("showFollows", settings.chat.showFollows, allocator);
+    chat.AddMember("showRedemptions", settings.chat.showRedemptions, allocator);
+    chat.AddMember("showViewerCount", settings.chat.showViewerCount, allocator);
+    chat.AddMember("reverseOrder", settings.chat.reverseOrder, allocator);
+    chat.AddMember("fontSize", settings.chat.fontSize, allocator);
+    AddVector(chat, "backgroundColor", settings.chat.backgroundColor, allocator);
+    AddVector(chat, "textColor", settings.chat.textColor, allocator);
+    AddVector(chat, "highlightColor", settings.chat.highlightColor, allocator);
+    AddVector(chat, "pingColor", settings.chat.pingColor, allocator);
+    AddVector(chat, "controlsPosition", settings.chat.controlsPosition, allocator);
+    chat.AddMember("controlsPlaced", settings.chat.controlsPlaced, allocator);
+    chat.AddMember("requestsPlaced", settings.chat.requestsPlaced, allocator);
+    AddVector(chat, "controlsRotation", settings.chat.controlsRotation, allocator);
+    AddVector(chat, "requestsPosition", settings.chat.requestsPosition, allocator);
+    AddVector(chat, "requestsRotation", settings.chat.requestsRotation, allocator);
+    chat.AddMember("requestsScale", settings.chat.requestsScale, allocator);
+    Value requests(rapidjson::kObjectType);
+    const auto& requestPolicy = settings.chat.requests;
+    requests.AddMember("enabled", requestPolicy.enabled, allocator);
+    requests.AddMember("maximumPending", requestPolicy.maximumPending, allocator);
+    requests.AddMember("perViewer", requestPolicy.perViewer, allocator);
+    requests.AddMember("vipBonus", requestPolicy.vipBonus, allocator);
+    requests.AddMember("subscriberBonus", requestPolicy.subscriberBonus, allocator);
+    requests.AddMember("cooldownSeconds", requestPolicy.cooldownSeconds, allocator);
+    requests.AddMember("cooldownPerUser", requestPolicy.cooldownPerUser, allocator);
+    requests.AddMember("queueCooldownSeconds", requestPolicy.queueCooldownSeconds, allocator);
+    requests.AddMember("queueCooldownPerUser", requestPolicy.queueCooldownPerUser, allocator);
+    Value commands(rapidjson::kObjectType);
+    for (std::size_t i = 0; i < requestPolicy.commands.size(); ++i)
+        commands.AddMember(Value(broadcast::kRequestCommandNames[i].data(), allocator).Move(), static_cast<int>(requestPolicy.commands[i]), allocator);
+    requests.AddMember("commands", commands, allocator);
+    requests.AddMember("maximumDurationSeconds", requestPolicy.maximumDurationSeconds, allocator);
+    requests.AddMember("historySize", requestPolicy.historySize, allocator);
+    requests.AddMember("subscribersOnly", requestPolicy.subscribersOnly, allocator);
+    requests.AddMember("blockUnsupported", requestPolicy.blockUnsupported, allocator);
+    requests.AddMember("duplicateHistory", requestPolicy.duplicateHistory, allocator);
+    chat.AddMember("requests", requests, allocator);
     document.AddMember("chat", chat, allocator);
 
     rapidjson::StringBuffer buffer;

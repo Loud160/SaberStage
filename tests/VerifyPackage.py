@@ -82,9 +82,12 @@ def main() -> int:
         fail("QMOD contains an unexpected payload category")
 
     dependency_ids = {item.get("id") for item in manifest.get("dependencies", [])}
-    required = {"beatsaber-hook", "bsml", "custom-types", "hollywood"}
+    required = {"beatsaber-hook", "bsml", "custom-types", "hollywood", "songcore"}
     if not required <= dependency_ids:
         fail(f"QMOD dependencies are missing: {sorted(required - dependency_ids)}")
+    songcore = next(item for item in manifest["dependencies"] if item.get("id") == "songcore")
+    if songcore.get("version") != "=1.1.26":
+        fail("SongCore must remain pinned to 1.1.26 for the 1.40.8 request navigation bindings")
     if "paper2_scotland2" in dependency_ids:
         fail("SaberStage must not declare Paper2 as a QMOD dependency")
 

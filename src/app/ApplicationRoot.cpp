@@ -81,18 +81,25 @@ bool ApplicationRoot::ApplyConfiguredAvatar(std::string* error) {
     if (!avatar_->LoadVrmAvatar(
             path,
             static_cast<std::uint32_t>(avatarProfile.maximumTextureDimension),
-            error)) {
+            error, true,
+            [this](bool success, const std::string& loadError) {
+                if (!avatar_) return;
+                if (!success) {
+                    Logging::Logger.error("Configured avatar load failed: {}", loadError);
+                    ErrorManager::Instance().ReportUserVisible("Avatar load failed", loadError);
+                    return;
+                }
+                const auto& profile = settings_.Get().avatar;
+                avatar_->SetAvatarVisible(profile.visible);
+                avatar_->ApplyAvatarSettings(profile);
+                if (!avatar_->RecalibrateNeutral()) {
+                    Logging::Logger.info("Configured avatar loaded and bound; neutral reset awaits tracking");
+                }
+            })) {
         return false;
     }
-    avatar_->SetAvatarVisible(avatarProfile.visible);
-    avatar_->ApplyAvatarSettings(avatarProfile);
-    // LoadVrmAvatar binds the solver and performs its first neutral reset.
-    // Repeat after the saved fit is applied so the active avatar always enters
-    // the scene in the same fully initialized order used by the Setup menu.
-    if (!avatar_->RecalibrateNeutral()) {
-        Logging::Logger.info(
-            "Configured avatar loaded and bound; neutral reset is waiting for tracked HMD/controllers");
-    }
+    // Completion applies the selected profile only after construction/binding;
+    // profile switching can now cancel an in-flight load without blocking UI.
     return true;
 }
 

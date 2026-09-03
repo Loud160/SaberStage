@@ -13,10 +13,17 @@
 #pragma once
 
 #include "saberstage/settings/SettingsModel.hpp"
+#include "saberstage/broadcast/ChatProtocol.hpp"
+#include "saberstage/broadcast/SongRequestService.hpp"
+#include "saberstage/broadcast/MapDownload.hpp"
+#include "saberstage/broadcast/ChatAssets.hpp"
+#include "saberstage/broadcast/TwitchNotices.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -44,16 +51,11 @@ enum class TwitchChatState {
     Failed,
 };
 
-struct TwitchChatMessage {
-    std::uint64_t sequence = 0;
-    std::string author;
-    std::string text;
-};
-
 // All Unity/Beat Saber objects are converted to plain data before this crosses
 // into TwitchService. The worker may safely inspect the optional beatmap JSON
 // path and perform the network request without retaining IL2CPP object lives.
 struct MapAnnouncement {
+    std::string levelHash;
     std::string songName;
     std::string songAuthorName;
     std::string mapper;
@@ -72,6 +74,7 @@ struct TwitchSnapshot {
     std::string verificationUri;
     std::string login;
     std::vector<TwitchChatMessage> messages;
+    std::uint64_t messagesRevision = 0;
     // Helix reports the live channel's current viewer count. Unknown remains
     // distinct from zero so the UI can show "--" while offline/auth is being
     // resolved instead of claiming that a failed request means no viewers.
@@ -84,6 +87,9 @@ struct TwitchSnapshot {
     bool mapAnnouncementPending = false;
     std::string mapAnnouncementStatus;
     bool tokenRefreshPending = false;
+    bool moderationPending = false;
+    std::string moderationStatus;
+    std::string noticeStatus;
 };
 
 // Provider-specific Twitch control plane. RTMP media remains owned by
@@ -104,9 +110,15 @@ public:
     bool BeginTitleUpdate(std::string title, std::string* error = nullptr);
     bool BeginMapAnnouncement(MapAnnouncement announcement, std::string* error = nullptr);
     void SetChatEnabled(bool enabled) noexcept;
+    void RetryChatConnections();
     void Tick() noexcept;
     void Shutdown() noexcept;
     [[nodiscard]] TwitchSnapshot Snapshot() const;
+    SongRequestService& Requests() noexcept { return *requests_; }
+    MapDownload& Downloads() noexcept { return downloads_; }
+    ChatAssets& Assets() noexcept { return assets_; }
+    bool QueueReply(std::string channelId, std::string text);
+    bool Moderate(std::string userId, std::string messageId, int timeoutSeconds, bool deleteMessage);
 
 private:
     struct PendingCredentials {
@@ -137,7 +149,7 @@ private:
         std::string clientId,
         std::string accessToken,
         std::string userId,
-        MapAnnouncement announcement) noexcept;
+        MapAnnouncement announcement, std::uint64_t generation) noexcept;
     void ViewerCountWorker(
         std::string clientId,
         std::string accessToken,
@@ -149,6 +161,8 @@ private:
     void SetStatus(TwitchAuthorizationState state, std::string status);
     bool RestoreSavedTokens(std::string* error = nullptr) noexcept;
     bool ProtectRuntimeTokens(std::string* error = nullptr) noexcept;
+    void ReplyWorker(std::string clientId, std::string token, std::string channel, std::string text, std::uint64_t generation) noexcept;
+    bool AcquireChatSendSlot();
 
     settings::SettingsService& settings_;
     mutable std::mutex mutex_;
@@ -161,6 +175,18 @@ private:
     std::thread titleWorker_;
     std::thread mapAnnouncementWorker_;
     std::thread viewerCountWorker_;
+    std::unique_ptr<SongRequestService> requests_;
+    MapDownload downloads_;
+    ChatAssets assets_;
+    std::unique_ptr<TwitchNotices> notices_;
+    std::thread replyWorker_;
+    std::thread moderationWorker_;
+    std::atomic<bool> replyDone_{true};
+    std::atomic<bool> moderationDone_{true};
+    std::atomic<bool> controlStop_{false};
+    std::mutex sendRateMutex_;
+    std::chrono::steady_clock::time_point nextChatSend_{};
+    std::deque<RequestReply> outgoingReplies_;
     std::atomic<bool> authorizationStop_{false};
     std::atomic<bool> refreshStop_{false};
     std::atomic<bool> chatStop_{false};
@@ -177,6 +203,11 @@ private:
     // Tick. The user explicitly toggles the panel off/on to clear this latch
     // and request one new connection attempt.
     std::atomic<bool> chatRetryBlocked_{false};
+    std::atomic<bool> chatAuthenticationRejected_{false};
+    std::chrono::steady_clock::time_point nextChatRetry_{};
+    unsigned chatRetryAttempts_ = 0;
+    std::chrono::steady_clock::time_point chatHealthySince_{}; // Main thread only.
+    std::string observedChatAccount_;
     // Workers capture this generation before an OAuth exchange. Disconnecting
     // increments it so a late network response cannot restore credentials the
     // user explicitly removed.
