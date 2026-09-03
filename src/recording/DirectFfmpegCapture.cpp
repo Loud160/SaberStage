@@ -126,6 +126,13 @@ struct RenderBridgeDiagnostics final {
     std::atomic<std::uint64_t> surfaceFramesPresented{0};
     std::atomic<std::uint64_t> makeCurrentFailures{0};
     std::atomic<std::uint64_t> swapFailures{0};
+    std::atomic<std::uint64_t> timedRenderEvents{0};
+    std::atomic<std::uint64_t> renderBridgeMicroseconds{0};
+    std::atomic<std::uint64_t> maximumRenderBridgeMicroseconds{0};
+    std::atomic<std::uint64_t> surfaceSwapMicroseconds{0};
+    std::atomic<std::uint64_t> maximumSurfaceSwapMicroseconds{0};
+    std::atomic<std::int32_t> minimumSwapInterval{-1};
+    std::atomic<std::int32_t> swapIntervalError{EGL_SUCCESS};
     std::atomic<std::uint64_t> consecutiveFailures{0};
     std::atomic<std::int32_t> lastEglError{EGL_SUCCESS};
     std::atomic<std::int32_t> lastGlError{GL_NO_ERROR};
@@ -133,6 +140,17 @@ struct RenderBridgeDiagnostics final {
     std::atomic<bool> initialized{false};
     std::atomic<bool> terminalFailure{false};
 };
+
+void RecordRenderDuration(
+    std::chrono::steady_clock::time_point start,
+    std::atomic<std::uint64_t>& total,
+    std::atomic<std::uint64_t>& maximum) noexcept {
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    total.fetch_add(elapsed, std::memory_order_relaxed);
+    // These have one writer, Unity's render thread. Readers only snapshot.
+    maximum.store(std::max(maximum.load(std::memory_order_relaxed), elapsed), std::memory_order_relaxed);
+}
 
 void RecordBridgeFailure(
     RenderBridgeDiagnostics& diagnostics,
@@ -470,6 +488,7 @@ struct RenderBridge {
     EGLContext context = EGL_NO_CONTEXT;
     EGLSurface surface = EGL_NO_SURFACE;
     GLuint program = 0;
+    GLint sourceTextureLocation = -1;
     GLuint vertexArray = 0;
     std::atomic<std::int64_t> presentationTimeNanos{0};
 };
@@ -568,6 +587,21 @@ bool InitializeRenderBridge(RenderBridge& bridge) {
             BridgeFailureStage::MakeEncoderSurfaceCurrent, false, eglGetError());
     }
 
+    // This is a MediaCodec input window, not the headset display. Capture PTS
+    // already controls its cadence; an extra display-vsync wait here can hold
+    // Unity's render thread. EGL applies this to the current draw surface only.
+    // Drivers may clamp zero to their config minimum, so expose both the
+    // minimum and failure status instead of promising a nonblocking swap.
+    EGLint minimumSwapInterval = -1;
+    if (eglGetConfigAttrib(bridge.display, selected, EGL_MIN_SWAP_INTERVAL, &minimumSwapInterval)) {
+        diagnostics.minimumSwapInterval.store(minimumSwapInterval, std::memory_order_relaxed);
+    } else {
+        diagnostics.swapIntervalError.store(eglGetError(), std::memory_order_relaxed);
+    }
+    if (!eglSwapInterval(bridge.display, 0)) {
+        diagnostics.swapIntervalError.store(eglGetError(), std::memory_order_relaxed);
+    }
+
     static constexpr char vertexSource[] = R"(#version 300 es
 out vec2 uv;
 void main() {
@@ -620,6 +654,7 @@ void main() {
     if (vertex) glDeleteShader(vertex);
     if (fragment) glDeleteShader(fragment);
     if (linked == GL_TRUE) glGenVertexArrays(1, &bridge.vertexArray);
+    if (linked == GL_TRUE) bridge.sourceTextureLocation = glGetUniformLocation(bridge.program, "sourceTexture");
     const auto initialized = linked == GL_TRUE && bridge.vertexArray != 0;
     if (!initialized) {
         if (bridge.vertexArray) glDeleteVertexArrays(1, &bridge.vertexArray);
@@ -656,6 +691,9 @@ void RenderToEncoder(int slot) {
     if (diagnostics.terminalFailure.load(std::memory_order_acquire)) return;
     if (bridge->surface == EGL_NO_SURFACE && !InitializeRenderBridge(*bridge)) return;
 
+    const auto bridgeStarted = std::chrono::steady_clock::now();
+    diagnostics.timedRenderEvents.fetch_add(1, std::memory_order_relaxed);
+
     const auto oldDisplay = eglGetCurrentDisplay();
     const auto oldContext = eglGetCurrentContext();
     const auto oldDraw = eglGetCurrentSurface(EGL_DRAW);
@@ -665,12 +703,16 @@ void RenderToEncoder(int slot) {
     GLint oldActiveTexture = 0;
     GLint oldTexture = 0;
     GLint oldViewport[4]{};
+    GLint oldDrawFramebuffer = 0;
+    GLint oldReadFramebuffer = 0;
     glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &oldVao);
     glGetIntegerv(GL_ACTIVE_TEXTURE, &oldActiveTexture);
     glActiveTexture(GL_TEXTURE0);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &oldTexture);
     glGetIntegerv(GL_VIEWPORT, oldViewport);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDrawFramebuffer);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldReadFramebuffer);
     const auto blend = glIsEnabled(GL_BLEND);
     const auto depth = glIsEnabled(GL_DEPTH_TEST);
     const auto cull = glIsEnabled(GL_CULL_FACE);
@@ -692,7 +734,7 @@ void RenderToEncoder(int slot) {
         glBindTexture(
             GL_TEXTURE_2D,
             overrideTexture != 0 ? overrideTexture : bridge->sourceTexture);
-        glUniform1i(glGetUniformLocation(bridge->program, "sourceTexture"), 0);
+        glUniform1i(bridge->sourceTextureLocation, 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         const auto drawError = glGetError();
         if (drawError != GL_NO_ERROR) {
@@ -713,7 +755,13 @@ void RenderToEncoder(int slot) {
                 static_cast<EGLnsecsANDROID>(
                     bridge->presentationTimeNanos.load(std::memory_order_acquire)));
         }
-        if (drawError == GL_NO_ERROR && eglSwapBuffers(bridge->display, bridge->surface)) {
+        bool swapped = false;
+        if (drawError == GL_NO_ERROR) {
+            const auto swapStarted = std::chrono::steady_clock::now();
+            swapped = eglSwapBuffers(bridge->display, bridge->surface);
+            RecordRenderDuration(swapStarted, diagnostics.surfaceSwapMicroseconds, diagnostics.maximumSurfaceSwapMicroseconds);
+        }
+        if (swapped) {
             diagnostics.surfaceFramesPresented.fetch_add(1, std::memory_order_relaxed);
             diagnostics.consecutiveFailures.store(0, std::memory_order_release);
             diagnostics.failureStage.store(
@@ -742,8 +790,13 @@ void RenderToEncoder(int slot) {
     if (!restored) {
         RecordBridgeFailure(
             diagnostics, BridgeFailureStage::RestoreUnityContext, true, eglGetError());
+        RecordRenderDuration(bridgeStarted, diagnostics.renderBridgeMicroseconds, diagnostics.maximumRenderBridgeMicroseconds);
         return;
     }
+    // Switching EGL surfaces does not restore GL context state. Leaving FBO 0
+    // bound corrupted the state Unity expected after the native capture event.
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(oldDrawFramebuffer));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(oldReadFramebuffer));
     glUseProgram(static_cast<GLuint>(oldProgram));
     glBindVertexArray(static_cast<GLuint>(oldVao));
     glActiveTexture(GL_TEXTURE0);
@@ -754,6 +807,7 @@ void RenderToEncoder(int slot) {
     if (depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
     if (scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    RecordRenderDuration(bridgeStarted, diagnostics.renderBridgeMicroseconds, diagnostics.maximumRenderBridgeMicroseconds);
 }
 
 void DestroyRenderBridge(int slot) {
@@ -902,6 +956,13 @@ public:
         result.makeCurrentFailures =
             bridgeDiagnostics_->makeCurrentFailures.load(std::memory_order_relaxed);
         result.swapFailures = bridgeDiagnostics_->swapFailures.load(std::memory_order_relaxed);
+        result.timedRenderEvents = bridgeDiagnostics_->timedRenderEvents.load(std::memory_order_relaxed);
+        result.renderBridgeMicroseconds = bridgeDiagnostics_->renderBridgeMicroseconds.load(std::memory_order_relaxed);
+        result.maximumRenderBridgeMicroseconds = bridgeDiagnostics_->maximumRenderBridgeMicroseconds.load(std::memory_order_relaxed);
+        result.surfaceSwapMicroseconds = bridgeDiagnostics_->surfaceSwapMicroseconds.load(std::memory_order_relaxed);
+        result.maximumSurfaceSwapMicroseconds = bridgeDiagnostics_->maximumSurfaceSwapMicroseconds.load(std::memory_order_relaxed);
+        result.minimumSwapInterval = bridgeDiagnostics_->minimumSwapInterval.load(std::memory_order_relaxed);
+        result.swapIntervalError = bridgeDiagnostics_->swapIntervalError.load(std::memory_order_relaxed);
         result.lastEglError = bridgeDiagnostics_->lastEglError.load(std::memory_order_relaxed);
         result.lastGlError = bridgeDiagnostics_->lastGlError.load(std::memory_order_relaxed);
         result.failureStage = bridgeDiagnostics_->failureStage.load(std::memory_order_relaxed);

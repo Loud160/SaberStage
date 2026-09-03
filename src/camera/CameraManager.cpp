@@ -59,6 +59,7 @@
 #include "custom-types/shared/delegate.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <functional>
@@ -183,6 +184,12 @@ public:
             }
 
             const auto deltaSeconds = std::max(0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+            if (externalOutputActive_) {
+                ++renderDiagnostics_.unityFrames;
+                renderDiagnostics_.unityFrameSeconds += deltaSeconds;
+                renderDiagnostics_.maximumUnityFrameSeconds = std::max(
+                    renderDiagnostics_.maximumUnityFrameSeconds, static_cast<double>(deltaSeconds));
+            }
             sessionTimeSeconds_ += deltaSeconds;
             const auto headPose = CurrentHeadPose();
             ObserveTrackingPose(headPose, deltaSeconds);
@@ -226,6 +233,8 @@ public:
         if (!IsUnityObjectAlive(spectatorCamera_) || externalOutputActive_) return nullptr;
         ReleaseRenderTarget();
         externalOutputActive_ = true;
+        renderDiagnostics_ = {};
+        renderTimingActive_ = false;
         externalOutputTexture_ = nullptr;
         scheduler_.Reset();
         Logging::Logger.info("Primary camera render output reserved for recording encoder");
@@ -281,11 +290,19 @@ public:
     }
 
     void PrepareForSpectatorRender() noexcept {
-        if (!beforeRenderHandler_) return;
+        renderTimingActive_ = externalOutputActive_;
+        if (renderTimingActive_) renderStarted_ = std::chrono::steady_clock::now();
         try {
-            beforeRenderHandler_();
+            if (beforeRenderHandler_) beforeRenderHandler_();
         } catch (...) {
             Logging::Logger.error("Spectator pre-render handler failed safely");
+        }
+        if (renderTimingActive_) {
+            const auto elapsed = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - renderStarted_).count();
+            renderDiagnostics_.prepareMicroseconds += elapsed;
+            renderDiagnostics_.maximumPrepareMicroseconds = std::max(
+                renderDiagnostics_.maximumPrepareMicroseconds, elapsed);
         }
     }
 
@@ -302,7 +319,18 @@ public:
         } catch (...) {
             Logging::Logger.error("Spectator post-render resolve/timing handler failed safely");
         }
+        if (renderTimingActive_) {
+            renderTimingActive_ = false;
+            const auto elapsed = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - renderStarted_).count();
+            ++renderDiagnostics_.renderedFrames;
+            renderDiagnostics_.renderCallbackMicroseconds += elapsed;
+            renderDiagnostics_.maximumRenderCallbackMicroseconds = std::max(
+                renderDiagnostics_.maximumRenderCallbackMicroseconds, elapsed);
+        }
     }
+
+    [[nodiscard]] CameraRenderDiagnostics RenderDiagnostics() const noexcept { return renderDiagnostics_; }
 
     void SetPreviewCaptureExcluded(bool excluded) noexcept {
         if (!captureExclusionHandler_) return;
@@ -876,6 +904,9 @@ private:
     settings::SettingsService& settings_;
     std::filesystem::path scriptDirectory_;
     bool started_ = false;
+    CameraRenderDiagnostics renderDiagnostics_{};
+    std::chrono::steady_clock::time_point renderStarted_{};
+    bool renderTimingActive_ = false;
     bool sceneChangePending_ = false;
     bool trackingOriginChangePending_ = false;
     bool forwardAnchorValid_ = false;
@@ -935,6 +966,7 @@ void CameraManager::SetExternalOutputTexture(UnityEngine::RenderTexture* texture
     impl_->SetExternalOutputTexture(texture);
 }
 void CameraManager::EndExternalRenderOutput() noexcept { impl_->EndExternalRenderOutput(); }
+CameraRenderDiagnostics CameraManager::RenderDiagnostics() const noexcept { return impl_->RenderDiagnostics(); }
 void CameraManager::SetRuntimeCameraInvalidatedHandler(RuntimeCameraInvalidatedHandler handler) {
     impl_->SetRuntimeCameraInvalidatedHandler(std::move(handler));
 }

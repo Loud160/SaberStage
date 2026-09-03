@@ -73,6 +73,11 @@ struct TrackingSample {
     std::int32_t renderFrame = -1;
 };
 
+// A spectator pre-cull may observe exactly the sample already solved in
+// LateUpdate. Reuse it only within the same Unity frame; genuine late pose or
+// grip changes still require a new solve with no added tracking latency.
+bool SameTrackingTargets(const TrackingSample& left, const TrackingSample& right) noexcept;
+
 struct BoneRestPose {
     Pose local{};
     Pose world{};

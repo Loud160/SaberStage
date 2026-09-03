@@ -48,6 +48,14 @@ struct DirectCaptureDiagnostics {
     std::uint64_t droppedFrames = 0;
     std::uint64_t makeCurrentFailures = 0;
     std::uint64_t swapFailures = 0;
+    // Render-thread CPU wall time (including driver waits), not GPU timers.
+    std::uint64_t timedRenderEvents = 0;
+    std::uint64_t renderBridgeMicroseconds = 0;
+    std::uint64_t maximumRenderBridgeMicroseconds = 0;
+    std::uint64_t surfaceSwapMicroseconds = 0;
+    std::uint64_t maximumSurfaceSwapMicroseconds = 0;
+    std::int32_t minimumSwapInterval = -1;
+    std::int32_t swapIntervalError = 0;
     std::int32_t lastEglError = 0;
     std::int32_t lastGlError = 0;
     std::int32_t failureStage = 0;

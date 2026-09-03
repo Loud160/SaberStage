@@ -34,6 +34,8 @@
 #include "UnityEngine/HumanBodyBones.hpp"
 #include "UnityEngine/Object.hpp"
 #include "UnityEngine/Resources.hpp"
+#include "UnityEngine/SceneManagement/Scene.hpp"
+#include "UnityEngine/SceneManagement/SceneManager.hpp"
 #include "UnityEngine/Time.hpp"
 #include "UnityEngine/Transform.hpp"
 #include "UnityEngine/Vector3.hpp"
@@ -790,6 +792,23 @@ public:
         if (!bound_) return;
         try {
             const auto frame = UnityEngine::Time::get_frameCount();
+            auto scene = UnityEngine::SceneManagement::SceneManager::GetActiveScene();
+            const auto sceneHandle = scene.get_handle();
+            if (!trackingSceneHandle_ || *trackingSceneHandle_ != sceneHandle) {
+                trackingSceneHandle_ = sceneHandle;
+                gameplayTrackingExpected_ = scene.get_name() == "GameCore";
+                // DontDestroyOnLoad/inactive menu objects can survive a map
+                // load. Never combine their cached head/root with new sabers.
+                tracking_ = nullptr;
+                headTransform_ = nullptr;
+                directXrNodeTracking_ = false;
+                trackingWasReady_ = false;
+                trackingHandoffPending_ = true;
+                resetOnTrackingRestore_ = true;
+                nextTrackingDiscoveryFrame_ = 0;
+                nextSaberDiscoveryFrame_ = 0;
+                Logging::Logger.info("Avatar tracking scene handoff: '{}' (handle={})", scene.get_name(), sceneHandle);
+            }
             if (!TrackingSourcesReady()) {
                 if (trackingWasReady_) {
                     trackingWasReady_ = false;
@@ -798,9 +817,21 @@ public:
                 if (frame < nextTrackingDiscoveryFrame_) return;
                 nextTrackingDiscoveryFrame_ = frame + 60;
                 if (!FindTrackingTransforms()) return;
+            } else if (gameplayTrackingExpected_ && !IsAlive(tracking_) &&
+                    frame >= nextTrackingDiscoveryFrame_) {
+                // GameCore can become active before PlayerTransforms exists.
+                // A usable temporary XR fallback must not prevent promotion
+                // to the game's authoritative rig once it finishes loading.
+                nextTrackingDiscoveryFrame_ = frame + 60;
+                if (!FindTrackingTransforms()) {
+                    trackingWasReady_ = false;
+                    return;
+                }
             }
             const auto timestamp = static_cast<double>(UnityEngine::Time::get_unscaledTime());
-            const auto previous = sample_;
+            // A coordinate-frame jump is not physical velocity. Do not feed
+            // that artificial impulse into crouch/lean/stepping inference.
+            const auto previous = trackingHandoffPending_ ? TrackingSample{} : sample_;
             sample_.head = SamplePose(headTransform_, previous.head, timestamp);
             if (directXrNodeTracking_) {
                 sample_.controllerHand[0] = SampleXrNodePose(
@@ -872,11 +903,38 @@ public:
             const auto trackingJump = previous.head.valid && player_.valid &&
                 Length(sample_.head.pose.position - previous.head.pose.position) >
                     std::max(player_.standingHmdHeight * 0.45F, 0.55F);
-            if (!player_.valid || originChanged) {
-                if (originChanged) {
-                    Logging::Logger.info("Avatar tracking origin changed; recalibrating and reseeding body state");
+            if (trackingWasReady_ && !trackingHandoffPending_ && !resetOnTrackingRestore_ &&
+                    !originChanged && SameTrackingTargets(sample_, previous)) {
+                // Keep the original velocity and sequence as well as pose.
+                // Resampling at the same timestamp otherwise zeros velocity
+                // and needlessly repeats every IK/finger transform write.
+                sample_ = previous;
+                return;
+            }
+            if (originChanged) {
+                for (auto* pose : {&sample_.head, &sample_.leftHand, &sample_.rightHand,
+                        &sample_.controllerHand[0], &sample_.controllerHand[1],
+                        &sample_.saberGrip[0], &sample_.saberGrip[1]}) {
+                    pose->linearVelocity = {};
+                    pose->angularVelocity = {};
                 }
+            }
+            if (!player_.valid) {
                 RecalibrateNeutral();
+            } else if ((trackingHandoffPending_ || originChanged) && IsAlive(originTransform_)) {
+                if (!RebasePlayerCalibration(player_, currentOrigin)) {
+                    trackingWasReady_ = false;
+                    return;
+                }
+                solver_.Reset(persistent_);
+                resetOnTrackingRestore_ = false;
+                Logging::Logger.info(
+                    "Avatar tracking rebased: source={} head=({:.3f},{:.3f},{:.3f}) "
+                    "origin=({:.3f},{:.3f},{:.3f}) standingHmd={:.3f} floor={:.3f}; measurements preserved",
+                    IsAlive(tracking_) ? "PlayerTransforms" : directXrNodeTracking_ ? "direct XR" : "VRController",
+                    sample_.head.pose.position.x, sample_.head.pose.position.y, sample_.head.pose.position.z,
+                    currentOrigin.position.x, currentOrigin.position.y, currentOrigin.position.z,
+                    player_.standingHmdHeight, player_.floorHeight);
             } else if (resetOnTrackingRestore_ || trackingJump) {
                 solver_.Reset(persistent_);
                 resetOnTrackingRestore_ = false;
@@ -886,6 +944,7 @@ public:
                     Logging::Logger.info("Avatar tracking restored; solver state reseeded");
                 }
             }
+            trackingHandoffPending_ = false;
             trackingWasReady_ = true;
             calibrationSession_.Update(sample_);
             if (calibrationSession_.Status().revision != calibrationStatusRevision_) {
@@ -913,7 +972,7 @@ public:
     }
 
     void SolveAndWrite() noexcept {
-        if (!bound_ || !player_.valid) return;
+        if (!bound_ || !player_.valid || !trackingWasReady_) return;
         try {
             SolverDiagnostics current{};
             const auto solveStart = std::chrono::steady_clock::now();
@@ -2163,25 +2222,36 @@ private:
         }
     }
 
-    bool TrackingSourcesReady() const noexcept {
-        if (!IsAlive(headTransform_)) return false;
-        if (directXrNodeTracking_) return IsAlive(directXrTrackingRoot_);
-        const auto transformHands = IsAlive(handTransforms_[0]) && IsAlive(handTransforms_[1]);
+    bool TrackingSourcesReady() const {
+        if (!IsAlive(headTransform_) || !headTransform_->get_gameObject()->get_activeInHierarchy()) return false;
+        auto mainCamera = UnityEngine::Camera::get_main();
+        if (!IsAlive(mainCamera) || !mainCamera->get_isActiveAndEnabled()) return false;
+        if (IsAlive(tracking_)) {
+            // The authoritative origin may be a separate reference object,
+            // not the HMD's ancestor. Match the actual head/camera hierarchy
+            // instead of imposing an unverified parent relationship on it.
+            auto* currentHead = mainCamera->get_transform().ptr();
+            const auto currentRig = currentHead == headTransform_ ||
+                currentHead->IsChildOf(headTransform_) || headTransform_->IsChildOf(currentHead);
+            return tracking_->get_isActiveAndEnabled() && IsAlive(originTransform_) &&
+                currentRig &&
+                IsAlive(handTransforms_[0]) && IsAlive(handTransforms_[1]) &&
+                handTransforms_[0]->get_gameObject()->get_activeInHierarchy() &&
+                handTransforms_[1]->get_gameObject()->get_activeInHierarchy();
+        }
+        if (mainCamera->get_transform().ptr() != headTransform_) return false;
+        if (directXrNodeTracking_) {
+            return IsAlive(directXrTrackingRoot_) &&
+                directXrTrackingRoot_->get_gameObject()->get_activeInHierarchy() &&
+                headTransform_->IsChildOf(directXrTrackingRoot_);
+        }
         const auto controllerHands = IsAlive(handControllers_[0]) && IsAlive(handControllers_[1]);
 
         // Unity can keep the previous scene's objects alive briefly (and some
         // Beat Saber tracking objects persist while inactive). Object lifetime
         // alone therefore cannot tell us whether cached poses are still being
         // updated after a menu/gameplay transition.
-        if (IsAlive(tracking_)) {
-            return tracking_->get_isActiveAndEnabled() && transformHands;
-        }
-
         if (!controllerHands) return false;
-        auto mainCamera = UnityEngine::Camera::get_main();
-        if (!mainCamera) return false;
-        auto currentHead = mainCamera->get_transform();
-        if (!currentHead || currentHead.ptr() != headTransform_) return false;
         for (auto* controller : handControllers_) {
             if (!IsAlive(controller) || !controller->get_isActiveAndEnabled() ||
                 !controller->get_active() || !controller->get_poseValid()) {
@@ -2192,6 +2262,17 @@ private:
     }
 
     bool FindTrackingTransforms() {
+        const auto* previousTracking = tracking_;
+        const auto* previousHead = headTransform_;
+        const auto* previousOrigin = originTransform_;
+        const auto previousDirect = directXrNodeTracking_;
+        const auto acquired = [&] {
+            const auto changed = previousTracking != tracking_ || previousHead != headTransform_ ||
+                previousOrigin != originTransform_ || previousDirect != directXrNodeTracking_;
+            trackingHandoffPending_ = trackingHandoffPending_ || changed;
+            trackingFailureLogged_ = false;
+            return changed;
+        };
         tracking_ = nullptr;
         headTransform_ = nullptr;
         handTransforms_[0] = nullptr;
@@ -2216,15 +2297,14 @@ private:
             auto* head = headReference ? headReference.ptr() : nullptr;
             auto* left = leftReference ? leftReference.ptr() : nullptr;
             auto* right = rightReference ? rightReference.ptr() : nullptr;
-            if (!IsAlive(originTransform_) && originReference) originTransform_ = originReference.ptr();
             if (!IsAlive(head) || !IsAlive(left) || !IsAlive(right)) continue;
             tracking_ = candidate;
             headTransform_ = head;
             handTransforms_[0] = left;
             handTransforms_[1] = right;
             originTransform_ = originReference ? originReference.ptr() : nullptr;
-            trackingFailureLogged_ = false;
-            Logging::Logger.info("Avatar tracking acquired from Beat Saber PlayerTransforms");
+            if (!TrackingSourcesReady()) continue;
+            if (acquired()) Logging::Logger.info("Avatar tracking acquired from Beat Saber PlayerTransforms");
             return true;
         }
 
@@ -2233,8 +2313,14 @@ private:
         // HMD camera and its two VRController components there, so use those
         // public runtime objects instead of leaving the avatar frozen until a
         // map begins.
+        tracking_ = nullptr;
+        handTransforms_[0] = nullptr;
+        handTransforms_[1] = nullptr;
         auto mainCamera = UnityEngine::Camera::get_main();
         if (mainCamera) headTransform_ = mainCamera->get_transform().ptr();
+        // The HMD's live rig is the fallback coordinate frame. An inactive
+        // VRController from Resources may belong to an entirely different rig.
+        if (IsAlive(headTransform_)) originTransform_ = headTransform_->get_parent().ptr();
         std::size_t controllerCount = 0;
         std::size_t totalControllerCount = 0;
         for (auto* controller : UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::VRController*>()) {
@@ -2255,8 +2341,7 @@ private:
             }
         }
         if (TrackingSourcesReady()) {
-            trackingFailureLogged_ = false;
-            Logging::Logger.info("Avatar tracking acquired from main HMD camera and Beat Saber VR controllers");
+            if (acquired()) Logging::Logger.info("Avatar tracking acquired from main HMD camera and Beat Saber VR controllers");
             return true;
         }
 
@@ -2268,11 +2353,11 @@ private:
         // saber-space tracking and origin transitions.
         UnityEngine::Transform* xrRoot = nullptr;
         for (auto* controller : handControllers_) {
-            if (!IsAlive(controller)) continue;
+            if (!IsAlive(controller) || !controller->get_isActiveAndEnabled()) continue;
             auto* transform = controller->get_transform().ptr();
             if (!IsAlive(transform)) continue;
             auto parent = transform->get_parent();
-            if (parent) {
+            if (parent && IsAlive(headTransform_) && headTransform_->IsChildOf(parent.ptr())) {
                 xrRoot = parent.ptr();
                 break;
             }
@@ -2291,8 +2376,9 @@ private:
             if ((leftFlags.value__ & 0x3) == 0x3 && (rightFlags.value__ & 0x3) == 0x3) {
                 directXrTrackingRoot_ = xrRoot;
                 directXrNodeTracking_ = true;
-                trackingFailureLogged_ = false;
-                Logging::Logger.info(
+                originTransform_ = xrRoot;
+                if (!TrackingSourcesReady()) return false;
+                if (acquired()) Logging::Logger.info(
                     "Avatar tracking acquired from main HMD camera and direct Unity XR hand poses "
                     "(active VRControllers={}/{})",
                     controllerCount,
@@ -2502,6 +2588,9 @@ private:
     bool lastTrackingOriginValid_ = false;
     bool trackingWasReady_ = false;
     bool resetOnTrackingRestore_ = false;
+    std::optional<int> trackingSceneHandle_;
+    bool gameplayTrackingExpected_ = false;
+    bool trackingHandoffPending_ = false;
 };
 
 AvatarManager::AvatarManager(

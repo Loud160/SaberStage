@@ -6177,7 +6177,10 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         // the underlying diagnostics intact for support logs, but establish
         // the panel baseline after that second so transient startup pressure is
         // not presented to the user as sustained recording frame loss.
-        const auto dropped = snapshot.droppedFrameCount;
+        // The local panel reports capture loss only. Network queue loss is an
+        // additional delivery stage, relevant only to the active live view.
+        const auto dropped = snapshot.droppedFrameCount +
+            (streamMode && broadcast::CanStop(livestream.state) ? livestream.videoPacketsDropped : 0);
         const bool outputActive = recording::HasRecordingTimeline(snapshot.state) ||
             broadcast::CanStop(livestream.state);
         if (!outputActive || selectedElapsed <= 0.0) {

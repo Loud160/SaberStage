@@ -907,11 +907,37 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("UnityEngine::Camera::get_main()", manager)
         self.assertIn("SampleControllerPose", manager)
         self.assertIn("tracking_->get_isActiveAndEnabled()", manager)
-        self.assertIn("currentHead.ptr() != headTransform_", manager)
+        self.assertIn("mainCamera->get_transform().ptr() != headTransform_", manager)
+        self.assertIn("trackingSceneHandle_", manager)
+        self.assertIn("headTransform_->IsChildOf(directXrTrackingRoot_)", manager)
+        self.assertIn("RebasePlayerCalibration(player_, currentOrigin)", manager)
+        self.assertIn("!player_.valid || !trackingWasReady_", manager)
         self.assertIn("!controller->get_poseValid()", manager)
         self.assertIn("transformReference ? transformReference.ptr() : nullptr", manager)
         self.assertIn("set_mainTextureOffset({transform->second.x, transform->second.y})", runtime)
         self.assertIn("set_mainTextureScale({transform->second.z, transform->second.w})", runtime)
+
+    def test_capture_losses_remain_session_scoped_and_stage_specific(self):
+        controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
+        snapshot = controller.split("RecordingSnapshot RecordingController::Snapshot() const", 1)[1].split(
+            "bool RecordingController::SetStreamKey", 1)[0]
+        self.assertNotIn("live.videoPacketsDropped", snapshot)
+        self.assertIn("completedDirectSkippedFrames_ = 0", controller)
+        self.assertIn("completedDirectEncoderDrops_ = 0", controller)
+        self.assertIn("completedDirectSkippedFrames_ += diagnostics.skippedTimelineFrames", controller)
+        self.assertIn("completedDirectEncoderDrops_ += diagnostics.droppedFrames", controller)
+        self.assertIn("snapshot.skippedCaptureFrameCount + snapshot.encoderDroppedFrameCount", snapshot)
+        self.assertIn("skippedDeadlines={} encoderDrops={} networkDrops={}", controller)
+        self.assertIn("std::chrono::seconds(5)", controller)
+
+    def test_direct_capture_restores_framebuffer_state_and_measures_driver_waits(self):
+        direct = (ROOT / "src/recording/DirectFfmpegCapture.cpp").read_text(encoding="utf-8")
+        for target, variable in (("DRAW", "oldDrawFramebuffer"), ("READ", "oldReadFramebuffer")):
+            self.assertIn(f"glGetIntegerv(GL_{target}_FRAMEBUFFER_BINDING, &{variable})", direct)
+            self.assertIn(f"glBindFramebuffer(GL_{target}_FRAMEBUFFER, static_cast<GLuint>({variable}))", direct)
+        self.assertIn("eglSwapInterval(bridge.display, 0)", direct)
+        self.assertIn("diagnostics.maximumSurfaceSwapMicroseconds", direct)
+        self.assertIn("diagnostics.maximumRenderBridgeMicroseconds", direct)
 
     def test_recording_retrieval_is_nondestructive_and_timestamped(self):
         tooling = (ROOT / "scripts/quest_tool.py").read_text(encoding="utf-8")

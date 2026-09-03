@@ -84,10 +84,10 @@ struct RecordingSnapshot {
     // callbacks). UI consumers difference it over wall time to display the
     // achieved capture frame rate; it is never reset mid-recording.
     std::uint64_t encodedFrameCount = 0;
-    // Presentation deadlines or bounded encoder/network queue packets that
-    // could not be delivered. This is monotonic for the current session and
-    // powers both the five-second rolling and total counters in the movable
-    // controls.
+    // Capture losses only. Network losses belong to LivestreamSnapshot and
+    // must not carry from an earlier/failed stream into a local recording.
+    std::uint64_t skippedCaptureFrameCount = 0;
+    std::uint64_t encoderDroppedFrameCount = 0;
     std::uint64_t droppedFrameCount = 0;
     // Session-level local-recording choice. It is available before capture
     // starts and remains adjustable while the WAV writer is active.
@@ -181,6 +181,7 @@ private:
         bool writeLocalOutput = true);
     void StartVideoSegment();
     void StopVideoSegment(bool recordCaptureFailure = true) noexcept;
+    void LogCapturePerformance(std::string_view reason) const noexcept;
     bool HandleDirectCaptureHealth() noexcept;
     void CreatePersistentAudioCapture();
     void SubmitLivestreamAudioLocked(
@@ -263,6 +264,11 @@ private:
     // continuously captured audio.
     std::int64_t hollywoodLastPresentationFrame_ = -1;
     std::uint64_t hollywoodSkippedPresentationFrames_ = 0;
+    // Direct capture components are replaced on pause/resume. Keep finished
+    // segment losses here so session totals do not jump backwards to zero.
+    std::uint64_t completedDirectSkippedFrames_ = 0;
+    std::uint64_t completedDirectEncoderDrops_ = 0;
+    std::chrono::steady_clock::time_point nextCaptureDiagnostic_{};
     mutable std::mutex statusMutex_;
     std::string status_ = "Ready to record Primary camera.";
     StatusChangedHandler statusChangedHandler_;

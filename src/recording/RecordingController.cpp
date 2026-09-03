@@ -286,6 +286,9 @@ bool RecordingController::StartCapture(
     directFallbackAttempted_ = false;
     firstVideoFrameMonotonicNanos_ = 0;
     firstAudioSampleMonotonicNanos_ = 0;
+    completedDirectSkippedFrames_ = 0;
+    completedDirectEncoderDrops_ = 0;
+    nextCaptureDiagnostic_ = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     {
         std::lock_guard lock(videoTimingMutex_);
         videoPresentationFrames_.clear();
@@ -549,6 +552,9 @@ void RecordingController::StartVideoSegment() {
 }
 
 void RecordingController::StopVideoSegment(bool recordCaptureFailure) noexcept {
+    if (IsUnityObjectAlive(videoCapture_) || IsUnityObjectAlive(directVideoCapture_)) {
+        LogCapturePerformance("segment stop");
+    }
     camera_.SetExternalOutputTexture(nullptr);
     try {
         if (IsUnityObjectAlive(videoCapture_)) {
@@ -576,6 +582,8 @@ void RecordingController::StopVideoSegment(bool recordCaptureFailure) noexcept {
             }
             directVideoCapture_->Stop();
             diagnostics = directVideoCapture_->Diagnostics();
+            completedDirectSkippedFrames_ += diagnostics.skippedTimelineFrames;
+            completedDirectEncoderDrops_ += diagnostics.droppedFrames;
             {
                 std::lock_guard lock(videoTimingMutex_);
                 if (videoSegmentLastPresentationFrame_ >= 0) {
@@ -789,6 +797,11 @@ void RecordingController::Tick() noexcept {
     const auto current = state_.load();
     if (current == RecordingState::Recording) {
         if (HandleDirectCaptureHealth()) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= nextCaptureDiagnostic_) {
+            nextCaptureDiagnostic_ = now + std::chrono::seconds(5);
+            LogCapturePerformance("periodic");
+        }
         UpdateAudioCapturePose();
         if (++audioListenerRefreshFrame_ >= 90) {
             audioListenerRefreshFrame_ = 0;
@@ -814,6 +827,37 @@ void RecordingController::Tick() noexcept {
         statusChangedHandler_();
     } catch (...) {
         Logging::Logger.error("Recording status UI callback failed");
+    }
+}
+
+void RecordingController::LogCapturePerformance(std::string_view reason) const noexcept {
+    try {
+        const auto snapshot = Snapshot();
+        const auto live = LivestreamSnapshot();
+        const auto camera = camera_.RenderDiagnostics();
+        const auto frameDivisor = static_cast<double>(std::max<std::uint64_t>(camera.renderedFrames, 1));
+        const auto direct = IsUnityObjectAlive(directVideoCapture_)
+            ? directVideoCapture_->Diagnostics() : DirectCaptureDiagnostics{};
+        const auto bridgeDivisor = static_cast<double>(std::max<std::uint64_t>(direct.timedRenderEvents, 1));
+        Logging::Logger.info(
+            "Capture performance ({}): backend={} target={}fps unityAvg={:.1f}fps unityMaxFrame={:.2f}ms "
+            "cameraFrames={} skippedDeadlines={} encoderDrops={} networkDrops={} "
+            "prepareAvg/Max={:.2f}/{:.2f}ms renderCallbackAvg/Max={:.2f}/{:.2f}ms "
+            "bridgeAvg/Max={:.2f}/{:.2f}ms swapAvg/Max={:.2f}/{:.2f}ms "
+            "swapIntervalMin={} swapIntervalError=0x{:x}; CPU wall times, not GPU timings",
+            reason, activeBackend_ == settings::RecordingBackend::Hollywood ? "Hollywood" : "Direct FFmpeg",
+            activeFramesPerSecond_,
+            camera.unityFrameSeconds > 0.0 ? camera.unityFrames / camera.unityFrameSeconds : 0.0,
+            camera.maximumUnityFrameSeconds * 1000.0, camera.renderedFrames,
+            snapshot.skippedCaptureFrameCount, snapshot.encoderDroppedFrameCount,
+            broadcast::CanStop(live.state) ? live.videoPacketsDropped : 0,
+            camera.prepareMicroseconds / frameDivisor / 1000.0, camera.maximumPrepareMicroseconds / 1000.0,
+            camera.renderCallbackMicroseconds / frameDivisor / 1000.0, camera.maximumRenderCallbackMicroseconds / 1000.0,
+            direct.renderBridgeMicroseconds / bridgeDivisor / 1000.0, direct.maximumRenderBridgeMicroseconds / 1000.0,
+            direct.surfaceSwapMicroseconds / bridgeDivisor / 1000.0, direct.maximumSurfaceSwapMicroseconds / 1000.0,
+            direct.minimumSwapInterval, direct.swapIntervalError);
+    } catch (...) {
+        Logging::Logger.warn("Capture performance snapshot unavailable ({})", reason);
     }
 }
 
@@ -880,13 +924,15 @@ RecordingSnapshot RecordingController::Snapshot() const {
     snapshot.encodedFrameCount = encodedFrameCount_.load(std::memory_order_relaxed);
     snapshot.gameAudioMuted = localRecordingGameAudioMuted_.load(
         std::memory_order_acquire);
-    snapshot.droppedFrameCount = hollywoodSkippedPresentationFrames_;
+    snapshot.skippedCaptureFrameCount = hollywoodSkippedPresentationFrames_ + completedDirectSkippedFrames_;
+    snapshot.encoderDroppedFrameCount = completedDirectEncoderDrops_;
     if (IsUnityObjectAlive(directVideoCapture_)) {
         const auto diagnostics = directVideoCapture_->Diagnostics();
-        snapshot.droppedFrameCount += diagnostics.skippedTimelineFrames + diagnostics.droppedFrames;
+        snapshot.skippedCaptureFrameCount += diagnostics.skippedTimelineFrames;
+        snapshot.encoderDroppedFrameCount += diagnostics.droppedFrames;
     }
+    snapshot.droppedFrameCount = snapshot.skippedCaptureFrameCount + snapshot.encoderDroppedFrameCount;
     const auto live = LivestreamSnapshot();
-    snapshot.droppedFrameCount += live.videoPacketsDropped;
     if (streamOnlySession_) {
         snapshot.outputType = RecordingOutputType::LiveStream;
     } else if (broadcast::CanStop(live.state)) {

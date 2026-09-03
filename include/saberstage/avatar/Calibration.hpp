@@ -32,4 +32,9 @@ PlayerCalibration MeasureNeutralPlayer(
     Pose leftControllerToWrist = {},
     Pose rightControllerToWrist = {}) noexcept;
 
+// Changes world coordinates, not the player's measured size. Scene handoffs
+// can occur while crouching; measuring a new neutral pose there would turn the
+// crouched height into the standing calibration for the rest of the map.
+bool RebasePlayerCalibration(PlayerCalibration& player, Pose trackingOrigin) noexcept;
+
 } // namespace saberstage::avatar

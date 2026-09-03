@@ -197,4 +197,23 @@ PlayerCalibration MeasureNeutralPlayer(
     return calibration;
 }
 
+bool RebasePlayerCalibration(PlayerCalibration& player, Pose trackingOrigin) noexcept {
+    if (!player.valid || !IsFinite(trackingOrigin.position) ||
+        !IsFinite(trackingOrigin.rotation) || !IsFinite(player.trackingOrigin.position) ||
+        !IsFinite(player.trackingOrigin.rotation)) return false;
+
+    const auto previousOrigin = player.trackingOrigin;
+    player.neutralHead = Compose(trackingOrigin, RelativeTo(previousOrigin, player.neutralHead));
+    for (auto& hand : player.neutralHand) {
+        hand = Compose(trackingOrigin, RelativeTo(previousOrigin, hand));
+    }
+    const auto rotationDelta = Multiply(trackingOrigin.rotation, Inverse(previousOrigin.rotation));
+    auto forward = Rotate(rotationDelta, player.neutralForward);
+    forward.y = 0.0F;
+    player.neutralForward = Normalize(forward, {0.0F, 0.0F, 1.0F});
+    player.floorHeight += trackingOrigin.position.y - previousOrigin.position.y;
+    player.trackingOrigin = trackingOrigin;
+    return true;
+}
+
 } // namespace saberstage::avatar

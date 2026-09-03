@@ -161,6 +161,105 @@ PlayerCalibration BuildPlayer(const TrackingSample& tracking) {
     return player;
 }
 
+void TestTrackingOriginRebase() {
+    const auto neutral = BuildTracking();
+    auto player = BuildPlayer(neutral);
+    const auto original = player;
+    player.controllerToWrist[0].position = {0.02F, -0.03F, 0.06F};
+    const auto grip = player.controllerToWrist[0];
+    const Pose gameOrigin{{2.0F, 0.12F, -3.0F}, AxisAngle({0.0F, 1.0F, 0.0F}, 1.57079633F)};
+    Check(RebasePlayerCalibration(player, gameOrigin), "menu-to-game origin rebases");
+    Check(Near(player.standingHmdHeight, original.standingHmdHeight), "handoff preserves standing height");
+    Check(Length(player.controllerToWrist[0].position - grip.position) < 0.0001F,
+          "handoff preserves controller-local grip offset");
+    Check(Near(player.floorHeight, original.floorHeight + gameOrigin.position.y), "floor follows origin elevation");
+    Check(Length(player.neutralHead.position - Compose(gameOrigin, original.neutralHead).position) < 0.0001F,
+          "neutral head is expressed in the active rig's world frame");
+    Check(Length(player.neutralForward - Rotate(gameOrigin.rotation, original.neutralForward)) < 0.0001F,
+          "neutral forward follows rig yaw");
+
+    // Scene changes are allowed while ducking. Only live input moves down;
+    // the neutral head and body dimensions must remain the standing ones.
+    auto crouched = neutral;
+    crouched.head.pose.position.y -= 0.45F;
+    crouched.head.pose = Compose(gameOrigin, crouched.head.pose);
+    crouched.leftHand.pose = Compose(gameOrigin, crouched.leftHand.pose);
+    crouched.rightHand.pose = Compose(gameOrigin, crouched.rightHand.pose);
+    StaticTrackerlessAvatarSolver solver;
+    SolverPersistentState state;
+    SolvedHumanoidPose pose;
+    Check(solver.Solve(crouched, BuildAvatar(), player, state, pose), "crouched scene handoff solves");
+    Check(Near(player.standingHmdHeight, original.standingHmdHeight), "crouch does not become standing calibration");
+    Check(RebasePlayerCalibration(player, original.trackingOrigin), "game-to-menu origin rebases");
+    Check(Length(player.neutralHead.position - original.neutralHead.position) < 0.0001F,
+          "round-trip scene transition has no neutral-pose drift");
+    const auto validHead = player.neutralHead.position;
+    auto invalidOrigin = gameOrigin;
+    invalidOrigin.position.x = std::numeric_limits<float>::quiet_NaN();
+    Check(!RebasePlayerCalibration(player, invalidOrigin), "invalid origin is rejected");
+    Check(Length(player.neutralHead.position - validHead) == 0.0F, "invalid origin leaves calibration untouched");
+}
+
+void TestSameFrameTrackingDeduplication() {
+    const auto sample = BuildTracking();
+    auto late = sample;
+    ++late.sequence;
+    Check(SameTrackingTargets(sample, late), "unchanged pre-render pose can reuse the previous solve");
+    ++late.renderFrame;
+    Check(!SameTrackingTargets(sample, late), "a new Unity frame always advances body inference");
+    late = sample;
+    late.rightHand.pose.position.x += 0.0001F;
+    Check(!SameTrackingTargets(sample, late), "even a small late hand movement is not suppressed");
+    late = sample;
+    late.head.pose.rotation = AxisAngle({0.0F, 1.0F, 0.0F}, 0.001F);
+    Check(!SameTrackingTargets(sample, late), "late head rotation is not suppressed");
+    late = sample;
+    late.controllerHand[0].valid = true;
+    Check(!SameTrackingTargets(sample, late), "controller source acquisition requires a new sample");
+    late = sample;
+    late.handIsSaberGrip[0] = true;
+    Check(!SameTrackingTargets(sample, late), "grip target changes require a new solve");
+}
+
+void TestSpineRotationFollowsSolvedChainAfterTurning() {
+    const auto avatar = BuildAvatar();
+    const auto neutral = BuildTracking();
+    const auto player = BuildPlayer(neutral);
+    // Bone positions alone can look correct while the skin follows a spine
+    // rotation pointed away from its child. Exercise a leaned pose facing all
+    // four directions; front-facing-only tests conceal a doubled yaw.
+    for (const auto yaw : {0.0F, 1.57079633F, -1.57079633F, 3.14159265F}) {
+        StaticTrackerlessAvatarSolver solver;
+        SolverPersistentState state;
+        SolvedHumanoidPose pose;
+        SolverDiagnostics diagnostics;
+        Check(solver.Solve(neutral, avatar, player, state, pose), "spine-turn neutral seeds");
+        const auto rotation = AxisAngle({0.0F, 1.0F, 0.0F}, yaw);
+        state.torsoYawRadians = yaw;
+        state.torsoYawAnchorRadians = yaw;
+        auto tracking = NextFrame(neutral, Rotate(rotation, {0.0F, 1.40F, 0.26F}), yaw);
+        tracking.leftHand.pose.position = Rotate(rotation, neutral.leftHand.pose.position);
+        tracking.rightHand.pose.position = Rotate(rotation, neutral.rightHand.pose.position);
+        Check(solver.Solve(tracking, avatar, player, state, pose, &diagnostics), "turned crouch solves");
+        for (const auto bone : {HumanoidBone::Spine, HumanoidBone::Chest, HumanoidBone::UpperChest}) {
+            const auto child = bone == HumanoidBone::Spine ? HumanoidBone::Chest :
+                bone == HumanoidBone::Chest ? HumanoidBone::UpperChest : HumanoidBone::Neck;
+            const auto& rest = avatar.rest.bones[BoneIndex(bone)];
+            const auto restDirection = avatar.rest.bones[BoneIndex(child)].world.position - rest.world.position;
+            const auto localDirection = Rotate(Inverse(rest.world.rotation), restDirection);
+            const auto& solved = pose.bones[BoneIndex(bone)];
+            const auto rotationDirection = Normalize(Rotate(solved.rotation, localDirection));
+            const auto positionDirection = Normalize(pose.bones[BoneIndex(child)].position - solved.position);
+            if (Dot(rotationDirection, positionDirection) < 0.995F) {
+                std::cerr << "Spine direction mismatch yaw=" << yaw << " bone=" << BoneIndex(bone)
+                          << " dot=" << Dot(rotationDirection, positionDirection) << '\n';
+            }
+            Check(Dot(rotationDirection, positionDirection) > 0.995F,
+                  "spine skin rotation follows solved child after body yaw");
+        }
+    }
+}
+
 void TestCalibration() {
     const auto calibration = BuildAvatar();
     Check(Near(calibration.eyeHeight, 1.66F), "eye height is measured from eye bones to toe floor");
@@ -1595,6 +1694,9 @@ void operator delete(void* pointer, std::size_t) noexcept { std::free(pointer); 
 
 int main() {
     TestCalibration();
+    TestTrackingOriginRebase();
+    TestSameFrameTrackingDeduplication();
+    TestSpineRotationFollowsSolvedChainAfterTurning();
     TestArmSpanScalingAndHeightRetargeting();
     TestExtendedAvatarFitOptions();
     TestTwoBone();

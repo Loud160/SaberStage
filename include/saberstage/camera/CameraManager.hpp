@@ -15,6 +15,7 @@
 #include "saberstage/camera/FrameDemand.hpp"
 #include "saberstage/camera/Math.hpp"
 
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -31,6 +32,19 @@ class SettingsService;
 }
 
 namespace saberstage::camera {
+
+// Main-thread counters between recording start/stop. Wall times include any
+// synchronous driver waits, but do not measure asynchronous GPU execution.
+struct CameraRenderDiagnostics {
+    std::uint64_t renderedFrames = 0;
+    double prepareMicroseconds = 0.0;
+    double maximumPrepareMicroseconds = 0.0;
+    double renderCallbackMicroseconds = 0.0;
+    double maximumRenderCallbackMicroseconds = 0.0;
+    std::uint64_t unityFrames = 0;
+    double unityFrameSeconds = 0.0;
+    double maximumUnityFrameSeconds = 0.0;
+};
 
 class CameraManager final {
 public:
@@ -66,6 +80,7 @@ public:
     // spectator is using MSAA this resolves its multisampled image into the
     // encoder-owned single-sample texture, then notifies recording timing.
     void FinishSpectatorRender() noexcept;
+    [[nodiscard]] CameraRenderDiagnostics RenderDiagnostics() const noexcept;
     void SetPreviewCaptureExcluded(bool excluded) noexcept;
 
     bool RecenterCameraToCurrentForward() noexcept;

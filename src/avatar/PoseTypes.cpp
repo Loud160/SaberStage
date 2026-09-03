@@ -14,6 +14,26 @@
 
 namespace saberstage::avatar {
 
+bool SameTrackingTargets(const TrackingSample& left, const TrackingSample& right) noexcept {
+    const auto same = [](const TrackedPose& a, const TrackedPose& b) {
+        if (a.valid != b.valid) return false;
+        if (!a.valid) return true;
+        return a.timestampSeconds == b.timestampSeconds &&
+            a.pose.position.x == b.pose.position.x && a.pose.position.y == b.pose.position.y &&
+            a.pose.position.z == b.pose.position.z && a.pose.rotation.x == b.pose.rotation.x &&
+            a.pose.rotation.y == b.pose.rotation.y && a.pose.rotation.z == b.pose.rotation.z &&
+            a.pose.rotation.w == b.pose.rotation.w;
+    };
+    if (left.renderFrame != right.renderFrame || !same(left.head, right.head) ||
+        !same(left.leftHand, right.leftHand) || !same(left.rightHand, right.rightHand)) return false;
+    for (int side = 0; side < 2; ++side) {
+        if (left.handIsSaberGrip[side] != right.handIsSaberGrip[side] ||
+            !same(left.controllerHand[side], right.controllerHand[side]) ||
+            !same(left.saberGrip[side], right.saberGrip[side])) return false;
+    }
+    return true;
+}
+
 // Stable lowercase bone names are used in diagnostics and serialized tooling;
 // keep these independent of Unity/VRM display names.
 const char* BoneName(HumanoidBone bone) noexcept {

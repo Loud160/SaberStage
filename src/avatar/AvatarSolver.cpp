@@ -2440,12 +2440,21 @@ bool StaticTrackerlessAvatarSolver::Solve(
         const auto neutral = Solved(neutralPose, chain[index]);
         bone.position = spineResult.positions[index];
         if (index + 1 < spine.jointCount) {
+            // Yaw the reference frame BEFORE aligning its segment to the
+            // solved world-space chain. Applying body yaw after AlignBone
+            // rotates an already aligned tilt a second time: after a half
+            // turn, a forward tilt becomes a backward skin rotation even
+            // though the debug joint positions still form the correct curve.
+            auto yawedNeutral = neutral;
+            yawedNeutral.rotation = Multiply(bodyDeltaRotation, neutral.rotation);
+            auto yawedChild = Solved(neutralPose, chain[index + 1]);
+            yawedChild.position = neutral.position + Rotate(
+                bodyDeltaRotation, yawedChild.position - neutral.position);
             bone.rotation = AlignBone(
-                neutral,
-                Solved(neutralPose, chain[index + 1]),
+                yawedNeutral,
+                yawedChild,
                 spineResult.positions[index],
                 spineResult.positions[index + 1]);
-            bone.rotation = Multiply(bodyDeltaRotation, bone.rotation);
             const auto fraction = totalSpineLength > kEpsilon
                 ? accumulatedSpineLength / totalSpineLength
                 : 0.0F;
