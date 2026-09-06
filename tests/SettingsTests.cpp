@@ -174,6 +174,8 @@ int main() {
     Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(!defaults.camera.Primary().keepLevel,
           "camera level lock defaults off to preserve existing authored/manual roll");
+    Check(!defaults.camera.Primary().gizmoVisible,
+          "persistent HMD camera gizmo defaults off");
     Check(saberstage::ui::copy::LongestLine(saberstage::ui::copy::kScaffoldDescription) <= 32,
           "every scaffold description line fits the narrow menu budget");
     Check(saberstage::ui::copy::LineCount(saberstage::ui::copy::kScaffoldDescription) <= 8,
@@ -343,6 +345,7 @@ int main() {
     first.Edit().camera.Primary().anchoredFloatMaxOffsetMeters = 1.25F;
     first.Edit().camera.Primary().multisampleCount = 2;
     first.Edit().camera.Primary().keepLevel = true;
+    first.Edit().camera.Primary().gizmoVisible = true;
     first.Edit().preview.visible = true;
     first.Edit().preview.position = {0.25F, 1.4F, 2.25F};
     first.Edit().preview.rotationDegrees = {5.0F, 175.0F, 0.0F};
@@ -478,6 +481,8 @@ int main() {
           "third-person camera MSAA survives restart");
     Check(second.Get().camera.Primary().keepLevel,
           "third-person camera level lock survives restart");
+    Check(second.Get().camera.Primary().gizmoVisible,
+          "persistent HMD camera gizmo visibility survives restart");
     Check(second.Get().preview.visible && second.Get().preview.position.x == 0.25F &&
               second.Get().preview.rotationDegrees.y == 175.0F && second.Get().preview.scale == 1.5F,
           "floating preview pose, scale, and visibility survive restart");

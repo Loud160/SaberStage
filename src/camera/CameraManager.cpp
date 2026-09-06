@@ -201,7 +201,8 @@ public:
                 : std::chrono::steady_clock::time_point{};
             // Retry a late-spawned gameplay rig even in static-camera mode.
             // Discovery itself is scene-gated and backs off on a cache miss.
-            if (settings_.Get().camera.Primary().enabled) FindPlayerTransforms();
+            const auto& profile = settings_.Get().camera.Primary();
+            if (profile.enabled || profile.gizmoVisible) FindPlayerTransforms();
             const auto headPose = CurrentHeadPose();
             ObserveTrackingPose(headPose, deltaSeconds);
             if (!forwardAnchorValid_ || trackingOriginChangePending_) {
@@ -793,7 +794,11 @@ private:
 
     void ApplyMotion(Pose headPose, float deltaSeconds) {
         const auto& profile = settings_.Get().camera.Primary();
-        if (!profile.enabled) return;
+        // Camera Visible is an HMD-only placement aid, independent of output
+        // rendering. Continue resolving the camera pose while it is enabled so
+        // the gizmo follows the same anchors and scripts the real camera would
+        // use, even when the camera's render-output switch is off.
+        if (!profile.enabled && !profile.gizmoVisible) return;
         const auto scriptSample = SampleMovementScript();
         auto motion = movement_.Evaluate(profile, {
             ResolveAnchor(headPose),

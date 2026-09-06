@@ -694,6 +694,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertGreaterEqual(source.count("CreateUIButton"), 4)
         self.assertIn('"Field of View"', source)
         self.assertIn('"Output Resolution"', source)
+        self.assertIn('"Camera Visible"', source)
+        self.assertIn("camera.gizmoVisible = value", source)
         self.assertIn('"Show Movable Preview"', source)
         self.assertIn('"Reset Camera"', source)
         self.assertIn("set_childControlHeight(true)", source)
@@ -912,6 +914,11 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("RecordingOutputTypeName(snapshot.outputType)", menu)
         self.assertIn("RecordingElapsed(elapsed)", menu)
         self.assertIn('"Current Frame Loss: 0   Total Frames Lost: 0"', menu)
+        # A missed camera deadline means no source frame was produced; it is
+        # reflected by REC FPS and support diagnostics, not misreported as an
+        # encoder/network queue drop on the panel.
+        self.assertIn("const auto dropped = snapshot.encoderDroppedFrameCount +", menu)
+        self.assertNotIn("const auto dropped = snapshot.droppedFrameCount +", menu)
         self.assertIn('"REC --.- FPS   HMD AVG --.- FPS"', menu)
         self.assertIn("recordingWorldPanelHmdSampledFrames_", menu)
         self.assertIn("recordingWorldPanelHmdTotalFrameSeconds_", menu)
@@ -1093,6 +1100,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         # feed in recordings and must never come back.
         self.assertIn("cullPreview(floatingImage_)", preview)
         self.assertIn("cacheRoot(floatingScreen_->get_gameObject().ptr())", preview)
+        self.assertIn("cacheRoot(placementScreen_->get_gameObject().ptr())", preview)
         self.assertNotIn("UnityEngine::GameObject* floatingCaptureRoot_", preview)
         # The popout owns its own opaque material instance; sharing one
         # material between the HMUI docked canvas and the world-space
@@ -1116,7 +1124,11 @@ class RepositoryInvariantTests(unittest.TestCase):
         )
         self.assertIn('"Queue"="Transparent"', preview_shader)
         self.assertIn("ZWrite Off", preview_shader)
-        self.assertIn("Blend SrcAlpha OneMinusSrcAlpha", preview_shader)
+        # Camera RGB must remain opaque while framebuffer alpha stays zero;
+        # Beat Saber interprets that alpha channel as bloom weight.
+        self.assertIn("Blend One Zero, Zero Zero", preview_shader)
+        self.assertIn("fixed4(tex2D(_MainTex, input.uv).rgb * _Color.rgb, 0.0)", preview_shader)
+        self.assertNotIn("Blend SrcAlpha OneMinusSrcAlpha", preview_shader)
         self.assertNotIn('"Queue"="Geometry"', preview_shader)
         non_bloom_shader = (ROOT / "tools/avatar-shader/Assets/SaberStageNonBloomUI.shader").read_text(
             encoding="utf-8"
@@ -1208,6 +1220,7 @@ class RepositoryInvariantTests(unittest.TestCase):
 
     def test_camera_runtime_discovery_is_gated_and_script_reload_is_keyed(self):
         source = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
+        preview = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
         song = source[source.index("std::optional<ScriptSample> SampleMovementScript()"):
                       source.index("void LogScriptTelemetry(")]
         self.assertLess(song.index("if (!gameplayScene_) return std::nullopt;"), song.index("FindObjectsOfTypeAll"))
@@ -1230,6 +1243,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("songLookups={}", diagnostic)
         self.assertIn("playerLookups={}", diagnostic)
         self.assertIn("motionMaxUs={:.1f}", diagnostic)
+        self.assertIn("profile.enabled || profile.gizmoVisible", source)
+        self.assertIn("!profile.enabled && !profile.gizmoVisible", source)
+        self.assertIn("if (!editorNeedsGizmo && !persistentGizmo)", preview)
+        self.assertIn("settings_.Get().camera.Primary().gizmoVisible", preview)
 
     def test_floor_preview_releases_demand_before_unity_cleanup(self):
         source = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")

@@ -466,6 +466,7 @@ void DecodeCameraProfile(const Value& source, camera::CameraProfile& profile, bo
         camera::TryParseSubjectAnchor, repaired);
     profile.position = Vector(source, "position", profile.position, repaired);
     profile.rotationDegrees = Vector(source, "rotationDegrees", profile.rotationDegrees, repaired);
+    profile.gizmoVisible = Bool(source, "gizmoVisible", profile.gizmoVisible, repaired);
     profile.keepLevel = Bool(source, "keepLevel", profile.keepLevel, repaired);
     profile.fovDegrees = Float(source, "fovDegrees", profile.fovDegrees, repaired);
     profile.requestedWidth = Int(source, "requestedWidth", profile.requestedWidth, repaired);
@@ -512,6 +513,7 @@ Value EncodeCameraProfile(const camera::CameraProfile& profile, Document::Alloca
     result.AddMember("subjectAnchor", Value(subjectAnchor.data(), static_cast<rapidjson::SizeType>(subjectAnchor.size()), allocator), allocator);
     AddVector(result, "position", profile.position, allocator);
     AddVector(result, "rotationDegrees", profile.rotationDegrees, allocator);
+    result.AddMember("gizmoVisible", profile.gizmoVisible, allocator);
     result.AddMember("keepLevel", profile.keepLevel, allocator);
     result.AddMember("fovDegrees", profile.fovDegrees, allocator);
     result.AddMember("requestedWidth", profile.requestedWidth, allocator);

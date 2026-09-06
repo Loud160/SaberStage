@@ -4831,6 +4831,12 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     placementHint->set_enableWordWrapping(true);
     placementHint->set_alignment(TMPro::TextAlignmentOptions::Center);
     ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(
+        placeContainer, "Camera Visible", profile.gizmoVisible, [](bool value) {
+            if (active_) active_->EditCamera(
+                [&](auto& camera) { camera.gizmoVisible = value; }, "gizmo visibility");
+        }),
+        "Keeps the grabbable camera gizmo visible to you in menus and maps. It remains hidden from recordings and streams."));
+    ConstrainRightPanelRow(WithHint(BSML::Lite::CreateToggle(
         placeContainer, "Keep Camera Level", profile.keepLevel, [](bool value) {
             if (active_) active_->EditCamera(
                 [&](auto& camera) { camera.keepLevel = value; }, "level lock");
@@ -5916,7 +5922,13 @@ void MenuController::EnsureRecordingWorldPanel() {
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDisplayedState_ = -1;
     recordingWorldPanelDropSamples_.clear();
-    recordingWorldPanelSessionStartDrops_ = root_.Recording().Snapshot().droppedFrameCount;
+    const auto initialRecording = root_.Recording().Snapshot();
+    const auto initialLivestream = root_.Recording().LivestreamSnapshot();
+    const bool streamMode = root_.Settings().Get().recording.worldControlsStreamMode;
+    recordingWorldPanelSessionStartDrops_ = initialRecording.encoderDroppedFrameCount +
+        (streamMode && broadcast::CanStop(initialLivestream.state)
+            ? initialLivestream.videoPacketsDropped
+            : 0);
     recordingWorldPanelDropWarmupComplete_ = false;
     RefreshRecordingWorldPanel();
     Logging::Logger.info("Created movable HMD-only recording controls");
@@ -6164,7 +6176,12 @@ void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode) {
     recordingWorldPanelDisplayedState_ = -1;
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDropSamples_.clear();
-    recordingWorldPanelSessionStartDrops_ = root_.Recording().Snapshot().droppedFrameCount;
+    const auto snapshot = root_.Recording().Snapshot();
+    const auto livestream = root_.Recording().LivestreamSnapshot();
+    recordingWorldPanelSessionStartDrops_ = snapshot.encoderDroppedFrameCount +
+        (streamMode && broadcast::CanStop(livestream.state)
+            ? livestream.videoPacketsDropped
+            : 0);
     RefreshRecordingWorldPanel();
 }
 
@@ -6242,14 +6259,17 @@ void MenuController::TickRecordingWorldPanel() noexcept {
             RefreshRecordingWorldPanel();
         }
 
-        // Both local and live Direct FFmpeg sessions feed this capture-level
-        // count. The first second is a connection/encoder warm-up period: keep
-        // the underlying diagnostics intact for support logs, but establish
-        // the panel baseline after that second so transient startup pressure is
-        // not presented to the user as sustained recording frame loss.
-        // The local panel reports capture loss only. Network queue loss is an
-        // additional delivery stage, relevant only to the active live view.
-        const auto dropped = snapshot.droppedFrameCount +
+        // "Frame Loss" means a frame that reached a bounded encoder/network
+        // queue and was then discarded. A missed camera timeline deadline is
+        // different: Unity never produced that frame, so calling it a dropped
+        // frame made a low HMD update rate look like total encoder failure even
+        // when MediaCodec accepted every submitted picture. The REC FPS field
+        // already exposes source-cadence shortfalls, while detailed support logs
+        // retain skippedCaptureFrameCount for diagnosis.
+        //
+        // The first second remains a warm-up period so normal encoder/connection
+        // startup pressure is not presented as sustained output loss.
+        const auto dropped = snapshot.encoderDroppedFrameCount +
             (streamMode && broadcast::CanStop(livestream.state) ? livestream.videoPacketsDropped : 0);
         const bool outputActive = recording::HasRecordingTimeline(snapshot.state) ||
             broadcast::CanStop(livestream.state);

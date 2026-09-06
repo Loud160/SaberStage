@@ -22,7 +22,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 28;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 29;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.

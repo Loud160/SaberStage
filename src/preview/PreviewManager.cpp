@@ -394,8 +394,8 @@ public:
         }
         try { RefreshCaptureRendererCache(); }
         catch (...) { Logging::Logger.warn("Floor preview capture-cache cleanup failed after detaching"); }
-        try { DestroyPlacementPreview(); }
-        catch (...) { Logging::Logger.warn("Floor preview placement gizmo cleanup failed after detaching"); }
+        try { EnsurePlacementPreview(); }
+        catch (...) { Logging::Logger.warn("Camera gizmo visibility refresh failed after floor preview detached"); }
         if (wasAttached) Logging::Logger.info("Floor preview detached; floor render demand removed");
     }
 
@@ -606,6 +606,7 @@ private:
         // CanvasGroup alpha is the proven non-destructive hide used for every
         // other SaberStage HMD-only surface.
         if (IsAlive(floatingScreen_)) cacheRoot(floatingScreen_->get_gameObject().ptr());
+        if (IsAlive(placementScreen_)) cacheRoot(placementScreen_->get_gameObject().ptr());
         for (auto* root : captureExcludedRoots_) cacheRoot(root);
         captureCanvasGroupSnapshot_.reserve(cachedCaptureCanvasGroups_.size());
         captureMeshSnapshot_.reserve(cachedCaptureMeshRenderers_.size());
@@ -618,10 +619,13 @@ private:
         // that channel and consequently show only emissive effects, pointers,
         // and floor markers.
         //
-        // Prefer the embedded SaberStage/VideoPreview shader: it forces
-        // opaque output AND is built with guaranteed STEREO_MULTIVIEW_ON
-        // variants. A stock shader located with Shader.Find carries only the
-        // variants Beat Saber happened to package; when its multiview variant
+        // Prefer the embedded SaberStage/VideoPreview shader: it replaces the
+        // monitor RGB as an opaque image while writing zero framebuffer alpha,
+        // preventing both preview surfaces from contributing to Beat Saber's
+        // alpha-weighted bloom. It is also built with guaranteed
+        // STEREO_MULTIVIEW_ON variants. A stock shader located with
+        // Shader.Find carries only the variants Beat Saber happened to package;
+        // when its multiview variant
         // is missing it binds without error and rasterizes NOTHING in the
         // headset while the mono spectator camera still sees it — the exact
         // "popout invisible in HMD but floor works" failure. (Lesson imported
@@ -985,7 +989,13 @@ private:
     }
 
     void EnsurePlacementPreview() {
-        if (!editorActive_ || !floorVisible_) {
+        // The floor-preview editor always exposes the grabbable camera while
+        // that editor is active. Camera Visible extends the same object lifetime
+        // across all menu and gameplay scenes; it does not create a second
+        // representation with different placement behavior.
+        const bool editorNeedsGizmo = editorActive_ && floorVisible_;
+        const bool persistentGizmo = settings_.Get().camera.Primary().gizmoVisible;
+        if (!editorNeedsGizmo && !persistentGizmo) {
             DestroyPlacementPreview();
             return;
         }
@@ -1021,6 +1031,10 @@ private:
                 DestroyPlacementPreview();
                 return;
             }
+            // Camera Visible is intended for the player, not for recordings or
+            // streams. Reuse the same per-render exclusion path as SaberStage's
+            // other HMD-only world panels so the gizmo cannot enter the output.
+            RefreshCaptureRendererCache();
             Logging::Logger.info("Created controller-grabbable Primary camera gizmo");
         }
     }
@@ -1061,10 +1075,17 @@ private:
     }
 
     void DestroyPlacementPreview() noexcept {
-        if (IsAlive(placementScreen_)) UnityEngine::Object::Destroy(placementScreen_->get_gameObject());
+        const bool hadScreen = IsAlive(placementScreen_);
+        if (hadScreen) UnityEngine::Object::Destroy(placementScreen_->get_gameObject());
         placementScreen_ = nullptr;
         placementWasGrabbed_ = false;
         placementFailureLogged_ = false;
+        // Avoid rebuilding this cache from the every-frame "not requested"
+        // path. Only a real teardown can have added placement renderers to it.
+        if (hadScreen) {
+            try { RefreshCaptureRendererCache(); }
+            catch (...) { Logging::Logger.warn("Camera gizmo capture-cache cleanup failed after teardown"); }
+        }
     }
 
     void SetDockedImageTexture(UnityEngine::RenderTexture* texture) {

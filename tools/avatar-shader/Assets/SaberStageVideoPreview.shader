@@ -21,8 +21,9 @@
 //    spectator camera could still see it. This bundle is built with the
 //    Oculus Multiview XR configuration, so the variants are guaranteed.
 // 2. The spectator RenderTexture's alpha channel is Beat Saber's bloom
-//    weight, not image opacity. The fragment therefore forces alpha to 1 so
-//    neither UI alpha blending nor the bloom post-process misreads it.
+//    weight, not image opacity. The pass therefore ignores sampled alpha for
+//    RGB compositing and writes zero to framebuffer alpha. This keeps the
+//    monitor opaque without making the copied image contribute to bloom.
 Shader "SaberStage/VideoPreview"
 {
     Properties
@@ -43,7 +44,10 @@ Shader "SaberStage/VideoPreview"
             Cull Off
             ZWrite Off
             ZTest [unity_GUIZTestMode]
-            Blend SrcAlpha OneMinusSrcAlpha
+            // RGB: the camera monitor is an opaque image and replaces the
+            // panel backdrop. Alpha: write zero bloom weight regardless of
+            // the spectator texture's source alpha.
+            Blend One Zero, Zero Zero
             CGPROGRAM
             #pragma target 3.0
             #pragma vertex vert
@@ -81,7 +85,7 @@ Shader "SaberStage/VideoPreview"
             {
                 UNITY_SETUP_INSTANCE_ID(input);
                 UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
-                return fixed4(tex2D(_MainTex, input.uv).rgb * _Color.rgb, 1.0);
+                return fixed4(tex2D(_MainTex, input.uv).rgb * _Color.rgb, 0.0);
             }
             ENDCG
         }

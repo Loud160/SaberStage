@@ -79,6 +79,10 @@ struct CameraProfile {
     SubjectAnchor subjectAnchor = SubjectAnchor::PlayerRoot;
     Vec3 position{0.0F, 2.2F, -3.5F};
     Vec3 rotationDegrees{8.0F, 0.0F, 0.0F};
+    // Keeps the existing grabbable camera-shaped placement gizmo visible in
+    // the headset after the camera editor closes, including during gameplay.
+    // The gizmo remains excluded from the third-person camera output.
+    bool gizmoVisible = false;
     // Keeps manually positioned cameras from rolling with an accidentally
     // tilted grab/rotation. Movement scripts are authored camera motion and
     // intentionally override this constraint while they are active.
