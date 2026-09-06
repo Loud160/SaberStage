@@ -33,6 +33,8 @@ Thumbs.db
 *.tombstone
 SaberStage Support Logs/
 SaberStage Recordings/
+SaberStage Device Backups/
+diagnostics/
 artifacts/
 
 # Unity is used only to produce the embedded Android MToon shader bundle.
