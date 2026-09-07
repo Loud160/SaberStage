@@ -23,7 +23,7 @@ Use current verified Quest Beat Saber tooling and dependency versions.
 - build instructions;
 - development deployment instructions;
 - host-test target for platform-neutral logic;
-- no camera/preview/encoder/network/chat/Discord/avatar implementation yet.
+- no camera/preview/encoder/network/chat/Discord implementation yet.
 
 At this scaffold stage the license decision was intentionally deferred. The
 owner later selected GPL-3.0-only with the repository's additional GPLv3
@@ -31,7 +31,7 @@ section 7 terms.
 
 Do not put future functionality into one giant `main.cpp`.
 
-Lay out the menu, settings, and subsystem boundaries so the finished product can present coherent Camera, Preview, Record, Companion/Outputs, Avatar, Scenes, Broadcast, and Chat areas. Preserve Camera2's left camera-list/main settings/bottom preview organization and keep the right screen available as features are added. Do not show controls for unfinished features.
+Lay out the menu, settings, and subsystem boundaries so the finished product can present coherent Camera, Preview, Record, Companion/Outputs, Scenes, Broadcast, and Chat areas. Preserve Camera2's left camera-list/main settings/bottom preview organization and keep the right screen available as features are added. Do not show controls for unfinished features.
 
 ## Set-it-and-forget-it groundwork
 

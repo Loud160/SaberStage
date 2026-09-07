@@ -75,6 +75,8 @@ int main() {
           "world panels default to the visible FloatingScreen face");
     Check(defaults.chat.width == 70.0F && defaults.chat.height == 58.0F,
           "larger chat size limits do not change the initial or reset size");
+    Check(defaults.chat.fontSize == 4.6F,
+          "Quest chat defaults to a readable world-space font size");
     auto enlargedChat = defaults;
     enlargedChat.chat.width = 240.0F;
     enlargedChat.chat.height = 200.0F;
@@ -136,42 +138,6 @@ int main() {
     refreshFixture.refreshToken.clear();
     Check(!TwitchTokenNeedsRefresh(refreshFixture, 10'000),
           "missing refresh credentials require authorization instead of a broken refresh attempt");
-    Check(defaults.avatar.maximumTextureDimension == 1024, "VRM textures default to the Quest-conscious 1024 cap");
-    Check(defaults.avatar.qualityPreset == AvatarQualityPreset::Balanced &&
-              defaults.avatar.toonLighting && defaults.avatar.normalMaps &&
-              defaults.avatar.rimLighting && !defaults.avatar.matcap &&
-              defaults.avatar.emission && defaults.avatar.animatedExpressions &&
-              defaults.avatar.cutoutSmoothing == AvatarCutoutSmoothing::Low &&
-              !defaults.avatar.alphaToMaskEnabled &&
-              defaults.avatar.outlines == AvatarOutlineMode::Off &&
-              defaults.avatar.materialStage == AvatarMaterialStage::Configured &&
-              defaults.avatar.lightingMode == AvatarLightingMode::Balanced,
-          "Balanced avatar defaults expose each MToon cost independently");
-    Check(defaults.avatar.springBones && defaults.avatar.springBoneQuality == SpringBoneQuality::Medium &&
-              defaults.avatar.springCollisions == SpringCollisionQuality::Reduced,
-          "SpringBones default to a conservative explicit Quest budget");
-    Check(defaults.avatar.sideStepLeanLimitPercent == 100.0F,
-          "side-step lean override defaults to the original solver boundary");
-    Check(defaults.avatar.plantedLegLeanLimitPercent == 100.0F,
-          "planted-leg lean override defaults to the original support boundary");
-    Check(defaults.avatar.stanceWidthPercent == 100.0F &&
-              defaults.avatar.backwardSpineCurveLimitPercent == 100.0F,
-          "stance width and backward spine controls default to original solver behavior");
-    Check(defaults.avatar.retargetingProfiles.empty() &&
-              RetargetingForSelectedAvatar(defaults.avatar).armSpanAvatarSizing &&
-              !RetargetingForSelectedAvatar(defaults.avatar).matchPlayerHeight &&
-              RetargetingForSelectedAvatar(defaults.avatar).manualAvatarScalePercent == 100.0F &&
-              RetargetingForSelectedAvatar(defaults.avatar).keepHandsOnSabers &&
-              !RetargetingForSelectedAvatar(defaults.avatar).adjustBodyProportions &&
-              RetargetingForSelectedAvatar(defaults.avatar).autoFloorHeight,
-          "new avatar fitting defaults preserve arm reach while leaving optional geometry passes off");
-    Check(defaults.activeAvatarPlayerProfileId == "default" &&
-              defaults.avatarPlayerProfiles.size() == 5 &&
-              defaults.avatarPlayerProfiles.front().displayName == "Profile 1" &&
-              defaults.avatarPlayerProfiles.back().displayName == "Profile 5",
-          "five fixed migration-safe Avatar player slots are available");
-    Check(defaults.avatar.selectedFile == "avatar.vrm", "avatar profile uses a stable mod-local default filename");
-    Check(defaults.avatar.selectedPath.empty(), "avatar profile waits for an on-headset file selection");
     Check(!defaults.camera.Primary().keepLevel,
           "camera level lock defaults off to preserve existing authored/manual roll");
     Check(!defaults.camera.Primary().gizmoVisible,
@@ -197,37 +163,6 @@ int main() {
     invalid.broadcast.microphoneVolumePercent = 500.0F;
     invalid.broadcast.youtube.serverUrl = "https://not-an-rtmp-endpoint";
     invalid.broadcast.kick.streamKey = "invalid key with spaces";
-    invalid.avatar.selectedFile = "../outside.vrm";
-    invalid.avatar.selectedPath = "relative/outside.vrm";
-    invalid.avatar.maximumTextureDimension = 8192;
-    invalid.avatar.cutoutSmoothing = static_cast<AvatarCutoutSmoothing>(99);
-    invalid.avatar.materialStage = static_cast<AvatarMaterialStage>(99);
-    invalid.avatar.lightingMode = static_cast<AvatarLightingMode>(99);
-    invalid.avatar.springUpdateRateHz = 1000;
-    invalid.avatar.springSubsteps = 20;
-    invalid.avatar.maximumSpringChains = 0;
-    invalid.avatar.maximumSpringJoints = 5000;
-    invalid.avatar.sideStepLeanLimitPercent = 10.0F;
-    invalid.avatar.plantedLegLeanLimitPercent = 10.0F;
-    invalid.avatar.stanceWidthPercent = 20.0F;
-    invalid.avatar.backwardSpineCurveLimitPercent = 150.0F;
-    invalid.avatar.retargetingProfiles.push_back({
-        .avatarKey = "/sdcard/Download/Test.vrm",
-        .matchPlayerHeight = true,
-        .heightAdjustmentBalance = 5.0F,
-        .manualAvatarScalePercent = 500.0F,
-        .shoulderWidthPercent = 20.0F,
-        .waistHipWidthPercent = 300.0F,
-        .lowerTorsoWidthPercent = 400.0F,
-        .neckBaseWidthPercent = std::numeric_limits<float>::quiet_NaN(),
-        .torsoHeightPercent = 10.0F,
-        .upperLegLengthPercent = 300.0F,
-        .lowerLegLengthPercent = std::numeric_limits<float>::quiet_NaN(),
-        .legWidthPercent = 400.0F,
-        .neutralKneeBendDegrees = 40.0F,
-        .attackPoseDegrees = -80.0F,
-        .backStiffnessPercent = 200.0F,
-        .floorOffsetMeters = 4.0F});
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -245,50 +180,6 @@ int main() {
     Check(invalid.broadcast.youtube.serverUrl == defaults.broadcast.youtube.serverUrl &&
               invalid.broadcast.kick.streamKey.empty(),
           "invalid service-specific livestream destinations repair without exposing credentials");
-    Check(invalid.avatar.materialStage == AvatarMaterialStage::Configured &&
-              invalid.avatar.lightingMode == AvatarLightingMode::Balanced &&
-              invalid.avatar.cutoutSmoothing == AvatarCutoutSmoothing::Low,
-          "invalid avatar material diagnostics repair to configured balanced rendering");
-    Check(invalid.avatar.sideStepLeanLimitPercent == defaults.avatar.sideStepLeanLimitPercent,
-          "invalid side-step lean limit repairs to the original solver boundary");
-    Check(invalid.avatar.plantedLegLeanLimitPercent == defaults.avatar.plantedLegLeanLimitPercent,
-          "invalid planted-leg lean limit repairs to the original support boundary");
-    Check(invalid.avatar.stanceWidthPercent == defaults.avatar.stanceWidthPercent &&
-              invalid.avatar.backwardSpineCurveLimitPercent ==
-                  defaults.avatar.backwardSpineCurveLimitPercent,
-          "invalid stance and backward spine limits repair to original behavior");
-    Check(invalid.avatar.retargetingProfiles.size() == 1 &&
-              invalid.avatar.retargetingProfiles[0].heightAdjustmentBalance == 0.0F &&
-              invalid.avatar.retargetingProfiles[0].manualAvatarScalePercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].shoulderWidthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].waistHipWidthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].lowerTorsoWidthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].neckBaseWidthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].torsoHeightPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].upperLegLengthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].lowerLegLengthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].legWidthPercent == 100.0F &&
-              invalid.avatar.retargetingProfiles[0].neutralKneeBendDegrees == 0.0F &&
-              invalid.avatar.retargetingProfiles[0].attackPoseDegrees == 0.0F &&
-              invalid.avatar.retargetingProfiles[0].backStiffnessPercent == 50.0F &&
-              invalid.avatar.retargetingProfiles[0].floorOffsetMeters == 0.0F,
-          "invalid per-avatar fit fields repair independently without losing the avatar key");
-
-    auto playerProfiles = defaults;
-    playerProfiles.camera.Primary().fovDegrees = 77.0F;
-    playerProfiles.avatar.visible = false;
-    SyncActiveAvatarPlayerProfile(playerProfiles);
-    Check(SwitchAvatarPlayerProfile(playerProfiles, "player-2") && playerProfiles.avatar.visible,
-          "unused fixed Avatar player slots start from safe Avatar defaults");
-    playerProfiles.avatar.selectedPath = "/sdcard/Download/Player Two.vrm";
-    Check(SwitchAvatarPlayerProfile(playerProfiles, "default") &&
-              !playerProfiles.avatar.visible &&
-              playerProfiles.camera.Primary().fovDegrees == 77.0F,
-          "switching players restores Avatar settings without changing shared camera settings");
-    Check(SwitchAvatarPlayerProfile(playerProfiles, "player-2") &&
-              playerProfiles.avatar.selectedPath == "/sdcard/Download/Player Two.vrm",
-          "Avatar settings remain independent between player profiles");
-
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
     futureProfile.profileId = "future-secondary";
@@ -316,9 +207,6 @@ int main() {
     reset.companion.enabled = true;
     ResetSubsystem(reset, Subsystem::Companion);
     Check(!reset.companion.enabled, "companion reset restores defaults");
-    reset.avatar.enabled = true;
-    ResetSubsystem(reset, Subsystem::Avatar);
-    Check(!reset.avatar.enabled, "avatar reset restores defaults");
     reset.scenes.enabled = true;
     ResetSubsystem(reset, Subsystem::Scenes);
     Check(!reset.scenes.enabled, "scenes reset restores defaults");
@@ -405,63 +293,6 @@ int main() {
     first.Edit().chat.rotationDegrees = {2.0F, 170.0F, -3.0F};
     first.Edit().chat.width = 240.0F;
     first.Edit().chat.height = 200.0F;
-    first.Edit().avatar.selectedFile = "Black Heart.vrm";
-    first.Edit().avatar.selectedPath = "/sdcard/Download/Black Heart.vrm";
-    first.Edit().avatar.maximumTextureDimension = 512;
-    first.Edit().avatar.qualityPreset = AvatarQualityPreset::Custom;
-    first.Edit().avatar.matcap = true;
-    first.Edit().avatar.cutoutSmoothing = AvatarCutoutSmoothing::High;
-    first.Edit().avatar.alphaToMaskEnabled = true;
-    first.Edit().avatar.animatedExpressions = false;
-    first.Edit().avatar.outlines = AvatarOutlineMode::Reduced;
-    first.Edit().avatar.materialStage = AvatarMaterialStage::RimLighting;
-    first.Edit().avatar.lightingMode = AvatarLightingMode::Studio;
-    first.Edit().avatar.springBoneQuality = SpringBoneQuality::Custom;
-    first.Edit().avatar.springCollisions = SpringCollisionQuality::Full;
-    first.Edit().avatar.springUpdateRateHz = 40;
-    first.Edit().avatar.springSubsteps = 2;
-    first.Edit().avatar.maximumSpringChains = 48;
-    first.Edit().avatar.maximumSpringJoints = 160;
-    first.Edit().avatar.sideStepLeanLimitPercent = 65.0F;
-    first.Edit().avatar.plantedLegLeanLimitPercent = 55.0F;
-    first.Edit().avatar.stanceWidthPercent = 145.0F;
-    first.Edit().avatar.backwardSpineCurveLimitPercent = 35.0F;
-    auto& savedFit = EditRetargetingForSelectedAvatar(first.Edit().avatar);
-    savedFit.armSpanAvatarSizing = false;
-    savedFit.matchPlayerHeight = true;
-    savedFit.heightAdjustmentBalance = -0.35F;
-    savedFit.manualAvatarScaleEnabled = true;
-    savedFit.manualAvatarScalePercent = 137.0F;
-    savedFit.keepHandsOnSabers = false;
-    savedFit.gripOffsetsInitialized = true;
-    savedFit.leftControllerToWrist.position = {0.011F, -0.022F, 0.033F};
-    savedFit.leftControllerToWrist.rotationDegrees = {4.0F, 5.0F, 6.0F};
-    savedFit.leftControllerToWrist.gripClosurePercent = 135.0F;
-    savedFit.leftControllerToWrist.thumbCurvePercent = 120.0F;
-    savedFit.rightControllerToWrist.position = {-0.014F, 0.025F, 0.036F};
-    savedFit.rightControllerToWrist.rotationDegrees = {-7.0F, 8.0F, -9.0F};
-    savedFit.rightControllerToWrist.gripClosurePercent = 65.0F;
-    savedFit.rightControllerToWrist.thumbCurvePercent = 75.0F;
-    savedFit.adjustBodyProportions = true;
-    savedFit.torsoWidthPercent = 116.0F;
-    savedFit.autoShoulderWidth = true;
-    savedFit.shoulderWidthPercent = 121.0F;
-    savedFit.waistHipWidthPercent = 94.0F;
-    savedFit.lowerTorsoWidthPercent = 112.0F;
-    savedFit.neckBaseWidthPercent = 108.0F;
-    savedFit.headSizePercent = 125.0F;
-    savedFit.torsoHeightPercent = 106.0F;
-    savedFit.upperLegLengthPercent = 109.0F;
-    savedFit.lowerLegLengthPercent = 96.0F;
-    savedFit.legWidthPercent = 118.0F;
-    savedFit.neutralKneeBendDegrees = 7.0F;
-    savedFit.attackPoseDegrees = 9.0F;
-    savedFit.backStiffnessPercent = 73.0F;
-    savedFit.autoFloorHeight = false;
-    savedFit.floorOffsetMeters = -0.035F;
-    savedFit.preventArmBodyClipping = true;
-    savedFit.armSpringBoneInteraction = true;
-    first.Edit().avatar.leftControllerToWrist.position = {0.01F, -0.02F, 0.03F};
     std::string error;
     Check(first.Save(&error), "edited settings save safely");
     Check(Read(path).find("\"profiles\"") != std::string::npos,
@@ -549,83 +380,6 @@ int main() {
           "movable Twitch chat visibility, pose, and doubled maximum size survive restart");
     Check(Read(path).find("\"destinations\"") != std::string::npos,
           "livestream destinations use the service-specific schema");
-    Check(second.Get().avatar.selectedFile == "Black Heart.vrm" &&
-              second.Get().avatar.selectedPath == "/sdcard/Download/Black Heart.vrm" &&
-              second.Get().avatar.maximumTextureDimension == 512 &&
-              second.Get().avatar.leftControllerToWrist.position.z == 0.03F &&
-              second.Get().avatar.qualityPreset == AvatarQualityPreset::Custom &&
-              second.Get().avatar.matcap &&
-              second.Get().avatar.cutoutSmoothing == AvatarCutoutSmoothing::High &&
-              second.Get().avatar.alphaToMaskEnabled &&
-              !second.Get().avatar.animatedExpressions &&
-              second.Get().avatar.outlines == AvatarOutlineMode::Reduced &&
-              second.Get().avatar.materialStage == AvatarMaterialStage::RimLighting &&
-              second.Get().avatar.lightingMode == AvatarLightingMode::Studio &&
-              second.Get().avatar.springBoneQuality == SpringBoneQuality::Custom &&
-              second.Get().avatar.springCollisions == SpringCollisionQuality::Full &&
-              second.Get().avatar.springUpdateRateHz == 40 && second.Get().avatar.springSubsteps == 2 &&
-              second.Get().avatar.maximumSpringChains == 48 && second.Get().avatar.maximumSpringJoints == 160 &&
-              second.Get().avatar.sideStepLeanLimitPercent == 65.0F &&
-              second.Get().avatar.plantedLegLeanLimitPercent == 55.0F &&
-              second.Get().avatar.stanceWidthPercent == 145.0F &&
-              second.Get().avatar.backwardSpineCurveLimitPercent == 35.0F,
-          "avatar selection, visual quality, SpringBone budget, and wrist calibration survive restart");
-    const auto loadedFit = RetargetingForSelectedAvatar(second.Get().avatar);
-    Check(loadedFit.avatarKey == "/sdcard/Download/Black Heart.vrm" &&
-              !loadedFit.armSpanAvatarSizing && loadedFit.matchPlayerHeight &&
-              loadedFit.heightAdjustmentBalance == -0.35F &&
-              loadedFit.manualAvatarScaleEnabled && loadedFit.manualAvatarScalePercent == 137.0F &&
-              !loadedFit.keepHandsOnSabers && loadedFit.gripOffsetsInitialized &&
-              loadedFit.leftControllerToWrist.position.z == 0.033F &&
-              loadedFit.leftControllerToWrist.gripClosurePercent == 135.0F &&
-              loadedFit.leftControllerToWrist.thumbCurvePercent == 120.0F &&
-              loadedFit.rightControllerToWrist.rotationDegrees.z == -9.0F &&
-              loadedFit.rightControllerToWrist.gripClosurePercent == 65.0F &&
-              loadedFit.rightControllerToWrist.thumbCurvePercent == 75.0F &&
-              loadedFit.adjustBodyProportions && loadedFit.autoShoulderWidth &&
-              loadedFit.torsoWidthPercent == 116.0F &&
-              loadedFit.shoulderWidthPercent == 121.0F &&
-              loadedFit.waistHipWidthPercent == 94.0F &&
-              loadedFit.lowerTorsoWidthPercent == 112.0F &&
-              loadedFit.neckBaseWidthPercent == 108.0F &&
-              loadedFit.headSizePercent == 125.0F &&
-              loadedFit.torsoHeightPercent == 106.0F &&
-              loadedFit.upperLegLengthPercent == 109.0F &&
-              loadedFit.lowerLegLengthPercent == 96.0F &&
-              loadedFit.legWidthPercent == 118.0F &&
-              loadedFit.neutralKneeBendDegrees == 7.0F &&
-              loadedFit.attackPoseDegrees == 9.0F &&
-              loadedFit.backStiffnessPercent == 73.0F &&
-              !loadedFit.autoFloorHeight && loadedFit.floorOffsetMeters == -0.035F &&
-              loadedFit.preventArmBodyClipping && loadedFit.armSpringBoneInteraction,
-          "all per-avatar fit, grip, posture, floor, and collision controls survive restart");
-    const auto savedSecondPlayerId = std::string("player-2");
-    Check(SwitchAvatarPlayerProfile(second.Edit(), savedSecondPlayerId),
-          "second fixed player slot can be selected");
-    second.Edit().avatar.selectedPath = "/sdcard/Download/Second Player.vrm";
-    second.Edit().avatar.visible = false;
-    Check(second.Save(&error), "multiple Avatar player profiles save safely");
-    SettingsService third(path);
-    Check(third.Load().loadedExisting &&
-              third.Get().activeAvatarPlayerProfileId == savedSecondPlayerId &&
-              third.Get().avatarPlayerProfiles.size() == 5 &&
-              third.Get().avatar.selectedPath == "/sdcard/Download/Second Player.vrm" &&
-              !third.Get().avatar.visible,
-          "active player identity and complete Avatar-only profile survive restart");
-
-    auto preset = defaults.avatar;
-    ApplyAvatarQualityPreset(preset, AvatarQualityPreset::Performance);
-    Check(preset.maximumTextureDimension == 512 && !preset.normalMaps && !preset.rimLighting &&
-              preset.outlines == AvatarOutlineMode::Off &&
-              preset.materialStage == AvatarMaterialStage::Configured &&
-              preset.lightingMode == AvatarLightingMode::Balanced &&
-              preset.springBoneQuality == SpringBoneQuality::Low,
-          "Performance preset assigns only visible individual avatar controls");
-    ApplyAvatarQualityPreset(preset, AvatarQualityPreset::Quality);
-    Check(preset.maximumTextureDimension == 2048 && preset.normalMaps && preset.rimLighting && preset.matcap &&
-              preset.outlines == AvatarOutlineMode::Full && preset.springBoneQuality == SpringBoneQuality::High,
-          "Quality preset assigns the documented high-fidelity controls");
-
     auto normalizedPreview = Defaults();
     normalizedPreview.preview.rotationDegrees = {365.0F, -540.0F, 720.0F};
     const auto previewValidation = ValidateAndRepair(normalizedPreview);
@@ -661,6 +415,20 @@ int main() {
               legacyWorldPanels.Get().preview.rotationDegrees.y == 0.0F &&
               legacyWorldPanels.Get().recording.worldControlsRotationDegrees.y == 0.0F,
           "schema 20 untouched world panels migrate from their reversed default face");
+
+    Write(path, R"({"schemaVersion":30,"chat":{"fontSize":3.3}})");
+    SettingsService legacySmallChat(path);
+    const auto legacySmallChatLoad = legacySmallChat.Load();
+    Check(legacySmallChatLoad.migrated &&
+              legacySmallChat.Get().chat.fontSize == 4.6F,
+          "schema 30 default chat text migrates to the readable Quest size");
+
+    Write(path, R"({"schemaVersion":30,"chat":{"fontSize":5.7}})");
+    SettingsService legacyCustomChat(path);
+    const auto legacyCustomChatLoad = legacyCustomChat.Load();
+    Check(legacyCustomChatLoad.migrated &&
+              legacyCustomChat.Get().chat.fontSize == 5.7F,
+          "schema 30 custom chat text size is preserved during migration");
 
     Write(path, R"({"schemaVersion":19,"broadcast":{"provider":"kick","serverUrl":"rtmps://legacy-kick.example/app","reconnectAttempts":5}})");
     SettingsService legacyLivestream(path);
@@ -703,7 +471,8 @@ int main() {
     auto& rich = repairedReload.Edit().chat;
     rich.showEmotes = true; rich.animateEmotes = true; rich.reverseOrder = true;
     rich.backgroundColor = {0.1F, 0.2F, 0.3F}; rich.fontSize = 4.5F;
-    rich.controlsPlaced = true; rich.requestsPlaced = true; rich.requestsScale = 1.5F;
+    rich.controlsPlaced = true; rich.controlsScale = 1.35F;
+    rich.requestsPlaced = true; rich.requestsScale = 1.5F;
     rich.requests.enabled = true; rich.requests.maximumPending = 81;
     rich.requests.cooldownPerUser = false; rich.requests.queueCooldownSeconds = 35;
     rich.requests.commands[0] = saberstage::broadcast::CommandPermission::SubscribersAndVips;
@@ -712,7 +481,8 @@ int main() {
     const auto& loadedChat = richReload.Get().chat;
     Check(loadedChat.animateEmotes && loadedChat.reverseOrder && loadedChat.fontSize == 4.5F && loadedChat.backgroundColor.z == 0.3F,
         "rich chat appearance roundtrips");
-    Check(loadedChat.controlsPlaced && loadedChat.requestsPlaced && loadedChat.requestsScale == 1.5F,
+    Check(loadedChat.controlsPlaced && loadedChat.controlsScale == 1.35F &&
+              loadedChat.requestsPlaced && loadedChat.requestsScale == 1.5F,
         "independent chat control/request panel placement persists");
     Check(loadedChat.requests.maximumPending == 81 && !loadedChat.requests.cooldownPerUser && loadedChat.requests.queueCooldownSeconds == 35 &&
         loadedChat.requests.commands[0] == saberstage::broadcast::CommandPermission::SubscribersAndVips, "request policy and permissions roundtrip");

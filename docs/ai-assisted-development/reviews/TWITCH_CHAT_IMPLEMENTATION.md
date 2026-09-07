@@ -6,13 +6,13 @@
 
 Authorization: 2026-09-02, implement the agreed
 [plan](../../planning/TWITCH_RICH_CHAT_AND_SONG_REQUESTS.md).
-Checkpoint `7628a89` preserves the deployed recording/avatar repairs and the
+Checkpoint `7628a89` preserves the deployed recording repairs and the
 full approved plan. No new device operations are authorized during this work.
 
 ## Execution boundaries
 
 - Twitch only; no rain, generic integration rule engine, OBS/PC companion,
-  YouTube/Kick changes, or unrelated avatar/camera/recording/UI changes.
+  YouTube/Kick changes, or unrelated camera/recording/UI changes.
 - Preserve the native chat scrollbar, joystick hover wake-up, grabbable surface,
   128-message retention, 50-row pool, and maximum 240 x 200 panel size.
 - New controls enter through Chat Control, not the main Live tab. Requests
@@ -37,7 +37,7 @@ full approved plan. No new device operations are authorized during this work.
 | Queue / commands | `SongRequests.cpp`, `SongRequestService.cpp`: per-channel two-slot durable snapshots, save-before-ack, closed restart, interrupted-attempt recovery, eight command groups, configurable limits/permissions/cooldowns, stable-ID mutations and close-during-lookup cancellation. |
 | Downloads | `ChatNetwork.cpp`, `MapArchive.cpp`, `MapDownload.cpp`: HTTPS host/redirect/size/time limits, explicit cancellable download, ZIP path/CRC/extraction checks, content SHA1 validation, file/directory flushing and atomic publication outside the scanner until ready. |
 | Native song integration | SongCore 1.1.26 pinned in QPM; `ChatControls.cpp` refreshes asynchronously and opens native difficulty selection without auto-start. `main.cpp` reports actual song start and completion/failure/quit, independently of panel selection. |
-| Rendering bundle | Separate `SaberStageChatSprite.shader` with stereo variants and UI stencil/rect clipping. Shared loader only gains an optional lookup; no avatar material/shader logic is changed. Unity reopens the generated bundle and verifies all six addressable names. |
+| Rendering bundle | Separate `SaberStageChatSprite.shader` with stereo variants and UI stencil/rect clipping. The current runtime bundle contains the chat sprite, non-bloom UI, and video-preview shaders. |
 | Existing chat integration | `MenuController.cpp` binds rich text to the existing 50-row pool, remeasures on style/asset changes, retains reader anchors, preserves native scroll/hover/grab behavior and recreates rows with saved font/background settings. No main Live/camera menu layout changes. |
 
 Policy defaults are implementation choices, not previously user-specified
@@ -85,7 +85,7 @@ moderation/EventSub subscriptions were performed in this implementation turn.
 - Host CMake/CTest: **13/13 suites passed**. Actual protocol/policy/store/worker
   code is compiled, not just source-string assertions. Added suites cover
   messages, asset catalogs, EventSub envelopes/frames, requests and archives;
-  existing settings/camera/recording/chat geometry/avatar/VRM tests remain green.
+  existing settings/camera/recording/chat geometry tests remain green.
 - Request fixtures include two-slot corruption fallback, interrupted Playing,
   ignored partial snapshots, account isolation, save-before-ack, a real
   filesystem commit failure, close while a resolver is blocked, duplicate
@@ -106,11 +106,10 @@ moderation/EventSub subscriptions were performed in this implementation turn.
   shapes/reachability, not Quest TLS, OAuth, channel catalogs or decoder output.
   FFZ's separate animation field is documented by its
   [official API](https://api.frankerfacez.com/docs/?urls.primaryName=API+v1).
-- Unity Android bundle rebuild succeeded, with all six names verified from
-  the produced bundle (`saberstage-chat-sprite`, `saberstage-grip-target`,
-  `saberstage-mtoon`, `saberstage-mtoon-outline`, `saberstage-non-bloom-ui`,
-  `saberstage-video-preview`). Bundle SHA-256:
-  `0de308f19af26eda0fae614f955d3b9ce9ba1f8afcd16f2efdc75d10ffd03e13`.
+- Unity Android bundle rebuild succeeded at that checkpoint. The later
+  camera-only product cleanup reduced the current runtime bundle to
+  `saberstage-chat-sprite`, `saberstage-non-bloom-ui`, and
+  `saberstage-video-preview`.
 - Final ARM64 integration link including reopen/cleanup changes succeeded;
   `verify-native-library.py` passed the private-logger ELF boundary check.
   Normal QPM packaging rebuilt its dependency-locked target. A final incremental
@@ -130,7 +129,7 @@ Final local artifacts (not deployed):
 Private local evidence: `diagnostics/chat-host-tests-final.log`,
 `diagnostics/chat-tooling-final.log`, `diagnostics/chat-release-build.log`, and
 `diagnostics/chat-final-map-flush-build.log`, `diagnostics/chat-qmod-final.log`,
-`tools/avatar-shader/Build/unity-avatar-shader.log`. These are local build/test
+`tools/runtime-shaders/Build/unity-runtime-shaders.log`. These are local build/test
 outputs, not a reason to commit diagnostics or device backups.
 
 ## UI reference, adaptations and outstanding acceptance

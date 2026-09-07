@@ -21,9 +21,6 @@
   "companion": {
     "enabled": false
   },
-  "avatar": {
-    "enabled": false
-  },
   "scenes": {
     "enabled": false
   },

@@ -2,7 +2,7 @@
 
 Investigate whether SaberStage can send the selected camera or composed view directly from Quest to a compatible TV or lightweight receiver without requiring a PCVR session.
 
-This is not the same as Meta's built-in first-person casting. The desired output is SaberStage's independent camera, including the third-person view and, later, the integrated avatar or selected broadcast scene.
+This is not the same as Meta's built-in first-person casting. The desired output is SaberStage's independent camera, including the third-person view and, later, the selected broadcast scene.
 
 ## Research before implementation
 

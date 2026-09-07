@@ -72,7 +72,7 @@ Provide clear actions to return to the saved base placement, disable motion laye
 
 ## Product-wide UI architecture
 
-Organize the settings so later Record, Companion/Outputs, Avatar, Scenes, Broadcast, and Chat sections fit naturally. Do not display fake controls for unfinished features.
+Organize the settings so later Record, Companion/Outputs, Scenes, Broadcast, and Chat sections fit naturally. Do not display fake controls for unfinished features.
 
 Use sensible defaults. Put low-level graphics and encoding details behind future Advanced pages rather than exposing them in the camera workflow.
 

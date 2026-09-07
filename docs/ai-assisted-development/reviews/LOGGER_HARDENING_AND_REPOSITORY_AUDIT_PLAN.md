@@ -5,7 +5,7 @@
 This pass removes SaberStage's direct runtime dependency on Paper2, adds a
 private native diagnostic path that remains available when another mod installs
 an incompatible Paper2 version, and hardens confirmed crash boundaries without
-changing the mod's intended camera, recording, streaming, avatar, or menu
+changing the mod's intended camera, recording, streaming, or menu
 behavior.
 
 The work starts from `Avatar-Framework` commit

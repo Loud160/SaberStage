@@ -19,9 +19,6 @@
 #include "saberstage/Logging.hpp"
 #include "saberstage/ErrorManager.hpp"
 #include "saberstage/app/ApplicationRoot.hpp"
-#include "saberstage/avatar/AvatarManager.hpp"
-#include "saberstage/avatar/Math.hpp"
-#include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
 #include "saberstage/camera/CameraManager.hpp"
@@ -29,9 +26,10 @@
 #include "saberstage/preview/PreviewManager.hpp"
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 #include "saberstage/recording/RecordingController.hpp"
+#include "saberstage/rendering/ShaderResources.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/settings/SettingsService.hpp"
-#include "saberstage/ui/CalibrationPanelRuntimeDriver.hpp"
+#include "saberstage/ui/MenuRuntimeDriver.hpp"
 #include "saberstage/ui/MenuFlowCoordinator.hpp"
 
 #include "HMUI/RangeValuesTextSlider.hpp"
@@ -138,30 +136,6 @@ extern "C" std::uint8_t _binary_saberstage_game_audio_muted_png_end[];
 namespace saberstage::ui {
 namespace {
 
-const UnityEngine::Vector2 kCalibrationPanelSize{126.0F, 104.0F};
-constexpr float kCalibrationPanelDistance = 1.4F;
-constexpr float kCalibrationPanelScale = 0.011F;
-const UnityEngine::Vector2 kGripEditorPanelSize{94.0F, 112.0F};
-constexpr float kGripEditorPanelDistance = 1.25F;
-constexpr float kGripEditorPanelScale = 0.011F;
-// The hand target uses three separate native FloatingScreen handles, one for
-// each translation axis. The colored arrows do not overlap the tracked hand,
-// and only the hovered/grabbed arrow's guide ring is visible. Although BSML's
-// handle can move freely, TickGripEditor projects the controller movement onto
-// the selected axis before it reaches the saved controller-to-wrist offset.
-const UnityEngine::Vector2 kGripTargetGizmoSize{1.0F, 1.0F};
-constexpr float kGripTargetGizmoScale = 0.01F;
-constexpr float kGripTargetArrowLength = 12.0F;
-constexpr float kGripTargetArrowWidth = 1.15F;
-constexpr float kGripTargetHandleWidth = 3.0F;
-constexpr float kGripTargetRingRadius = 8.5F;
-constexpr float kGripTargetRingWidth = 0.18F;
-constexpr int kGripTargetRingSegments = 64;
-// The bottom band contains every actionable control. The invisible native
-// handle covers the rest of the visual panel, so the panel remains freely
-// grabbable without introducing a dedicated move bar while button pointer
-// input can never be stolen by the physics handle.
-constexpr float kCalibrationPanelControlBandHeight = 22.0F;
 // Floating recording-controls geometry. Every value below is in FloatingScreen
 // canvas units; the world size is canvas units multiplied by
 // kRecordingPanelScale (48 x 24 units -> 60 x 30 cm at 0.0125). The panel has
@@ -193,6 +167,10 @@ static_assert(12.8F + kRecordingPanelAudioButtonSize.y * 0.5F < kRecordingPanelB
 const UnityEngine::Vector2 kChatPanelSize{70.0F, 58.0F};
 constexpr float kChatPanelScale = 0.011F;
 constexpr float kChatPanelHeaderHeight = 10.0F;
+constexpr float kChatPanelReferenceWidth = 70.0F;
+constexpr float kChatPanelReferenceHeight = 58.0F;
+constexpr float kChatPanelHeaderMinimumScale = 0.75F;
+constexpr float kChatPanelHeaderMaximumScale = 1.8F;
 constexpr float kChatResizeHandleSize = 14.0F;
 constexpr float kChatResizeHandleInset = 5.5F;
 constexpr float kChatVirtualRowMinimumHeight = 4.25F;
@@ -233,23 +211,6 @@ UnityEngine::Vector2 RecordingPanelSize(bool showFps) {
             kRecordingPanelButtonBandHeight + 2.0F};
 }
 
-// Grab proxy for the free-standing avatar display clone. The FloatingScreen
-// draws nothing: it exists purely to carry BSML's invisible physics grab
-// handle, which is enlarged into a body-sized box so the clone can be grabbed
-// anywhere on its body (a small tag at hip height ended up embedded inside
-// the body mesh, leaving only a sliver near the leg reachable). All handle
-// dimensions are in canvas units; world meters = units * kStandinProxyScale,
-// so 1 meter = 80 units. The screen origin floats a fixed height above the
-// clone's feet; the handle box is offset and scaled from there to track the
-// clone's Body and its user-chosen scale.
-const UnityEngine::Vector2 kStandinProxySize{8.0F, 8.0F};
-constexpr float kStandinProxyScale = 0.0125F;
-constexpr float kStandinProxyHeightMeters = 1.05F;
-// Approximate standing-body volume of a 1.0-scale humanoid avatar, in meters.
-constexpr float kStandinBodyWidthMeters = 0.85F;
-constexpr float kStandinBodyHeightMeters = 1.95F;
-constexpr float kStandinBodyDepthMeters = 0.55F;
-constexpr float kStandinBodyCenterHeightMeters = 0.95F;
 
 template <typename T>
 T* WithHint(T* control, std::string_view text) {
@@ -273,26 +234,6 @@ bool IsAlive(UnityEngine::Object* object) {
 // scale. Called at creation and again whenever the scale setting changes.
 // (Defined after IsAlive: everything in this anonymous namespace must respect
 // declaration order.)
-void FitStandinProxyHandleToBody(BSML::FloatingScreen* screen, float cloneScale) {
-    if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
-    if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
-        renderer->set_enabled(false);
-    }
-    const float unitsPerMeter = 1.0F / kStandinProxyScale;
-    const float scale = std::max(0.05F, cloneScale);
-    // The screen origin sits kStandinProxyHeightMeters above the clone's
-    // feet; the body's center sits kStandinBodyCenterHeightMeters * scale
-    // above the feet, so the handle is offset by the difference.
-    const float centerOffsetMeters =
-        kStandinBodyCenterHeightMeters * scale - kStandinProxyHeightMeters;
-    screen->handle->get_transform()->set_localPosition({
-        0.0F, centerOffsetMeters * unitsPerMeter, 0.0F});
-    screen->handle->get_transform()->set_localScale({
-        kStandinBodyWidthMeters * scale * unitsPerMeter,
-        kStandinBodyHeightMeters * scale * unitsPerMeter,
-        kStandinBodyDepthMeters * scale * unitsPerMeter});
-}
-
 bool FloatingUiServicesReady() {
     auto scene = UnityEngine::SceneManagement::SceneManager::GetActiveScene();
     if (!scene.IsValid()) return false;
@@ -315,188 +256,6 @@ camera::Pose ReadWorldPose(UnityEngine::Transform* transform) {
     return {
         {position.x, position.y, position.z},
         {rotation.x, rotation.y, rotation.z, rotation.w}};
-}
-
-camera::Pose ToCamera(avatar::Pose value) {
-    return {
-        {value.position.x, value.position.y, value.position.z},
-        {value.rotation.x, value.rotation.y, value.rotation.z, value.rotation.w}};
-}
-
-camera::Vec3 ToCamera(UnityEngine::Vector3 value) {
-    return {value.x, value.y, value.z};
-}
-
-camera::Quaternion ToCamera(UnityEngine::Quaternion value) {
-    return {value.x, value.y, value.z, value.w};
-}
-
-avatar::Pose ToAvatar(camera::Pose value) {
-    return {
-        {value.position.x, value.position.y, value.position.z},
-        {value.rotation.x, value.rotation.y, value.rotation.z, value.rotation.w}};
-}
-
-camera::Quaternion AxisAngle(camera::Vec3 axis, float degrees) noexcept {
-    const auto magnitude = std::sqrt(
-        axis.x * axis.x + axis.y * axis.y + axis.z * axis.z);
-    if (magnitude < 1.0e-6F || !std::isfinite(degrees)) return {};
-    axis = axis * (1.0F / magnitude);
-    constexpr float kDegreesToRadians = 0.01745329251994329577F;
-    const auto half = degrees * kDegreesToRadians * 0.5F;
-    const auto sine = std::sin(half);
-    return camera::Normalize({
-        axis.x * sine, axis.y * sine, axis.z * sine, std::cos(half)});
-}
-
-camera::Vec3 EulerDegrees(camera::Quaternion rotation) noexcept {
-    const auto euler = ToUnity(camera::Normalize(rotation)).get_eulerAngles();
-    return {
-        camera::NormalizeDegrees(euler.x),
-        camera::NormalizeDegrees(euler.y),
-        camera::NormalizeDegrees(euler.z)};
-}
-
-float SignedControllerTwistDegrees(
-    camera::Quaternion start,
-    camera::Quaternion current,
-    camera::Vec3 worldAxis) noexcept {
-    const auto axisMagnitude = std::sqrt(
-        worldAxis.x * worldAxis.x + worldAxis.y * worldAxis.y + worldAxis.z * worldAxis.z);
-    if (axisMagnitude < 1.0e-6F) return 0.0F;
-    worldAxis = worldAxis * (1.0F / axisMagnitude);
-    auto delta = camera::Multiply(current, camera::Inverse(start));
-    if (delta.w < 0.0F) {
-        delta = {-delta.x, -delta.y, -delta.z, -delta.w};
-    }
-    const auto projected = delta.x * worldAxis.x +
-        delta.y * worldAxis.y + delta.z * worldAxis.z;
-    const auto magnitude = std::sqrt(projected * projected + delta.w * delta.w);
-    if (magnitude < 1.0e-6F) return 0.0F;
-    constexpr float kRadiansToDegrees = 57.295779513082320876F;
-    return camera::NormalizeDegrees(
-        2.0F * std::atan2(projected / magnitude, delta.w / magnitude) * kRadiansToDegrees);
-}
-
-GlobalNamespace::VRController* OppositeGripEditorController(int editedSide) noexcept {
-    try {
-        const auto wantedNode = editedSide == 0
-            ? UnityEngine::XR::XRNode::RightHand
-            : UnityEngine::XR::XRNode::LeftHand;
-        for (auto* controller :
-                UnityEngine::Resources::FindObjectsOfTypeAll<GlobalNamespace::VRController*>()) {
-            if (!IsAlive(controller) || controller->get_node().value__ != wantedNode.value__) continue;
-            auto anchor = controller->get_viewAnchorTransform();
-            if (IsAlive(anchor.ptr())) return controller;
-        }
-    } catch (...) {
-    }
-    return nullptr;
-}
-
-bool GripRotationButtonHeld(GlobalNamespace::VRController* controller) noexcept {
-    if (!IsAlive(controller)) return false;
-    try {
-        const auto controllerMask = controller->get_node().value__ ==
-                UnityEngine::XR::XRNode::LeftHand.value__
-            ? GlobalNamespace::OVRInput_Controller::LTouch
-            : GlobalNamespace::OVRInput_Controller::RTouch;
-        return GlobalNamespace::OVRInput::Get(
-            GlobalNamespace::OVRInput_Axis1D::PrimaryHandTrigger,
-            controllerMask) >= 0.55F;
-    } catch (...) {
-        return false;
-    }
-}
-
-UnityEngine::LineRenderer* CreateGripTargetRing(
-    UnityEngine::Transform* parent,
-    int normalAxis,
-    UnityEngine::Color color,
-    UnityEngine::Material* material) {
-    auto* object = UnityEngine::GameObject::New_ctor("SaberStage Hand Target Ring");
-    object->set_layer(5);
-    object->get_transform()->SetParent(parent, false);
-    auto* ring = object->AddComponent<UnityEngine::LineRenderer*>();
-    ring->set_useWorldSpace(false);
-    ring->set_loop(true);
-    ring->set_positionCount(kGripTargetRingSegments);
-    ring->set_startWidth(kGripTargetRingWidth);
-    ring->set_endWidth(kGripTargetRingWidth);
-    ring->set_startColor(color);
-    ring->set_endColor(color);
-    if (IsAlive(material)) ring->set_material(material);
-    constexpr float kTau = 6.28318530717958647692F;
-    for (int index = 0; index < kGripTargetRingSegments; ++index) {
-        const auto angle = kTau * static_cast<float>(index) /
-            static_cast<float>(kGripTargetRingSegments);
-        const auto first = std::cos(angle) * kGripTargetRingRadius;
-        const auto second = std::sin(angle) * kGripTargetRingRadius;
-        UnityEngine::Vector3 point{};
-        if (normalAxis == 0) point = {0.0F, first, second};
-        else if (normalAxis == 1) point = {first, 0.0F, second};
-        else point = {first, second, 0.0F};
-        ring->SetPosition(index, point);
-    }
-    return ring;
-}
-
-UnityEngine::GameObject* CreateGripArrowPart(
-    UnityEngine::Transform* parent,
-    std::string_view name,
-    UnityEngine::Vector3 position,
-    UnityEngine::Vector3 scale,
-    UnityEngine::Vector3 rotation,
-    UnityEngine::Material* material) {
-    auto object = UnityEngine::GameObject::CreatePrimitive(UnityEngine::PrimitiveType::Cube);
-    if (!IsAlive(object.ptr())) return nullptr;
-    object->set_name(StringW(std::string(name)));
-    object->set_layer(5);
-    object->get_transform()->SetParent(parent, false);
-    object->get_transform()->set_localPosition(position);
-    object->get_transform()->set_localScale(scale);
-    object->get_transform()->set_localRotation(UnityEngine::Quaternion::Euler(rotation));
-    if (auto* collider = object->GetComponent<UnityEngine::Collider*>()) {
-        UnityEngine::Object::Destroy(collider);
-    }
-    if (auto* renderer = object->GetComponent<UnityEngine::MeshRenderer*>()) {
-        if (IsAlive(material)) renderer->set_material(material);
-    }
-    return object.ptr();
-}
-
-void CreateGripTargetArrow(
-    UnityEngine::Transform* parent,
-    int axis,
-    float directionSign,
-    UnityEngine::Material* material) {
-    auto* root = UnityEngine::GameObject::New_ctor("SaberStage Hand Target Arrow");
-    root->set_layer(5);
-    root->get_transform()->SetParent(parent, false);
-    root->get_transform()->set_localPosition({0.0F, 0.0F, 0.0F});
-    root->get_transform()->set_localRotation(
-        axis == 0 && directionSign < 0.0F ? UnityEngine::Quaternion::Euler({0.0F, 180.0F, 0.0F}) :
-        axis == 0 ? UnityEngine::Quaternion::get_identity() :
-        axis == 1 ? UnityEngine::Quaternion::Euler({0.0F, 0.0F, 90.0F}) :
-                    UnityEngine::Quaternion::Euler({0.0F, -90.0F, 0.0F}));
-
-    // Build the arrow along local +X. Four short diagonal bars form a
-    // three-dimensional arrowhead that remains recognizable from any angle.
-    CreateGripArrowPart(root->get_transform(), "Arrow Shaft",
-        {5.5F, 0.0F, 0.0F}, {8.0F, kGripTargetArrowWidth, kGripTargetArrowWidth},
-        {}, material);
-    CreateGripArrowPart(root->get_transform(), "Arrow Head +Y",
-        {9.8F, 1.2F, 0.0F}, {3.8F, kGripTargetArrowWidth, kGripTargetArrowWidth},
-        {0.0F, 0.0F, -38.0F}, material);
-    CreateGripArrowPart(root->get_transform(), "Arrow Head -Y",
-        {9.8F, -1.2F, 0.0F}, {3.8F, kGripTargetArrowWidth, kGripTargetArrowWidth},
-        {0.0F, 0.0F, 38.0F}, material);
-    CreateGripArrowPart(root->get_transform(), "Arrow Head +Z",
-        {9.8F, 0.0F, 1.2F}, {3.8F, kGripTargetArrowWidth, kGripTargetArrowWidth},
-        {0.0F, 38.0F, 0.0F}, material);
-    CreateGripArrowPart(root->get_transform(), "Arrow Head -Z",
-        {9.8F, 0.0F, -1.2F}, {3.8F, kGripTargetArrowWidth, kGripTargetArrowWidth},
-        {0.0F, -38.0F, 0.0F}, material);
 }
 
 float WorldPoseDifference(camera::Pose left, camera::Pose right) {
@@ -532,7 +291,7 @@ void ConfigureWorldPanelImage(
 }
 
 UnityEngine::Material* CreateNonBloomWorldPanelMaterial(std::string_view name) {
-    auto* shader = avatar::vrm::EmbeddedNonBloomUiShader();
+    auto* shader = rendering::EmbeddedNonBloomUiShader();
     if (!IsAlive(shader)) {
         Logging::Logger.warn(
             "World-panel accent '{}' is using the stock UI material because the embedded non-bloom shader is unavailable",
@@ -589,23 +348,6 @@ void HideAndFitWorldPanelHandleBehindContent(
         panelSize.x, panelSize.y, 0.2F});
 }
 
-void HideAndFitCalibrationPanelHandleAboveControls(BSML::FloatingScreen* screen) {
-    if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
-    if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
-        renderer->set_enabled(false);
-    }
-    // Keep the same proven invisible native handle across the panel's complete
-    // reading surface. Do not extend its collider through the bottom control
-    // band: a physics hit there wins over Unity's UI raycast and turns a button
-    // click into a panel grab. This leaves no special visible grab area while
-    // preserving normal buttons across every calibration phase.
-    const float handleHeight = kCalibrationPanelSize.y - kCalibrationPanelControlBandHeight;
-    screen->handle->get_transform()->set_localPosition({
-        0.0F, kCalibrationPanelControlBandHeight * 0.5F, 0.0F});
-    screen->handle->get_transform()->set_localScale({
-        kCalibrationPanelSize.x, handleHeight, 2.0F});
-}
-
 void UpdateWorldPanelHandleRotation(BSML::FloatingScreen* screen) {
     if (!IsAlive(screen) || !IsAlive(screen->handle)) return;
     auto* handle = screen->handle->GetComponent<BSML::FloatingScreenHandle*>();
@@ -629,44 +371,6 @@ std::string RecordingElapsed(double elapsedSeconds) {
     text << std::setfill('0');
     if (hours > 0) text << std::setw(2) << hours << ':';
     text << std::setw(2) << minutes << ':' << std::setw(2) << seconds;
-    return text.str();
-}
-
-float Mean(float left, float right) { return (left + right) * 0.5F; }
-
-std::string CalibrationReviewDetails(
-    const avatar::calibration::PlayerCalibrationProfile& profile) {
-    const auto grip = Mean(profile.grip.confidence[0], profile.grip.confidence[1]);
-    const auto reach = Mean(profile.reach.confidence[0], profile.reach.confidence[1]);
-    float motionTotal = 0.0F;
-    std::size_t motionCount = 0;
-    for (const auto& capture : profile.motionCaptures) {
-        if (!capture.valid) continue;
-        motionTotal += capture.confidence;
-        ++motionCount;
-    }
-    const auto motion = motionCount > 0 ? motionTotal / static_cast<float>(motionCount) : 0.0F;
-    const auto percent = [](float value) {
-        return static_cast<int>(std::round(std::clamp(value, 0.0F, 1.0F) * 100.0F));
-    };
-    std::ostringstream text;
-    text << "Overall " << percent(profile.overallConfidence) << "%   |   Grip "
-         << percent(grip) << "%   |   Reach " << percent(reach)
-         << "%\nMovement " << percent(motion) << "%";
-    std::vector<std::string_view> warnings;
-    if (grip < 0.55F) warnings.emplace_back("grip");
-    if (reach < 0.55F) warnings.emplace_back("reach");
-    if (motion < 0.55F) warnings.emplace_back("movement");
-    if (!warnings.empty()) {
-        text << "\nLow-confidence area" << (warnings.size() == 1 ? ": " : "s: ");
-        for (std::size_t index = 0; index < warnings.size(); ++index) {
-            if (index != 0) text << ", ";
-            text << warnings[index];
-        }
-        text << ". Restart if the result does not look representative.";
-    } else {
-        text << "\nAll measured sections passed without a low-confidence warning.";
-    }
     return text.str();
 }
 
@@ -890,40 +594,6 @@ T* ConstrainRightPanelRow(T* control) {
     return control;
 }
 
-// The center screen is substantially wider than either side screen. Use that
-// space instead of squeezing the stock 90-unit BSML rows into a 52-unit strip:
-// long labels stay readable, slider tracks retain useful travel, and adjacent
-// action buttons can be arranged in rows without overlapping captions.
-constexpr float kCenterPanelRowWidth = 82.0F;
-constexpr float kCenterPanelTextWidth = 84.0F;
-constexpr float kCenterPanelLabelFraction = 0.42F;
-// The Setup page's three-action rows deliberately use more of the center
-// screen than ordinary setting rows. The four tab captions above establish
-// the safe visual width on Quest; 116 units remains inside that span while
-// preventing labels such as Enable Avatar and Reset Profile Calibration from
-// being compressed. Equal columns keep the profile selector truly centered.
-constexpr float kCenterThreeColumnRowWidth = 116.0F;
-constexpr float kCenterThreeColumnWidth = 38.0F;
-
-void ConstrainCenterPanelRowObject(UnityEngine::GameObject* object) {
-    if (!object) return;
-    auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>();
-    if (!layout) layout = object->AddComponent<UnityEngine::UI::LayoutElement*>();
-    if (!layout) return;
-
-    // BSML's setting prefabs are authored for a 90-unit settings screen.
-    // SaberStage's center tab deliberately owns a wide 82-unit content column.
-    // The parent layout and every stock row must agree on that same width or
-    // Unity preserves the prefab's 90-unit geometry outside the scroll mask.
-    layout->set_minWidth(kCenterPanelRowWidth);
-    layout->set_preferredWidth(kCenterPanelRowWidth);
-    layout->set_flexibleWidth(0.0F);
-
-    // Center pages use the same flat geometry as the side pages. Keep the
-    // stock row on the panel plane before positioning its label/control halves.
-    FlattenFlatPanelDepth(object->get_transform().ptr());
-}
-
 void FitRectToParentRegion(
     UnityEngine::RectTransform* rect,
     float left,
@@ -1024,251 +694,6 @@ BSML::ToggleSetting* ConstrainRightPanelRow(BSML::ToggleSetting* control) {
     return control;
 }
 
-BSML::DropdownListSetting* ConstrainCenterPanelRow(BSML::DropdownListSetting* control) {
-    if (!control) return nullptr;
-    auto object = control->get_gameObject();
-    ConstrainCenterPanelRowObject(object);
-    if (!object) return control;
-
-    // A stock dropdown keeps its selector at the far edge of a 90-unit row.
-    // Re-anchor both halves inside this row instead of merely shrinking the
-    // row's LayoutElement and leaving the visible children off-screen.
-    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
-    if (auto labelTransform = root->Find("Label")) {
-        FitRectToParentRegion(
-            labelTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
-            0.0F,
-            kCenterPanelLabelFraction,
-            0.5F,
-            0.75F);
-        if (auto* label = labelTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
-            label->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-            label->set_enableWordWrapping(false);
-            label->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-        }
-    }
-    if (control->dropdown) {
-        FitRectToParentRegion(
-            control->dropdown->get_transform().cast<UnityEngine::RectTransform>(),
-            kCenterPanelLabelFraction,
-            1.0F,
-            0.75F,
-            0.5F);
-    }
-    return control;
-}
-
-BSML::SliderSetting* ConstrainCenterPanelRow(BSML::SliderSetting* control) {
-    if (!control) return nullptr;
-    auto object = control->get_gameObject();
-    ConstrainCenterPanelRowObject(object);
-    if (!object) return control;
-
-    // SliderSettingTag reserves a fixed 52 units for the slider by default.
-    // Split
-    // the row explicitly so the title and the complete native slider remain
-    // visible and interactive inside the same masked column.
-    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
-    if (auto titleTransform = root->Find("Title")) {
-        FitRectToParentRegion(
-            titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
-            0.0F,
-            kCenterPanelLabelFraction,
-            0.5F,
-            0.75F);
-        if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
-            title->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-            title->set_enableWordWrapping(false);
-            title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-        }
-    }
-    if (control->slider) {
-        FitRectToParentRegion(
-            control->slider->get_transform().cast<UnityEngine::RectTransform>(),
-            kCenterPanelLabelFraction,
-            1.0F,
-            0.75F,
-            0.5F);
-    }
-    return control;
-}
-
-template <typename Callback>
-UnityEngine::UI::Button* AddCenterSliderResetButton(
-    UnityEngine::Transform* creationParent,
-    BSML::SliderSetting* setting,
-    Callback&& callback,
-    std::string_view hoverText) {
-    if (!creationParent || !setting || !setting->slider) return nullptr;
-
-    // This deliberately copies Big Screen's proven reset-control hierarchy:
-    // create a normal BSML button, then reparent it as an overlay immediately
-    // left of the native slider. It does not become another layout column, so
-    // the narrow SaberStage center panel keeps its established row width and
-    // the label/slider geometry cannot be pushed outside the scroll mask.
-    constexpr float kResetButtonSize = 6.5F;
-    auto* button = BSML::Lite::CreateUIButton(
-        creationParent,
-        "↻",
-        {0.0F, 0.0F},
-        {kResetButtonSize, kResetButtonSize},
-        std::forward<Callback>(callback));
-    if (!button) return nullptr;
-    BSML::Lite::SetButtonTextSize(button, 5.5F);
-    ConfigureLayout(button, kResetButtonSize, kResetButtonSize, 0.0F, 0.0F);
-    WithHint(button, hoverText);
-
-    auto* resetRect = button->get_transform()
-        .template cast<UnityEngine::RectTransform>()
-        .ptr();
-    auto* sliderRect = setting->slider->get_transform()
-        .cast<UnityEngine::RectTransform>()
-        .ptr();
-    resetRect->SetParent(sliderRect, false);
-    resetRect->set_anchorMin({0.0F, 0.5F});
-    resetRect->set_anchorMax({0.0F, 0.5F});
-    resetRect->set_pivot({1.0F, 0.5F});
-    resetRect->set_anchoredPosition({-0.75F, 0.0F});
-    resetRect->set_sizeDelta({kResetButtonSize, kResetButtonSize});
-    resetRect->SetAsLastSibling();
-    return button;
-}
-
-BSML::ToggleSetting* ConstrainCenterPanelRow(BSML::ToggleSetting* control) {
-    if (!control) return nullptr;
-    auto object = control->get_gameObject();
-    ConstrainCenterPanelRowObject(object);
-    if (!object) return control;
-
-    // ToggleSettingTag copies the game's full-width Fullscreen row. Preserve
-    // the native switch dimensions, but pin it to this row's right edge and
-    // give all remaining width to the label.
-    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
-    auto switchTransform = root->Find("SwitchView");
-    auto* switchRect = switchTransform
-        ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
-        : nullptr;
-    const auto switchWidth = switchRect ? switchRect->get_sizeDelta().x : 12.0F;
-    if (auto nameTransform = root->Find("NameText")) {
-        auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
-        nameRect->set_anchorMin({0.0F, 0.0F});
-        nameRect->set_anchorMax({1.0F, 1.0F});
-        nameRect->set_pivot({0.5F, 0.5F});
-        nameRect->set_offsetMin({0.5F, 0.0F});
-        nameRect->set_offsetMax({-(switchWidth + 1.5F), 0.0F});
-        if (control->text) {
-            control->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-            control->text->set_enableWordWrapping(false);
-            control->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-        }
-    }
-    if (switchRect) {
-        switchRect->set_anchorMin({1.0F, 0.5F});
-        switchRect->set_anchorMax({1.0F, 0.5F});
-        switchRect->set_pivot({1.0F, 0.5F});
-        switchRect->set_anchoredPosition({-0.5F, 0.0F});
-    }
-    return control;
-}
-
-void ConfigureCompactCenterControl(UnityEngine::Component* component, float width) {
-    if (!component) return;
-    NeutralizeContentSizeFitter(component);
-    ConfigureLayout(component, width, 8.0F, 0.0F, 0.0F);
-    auto object = component->get_gameObject();
-    if (!object) return;
-    if (auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>()) {
-        layout->set_minWidth(width);
-    }
-    FlattenFlatPanelDepth(object->get_transform().ptr());
-}
-
-BSML::ToggleSetting* ConfigureCompactCenterToggle(BSML::ToggleSetting* control, float width) {
-    if (!control) return nullptr;
-    ConfigureCompactCenterControl(control, width);
-    auto object = control->get_gameObject();
-    if (!object) return control;
-
-    // This compact variant is used only by the three-column Setup row. Keep
-    // the label and native switch together inside the left column instead of
-    // inheriting the ordinary center setting-row geometry.
-    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
-    auto switchTransform = root->Find("SwitchView");
-    auto* switchRect = switchTransform
-        ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
-        : nullptr;
-    const auto switchWidth = switchRect ? switchRect->get_sizeDelta().x : 12.0F;
-    if (auto nameTransform = root->Find("NameText")) {
-        auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
-        nameRect->set_anchorMin({0.0F, 0.0F});
-        nameRect->set_anchorMax({1.0F, 1.0F});
-        nameRect->set_pivot({0.5F, 0.5F});
-        nameRect->set_offsetMin({0.5F, 0.0F});
-        nameRect->set_offsetMax({-(switchWidth + 0.75F), 0.0F});
-        if (control->text) {
-            control->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-            control->text->set_enableWordWrapping(false);
-            control->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-        }
-    }
-    if (switchRect) {
-        switchRect->set_anchorMin({1.0F, 0.5F});
-        switchRect->set_anchorMax({1.0F, 0.5F});
-        switchRect->set_pivot({1.0F, 0.5F});
-        switchRect->set_anchoredPosition({-0.25F, 0.0F});
-    }
-    return control;
-}
-
-BSML::DropdownListSetting* ConfigureCompactCenterDropdown(
-    BSML::DropdownListSetting* control,
-    float width) {
-    if (!control) return nullptr;
-    ConfigureCompactCenterControl(control, width);
-    auto object = control->get_gameObject();
-    if (!object) return control;
-
-    // The profile's location in the Setup row already communicates its
-    // purpose. Remove the stock prefix label and let the selector occupy the
-    // complete middle column so the profile name is centered and readable.
-    auto root = object->get_transform().cast<UnityEngine::RectTransform>();
-    if (auto labelTransform = root->Find("Label")) {
-        labelTransform->get_gameObject()->SetActive(false);
-    }
-    if (control->dropdown) {
-        FitRectToParentRegion(
-            control->dropdown->get_transform().cast<UnityEngine::RectTransform>(),
-            0.0F,
-            1.0F,
-            0.5F,
-            0.5F);
-    }
-    return control;
-}
-
-UnityEngine::UI::HorizontalLayoutGroup* CreateCenterThreeColumnRow(UnityEngine::Transform* parent) {
-    auto* row = BSML::Lite::CreateHorizontalLayoutGroup(parent);
-    if (!row) return nullptr;
-    row->set_spacing(1.0F);
-    row->set_childControlWidth(true);
-    row->set_childControlHeight(true);
-    row->set_childForceExpandWidth(false);
-    row->set_childForceExpandHeight(false);
-    row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
-    ConfigureLayout(row, kCenterThreeColumnRowWidth, 8.0F, 0.0F, 0.0F);
-    return row;
-}
-
-UnityEngine::UI::Button* ConfigureCenterRowButton(
-    UnityEngine::UI::Button* button,
-    float width,
-    float textSize = 3.0F) {
-    if (!button) return nullptr;
-    ConfigureCompactCenterControl(button, width);
-    BSML::Lite::SetButtonTextSize(button, textSize);
-    return button;
-}
-
 void ConfigureRightPanelButton(UnityEngine::UI::Button* button) {
     if (!IsAlive(button)) return;
     NeutralizeContentSizeFitter(button);
@@ -1303,25 +728,6 @@ TMPro::TextMeshProUGUI* CreateRightPanelSubheader(
     // edge lines up with the setting rows beneath it. The extra height above
     // a plain row provides the visual section break.
     ConfigureLayout(text, kRightPanelRowWidth, 4.5F, 0.0F, 0.0F);
-    text->set_color({0.55F, 0.78F, 0.95F, 1.0F});
-    return text;
-}
-
-TMPro::TextMeshProUGUI* CreateCenterPanelSubheader(
-    UnityEngine::Transform* parent,
-    std::string_view label) {
-    auto* text = BSML::Lite::CreateText(
-        parent, StringW(label), TMPro::FontStyles::Bold, 3.4F);
-    if (!IsAlive(text)) return nullptr;
-    text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-    text->set_enableWordWrapping(false);
-    text->set_raycastTarget(false);
-    // Center pages own the kCenterPanelRowWidth content column; the
-    // subheader takes the same width so it aligns with the rows it titles.
-    ConfigureLayout(text, kCenterPanelRowWidth, 5.0F, 0.0F, 0.0F);
-    if (auto* layout = text->get_gameObject()->GetComponent<UnityEngine::UI::LayoutElement*>()) {
-        layout->set_minWidth(kCenterPanelRowWidth);
-    }
     text->set_color({0.55F, 0.78F, 0.95F, 1.0F});
     return text;
 }
@@ -1457,52 +863,11 @@ void FitLivestreamActionRow(
     }
 }
 
-void ConfigureCalibrationPanelText(
-    TMPro::TextMeshProUGUI* text,
-    float preferredHeight,
-    float minimumSize,
-    float maximumSize,
-    bool wordWrapping,
-    float flexibleHeight = 0.0F) {
-    if (!IsAlive(text)) return;
-    text->get_gameObject()->set_layer(5);
-    text->set_alignment(TMPro::TextAlignmentOptions::Center);
-    text->set_enableWordWrapping(wordWrapping);
-    text->set_raycastTarget(false);
-    text->set_enableAutoSizing(true);
-    text->set_fontSizeMin(minimumSize);
-    text->set_fontSizeMax(maximumSize);
-    // Width comes from the fixed calibration root's child-control setting.
-    // The LayoutElement supplies only vertical policy, exactly as Big Screen's
-    // proven performance panel does for its persistent TMP rows.
-    ConfigureLayout(text, -1.0F, preferredHeight, 0.0F, flexibleHeight);
-}
-
-void ConfigureCalibrationButton(
-    UnityEngine::UI::Button* button,
-    UnityEngine::Vector2 size) {
-    if (!IsAlive(button)) return;
-    NeutralizeContentSizeFitter(button);
-    ConfigureLayout(button, size.x, size.y, 0.0F, 0.0F);
-    if (auto* layout = button->GetComponent<UnityEngine::UI::LayoutElement*>()) {
-        layout->set_minWidth(size.x);
-        layout->set_minHeight(size.y);
-    }
-    // Keep the stock BSML button label and sizing path. The containing native
-    // HorizontalLayoutGroup owns placement while BSML owns caption geometry.
-    BSML::Lite::SetButtonTextSize(button, 3.4F);
-    BSML::Lite::ToggleButtonWordWrapping(button, false);
-}
-
 std::string Lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));
     });
     return value;
-}
-
-bool IsVrmFile(const std::filesystem::path& path) {
-    return Lower(path.extension().string()) == ".vrm";
 }
 
 bool IsAfkMediaFile(const std::filesystem::path& path) {
@@ -1536,9 +901,6 @@ MenuController::MenuController(app::ApplicationRoot& root) : root_(root) {
     root_.Recording().SetStatusChangedHandler([] {
         if (active_ != nullptr) active_->RefreshRecordingStatus();
     });
-    root_.Avatar().SetCalibrationStatusChangedHandler([] {
-        if (active_ != nullptr) active_->RefreshCalibrationStatus();
-    });
 }
 MenuController::~MenuController() noexcept {
     // Stop callbacks from discovering a half-destroyed controller before any
@@ -1548,8 +910,6 @@ MenuController::~MenuController() noexcept {
     if (active_ == this) active_ = nullptr;
     auto& errors = ErrorManager::Instance();
     errors.Guard("releasing main-menu slider registrations", [this] {
-        if (IsAlive(avatarSettingsView_))
-            (void)ReleaseSliderRegistrations(avatarSettingsView_->get_gameObject(), "avatar menu shutdown");
         if (IsAlive(recordingView_))
             (void)ReleaseSliderRegistrations(recordingView_->get_gameObject(), "recording menu shutdown");
         for (auto* page : tabViewRoots_)
@@ -1558,9 +918,6 @@ MenuController::~MenuController() noexcept {
     errors.Guard("clearing recording UI callbacks", [this] {
         root_.Recording().SetStatusChangedHandler({});
     });
-    errors.Guard("clearing avatar UI callbacks", [this] {
-        root_.Avatar().SetCalibrationStatusChangedHandler({});
-    });
     errors.Guard("destroying floating recording controls", [this] {
         DestroyRecordingWorldPanel();
     });
@@ -1568,24 +925,15 @@ MenuController::~MenuController() noexcept {
         chatControls_.reset();
         DestroyChatWorldPanel();
     });
-    errors.Guard("destroying avatar display proxies", [this] {
-        DestroyAllStandinProxies();
-    });
-    errors.Guard("closing avatar grip editor", [this] {
-        DestroyGripEditor(true);
-    });
-    errors.Guard("closing player calibration panel", [this] {
-        DestroyCalibrationPanel();
-    });
     errors.Guard("unbinding the menu runtime driver", [this] {
-        UnbindCalibrationPanelRuntimeDriver(this);
+        UnbindMenuRuntimeDriver(this);
     });
     errors.Guard("destroying the menu runtime driver", [this] {
-        if (IsAlive(calibrationPanelDriverObject_)) {
-            UnityEngine::Object::Destroy(calibrationPanelDriverObject_);
+        if (IsAlive(menuRuntimeDriverObject_)) {
+            UnityEngine::Object::Destroy(menuRuntimeDriverObject_);
         }
     });
-    calibrationPanelDriverObject_ = nullptr;
+    menuRuntimeDriverObject_ = nullptr;
     errors.Guard("detaching the docked camera preview", [this] {
         root_.Preview().DetachDockedPreview();
     });
@@ -1594,15 +942,15 @@ MenuController::~MenuController() noexcept {
 void MenuController::Register() {
     if (registered_) return;
     active_ = this;
-    RegisterCalibrationPanelRuntimeDriverType();
-    BindCalibrationPanelRuntimeDriver(this);
-    calibrationPanelDriverObject_ = UnityEngine::GameObject::New_ctor(
-        "SaberStage Calibration Panel Runtime");
-    if (IsAlive(calibrationPanelDriverObject_)) {
-        UnityEngine::Object::DontDestroyOnLoad(calibrationPanelDriverObject_);
-        calibrationPanelDriverObject_->AddComponent<CalibrationPanelRuntimeDriver*>();
+    RegisterMenuRuntimeDriverType();
+    BindMenuRuntimeDriver(this);
+    menuRuntimeDriverObject_ = UnityEngine::GameObject::New_ctor(
+        "SaberStage Menu Runtime");
+    if (IsAlive(menuRuntimeDriverObject_)) {
+        UnityEngine::Object::DontDestroyOnLoad(menuRuntimeDriverObject_);
+        menuRuntimeDriverObject_->AddComponent<MenuRuntimeDriver*>();
     } else {
-        Logging::Logger.error("Could not create the player-calibration panel runtime driver");
+        Logging::Logger.error("Could not create the world-panel menu runtime driver");
     }
     RegisterMenuFlowCoordinatorType();
     BSML::Register::RegisterMainMenuFlowCoordinator(
@@ -1611,1318 +959,6 @@ void MenuController::Register() {
         csTypeOf(MenuFlowCoordinator*));
     registered_ = true;
     Logging::Logger.info("Registered SaberStage main-menu entry with Camera2-familiar panels");
-}
-
-void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
-    if (active_ == nullptr) return;
-    Logging::Logger.info("AvatarSettingsBuild begin selectedTab={}", active_->selectedAvatarTab_);
-    active_->avatarSettingsView_ = view;
-    static std::array<std::string_view, 4> tabNames{"Setup", "Display", "Quality", "Fit"};
-    active_->avatarTabViewRoots_.fill(nullptr);
-    active_->avatarTabContentRoots_.fill(nullptr);
-    // selectedAvatarTab_ is initialized to Setup for the first construction,
-    // but is deliberately not reset here. Rebuilding the center panel after
-    // a profile, avatar, or capability change must leave the user on the page
-    // where that action occurred instead of unexpectedly jumping to Setup.
-    active_->avatarTabs_ = BSML::Lite::CreateTextSegmentedControl(
-        view,
-        {0.0F, 0.0F},
-        {86.0F, 7.0F},
-        tabNames,
-        [](int index) {
-            if (active_) active_->ShowAvatarTab(index);
-        });
-    if (active_->avatarTabs_) {
-        WithHint(active_->avatarTabs_, "Setup contains the required first-run workflow. Display, Quality, and Fit contain optional adjustments grouped by purpose.");
-        auto tabsRect = active_->avatarTabs_->get_transform().cast<UnityEngine::RectTransform>();
-        tabsRect->set_anchorMin({0.0F, 1.0F});
-        tabsRect->set_anchorMax({1.0F, 1.0F});
-        tabsRect->set_pivot({0.5F, 1.0F});
-        tabsRect->set_anchoredPosition({0.0F, -1.5F});
-        tabsRect->set_sizeDelta({-4.0F, 7.0F});
-    }
-
-    const auto createTabPage = [&](int index) -> UnityEngine::GameObject* {
-        auto* page = BSML::Lite::CreateScrollableSettingsContainer(view);
-        if (!page) return nullptr;
-        active_->avatarTabContentRoots_[index] = page;
-        if (auto* external = page->GetComponent<BSML::ExternalComponents*>()) {
-            if (auto* scroll = external->Get<UnityEngine::RectTransform*>()) {
-                scroll->set_anchoredPosition({2.0F, -3.5F});
-                scroll->set_sizeDelta({0.0F, -13.0F});
-                active_->avatarTabViewRoots_[index] = scroll->get_gameObject();
-            }
-        }
-        if (!active_->avatarTabViewRoots_[index]) active_->avatarTabViewRoots_[index] = page;
-        if (auto* rows = page->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
-            // The scroll content owns one consistent center-column layout.
-            // Width control is required here; without it the row-level
-            // LayoutElements are ignored and BSML retains its 90-unit prefab
-            // geometry beyond both sides of the visible mask.
-            rows->set_childControlWidth(true);
-            rows->set_childForceExpandWidth(false);
-            rows->set_childControlHeight(true);
-            rows->set_childForceExpandHeight(false);
-            rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
-            rows->set_spacing(1.0F);
-        }
-        return page;
-    };
-    std::array<UnityEngine::GameObject*, 4> pages{
-        createTabPage(0),
-        createTabPage(1),
-        createTabPage(2),
-        createTabPage(3)};
-    if (std::any_of(pages.begin(), pages.end(), [](auto* page) { return page == nullptr; })) {
-        Logging::Logger.error("Could not create all native SaberStage avatar settings pages");
-        return;
-    }
-
-    auto* container = pages[0];
-    auto* heading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Setup", 6.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 8.0F});
-    heading->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    const auto& avatar = active_->root_.Settings().Get().avatar;
-    auto* setupQuickActions = CreateCenterThreeColumnRow(container->get_transform());
-    active_->avatarEnabledToggle_ = ConfigureCompactCenterToggle(WithHint(BSML::Lite::CreateToggle(
-        setupQuickActions, "Enable Avatar", avatar.enabled, [](bool enabled) {
-            if (active_) active_->SetAvatarMasterEnabled(enabled);
-        }), "Master avatar control. Enabling loads, binds tracking, and resets the selected avatar automatically. Disabling unloads it and frees its runtime resources."), kCenterThreeColumnWidth);
-
-    const auto& playerProfiles = active_->root_.Settings().Get().avatarPlayerProfiles;
-    const auto activeProfileId = active_->root_.Settings().Get().activeAvatarPlayerProfileId;
-    const auto activeProfile = std::find_if(
-        playerProfiles.begin(),
-        playerProfiles.end(),
-        [&](const auto& profile) { return profile.id == activeProfileId; });
-    const auto profileName = activeProfile == playerProfiles.end()
-        ? std::string("Profile 1")
-        : activeProfile->displayName;
-    static std::array<std::string_view, 5> playerProfileNames{
-        "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"};
-    ConfigureCompactCenterDropdown(WithHint(BSML::Lite::CreateDropdown(
-        setupQuickActions,
-        "",
-        profileName,
-        playerProfileNames,
-        [](StringW value) {
-            if (!active_) return;
-            const auto name = static_cast<std::string>(value);
-            const auto slot = std::find(playerProfileNames.begin(), playerProfileNames.end(), name);
-            if (slot == playerProfileNames.end()) return;
-            static constexpr std::array<std::string_view, 5> ids{
-                "default", "player-2", "player-3", "player-4", "player-5"};
-            const auto id = ids[static_cast<std::size_t>(std::distance(playerProfileNames.begin(), slot))];
-            if (id == active_->root_.Settings().Get().activeAvatarPlayerProfileId) return;
-            std::string error;
-            if (!active_->root_.SwitchAvatarPlayerProfile(id, &error)) {
-                Logging::Logger.error("Could not switch avatar player profile: {}", error);
-                return;
-            }
-            active_->DestroyAllStandinProxies();
-            active_->RequestAvatarSettingsRebuild();
-        }), "Player Profile: selects one of five local players. Each slot keeps independent calibration and avatar settings; camera and recording settings remain shared."), kCenterThreeColumnWidth);
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(setupQuickActions, "Reset Avatar Pose", [] {
-        if (active_ && !active_->root_.Avatar().RecalibrateNeutral()) {
-            Logging::Logger.warn("Avatar pose reset needs a loaded avatar and valid HMD/controller tracking");
-        }
-        if (active_) active_->RefreshAvatarStatus();
-    }), "Recovery action: resynchronizes the loaded avatar with the current floor, headset, and controller pose without deleting saved calibration."), kCenterThreeColumnWidth);
-
-    active_->calibrationStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 10.0F});
-    active_->calibrationStatusText_->set_enableWordWrapping(true);
-    active_->calibrationStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    auto* profileActions = CreateCenterThreeColumnRow(container->get_transform());
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(profileActions, "Basic Calibration", [] {
-        if (active_) active_->BeginPlayerCalibration(false);
-    }), "Opens the shorter guided calibration. If necessary, the selected avatar is staged invisibly and tracking is bound automatically before the guide opens."), kCenterThreeColumnWidth);
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(profileActions, "Advanced Calibration", [] {
-        if (active_) active_->BeginPlayerCalibration(true);
-    }), "Opens the full guided calibration with additional poses and movement samples. No countdown begins until you choose a start mode on the guide."), kCenterThreeColumnWidth);
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(
-        profileActions, "Reset Profile Calibration", [] {
-            if (active_) active_->ShowAvatarSetupConfirmation(1);
-        }), "Deletes only the active player's saved calibration after a confirmation. Avatar files and avatar-specific settings are kept."), kCenterThreeColumnWidth, 2.75F);
-
-    CreateCenterPanelSubheader(container->get_transform(), "Avatar File");
-    active_->avatarSelectionText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 6.0F});
-    active_->avatarSelectionText_->set_enableWordWrapping(false);
-    active_->avatarSelectionText_->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-    active_->avatarSelectionText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* chooseAvatar = WithHint(BSML::Lite::CreateUIButton(container, "Choose Avatar File", [] {
-        if (active_) active_->OpenAvatarFilePicker();
-    }), "Browse the headset and choose the VRM avatar SaberStage should display.");
-    ConfigureLayout(chooseAvatar, kCenterPanelRowWidth, 8.0F, 1.0F);
-
-    // Primary lifecycle and tracking actions share one clearly titled row.
-    // Their fixed columns preserve the left/center/right alignment even when
-    // one caption is longer than another.
-    CreateCenterPanelSubheader(container->get_transform(), "Avatar Controls");
-    auto* loadActions = CreateCenterThreeColumnRow(container->get_transform());
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Load Avatar", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().PlayerProfile().valid) {
-            // First load is calibration, not a chance to display a malformed
-            // generic fit. BeginPlayerCalibration stages and binds the model
-            // invisibly, then activates it only after the profile is saved.
-            active_->BeginPlayerCalibration(false);
-            return;
-        }
-        if (!active_->LoadSelectedAvatar(false, &error)) {
-            Logging::Logger.error("Avatar load button failed: {}", error);
-            active_->RefreshAvatarStatus();
-            if (active_->avatarStatusText_) {
-                active_->avatarStatusText_->set_text("Avatar could not be loaded\n" + error);
-            }
-            return;
-        }
-        active_->RefreshAvatarStatus();
-        // Material capability (not merely the .vrm extension) determines
-        // whether AlphaToMask can be used. Rebuild after loading so the
-        // capability-gated control immediately reflects this avatar.
-        active_->RequestAvatarSettingsRebuild();
-    }), "Loads the selected VRM, binds Quest tracking, applies its saved settings, and resets its neutral pose in the correct order. With no player calibration, this opens Basic Calibration instead of displaying a broken avatar."), kCenterThreeColumnWidth);
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Unload Avatar", [] {
-        if (!active_) return;
-        active_->DestroyGripEditor(true);
-        active_->DestroyAllStandinProxies();
-        active_->root_.Avatar().UnloadVrmAvatar();
-        active_->root_.Settings().Edit().avatar.enabled = false;
-        active_->root_.Settings().Save(nullptr);
-        active_->RefreshAvatarStatus();
-        active_->RequestAvatarSettingsRebuild();
-    }), "Unloads the avatar and frees its runtime resources. The selected file, player calibration, and avatar settings remain saved."), kCenterThreeColumnWidth);
-    ConfigureCenterRowButton(WithHint(BSML::Lite::CreateUIButton(loadActions, "Bind Tracking", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().BindLoadedVrmAvatar(&error)) {
-            Logging::Logger.error("Avatar tracking rebind failed: {}", error);
-        } else if (!active_->root_.Avatar().RecalibrateNeutral()) {
-            Logging::Logger.info("Avatar rebound; pose reset is waiting for tracked HMD/controllers");
-        }
-        active_->RefreshAvatarStatus();
-    }), "Recovery action: reconnects the already loaded avatar to headset/controller tracking, then resets its neutral pose. Normal loading does this automatically."), kCenterThreeColumnWidth);
-
-    active_->avatarStatusText_ = BSML::Lite::CreateText(
-        container->get_transform(), "", 3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 13.0F});
-    active_->avatarStatusText_->set_enableWordWrapping(true);
-    active_->avatarStatusText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    CreateCenterPanelSubheader(container->get_transform(), "Saved Avatar Data");
-    auto* dataActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    dataActions->set_spacing(1.0F);
-    dataActions->set_childControlWidth(true);
-    dataActions->set_childControlHeight(true);
-    dataActions->set_childForceExpandWidth(true);
-    dataActions->set_childForceExpandHeight(false);
-    ConfigureLayout(dataActions, kCenterPanelRowWidth, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(dataActions, "Clear Avatar Data", [] {
-        if (active_) active_->ShowAvatarSetupConfirmation(2);
-    }), "After confirmation, clears this profile's selected avatar plus saved fit, grip, display, material, and quality settings. It does not delete the VRM file or player calibration.");
-    WithHint(BSML::Lite::CreateUIButton(dataActions, "Write Diagnostic Log", [] {
-        if (active_) active_->root_.Avatar().LogDiagnostics();
-    }), "Writes detailed avatar tracking and solver measurements to the SaberStage log without changing the avatar.");
-
-    // Display-only controls are separated from the required setup flow.
-    container = pages[1];
-    auto* displayHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Display", 5.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
-    displayHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
-    CreateCenterPanelSubheader(container->get_transform(), "Visibility and First-Person View");
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Visible", avatar.visible, [](bool visible) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.visible = visible;
-        active_->root_.Avatar().SetAvatarVisible(visible);
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar visibility: {}", error);
-    }), "Shows or hides the loaded avatar without unloading it."));
-
-    // Applies any avatar-settings change live and persists it; shared by the
-    // wear and display-clone rows below.
-    const auto applyAndSaveAvatar = [] {
-        if (!active_) return;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().RequestSave();
-    };
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Wear Avatar", avatar.wearAvatar, [applyAndSaveAvatar](bool enabled) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.wearAvatar = enabled;
-        applyAndSaveAvatar();
-    }), "Shows the avatar's body on you in the headset. The camera and recordings always show the complete avatar; the hide switches below only affect your own view."));
-    // Independent hide switches instead of tiered coverage: players asked to
-    // control each head element separately (e.g. keep hair out of their eyes
-    // without touching anything else).
-    const auto addWearToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
-        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [applyAndSaveAvatar, member](bool enabled) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().avatar.*member = enabled;
-            applyAndSaveAvatar();
-        }), hint));
-    };
-    addWearToggle("Hide Face In Headset", avatar.wearHideFace, &settings::AvatarSettings::wearHideFace,
-        "Hides the avatar's face geometry from your own view while worn. Leave this on: with it off you look through the inside of the head's eye and mouth meshes.");
-    addWearToggle("Hide Hair In Headset", avatar.wearHideHair, &settings::AvatarSettings::wearHideHair,
-        "Hides hair meshes from your own view while worn, for players who find hair at the edge of vision annoying. The camera still shows the hair.");
-    addWearToggle("Hide Neck Accessories", avatar.wearHideNeckAccessories, &settings::AvatarSettings::wearHideNeckAccessories,
-        "Hides collars, chokers, and scarves from your own view while worn. The camera still shows them.");
-
-    CreateCenterPanelSubheader(container->get_transform(), "Display Clone");
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Show Display Clone", avatar.standinEnabled, [applyAndSaveAvatar](bool enabled) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.standinEnabled = enabled;
-        applyAndSaveAvatar();
-    }), "Places a free-standing copy of your avatar in the world that mirrors your movements live. Grab the clone's body anywhere to move and turn it."));
-    static std::array<std::string_view, 3> standinCounts{"1", "2", "3"};
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
-        container,
-        "Clone Count",
-        std::to_string(std::clamp(avatar.standinCount, 1, 3)),
-        standinCounts,
-        [applyAndSaveAvatar](StringW value) {
-            if (!active_) return;
-            const auto label = static_cast<std::string>(value);
-            active_->root_.Settings().Edit().avatar.standinCount =
-                label == "2" ? 2 : label == "3" ? 3 : 1;
-            applyAndSaveAvatar();
-        }), "How many clones to place (each is grabbed and positioned independently). Every visible clone renders a full extra avatar in each view that shows it; 2 or 3 clones can noticeably reduce performance during gameplay."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Clones Hold Sabers", avatar.standinShowSabers, [applyAndSaveAvatar](bool enabled) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.standinShowSabers = enabled;
-        applyAndSaveAvatar();
-    }), "During a map, places visual copies of your sabers in the clones' hands, matching your saber motion."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, "Clones Hold Pointers", avatar.standinShowPointers, [applyAndSaveAvatar](bool enabled) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().avatar.standinShowPointers = enabled;
-        applyAndSaveAvatar();
-    }), "In menus, places visual copies of the menu pointer grips in the clones' hands."));
-    static std::array<std::string_view, 3> standinVisibilities{"Headset + Camera", "Camera Only", "Headset Only"};
-    const auto standinVisibilityLabel = avatar.standinVisibility == settings::AvatarStandinVisibility::CameraOnly ? "Camera Only"
-        : avatar.standinVisibility == settings::AvatarStandinVisibility::HeadsetOnly ? "Headset Only" : "Headset + Camera";
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Clone Visibility", standinVisibilityLabel, standinVisibilities, [applyAndSaveAvatar](StringW value) {
-        if (!active_) return;
-        const auto label = static_cast<std::string>(value);
-        active_->root_.Settings().Edit().avatar.standinVisibility =
-            label == "Camera Only" ? settings::AvatarStandinVisibility::CameraOnly :
-            label == "Headset Only" ? settings::AvatarStandinVisibility::HeadsetOnly :
-            settings::AvatarStandinVisibility::Both;
-        applyAndSaveAvatar();
-    }), "Chooses which views render the clone. Camera Only keeps your headset view clear while the clone appears in recordings; Headset Only keeps it out of recordings."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container,
-        "Clone Scale",
-        0.05F,
-        avatar.standinScale,
-        0.25F,
-        3.0F,
-        0.15F,
-        true,
-        {0.0F, 0.0F},
-        [applyAndSaveAvatar](float value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().avatar.standinScale = value;
-            applyAndSaveAvatar();
-        }),
-        "Physical size of the display clone. 1.0 is the avatar's real size."));
-    auto* resetStandin = WithHint(BSML::Lite::CreateUIButton(container, "Reset Clone Placement", [applyAndSaveAvatar] {
-        if (!active_) return;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        // Line all three slots up 1.6 m in front of the player at floor
-        // level, facing them, spread 0.9 m apart sideways so multiple clones
-        // never rebuild stacked inside each other. Then drop the grab handles
-        // so they rebuild at the new poses.
-        float forwardX = 0.0F;
-        float forwardZ = 1.0F;
-        float facingYaw = 180.0F;
-        if (auto mainCamera = UnityEngine::Camera::get_main()) {
-            auto* head = mainCamera->get_transform().ptr();
-            const auto headPosition = head->get_position();
-            const auto headYaw = head->get_rotation().get_eulerAngles().y;
-            const auto forward = UnityEngine::Quaternion::op_Multiply(
-                UnityEngine::Quaternion::Euler({0.0F, headYaw, 0.0F}),
-                UnityEngine::Vector3::get_forward());
-            forwardX = forward.x;
-            forwardZ = forward.z;
-            facingYaw = camera::NormalizeDegrees(headYaw + 180.0F);
-            for (int slot = 0; slot < 3; ++slot) {
-                // Right vector = forward rotated -90 degrees around Y.
-                const float side = 0.9F * static_cast<float>(slot == 1 ? -1 : slot == 2 ? 1 : 0);
-                settings::StandinSlotPosition(avatarSettings, slot) = {
-                    headPosition.x + forwardX * 1.6F + forwardZ * side,
-                    0.0F,
-                    headPosition.z + forwardZ * 1.6F - forwardX * side};
-                settings::StandinSlotYaw(avatarSettings, slot) = facingYaw;
-            }
-        } else {
-            for (int slot = 0; slot < 3; ++slot) {
-                const float side = 0.9F * static_cast<float>(slot == 1 ? -1 : slot == 2 ? 1 : 0);
-                settings::StandinSlotPosition(avatarSettings, slot) = {side, 0.0F, 1.6F};
-                settings::StandinSlotYaw(avatarSettings, slot) = facingYaw;
-            }
-        }
-        active_->DestroyAllStandinProxies();
-        applyAndSaveAvatar();
-    }), "Moves every clone back in front of you at floor level, facing you, spread side by side.");
-    ConfigureLayout(resetStandin, kCenterPanelRowWidth, 8.0F, 1.0F);
-    auto* standinNote = BSML::Lite::CreateText(
-        container->get_transform(),
-        "Each visible clone renders a full extra copy of the avatar in every view that shows it and can reduce performance during gameplay.",
-        3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 10.0F});
-    standinNote->set_enableWordWrapping(true);
-    standinNote->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    CreateCenterPanelSubheader(container->get_transform(), "Expression Test");
-    auto* expressionActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    expressionActions->set_spacing(1.0F);
-    expressionActions->set_childControlWidth(true);
-    expressionActions->set_childControlHeight(true);
-    expressionActions->set_childForceExpandWidth(true);
-    expressionActions->set_childForceExpandHeight(false);
-    ConfigureLayout(expressionActions, kCenterPanelRowWidth, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Blink", [] {
-        if (active_) active_->root_.Avatar().SetExpression("blink", 1.0F, nullptr);
-    }), "Tests the avatar's blink expression by closing its eyes.");
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Open Eyes", [] {
-        if (active_) active_->root_.Avatar().SetExpression("blink", 0.0F, nullptr);
-    }), "Clears the blink test and opens the avatar's eyes.");
-    WithHint(BSML::Lite::CreateUIButton(expressionActions, "Joy", [] {
-        if (active_) active_->root_.Avatar().SetExpression("joy", 1.0F, nullptr);
-    }), "Tests the avatar's happy or joy expression, when the VRM supplies one.");
-
-    container = pages[2];
-    auto* qualityHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Quality", 5.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
-    qualityHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* qualityNote = BSML::Lite::CreateText(
-        container->get_transform(),
-        "Presets set the controls below. Change any individual option to create a Custom profile. Texture Limit applies on the next avatar load; 4096 can use about 85 MB per RGBA texture with mipmaps. The other controls update live.",
-        3.0F, {0.0F, 0.0F}, {kCenterPanelTextWidth, 13.0F});
-    qualityNote->set_enableWordWrapping(true);
-    qualityNote->set_alignment(TMPro::TextAlignmentOptions::Center);
-    // Page grouping: Rendering (preset + material features), Posture & Motion
-    // (solver limits), SpringBones (secondary motion), Expressions. Controls
-    // are unchanged; only the order and section headers differ so related
-    // rows sit together in the scroll.
-    CreateCenterPanelSubheader(container->get_transform(), "Rendering");
-    static std::array<std::string_view, 4> qualityPresets{"Performance", "Balanced", "Quality", "Custom"};
-    const auto presetLabel = [&] {
-        switch (avatar.qualityPreset) {
-            case settings::AvatarQualityPreset::Performance: return std::string("Performance");
-            case settings::AvatarQualityPreset::Balanced: return std::string("Balanced");
-            case settings::AvatarQualityPreset::Quality: return std::string("Quality");
-            case settings::AvatarQualityPreset::Custom: return std::string("Custom");
-        }
-        return std::string("Balanced");
-    }();
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Quality Preset", presetLabel, qualityPresets, [](StringW value) {
-        if (!active_) return;
-        const auto label = static_cast<std::string>(value);
-        auto preset = settings::AvatarQualityPreset::Custom;
-        if (label == "Performance") preset = settings::AvatarQualityPreset::Performance;
-        else if (label == "Balanced") preset = settings::AvatarQualityPreset::Balanced;
-        else if (label == "Quality") preset = settings::AvatarQualityPreset::Quality;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        settings::ApplyAvatarQualityPreset(avatarSettings, preset);
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Applies visible Quest-conscious defaults. Changing any individual quality control selects Custom."));
-
-    static std::array<std::string_view, 10> materialStages{
-        "Configured", "1 Texture Only", "2 Texture + Color", "3 Toon Lighting",
-        "4 Toon + Shade", "5 + Normal Maps", "6 + Rim Lighting",
-        "7 + MatCap", "8 + Emission", "9 + Outlines"};
-    const auto materialStageLabel = [&] {
-        switch (avatar.materialStage) {
-            case settings::AvatarMaterialStage::Configured: return std::string("Configured");
-            case settings::AvatarMaterialStage::MainTextureOnly: return std::string("1 Texture Only");
-            case settings::AvatarMaterialStage::MainTextureColor: return std::string("2 Texture + Color");
-            case settings::AvatarMaterialStage::ToonLighting: return std::string("3 Toon Lighting");
-            case settings::AvatarMaterialStage::ToonShadeTexture: return std::string("4 Toon + Shade");
-            case settings::AvatarMaterialStage::NormalMaps: return std::string("5 + Normal Maps");
-            case settings::AvatarMaterialStage::RimLighting: return std::string("6 + Rim Lighting");
-            case settings::AvatarMaterialStage::MatCap: return std::string("7 + MatCap");
-            case settings::AvatarMaterialStage::Emission: return std::string("8 + Emission");
-            case settings::AvatarMaterialStage::Outlines: return std::string("9 + Outlines");
-        }
-        return std::string("Configured");
-    }();
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Material Stage", materialStageLabel, materialStages, [](StringW value) {
-        if (!active_) return;
-        const auto label = static_cast<std::string>(value);
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        avatarSettings.materialStage = label.starts_with("1 ") ? settings::AvatarMaterialStage::MainTextureOnly :
-            label.starts_with("2 ") ? settings::AvatarMaterialStage::MainTextureColor :
-            label.starts_with("3 ") ? settings::AvatarMaterialStage::ToonLighting :
-            label.starts_with("4 ") ? settings::AvatarMaterialStage::ToonShadeTexture :
-            label.starts_with("5 ") ? settings::AvatarMaterialStage::NormalMaps :
-            label.starts_with("6 ") ? settings::AvatarMaterialStage::RimLighting :
-            label.starts_with("7 ") ? settings::AvatarMaterialStage::MatCap :
-            label.starts_with("8 ") ? settings::AvatarMaterialStage::Emission :
-            label.starts_with("9 ") ? settings::AvatarMaterialStage::Outlines :
-            settings::AvatarMaterialStage::Configured;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Diagnostic ladder. Configured uses the individual quality controls; numbered stages cumulatively add one material feature at a time."));
-
-    static std::array<std::string_view, 3> lightingModes{"Environment", "Balanced", "Studio"};
-    const auto lightingLabel = avatar.lightingMode == settings::AvatarLightingMode::Environment ? "Environment" :
-        avatar.lightingMode == settings::AvatarLightingMode::Studio ? "Studio" : "Balanced";
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Avatar Lighting", lightingLabel, lightingModes, [](StringW value) {
-        if (!active_) return;
-        const auto label = static_cast<std::string>(value);
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        avatarSettings.lightingMode = label == "Environment" ? settings::AvatarLightingMode::Environment :
-            label == "Studio" ? settings::AvatarLightingMode::Studio : settings::AvatarLightingMode::Balanced;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Environment follows map darkness. Balanced preserves map influence with a readability floor. Studio uses stable avatar-only key and fill shading for recording."));
-
-    static std::array<std::string_view, 4> textureCaps{"512", "1024", "2048", "4096"};
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
-        container,
-        "Texture Limit",
-        std::to_string(avatar.maximumTextureDimension),
-        textureCaps,
-        [](StringW value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.maximumTextureDimension = std::stoi(static_cast<std::string>(value));
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) Logging::Logger.error("Could not save avatar texture limit: {}", error);
-        }), "Limits avatar texture size. It takes effect the next time the avatar is loaded; other quality controls update live."));
-    const auto addQualityToggle = [&](const char* label, bool initial, bool settings::AvatarSettings::*member, const char* hint) {
-        ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(container, label, initial, [member](bool enabled) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.*member = enabled;
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().RequestSave();
-        }), hint));
-    };
-    addQualityToggle("Toon Lighting", avatar.toonLighting, &settings::AvatarSettings::toonLighting,
-        "Uses the authored MToon light and shade model. Off is an emergency unlit fallback.");
-    addQualityToggle("Normal Maps", avatar.normalMaps, &settings::AvatarSettings::normalMaps,
-        "Adds authored surface detail. Turning it off removes the normal-map shader sample.");
-    addQualityToggle("Rim Lighting", avatar.rimLighting, &settings::AvatarSettings::rimLighting,
-        "Adds authored edge lighting. Turning it off removes rim texture and Fresnel work.");
-    addQualityToggle("MatCap", avatar.matcap, &settings::AvatarSettings::matcap,
-        "Adds authored sphere/matcap highlights. This can be expensive on complex avatars.");
-    addQualityToggle("Emission", avatar.emission, &settings::AvatarSettings::emission,
-        "Shows authored glowing materials while retaining a bounded Quest-safe intensity.");
-    static std::array<std::string_view, 3> outlineModes{"Off", "Reduced", "Full"};
-    const auto outlineLabel = avatar.outlines == settings::AvatarOutlineMode::Full ? "Full" :
-        avatar.outlines == settings::AvatarOutlineMode::Reduced ? "Reduced" : "Off";
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Outlines", outlineLabel, outlineModes, [](StringW value) {
-        if (!active_) return;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        const auto label = static_cast<std::string>(value);
-        avatarSettings.outlines = label == "Full" ? settings::AvatarOutlineMode::Full :
-            label == "Reduced" ? settings::AvatarOutlineMode::Reduced : settings::AvatarOutlineMode::Off;
-        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Off skips the outline pass. Reduced omits low-value transparent or tiny outlines; Full honors authored outlines."));
-
-    static std::array<std::string_view, 4> cutoutSmoothingValues{"Off", "Low", "Medium", "High"};
-    const auto cutoutSmoothingLabel = [&] {
-        switch (avatar.cutoutSmoothing) {
-            case settings::AvatarCutoutSmoothing::Off: return std::string("Off");
-            case settings::AvatarCutoutSmoothing::Low: return std::string("Low");
-            case settings::AvatarCutoutSmoothing::Medium: return std::string("Medium");
-            case settings::AvatarCutoutSmoothing::High: return std::string("High");
-        }
-        return std::string("Low");
-    }();
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
-        container,
-        "Avatar Cutout Smoothing",
-        cutoutSmoothingLabel,
-        cutoutSmoothingValues,
-        [](StringW value) {
-            if (!active_) return;
-            const auto label = static_cast<std::string>(value);
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.cutoutSmoothing = label == "High"
-                ? settings::AvatarCutoutSmoothing::High
-                : label == "Medium"
-                    ? settings::AvatarCutoutSmoothing::Medium
-                    : label == "Low"
-                        ? settings::AvatarCutoutSmoothing::Low
-                        : settings::AvatarCutoutSmoothing::Off;
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
-        }),
-        "Smooths alpha-cutout hair and clothing edges on the avatar and its clones without changing Beat Saber's global graphics. Higher levels perform more shader work and may reduce gameplay performance on complex avatars."));
-
-    const auto alphaToMaskSupported = active_->root_.Avatar().LoadedAvatarSupportsAlphaToMask();
-    active_->alphaToMaskToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container,
-        "Alpha To Coverage",
-        alphaToMaskSupported && avatar.alphaToMaskEnabled,
-        [](bool enabled) {
-            if (!active_ || !active_->root_.Avatar().LoadedAvatarSupportsAlphaToMask()) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.alphaToMaskEnabled = enabled;
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
-        }),
-        alphaToMaskSupported
-            ? "Uses multisample alpha coverage on supported MToon cutout materials. It is most useful with 2x or 4x camera MSAA (or headset MSAA supplied elsewhere), and may increase GPU cost."
-            : "Unavailable: load an avatar containing supported MToon alpha-cutout materials. Alpha to coverage also needs an MSAA render target to improve the edge."));
-    if (active_->alphaToMaskToggle_) {
-        active_->alphaToMaskToggle_->set_interactable(alphaToMaskSupported);
-    }
-
-    // Solver posture limits belong with body fitting, not render quality.
-    // Build them on the Fit page before returning to Quality for the remaining
-    // shader/secondary-motion controls.
-    container = pages[3];
-    auto* fitHeading = BSML::Lite::CreateText(
-        container->get_transform(), "Avatar Fit and Posture", 4.5F,
-        {0.0F, 0.0F}, {kCenterPanelTextWidth, 7.0F});
-    fitHeading->set_alignment(TMPro::TextAlignmentOptions::Center);
-    CreateCenterPanelSubheader(container->get_transform(), "Posture and Motion");
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container,
-        "Side-Step Lean Limit",
-        5.0F,
-        avatar.sideStepLeanLimitPercent,
-        40.0F,
-        100.0F,
-        0.15F,
-        true,
-        {0.0F, 0.0F},
-        [](float value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.sideStepLeanLimitPercent = value;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().RequestSave();
-        }),
-        "Maximum sideways lean before SaberStage shifts the body and steps. 100% keeps the previous behavior; lower values force an earlier side step."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container,
-        "Planted Leg Lean Limit",
-        5.0F,
-        avatar.plantedLegLeanLimitPercent,
-        20.0F,
-        100.0F,
-        0.15F,
-        true,
-        {0.0F, 0.0F},
-        [](float value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.plantedLegLeanLimitPercent = value;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().RequestSave();
-        }),
-        "Maximum sideways pelvis movement over planted feet before SaberStage forces a step. Lower values reduce whole-body leaning from the ankles without changing the torso lean setting."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container,
-        "Stance Width",
-        5.0F,
-        avatar.stanceWidthPercent,
-        75.0F,
-        400.0F,
-        0.15F,
-        true,
-        {0.0F, 0.0F},
-        [](float value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.stanceWidthPercent = value;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().RequestSave();
-        }),
-        "Scales the avatar's normal foot separation. 100% keeps the original stance; higher values create a wider, more stable baseline."));
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container,
-        "Backward Spine Curve Limit",
-        5.0F,
-        avatar.backwardSpineCurveLimitPercent,
-        0.0F,
-        100.0F,
-        0.15F,
-        true,
-        {0.0F, 0.0F},
-        [](float value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            avatarSettings.backwardSpineCurveLimitPercent = value;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().RequestSave();
-        }),
-        "Limits only backward spine bowing. 0% prevents rearward curve; forward attack and lunge bending remain available."));
-
-    container = pages[2];
-    CreateCenterPanelSubheader(container->get_transform(), "SpringBones");
-    addQualityToggle("SpringBones", avatar.springBones, &settings::AvatarSettings::springBones,
-        "Animates VRM hair, clothing, and accessories. Off performs no secondary-motion work.");
-    static std::array<std::string_view, 7> springQualities{"Off", "Very Low", "Low", "Medium", "High", "Ultra", "Custom"};
-    const auto springLabel = [&] {
-        switch (avatar.springBoneQuality) {
-            case settings::SpringBoneQuality::Off: return std::string("Off");
-            case settings::SpringBoneQuality::VeryLow: return std::string("Very Low");
-            case settings::SpringBoneQuality::Low: return std::string("Low");
-            case settings::SpringBoneQuality::Medium: return std::string("Medium");
-            case settings::SpringBoneQuality::High: return std::string("High");
-            case settings::SpringBoneQuality::Ultra: return std::string("Ultra");
-            case settings::SpringBoneQuality::Custom: return std::string("Custom");
-        }
-        return std::string("Medium");
-    }();
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(container, "Spring Quality", springLabel, springQualities, [](StringW value) {
-        if (!active_) return;
-        const auto label = static_cast<std::string>(value);
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        if (label == "Off") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Off;
-        else if (label == "Very Low") avatarSettings.springBoneQuality = settings::SpringBoneQuality::VeryLow;
-        else if (label == "Low") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Low;
-        else if (label == "High") avatarSettings.springBoneQuality = settings::SpringBoneQuality::High;
-        else if (label == "Ultra") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Ultra;
-        else if (label == "Custom") avatarSettings.springBoneQuality = settings::SpringBoneQuality::Custom;
-        else avatarSettings.springBoneQuality = settings::SpringBoneQuality::Medium;
-        avatarSettings.springBones = avatarSettings.springBoneQuality != settings::SpringBoneQuality::Off;
-        avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().Save(nullptr);
-    }), "Controls update rate, substeps, and deterministic chain/joint budgets rather than one unexplained iteration value."));
-
-    static std::array<std::string_view, 3> collisionQualities{"Off", "Reduced", "Full"};
-    const auto collisionLabel = avatar.springCollisions == settings::SpringCollisionQuality::Full ? "Full" :
-        avatar.springCollisions == settings::SpringCollisionQuality::Reduced ? "Reduced" : "Off";
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateDropdown(
-        container, "Spring Collisions", collisionLabel, collisionQualities, [](StringW value) {
-            if (!active_) return;
-            auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-            const auto label = static_cast<std::string>(value);
-            avatarSettings.springCollisions = label == "Full" ? settings::SpringCollisionQuality::Full :
-                label == "Reduced" ? settings::SpringCollisionQuality::Reduced : settings::SpringCollisionQuality::Off;
-            avatarSettings.qualityPreset = settings::AvatarQualityPreset::Custom;
-            active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-            active_->root_.Settings().Save(nullptr);
-        }), "Off skips SpringBone collider checks. Reduced uses the deterministic collider budget; Full honors all supported VRM colliders."));
-
-    CreateCenterPanelSubheader(container->get_transform(), "Expressions");
-    addQualityToggle("Animated Expressions", avatar.animatedExpressions, &settings::AvatarSettings::animatedExpressions,
-        "Adds a subtle menu smile, randomly timed blinks, happier faces as the gameplay multiplier rises, an angry reaction to a missed note, and sorrow after a failed level. Off performs no automatic face updates.");
-
-    container = pages[3];
-    Logging::Logger.info("AvatarSettingsBuild phase=fit-controls");
-    const auto fitSettings = settings::RetargetingForSelectedAvatar(avatar);
-    const auto applyFitAndSave = [] {
-        if (!active_) return;
-        auto& avatarSettings = active_->root_.Settings().Edit().avatar;
-        settings::ValidateAndRepair(active_->root_.Settings().Edit());
-        active_->root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        active_->root_.Settings().RequestSave();
-    };
-
-    CreateCenterPanelSubheader(container->get_transform(), "Sizing Mode and Height");
-    active_->armSpanSizingToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Arm-Span Avatar Sizing", fitSettings.armSpanAvatarSizing,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            auto& fit = settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar);
-            fit.armSpanAvatarSizing = enabled;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }), "On sizes the complete avatar from your calibrated arm span so the hands naturally reach the sabers. Off uses the original player-height sizing method."));
-    active_->matchPlayerHeightToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Match Player Height", fitSettings.matchPlayerHeight,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).matchPlayerHeight = enabled;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }), "With arm-span sizing on, adjusts leg and torso height after the arm-span fit. It does not change the final Manual Avatar Scale."));
-    active_->heightAdjustmentBalanceSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Height Balance", 0.01F, fitSettings.heightAdjustmentBalance,
-        -1.0F, 1.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).heightAdjustmentBalance = value;
-            applyFitAndSave();
-        }), "Redistributes the fitted height between the legs and torso without changing overall avatar height or arm reach. Left favours legs, center preserves the measured proportions, and right favours the torso."));
-    active_->heightAdjustmentBalanceResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->heightAdjustmentBalanceSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).heightAdjustmentBalance = 0.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Height Balance to Even (0.00), preserving the fitted leg-to-torso proportions.");
-    auto* fitBalanceCaption = BSML::Lite::CreateText(
-        container->get_transform(), "Legs  ←  Even  →  Torso", 3.0F, {0.0F, 0.0F}, {kCenterPanelRowWidth, 5.0F});
-    fitBalanceCaption->set_alignment(TMPro::TextAlignmentOptions::Center);
-
-    active_->manualAvatarScaleToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Manual Avatar Scale", fitSettings.manualAvatarScaleEnabled,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).manualAvatarScaleEnabled = enabled;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }), "Applies one final whole-avatar size adjustment after arm-span/height fitting and body proportions."));
-    active_->manualAvatarScaleSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Final Avatar Size", 1.0F, fitSettings.manualAvatarScalePercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).manualAvatarScalePercent = value;
-            applyFitAndSave();
-        }), "Final avatar size as a percentage. 100% preserves the automatic fit; lower values shrink it and higher values enlarge it."));
-    active_->manualAvatarScaleResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->manualAvatarScaleSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).manualAvatarScalePercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Final Avatar Size to 100%, preserving the automatic fitted size.");
-    active_->keepHandsOnSabersToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Keep Hands on Sabers", fitSettings.keepHandsOnSabers,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            if (!enabled) {
-                active_->ShowAvatarFitWarning(1);
-                return;
-            }
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).keepHandsOnSabers = enabled;
-            applyFitAndSave();
-        }), "Keeps each tracked saber handle as the exact hand target, extending the arm chain when necessary. Turning this off can let hands separate from sabers at full reach."));
-    auto* gripActions = BSML::Lite::CreateHorizontalLayoutGroup(container->get_transform());
-    gripActions->set_spacing(1.0F);
-    gripActions->set_childControlWidth(true);
-    gripActions->set_childControlHeight(true);
-    gripActions->set_childForceExpandWidth(true);
-    gripActions->set_childForceExpandHeight(false);
-    ConfigureLayout(gripActions, kCenterPanelRowWidth, 8.0F, 1.0F);
-    WithHint(BSML::Lite::CreateUIButton(gripActions, "Position Left Hand", [] {
-        if (active_) active_->OpenGripEditor(0);
-    }), "Opens a movable position, rotation, and finger-closure editor for this player, avatar, and physical grip style.");
-    WithHint(BSML::Lite::CreateUIButton(gripActions, "Position Right Hand", [] {
-        if (active_) active_->OpenGripEditor(1);
-    }), "Opens a movable position, rotation, and finger-closure editor for this player, avatar, and physical grip style.");
-
-    CreateCenterPanelSubheader(container->get_transform(), "Body Proportions");
-    active_->bodyProportionToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Adjust Body Proportions", fitSettings.adjustBodyProportions,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).adjustBodyProportions = enabled;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }), "Enables manual skeletal and mesh proportion controls for shoulders, torso, neck, and legs."));
-    active_->torsoWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Torso Width", 1.0F, fitSettings.torsoWidthPercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).torsoWidthPercent = value;
-            applyFitAndSave();
-        }), "Sets the base width of the complete torso. Shoulder, Waist / Hip, and Lower Torso Width are applied afterward as relative refinements."));
-    active_->torsoWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->torsoWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).torsoWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Torso Width to the avatar's authored 100% width.");
-    active_->autoShoulderWidthToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Auto Shoulder Width", fitSettings.autoShoulderWidth,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).autoShoulderWidth = enabled;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }), "Uses a confidence-gated estimate from accepted calibration poses. If confidence is insufficient, the saved manual shoulder value remains active."));
-    active_->shoulderWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Shoulder Width", 1.0F, fitSettings.shoulderWidthPercent,
-        50.0F, 300.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).shoulderWidthPercent = value;
-            applyFitAndSave();
-        }), "Changes the lateral separation of the shoulder and upper-arm pivots. Wider shoulders contribute to effective arm span and reduce how much arm-chain extension is needed."));
-    active_->shoulderWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->shoulderWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).shoulderWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets the saved manual shoulder width to the avatar's fitted 100% width.");
-    active_->waistHipWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Waist / Hip Width", 1.0F, fitSettings.waistHipWidthPercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).waistHipWidthPercent = value;
-            applyFitAndSave();
-        }), "Changes the lateral hip and waist support width without changing avatar height."));
-    active_->waistHipWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->waistHipWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).waistHipWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Waist / Hip Width to the avatar's fitted 100% width.");
-    active_->lowerTorsoWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Lower Torso Width", 1.0F, fitSettings.lowerTorsoWidthPercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).lowerTorsoWidthPercent = value;
-            applyFitAndSave();
-        }), "Widens or narrows the lower torso mesh above the hip line without changing shoulder width."));
-    active_->lowerTorsoWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->lowerTorsoWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).lowerTorsoWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Lower Torso Width to the avatar's authored 100% width.");
-    active_->neckBaseWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Neck Base Width", 1.0F, fitSettings.neckBaseWidthPercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).neckBaseWidthPercent = value;
-            applyFitAndSave();
-        }), "Adjusts the lower neck/shoulder transition while preserving the head connection."));
-    active_->neckBaseWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->neckBaseWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).neckBaseWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Neck Base Width to the avatar's fitted 100% width.");
-    active_->headSizeSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Head Size", 1.0F, fitSettings.headSizePercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).headSizePercent = value;
-            applyFitAndSave();
-        }), "Scales the complete head and face. The upper neck blends toward this size while Neck Base Width controls the lower neck."));
-    active_->headSizeResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->headSizeSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).headSizePercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Head Size to the avatar's authored 100% size.");
-
-    active_->torsoHeightSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Torso Height", 1.0F, fitSettings.torsoHeightPercent,
-        50.0F, 150.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).torsoHeightPercent = value;
-            applyFitAndSave();
-        }), "Changes the vertical length of the torso after automatic height matching, so it also changes final avatar height."));
-    active_->torsoHeightResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->torsoHeightSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).torsoHeightPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Torso Height to the avatar's authored 100% length.");
-
-    CreateCenterPanelSubheader(container->get_transform(), "Leg Proportions");
-    active_->upperLegLengthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Hip to Knee Length", 1.0F, fitSettings.upperLegLengthPercent,
-        50.0F, 150.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).upperLegLengthPercent = value;
-            applyFitAndSave();
-        }), "Changes both thigh lengths between the hip and knee. This changes the avatar's final height."));
-    active_->upperLegLengthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->upperLegLengthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).upperLegLengthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Hip to Knee Length to the avatar's authored 100% length.");
-    active_->lowerLegLengthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Knee to Ankle Length", 1.0F, fitSettings.lowerLegLengthPercent,
-        50.0F, 150.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).lowerLegLengthPercent = value;
-            applyFitAndSave();
-        }), "Changes both lower-leg lengths between the knee and ankle. This changes the avatar's final height."));
-    active_->lowerLegLengthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->lowerLegLengthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).lowerLegLengthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Knee to Ankle Length to the avatar's authored 100% length.");
-    active_->legWidthSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Leg Width", 1.0F, fitSettings.legWidthPercent,
-        50.0F, 200.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).legWidthPercent = value;
-            applyFitAndSave();
-        }), "Makes both complete legs wider or slimmer while preserving the authored foot size."));
-    active_->legWidthResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->legWidthSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).legWidthPercent = 100.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Leg Width to the avatar's authored 100% width.");
-
-    CreateCenterPanelSubheader(container->get_transform(), "Posture and Floor");
-    active_->neutralKneeBendSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Neutral Knee Bend", 1.0F, fitSettings.neutralKneeBendDegrees,
-        0.0F, 20.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).neutralKneeBendDegrees = value;
-            applyFitAndSave();
-        }), "Adds a small symmetric knee bend to the neutral stance. Attack Pose is solved from this knee-adjusted base."));
-    active_->neutralKneeBendResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->neutralKneeBendSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).neutralKneeBendDegrees = 0.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Neutral Knee Bend to zero additional bend.");
-    active_->attackPoseSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Attack Pose", 1.0F, fitSettings.attackPoseDegrees,
-        -20.0F, 20.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).attackPoseDegrees = value;
-            applyFitAndSave();
-        }), "Positive values add a forward waist hinge; negative values counter a naturally forward stance or add a mild rearward bias. Feet and the tracked head remain authoritative."));
-    active_->attackPoseResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->attackPoseSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).attackPoseDegrees = 0.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Attack Pose to the calibrated neutral waist posture.");
-    active_->backStiffnessSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Back Stiffness", 1.0F, fitSettings.backStiffnessPercent,
-        0.0F, 100.0F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).backStiffnessPercent = value;
-            applyFitAndSave();
-        }), "Controls how readily the spine bows after neck motion is used. The separate Backward Spine Curve Limit remains the absolute safety ceiling."));
-    active_->backStiffnessResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->backStiffnessSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).backStiffnessPercent = 50.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Back Stiffness to the balanced 50% response.");
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Auto Floor Height", fitSettings.autoFloorHeight,
-        [applyFitAndSave](bool enabled) {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).autoFloorHeight = enabled;
-            applyFitAndSave();
-        }), "On follows the current Quest tracking-origin floor. Off uses the floor saved by player calibration. Floor Offset is added in either mode."));
-    active_->floorOffsetSlider_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateSliderSetting(
-        container, "Floor Offset", 0.005F, fitSettings.floorOffsetMeters,
-        -0.25F, 0.25F, 0.15F, true, {0.0F, 0.0F},
-        [applyFitAndSave](float value) {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).floorOffsetMeters = value;
-            applyFitAndSave();
-        }), "Moves the solved floor vertically in metres. Positive raises the avatar and negative lowers it."));
-    active_->floorOffsetResetButton_ = AddCenterSliderResetButton(
-        container->get_transform(), active_->floorOffsetSlider_, [applyFitAndSave] {
-            if (!active_) return;
-            settings::EditRetargetingForSelectedAvatar(
-                active_->root_.Settings().Edit().avatar).floorOffsetMeters = 0.0F;
-            applyFitAndSave();
-            active_->RefreshRetargetingControls();
-        }, "Resets Floor Offset to 0.000 metres while retaining the selected automatic or calibrated floor source.");
-    ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Hide Hair for Solver Testing", active_->debugHideAvatarHair_,
-        [](bool enabled) {
-            if (!active_) return;
-            active_->debugHideAvatarHair_ = enabled;
-            active_->root_.Avatar().SetDebugHairHidden(enabled);
-        }), "Temporary session-only diagnostic that hides hair on the live avatar and all display clones so neck and spine motion can be inspected. It resets off when Beat Saber restarts."));
-
-    CreateCenterPanelSubheader(container->get_transform(), "Collision (Experimental)");
-    active_->armBodyCollisionToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Prevent Arm-Body Clipping", fitSettings.preventArmBodyClipping,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            if (enabled) {
-                active_->ShowAvatarFitWarning(2);
-                return;
-            }
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).preventArmBodyClipping = enabled;
-            applyFitAndSave();
-        }), "Keeps solved arms outside a low-cost torso volume. With Keep Hands on Sabers enabled, the grip stays authoritative and the solver reroutes the arm without moving the hand. This adds solver work."));
-    active_->armSpringCollisionToggle_ = ConstrainCenterPanelRow(WithHint(BSML::Lite::CreateToggle(
-        container, "Arms Affect SpringBones", fitSettings.armSpringBoneInteraction,
-        [applyFitAndSave](bool enabled) {
-            if (!active_ || active_->refreshingRetargetingControls_) return;
-            if (enabled) {
-                active_->ShowAvatarFitWarning(3);
-                return;
-            }
-            settings::EditRetargetingForSelectedAvatar(active_->root_.Settings().Edit().avatar).armSpringBoneInteraction = enabled;
-            applyFitAndSave();
-        }), "Lets solved arms push compatible VRM SpringBone chains such as hair or clothing. It has no visible effect when SpringBones are off or the avatar has no compatible chains, and it adds per-update collision work."));
-
-    active_->BuildAvatarFilePicker(view);
-    active_->RefreshAvatarStatus();
-    active_->RefreshCalibrationStatus();
-    active_->RefreshRetargetingControls();
-    active_->ShowAvatarTab(0);
-    if (active_->avatarTabs_) active_->avatarTabs_->SelectCellWithNumber(0);
-
-    // This is intentionally outside the scrolling settings content. It stays
-    // visible at the bottom of the center screen and uniquely identifies the
-    // exact binary under headset test, including local builds with the same
-    // semantic version.
-    auto* buildIdentity = BSML::Lite::CreateText(
-        view->get_transform(),
-        "SaberStage " VERSION "  |  Build " SABERSTAGE_BUILD_NUMBER,
-        TMPro::FontStyles::Normal,
-        2.5F);
-    if (IsAlive(buildIdentity)) {
-        buildIdentity->set_alignment(TMPro::TextAlignmentOptions::Center);
-        buildIdentity->set_enableWordWrapping(false);
-        buildIdentity->set_raycastTarget(false);
-        buildIdentity->set_color({0.72F, 0.82F, 0.92F, 0.78F});
-        auto rect = buildIdentity->get_transform().cast<UnityEngine::RectTransform>();
-        rect->set_anchorMin({0.5F, 0.0F});
-        rect->set_anchorMax({0.5F, 0.0F});
-        rect->set_pivot({0.5F, 0.0F});
-        rect->set_anchoredPosition({0.0F, 0.75F});
-        rect->set_sizeDelta({82.0F, 3.5F});
-    }
-    Logging::Logger.info("AvatarSettingsBuild complete");
-}
-
-void MenuController::BuildAvatarFilePicker(HMUI::ViewController* view) {
-    avatarPickerModal_ = BSML::Lite::CreateModal(view, {86.0F, 72.0F}, nullptr, true);
-    if (!avatarPickerModal_) {
-        Logging::Logger.error("Could not create the SaberStage avatar file picker");
-        return;
-    }
-
-    auto* root = BSML::Lite::CreateVerticalLayoutGroup(avatarPickerModal_->get_transform());
-    root->set_spacing(0.6F);
-    root->set_childControlWidth(true);
-    root->set_childControlHeight(true);
-    root->set_childForceExpandWidth(true);
-    root->set_childForceExpandHeight(false);
-    if (auto rect = root->get_rectTransform()) {
-        rect->set_anchorMin({0.5F, 0.0F});
-        rect->set_anchorMax({0.5F, 1.0F});
-        rect->set_pivot({0.5F, 0.5F});
-        rect->set_anchoredPosition({0.0F, 0.0F});
-        rect->set_sizeDelta({80.0F, -4.0F});
-    }
-
-    auto* title = BSML::Lite::CreateText(root, "Select a VRM Avatar", TMPro::FontStyles::Bold, 4.2F);
-    title->set_alignment(TMPro::TextAlignmentOptions::Center);
-    ConfigureLayout(title, 80.0F, 6.0F, 1.0F);
-
-    auto* navigation = BSML::Lite::CreateHorizontalLayoutGroup(root);
-    navigation->set_spacing(0.6F);
-    navigation->set_childControlWidth(true);
-    navigation->set_childControlHeight(true);
-    navigation->set_childForceExpandWidth(true);
-    navigation->set_childForceExpandHeight(false);
-    ConfigureLayout(navigation, 80.0F, 8.0F, 1.0F);
-    auto* sharedStorage = WithHint(BSML::Lite::CreateUIButton(navigation, "Shared Storage", [] {
-        if (active_) active_->BrowseAvatarDirectory("/sdcard");
-    }), "Opens the headset's shared storage, where downloaded VRM files are normally found.");
-    auto* systemRoot = WithHint(BSML::Lite::CreateUIButton(navigation, "System Root", [] {
-        if (active_) active_->BrowseAvatarDirectory("/");
-    }), "Opens the Android filesystem root for VRM files stored outside shared storage.");
-    auto* up = WithHint(BSML::Lite::CreateUIButton(navigation, "Up", [] {
-        if (!active_) return;
-        const auto parent = active_->avatarPickerDirectory_.parent_path();
-        active_->BrowseAvatarDirectory(parent.empty() ? std::filesystem::path("/") : parent);
-    }), "Moves to the parent folder.");
-    ConfigureLayout(sharedStorage, 28.0F, 7.5F, 1.0F);
-    ConfigureLayout(systemRoot, 24.0F, 7.5F, 1.0F);
-    ConfigureLayout(up, 14.0F, 7.5F, 1.0F);
-
-    avatarPickerPathText_ = BSML::Lite::CreateText(root, "", 2.8F);
-    avatarPickerPathText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-    avatarPickerPathText_->set_enableWordWrapping(false);
-    avatarPickerPathText_->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-    ConfigureLayout(avatarPickerPathText_, 80.0F, 5.0F, 1.0F);
-
-    avatarPickerListContent_ = BSML::Lite::CreateScrollableSettingsContainer(root);
-    if (avatarPickerListContent_) {
-        if (auto* external = avatarPickerListContent_->GetComponent<BSML::ExternalComponents*>()) {
-            if (auto* layout = external->Get<UnityEngine::UI::LayoutElement*>()) {
-                layout->set_minHeight(30.0F);
-                layout->set_preferredHeight(42.0F);
-                layout->set_flexibleHeight(1.0F);
-                layout->set_preferredWidth(80.0F);
-                layout->set_flexibleWidth(1.0F);
-            }
-        }
-        if (auto* rows = avatarPickerListContent_->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
-            rows->set_spacing(0.35F);
-            rows->set_childControlWidth(true);
-            rows->set_childControlHeight(true);
-            rows->set_childForceExpandWidth(true);
-            rows->set_childForceExpandHeight(false);
-            rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
-        }
-    }
-
-    auto* close = WithHint(BSML::Lite::CreateUIButton(root, "Cancel", [] {
-        if (active_ && active_->avatarPickerModal_) active_->avatarPickerModal_->Hide();
-    }), "Closes the file picker without changing the selected avatar.");
-    ConfigureLayout(close, 30.0F, 7.5F, 0.0F);
-}
-
-void MenuController::OpenAvatarFilePicker() {
-    if (!avatarPickerModal_) return;
-    auto start = ConfiguredAvatarPath();
-    if (!start.empty()) start = start.parent_path();
-    std::error_code error;
-    if (start.empty() || !std::filesystem::is_directory(start, error)) start = "/sdcard";
-    error.clear();
-    if (!std::filesystem::is_directory(start, error)) start = "/";
-    BrowseAvatarDirectory(start);
-    avatarPickerModal_->Show();
-}
-
-void MenuController::BrowseAvatarDirectory(const std::filesystem::path& requestedDirectory) {
-    if (!avatarPickerListContent_) return;
-    auto directory = requestedDirectory.empty() ? std::filesystem::path("/") : requestedDirectory.lexically_normal();
-    std::error_code error;
-    if (!std::filesystem::is_directory(directory, error)) {
-        Logging::Logger.warn("Avatar picker cannot open '{}': {}", directory.string(), error.message());
-        return;
-    }
-
-    for (auto* row : avatarPickerRows_) {
-        if (!row) continue;
-        row->SetActive(false);
-        UnityEngine::Object::Destroy(row);
-    }
-    avatarPickerRows_.clear();
-    avatarPickerDirectory_ = directory;
-    if (avatarPickerPathText_) avatarPickerPathText_->set_text(directory.string());
-
-    std::vector<std::filesystem::path> directories;
-    std::vector<std::filesystem::path> avatars;
-    constexpr std::size_t maximumRows = 512;
-    std::filesystem::directory_iterator iterator(
-        directory, std::filesystem::directory_options::skip_permission_denied, error);
-    const std::filesystem::directory_iterator end;
-    for (; !error && iterator != end && directories.size() + avatars.size() < maximumRows; iterator.increment(error)) {
-        std::error_code entryError;
-        if (iterator->is_directory(entryError)) {
-            directories.push_back(iterator->path());
-        } else if (!entryError && iterator->is_regular_file(entryError) && IsVrmFile(iterator->path())) {
-            avatars.push_back(iterator->path());
-        }
-    }
-    const auto byName = [](const auto& left, const auto& right) {
-        return Lower(left.filename().string()) < Lower(right.filename().string());
-    };
-    std::sort(directories.begin(), directories.end(), byName);
-    std::sort(avatars.begin(), avatars.end(), byName);
-
-    for (const auto& child : directories) {
-        auto* button = BSML::Lite::CreateUIButton(
-            avatarPickerListContent_, "[Folder]  " + child.filename().string(), [child] {
-                if (active_) active_->BrowseAvatarDirectory(child);
-            });
-        WithHint(button, "Opens this folder.");
-        ConfigureLayout(button, 76.0F, 7.0F, 0.0F);
-        BSML::Lite::SetButtonTextSize(button, 2.5F);
-        avatarPickerRows_.push_back(button->get_gameObject());
-    }
-    for (const auto& avatar : avatars) {
-        auto* button = BSML::Lite::CreateUIButton(
-            avatarPickerListContent_, avatar.filename().string(), [avatar] {
-                if (active_) active_->SelectAvatarFile(avatar);
-            });
-        WithHint(button, "Selects this VRM file and returns to the avatar controls.");
-        ConfigureLayout(button, 76.0F, 7.0F, 0.0F);
-        BSML::Lite::SetButtonTextSize(button, 2.5F);
-        avatarPickerRows_.push_back(button->get_gameObject());
-    }
-    if (directories.empty() && avatars.empty()) {
-        const auto message = error
-            ? "This folder cannot be read. Use Up or choose another root."
-            : "No folders or .vrm files are visible here.";
-        auto* text = BSML::Lite::CreateText(avatarPickerListContent_->get_transform(), message, 3.0F);
-        text->set_alignment(TMPro::TextAlignmentOptions::Center);
-        text->set_enableWordWrapping(true);
-        ConfigureLayout(text, 76.0F, 12.0F, 1.0F);
-        avatarPickerRows_.push_back(text->get_gameObject());
-    }
-}
-
-void MenuController::SelectAvatarFile(const std::filesystem::path& selected) {
-    std::error_code error;
-    const auto normalized = selected.lexically_normal();
-    if (!normalized.is_absolute() || !std::filesystem::is_regular_file(normalized, error) || !IsVrmFile(normalized)) {
-        Logging::Logger.warn("Avatar picker rejected '{}': not a readable .vrm file", normalized.string());
-        return;
-    }
-    auto& profile = root_.Settings().Edit().avatar;
-    profile.selectedPath = normalized.string();
-    profile.selectedFile = normalized.filename().string();
-    settings::ValidateAndRepair(root_.Settings().Edit());
-    std::string saveError;
-    if (!root_.Settings().Save(&saveError)) {
-        Logging::Logger.error("Could not save selected avatar path: {}", saveError);
-        return;
-    }
-    Logging::Logger.info("Selected VRM avatar '{}'", normalized.string());
-    if (avatarPickerModal_) avatarPickerModal_->Hide();
-    RefreshAvatarStatus();
-    // The fit record is keyed by the selected avatar path. Rebuild the Fit
-    // page so every control and interactivity rule points at the new avatar's
-    // record instead of retaining values from the previous avatar key.
-    RequestAvatarSettingsRebuild();
 }
 
 void MenuController::BuildAfkFilePicker(HMUI::ViewController* view) {
@@ -3110,724 +1146,201 @@ void MenuController::SelectAfkFile(const std::filesystem::path& selected) {
     if (afkPickerModal_) afkPickerModal_->Hide();
 }
 
-void MenuController::RefreshRetargetingControls() {
-    const auto fit = settings::RetargetingForSelectedAvatar(root_.Settings().Get().avatar);
-    const auto& playerFit = root_.Avatar().PlayerProfile();
-    const bool automaticShoulderAvailable = playerFit.valid &&
-        playerFit.bodyFit.shoulderWidthConfidence >= 0.60F &&
-        std::isfinite(playerFit.bodyFit.estimatedShoulderWidth) &&
-        playerFit.bodyFit.estimatedShoulderWidth > 0.15F;
-    refreshingRetargetingControls_ = true;
-    if (armSpanSizingToggle_) armSpanSizingToggle_->set_Value(fit.armSpanAvatarSizing);
-    if (matchPlayerHeightToggle_) matchPlayerHeightToggle_->set_Value(fit.matchPlayerHeight);
-    if (heightAdjustmentBalanceSlider_) {
-        heightAdjustmentBalanceSlider_->set_Value(fit.heightAdjustmentBalance);
-        heightAdjustmentBalanceSlider_->set_interactable(
-            fit.armSpanAvatarSizing && fit.matchPlayerHeight);
-    }
-    if (heightAdjustmentBalanceResetButton_) {
-        heightAdjustmentBalanceResetButton_->set_interactable(
-            fit.armSpanAvatarSizing && fit.matchPlayerHeight);
-    }
-    if (matchPlayerHeightToggle_) matchPlayerHeightToggle_->set_interactable(fit.armSpanAvatarSizing);
-    if (manualAvatarScaleToggle_) manualAvatarScaleToggle_->set_Value(fit.manualAvatarScaleEnabled);
-    if (manualAvatarScaleSlider_) {
-        manualAvatarScaleSlider_->set_Value(fit.manualAvatarScalePercent);
-        manualAvatarScaleSlider_->set_interactable(fit.manualAvatarScaleEnabled);
-    }
-    if (manualAvatarScaleResetButton_) {
-        manualAvatarScaleResetButton_->set_interactable(fit.manualAvatarScaleEnabled);
-    }
-    if (bodyProportionToggle_) bodyProportionToggle_->set_Value(fit.adjustBodyProportions);
-    if (torsoWidthSlider_) {
-        torsoWidthSlider_->set_Value(fit.torsoWidthPercent);
-        torsoWidthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (torsoWidthResetButton_) torsoWidthResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (autoShoulderWidthToggle_) {
-        autoShoulderWidthToggle_->set_Value(fit.autoShoulderWidth);
-        autoShoulderWidthToggle_->set_interactable(
-            fit.adjustBodyProportions && automaticShoulderAvailable);
-    }
-    if (shoulderWidthSlider_) {
-        shoulderWidthSlider_->set_Value(fit.shoulderWidthPercent);
-        shoulderWidthSlider_->set_interactable(
-            fit.adjustBodyProportions &&
-            !(fit.autoShoulderWidth && automaticShoulderAvailable));
-    }
-    if (shoulderWidthResetButton_) {
-        shoulderWidthResetButton_->set_interactable(
-            fit.adjustBodyProportions &&
-            !(fit.autoShoulderWidth && automaticShoulderAvailable));
-    }
-    if (waistHipWidthSlider_) {
-        waistHipWidthSlider_->set_Value(fit.waistHipWidthPercent);
-        waistHipWidthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (waistHipWidthResetButton_) {
-        waistHipWidthResetButton_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (lowerTorsoWidthSlider_) {
-        lowerTorsoWidthSlider_->set_Value(fit.lowerTorsoWidthPercent);
-        lowerTorsoWidthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (lowerTorsoWidthResetButton_) {
-        lowerTorsoWidthResetButton_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (neckBaseWidthSlider_) {
-        neckBaseWidthSlider_->set_Value(fit.neckBaseWidthPercent);
-        neckBaseWidthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (neckBaseWidthResetButton_) {
-        neckBaseWidthResetButton_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (headSizeSlider_) {
-        headSizeSlider_->set_Value(fit.headSizePercent);
-        headSizeSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (headSizeResetButton_) headSizeResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (torsoHeightSlider_) {
-        torsoHeightSlider_->set_Value(fit.torsoHeightPercent);
-        torsoHeightSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (torsoHeightResetButton_) torsoHeightResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (upperLegLengthSlider_) {
-        upperLegLengthSlider_->set_Value(fit.upperLegLengthPercent);
-        upperLegLengthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (upperLegLengthResetButton_) upperLegLengthResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (lowerLegLengthSlider_) {
-        lowerLegLengthSlider_->set_Value(fit.lowerLegLengthPercent);
-        lowerLegLengthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (lowerLegLengthResetButton_) lowerLegLengthResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (legWidthSlider_) {
-        legWidthSlider_->set_Value(fit.legWidthPercent);
-        legWidthSlider_->set_interactable(fit.adjustBodyProportions);
-    }
-    if (legWidthResetButton_) legWidthResetButton_->set_interactable(fit.adjustBodyProportions);
-    if (neutralKneeBendSlider_) neutralKneeBendSlider_->set_Value(fit.neutralKneeBendDegrees);
-    if (attackPoseSlider_) attackPoseSlider_->set_Value(fit.attackPoseDegrees);
-    if (backStiffnessSlider_) backStiffnessSlider_->set_Value(fit.backStiffnessPercent);
-    if (floorOffsetSlider_) floorOffsetSlider_->set_Value(fit.floorOffsetMeters);
-    if (keepHandsOnSabersToggle_) keepHandsOnSabersToggle_->set_Value(fit.keepHandsOnSabers);
-    if (armBodyCollisionToggle_) armBodyCollisionToggle_->set_Value(fit.preventArmBodyClipping);
-    if (armSpringCollisionToggle_) armSpringCollisionToggle_->set_Value(fit.armSpringBoneInteraction);
-    refreshingRetargetingControls_ = false;
-}
+void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
+    if (active_ == nullptr) return;
 
-void MenuController::ShowAvatarFitWarning(int warningKind) {
-    pendingAvatarFitWarning_ = warningKind;
-    if (!avatarFitWarningModal_) {
-        if (!IsAlive(avatarSettingsView_)) return;
-        avatarFitWarningModal_ = BSML::Lite::CreateModal(
-            avatarSettingsView_, {82.0F, 48.0F}, nullptr, true);
-        if (!avatarFitWarningModal_) return;
-        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(avatarFitWarningModal_->get_transform());
-        layout->set_spacing(2.0F);
-        layout->set_childControlWidth(true);
-        layout->set_childControlHeight(true);
-        layout->set_childForceExpandWidth(true);
-        layout->set_childForceExpandHeight(false);
-        avatarFitWarningText_ = BSML::Lite::CreateText(
-            layout->get_transform(), "", 3.8F, {0.0F, 0.0F}, {74.0F, 29.0F});
-        avatarFitWarningText_->set_enableWordWrapping(true);
-        avatarFitWarningText_->set_overflowMode(TMPro::TextOverflowModes::Overflow);
-        avatarFitWarningText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-        // A VerticalLayoutGroup otherwise asks TMP for its single-line
-        // preferred width and can expand the warning far beyond the modal.
-        // Fix the text cell to the modal's inner width so wrapping is real,
-        // not merely enabled on an unconstrained rectangle.
-        ConfigureLayout(avatarFitWarningText_, 74.0F, 29.0F, 1.0F);
-        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
-        actions->set_spacing(2.0F);
-        actions->set_childControlWidth(true);
-        actions->set_childForceExpandWidth(true);
-        ConfigureLayout(actions, 72.0F, 8.0F, 1.0F);
-        WithHint(BSML::Lite::CreateUIButton(actions, "Cancel", [] {
-            if (active_) active_->ResolveAvatarFitWarning(false);
-        }), "Keeps the current avatar-fit setting unchanged and closes this warning.");
-        WithHint(BSML::Lite::CreateUIButton(actions, "Continue", [] {
-            if (active_) active_->ResolveAvatarFitWarning(true);
-        }), "Accepts the displayed performance or fit warning and enables the requested setting.");
-    }
-    if (!avatarFitWarningModal_ || !avatarFitWarningText_) return;
-    if (warningKind == 1) {
-        avatarFitWarningText_->set_text(
-            "Turn off emergency arm extension? If the avatar is resized or your reach exceeds its authored arm length, its hands may separate from the saber handles.");
-    } else {
-        avatarFitWarningText_->set_text(warningKind == 2
-            ? "Enable arm-body collision? This adds IK work each frame. With Keep Hands on Sabers enabled, the hand remains locked to the grip while the solver reroutes the arm around the torso."
-            : "Enable arm interaction with compatible SpringBones? This adds collision work while hair, clothing, or accessories are simulated and may affect performance.");
-    }
-    avatarFitWarningModal_->Show();
-}
+    static std::array<std::string_view, 3> tabNames{
+        "Tab 1", "Tab 2", "Tab 3"};
+    active_->centerDebugTabViewRoots_.fill(nullptr);
+    active_->centerDebugTabContentRoots_.fill(nullptr);
+    active_->selectedCenterDebugTab_ = 0;
 
-void MenuController::ResolveAvatarFitWarning(bool accepted) {
-    const auto warningKind = pendingAvatarFitWarning_;
-    pendingAvatarFitWarning_ = 0;
-    if (avatarFitWarningModal_) avatarFitWarningModal_->Hide();
-    if (warningKind == 0) return;
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    auto& fit = settings::EditRetargetingForSelectedAvatar(avatarSettings);
-    if (accepted) {
-        if (warningKind == 1) fit.keepHandsOnSabers = false;
-        else if (warningKind == 2) fit.preventArmBodyClipping = true;
-        else if (warningKind == 3) fit.armSpringBoneInteraction = true;
-        settings::ValidateAndRepair(root_.Settings().Edit());
-        root_.Avatar().ApplyAvatarSettings(avatarSettings);
-        root_.Settings().Save(nullptr);
-    }
-    RefreshRetargetingControls();
-}
+    // DEBUG LAYOUT VISUALIZATION -- intentionally temporary. Keep this marker
+    // searchable so every diagnostic color and inset can be removed together
+    // after headset screenshots verify the center-panel geometry.
+    constexpr float kDebugPageInset = 5.0F;
+    constexpr float kDebugScrollHorizontalInset = 3.0F;
+    constexpr float kDebugScrollVerticalInset = 0.0F;
+    constexpr float kDebugTabStripHeight = 10.0F;
+    const std::array<UnityEngine::Color, 3> debugPageColors{
+        UnityEngine::Color{0.82F, 0.08F, 0.08F, 0.82F}, // Tab 1 page: red
+        UnityEngine::Color{0.08F, 0.72F, 0.16F, 0.82F}, // Tab 2 page: green
+        UnityEngine::Color{0.08F, 0.22F, 0.88F, 0.82F}  // Tab 3 page: blue
+    };
+    const std::array<UnityEngine::Color, 3> debugScrollColors{
+        UnityEngine::Color{0.04F, 0.82F, 0.92F, 0.88F}, // Tab 1 scroll: cyan
+        UnityEngine::Color{0.92F, 0.10F, 0.78F, 0.88F}, // Tab 2 scroll: magenta
+        UnityEngine::Color{0.96F, 0.76F, 0.06F, 0.88F}  // Tab 3 scroll: yellow
+    };
 
-void MenuController::OpenGripEditor(int side) {
-    if (side < 0 || side > 1 || !root_.Avatar().HasLoadedVrmAvatar()) {
-        Logging::Logger.warn("Load an avatar before opening the hand-position editor");
-        return;
-    }
-    // Only one side is edited at a time so the opposite controller remains a
-    // reliable pointer for operating and moving the world panel.
-    if (gripEditorSide_ >= 0) DestroyGripEditor(true);
-    const auto fit = settings::RetargetingForSelectedAvatar(root_.Settings().Get().avatar);
-    const auto& source = side == 0 ? fit.leftControllerToWrist : fit.rightControllerToWrist;
-    gripEditorSide_ = side;
-    gripEditorOriginalPosition_ = source.position;
-    gripEditorOriginalRotation_ = source.rotationDegrees;
-    gripEditorOriginalClosurePercent_ = source.gripClosurePercent;
-    gripEditorOriginalThumbCurvePercent_ = source.thumbCurvePercent;
-    gripEditorWorkingPosition_ = source.position;
-    gripEditorWorkingRotation_ = source.rotationDegrees;
-    gripEditorWorkingRotationQuaternion_ = camera::FromEulerDegrees(source.rotationDegrees);
-    gripEditorWorkingClosurePercent_ = source.gripClosurePercent;
-    gripEditorWorkingThumbCurvePercent_ = source.thumbCurvePercent;
-    gripEditorShowAvatarArm_ = true;
-    gripEditorGizmoRotation_ = {};
-    if (auto* mainCamera = UnityEngine::Camera::get_main().ptr(); IsAlive(mainCamera)) {
-        const auto euler = mainCamera->get_transform()->get_rotation().get_eulerAngles();
-        gripEditorGizmoRotation_ = camera::FromEulerDegrees({0.0F, euler.y, 0.0F});
-    }
-    root_.Avatar().SetGripEditingPreview(side, gripEditorShowAvatarArm_);
-    EnsureGripEditor();
-    EnsureGripTargetGizmo();
-    RefreshGripEditorControls();
-    RecenterGripEditor();
-}
+    const auto fitInsideParent = [](
+        UnityEngine::RectTransform* rect,
+        float left,
+        float bottom,
+        float right,
+        float top) {
+        if (!rect) return;
+        rect->set_anchorMin({0.0F, 0.0F});
+        rect->set_anchorMax({1.0F, 1.0F});
+        rect->set_pivot({0.5F, 0.5F});
+        rect->set_offsetMin({left, bottom});
+        rect->set_offsetMax({-right, -top});
+    };
+    const auto createDebugBackground = [&fitInsideParent](
+        UnityEngine::Transform* parent,
+        std::string_view name,
+        UnityEngine::Color color) -> HMUI::ImageView* {
+        auto* image = BSML::Lite::CreateImage(
+            parent, BSML::Utilities::ImageResources::GetWhitePixel());
+        if (!image) return nullptr;
+        image->get_gameObject()->set_name(name);
+        image->set_color(color);
+        image->set_preserveAspect(false);
+        image->set_raycastTarget(false);
+        fitInsideParent(
+            image->get_transform().cast<UnityEngine::RectTransform>(),
+            0.0F, 0.0F, 0.0F, 0.0F);
+        image->get_transform()->SetAsFirstSibling();
+        return image;
+    };
 
-void MenuController::EnsureGripEditor() {
-    if (IsAlive(gripEditorScreen_) || gripEditorSide_ < 0 || !FloatingUiServicesReady()) return;
-    gripEditorScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
-        kGripEditorPanelSize, true, {0.0F, 0.0F, 0.0F},
-        UnityEngine::Quaternion::get_identity(), 0.0F, false);
-    if (!IsAlive(gripEditorScreen_)) return;
-    auto* object = gripEditorScreen_->get_gameObject().ptr();
-    object->set_name("SaberStage Hand Position Editor");
-    object->set_layer(5);
-    UnityEngine::Object::DontDestroyOnLoad(object);
-    gripEditorScreen_->set_HandleSide(BSML::Side::Top);
-    gripEditorScreen_->set_HighlightHandle(true);
-    gripEditorScreen_->get_transform()->set_localScale({
-        kGripEditorPanelScale, kGripEditorPanelScale, kGripEditorPanelScale});
-    auto* layout = BSML::Lite::CreateVerticalLayoutGroup(gripEditorScreen_->get_transform());
-    layout->set_spacing(0.5F);
-    layout->set_padding(UnityEngine::RectOffset::New_ctor(4, 4, 3, 3));
-    layout->set_childControlWidth(true);
-    layout->set_childControlHeight(true);
-    layout->set_childForceExpandWidth(true);
-    layout->set_childForceExpandHeight(false);
-    ConfigureLayout(layout, 86.0F, 88.0F, 1.0F);
-    gripEditorTitleText_ = BSML::Lite::CreateText(
-        layout->get_transform(), "Hand Position", 5.0F, {0.0F, 0.0F}, {82.0F, 7.0F});
-    gripEditorTitleText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-    auto* note = BSML::Lite::CreateText(
-        layout->get_transform(),
-        "Hold the adjusted controller naturally. With the OTHER controller, point at an axis: hold Trigger to move or the side Grip button to rotate. The red axis is inside the hand, green is above it, and blue is in front. Use the sliders for fine adjustment.",
-        3.0F, {0.0F, 0.0F}, {82.0F, 14.0F});
-    note->set_enableWordWrapping(true);
-    note->set_alignment(TMPro::TextAlignmentOptions::Center);
-    gripEditorShowArmToggle_ = BSML::Lite::CreateToggle(
-        layout, "Show Avatar Arm", gripEditorShowAvatarArm_, [](bool visible) {
-            if (active_) active_->SetGripEditorShowAvatarArm(visible);
+    // This is the same native segmented-control pattern the pre-removal avatar
+    // center menu used. Only its page contents are the empty debug scaffold.
+    active_->centerDebugTabs_ = BSML::Lite::CreateTextSegmentedControl(
+        view,
+        {0.0F, 0.0F},
+        {86.0F, 7.0F},
+        tabNames,
+        [](int index) {
+            if (active_) active_->ShowCenterDebugTab(index);
         });
-    ConfigureLayout(gripEditorShowArmToggle_, 82.0F, 7.0F, 1.0F);
-    constexpr const char* labels[8]{
-        "Position X", "Position Y", "Position Z", "Pitch", "Yaw", "Roll",
-        "Finger Closure", "Thumb Curve"};
-    for (int component = 0; component < 8; ++component) {
-        const bool position = component < 3;
-        const bool closure = component >= 6;
-        gripEditorSliders_[component] = BSML::Lite::CreateSliderSetting(
-            layout, labels[component], position ? 0.005F : 1.0F,
-            closure ? 100.0F : 0.0F,
-            position ? -0.25F : closure ? 0.0F : -180.0F,
-            position ? 0.25F : closure ? 150.0F : 180.0F,
-            0.15F, true, {0.0F, 0.0F},
-            [component](float value) {
-                if (active_) active_->SetGripEditorComponent(component, value);
-            });
-        ConfigureLayout(gripEditorSliders_[component], 82.0F, 7.0F, 1.0F);
-    }
-    auto* mirrorActions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
-    mirrorActions->set_childControlWidth(true);
-    mirrorActions->set_childForceExpandWidth(true);
-    ConfigureLayout(mirrorActions, 82.0F, 7.0F, 1.0F);
-    BSML::Lite::CreateUIButton(mirrorActions, "Mirror To Other + Save", [] {
-        if (active_) active_->MirrorGripEditorToOtherHand();
-    });
-    auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
-    actions->set_spacing(1.0F);
-    actions->set_childControlWidth(true);
-    actions->set_childForceExpandWidth(true);
-    ConfigureLayout(actions, 82.0F, 8.0F, 1.0F);
-    BSML::Lite::CreateUIButton(actions, "Reset", [] { if (active_) active_->ResetGripEditor(); });
-    BSML::Lite::CreateUIButton(actions, "Cancel", [] { if (active_) active_->DestroyGripEditor(true); });
-    BSML::Lite::CreateUIButton(actions, "Save", [] { if (active_) active_->SaveGripEditor(); });
-}
-
-void MenuController::EnsureGripTargetGizmo() {
-    if (gripEditorSide_ < 0 || !FloatingUiServicesReady()) return;
-    bool complete = true;
-    for (auto* screen : gripAxisHandles_) complete = complete && IsAlive(screen);
-    if (complete) return;
-
-    // Recover cleanly if scene teardown interrupted creation between axes.
-    for (auto*& screen : gripAxisHandles_) {
-        if (IsAlive(screen)) UnityEngine::Object::Destroy(screen->get_gameObject());
-        screen = nullptr;
-    }
-    gripAxisRings_.fill(nullptr);
-    for (auto*& material : gripAxisMaterials_) {
-        if (IsAlive(material)) UnityEngine::Object::Destroy(material);
-        material = nullptr;
-    }
-    for (auto*& material : gripAxisRingMaterials_) {
-        if (IsAlive(material)) UnityEngine::Object::Destroy(material);
-        material = nullptr;
+    if (active_->centerDebugTabs_) {
+        auto tabsRect = active_->centerDebugTabs_->get_transform()
+            .cast<UnityEngine::RectTransform>();
+        tabsRect->set_anchorMin({0.0F, 1.0F});
+        tabsRect->set_anchorMax({1.0F, 1.0F});
+        tabsRect->set_pivot({0.5F, 1.0F});
+        tabsRect->set_anchoredPosition({0.0F, -1.5F});
+        tabsRect->set_sizeDelta({-4.0F, 7.0F});
     }
 
-    // Use the embedded transparent 3D shader. Stock UI materials can render
-    // world primitives as opaque in Quest multiview and hide the controller.
-    auto* shader = avatar::vrm::EmbeddedGripTargetShader();
-    if (!IsAlive(shader)) shader = UnityEngine::Shader::Find("Unlit/Transparent").ptr();
-    const UnityEngine::Color colors[3]{
-        {1.0F, 0.12F, 0.12F, 0.76F},
-        {0.12F, 1.0F, 0.22F, 0.76F},
-        {0.12F, 0.42F, 1.0F, 0.76F}};
-    const UnityEngine::Color ringColors[3]{
-        {1.0F, 0.12F, 0.12F, 0.24F},
-        {0.12F, 1.0F, 0.22F, 0.24F},
-        {0.12F, 0.42F, 1.0F, 0.24F}};
-    const float xDirection = gripEditorSide_ == 0 ? 1.0F : -1.0F;
-    const UnityEngine::Vector3 handlePositions[3]{
-        {xDirection * kGripTargetArrowLength * 0.5F, 0.0F, 0.0F},
-        {0.0F, kGripTargetArrowLength * 0.5F, 0.0F},
-        {0.0F, 0.0F, kGripTargetArrowLength * 0.5F}};
-    const UnityEngine::Vector3 handleScales[3]{
-        {kGripTargetArrowLength, kGripTargetHandleWidth, kGripTargetHandleWidth},
-        {kGripTargetHandleWidth, kGripTargetArrowLength, kGripTargetHandleWidth},
-        {kGripTargetHandleWidth, kGripTargetHandleWidth, kGripTargetArrowLength}};
+    for (std::size_t index = 0; index < tabNames.size(); ++index) {
+        const auto pageName =
+            "SaberStage Center Debug Tab Page " + std::to_string(index + 1);
+        auto* page = UnityEngine::GameObject::New_ctor(StringW(pageName));
+        if (!page) continue;
+        auto* pageRect = page->AddComponent<UnityEngine::RectTransform*>();
+        page->get_transform()->SetParent(view->get_transform(), false);
+        // Five units of exposed parent surround prove that the page itself
+        // remains inside the center panel. The larger top inset reserves the
+        // native tab strip while retaining the same five-unit gap below it.
+        fitInsideParent(
+            pageRect,
+            kDebugPageInset,
+            kDebugPageInset,
+            kDebugPageInset,
+            kDebugTabStripHeight);
+        createDebugBackground(
+            page->get_transform(),
+            "DEBUG Tab Page Background " + std::to_string(index + 1),
+            debugPageColors[index]);
 
-    for (int axis = 0; axis < 3; ++axis) {
-        auto* screen = BSML::FloatingScreen::CreateFloatingScreen(
-            kGripTargetGizmoSize, true, {0.0F, 0.0F, 0.0F},
-            UnityEngine::Quaternion::get_identity(), 0.0F, false);
-        gripAxisHandles_[axis] = screen;
-        if (!IsAlive(screen)) continue;
-        auto* object = screen->get_gameObject().ptr();
-        object->set_name(StringW("SaberStage Hand Axis " + std::to_string(axis)));
-        object->set_layer(5);
-        UnityEngine::Object::DontDestroyOnLoad(object);
-        screen->set_HighlightHandle(true);
-        screen->get_transform()->set_localScale({
-            kGripTargetGizmoScale, kGripTargetGizmoScale, kGripTargetGizmoScale});
-
-        auto* material = IsAlive(shader) ? UnityEngine::Material::New_ctor(shader) : nullptr;
-        gripAxisMaterials_[axis] = material;
-        if (IsAlive(material)) {
-            material->set_name(StringW("SaberStage Hand Axis Material " + std::to_string(axis)));
-            material->set_color(colors[axis]);
-            if (material->HasProperty("_Cull")) material->SetFloat("_Cull", 0.0F);
-            material->set_renderQueue(3001);
+        auto* content = BSML::Lite::CreateScrollableSettingsContainer(
+            page->get_transform());
+        if (!content) {
+            UnityEngine::Object::Destroy(page);
+            continue;
         }
-        auto* ringMaterial = IsAlive(shader) ? UnityEngine::Material::New_ctor(shader) : nullptr;
-        gripAxisRingMaterials_[axis] = ringMaterial;
-        if (IsAlive(ringMaterial)) {
-            ringMaterial->set_name(StringW("SaberStage Hand Axis Band " + std::to_string(axis)));
-            ringMaterial->set_color(ringColors[axis]);
-            if (ringMaterial->HasProperty("_Cull")) ringMaterial->SetFloat("_Cull", 0.0F);
-            ringMaterial->set_renderQueue(3002);
+        active_->centerDebugTabViewRoots_[index] = page;
+        active_->centerDebugTabContentRoots_[index] = content;
+
+        auto* external = content->GetComponent<BSML::ExternalComponents*>();
+        auto* scrollRect = external
+            ? external->Get<UnityEngine::RectTransform*>()
+            : nullptr;
+        if (scrollRect) {
+            // Keep the scroll viewport flush with the page vertically while a
+            // narrow three-unit horizontal inset exposes the page boundary and
+            // guarantees the viewport cannot exceed either visible side.
+            fitInsideParent(
+                scrollRect,
+                kDebugScrollHorizontalInset,
+                kDebugScrollVerticalInset,
+                kDebugScrollHorizontalInset,
+                kDebugScrollVerticalInset);
+            createDebugBackground(
+                scrollRect,
+                "DEBUG Vertical Scroll Background " + std::to_string(index + 1),
+                debugScrollColors[index]);
         }
 
-        // The stock cube remains the raycast target but is not rendered; the
-        // colored arrow children are the only normal-state geometry. Keeping
-        // each collider off the center prevents ambiguous overlapping hits.
-        if (IsAlive(screen->handle)) {
-            screen->handle->set_layer(5);
-            screen->handle->get_transform()->set_localPosition(handlePositions[axis]);
-            screen->handle->get_transform()->set_localScale(handleScales[axis]);
-            if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
-                renderer->set_enabled(false);
-            }
-        }
-        CreateGripTargetArrow(screen->get_transform(), axis, axis == 0 ? xDirection : 1.0F, material);
-        auto* ring = CreateGripTargetRing(
-            screen->get_transform(), axis, {1.0F, 1.0F, 1.0F, 1.0F}, ringMaterial);
-        gripAxisRings_[axis] = ring;
-        if (IsAlive(ring)) ring->get_gameObject()->SetActive(false);
-    }
-    SyncGripTargetGizmo();
-}
-
-void MenuController::RefreshGripEditorControls() {
-    refreshingGripEditor_ = true;
-    const float values[8]{
-        gripEditorWorkingPosition_.x, gripEditorWorkingPosition_.y, gripEditorWorkingPosition_.z,
-        gripEditorWorkingRotation_.x, gripEditorWorkingRotation_.y, gripEditorWorkingRotation_.z,
-        gripEditorWorkingClosurePercent_, gripEditorWorkingThumbCurvePercent_};
-    for (int i = 0; i < 8; ++i) if (gripEditorSliders_[i]) gripEditorSliders_[i]->set_Value(values[i]);
-    if (gripEditorShowArmToggle_) gripEditorShowArmToggle_->set_Value(gripEditorShowAvatarArm_);
-    if (gripEditorTitleText_) gripEditorTitleText_->set_text(
-        gripEditorSide_ == 0 ? "Position Left Hand" : "Position Right Hand");
-    refreshingGripEditor_ = false;
-}
-
-void MenuController::SetGripEditorComponent(int component, float value) {
-    if (refreshingGripEditor_ || gripEditorSide_ < 0 || component < 0 || component >= 8) return;
-    if (component == 6) {
-        gripEditorWorkingClosurePercent_ = value;
-    } else if (component == 7) {
-        gripEditorWorkingThumbCurvePercent_ = value;
-    } else {
-        auto* destination = component < 3 ? &gripEditorWorkingPosition_ : &gripEditorWorkingRotation_;
-        const auto axis = component % 3;
-        if (axis == 0) destination->x = value;
-        else if (axis == 1) destination->y = value;
-        else destination->z = value;
-        if (component >= 3) {
-            gripEditorWorkingRotationQuaternion_ =
-                camera::FromEulerDegrees(gripEditorWorkingRotation_);
+        if (auto* rows = content->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
+            rows->set_childControlWidth(true);
+            rows->set_childForceExpandWidth(false);
+            rows->set_childControlHeight(true);
+            rows->set_childForceExpandHeight(false);
+            rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
+            rows->set_spacing(1.0F);
+            // Keep future diagnostic children five units inside the scroll
+            // content so the container color remains visible around them too.
+            rows->set_padding(UnityEngine::RectOffset::New_ctor(5, 5, 5, 5));
         }
     }
 
-    ApplyGripEditorPreview();
-}
-
-void MenuController::SetGripEditorShowAvatarArm(bool visible) {
-    if (refreshingGripEditor_ || gripEditorSide_ < 0) return;
-    gripEditorShowAvatarArm_ = visible;
-    root_.Avatar().SetGripEditingPreview(gripEditorSide_, visible);
-}
-
-void MenuController::ApplyGripEditorPreview() {
-    if (gripEditorSide_ < 0) return;
-    // Interactive placement bypasses the broad settings apply path. A target
-    // can move at controller refresh rate; resetting feet, body history, and
-    // every rendering option for each sample would make the axis target stutter and
-    // flood the log. Persistence still occurs only through SaveGripEditor.
-    const camera::Pose adjustment{
-        gripEditorWorkingPosition_,
-        gripEditorWorkingRotationQuaternion_};
-    root_.Avatar().SetGripAdjustmentPreview(
-        gripEditorSide_, ToAvatar(adjustment), gripEditorWorkingClosurePercent_,
-        gripEditorWorkingThumbCurvePercent_);
-}
-
-void MenuController::ResetGripEditor() {
-    gripEditorWorkingPosition_ = {};
-    gripEditorWorkingRotation_ = {};
-    gripEditorWorkingRotationQuaternion_ = {};
-    gripEditorWorkingClosurePercent_ = 100.0F;
-    gripEditorWorkingThumbCurvePercent_ = 100.0F;
-    ApplyGripEditorPreview();
-    RefreshGripEditorControls();
-}
-
-void MenuController::SaveGripEditor() {
-    if (gripEditorSide_ < 0) return;
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    auto& fit = settings::EditRetargetingForSelectedAvatar(avatarSettings);
-    auto& destination = gripEditorSide_ == 0
-        ? fit.leftControllerToWrist : fit.rightControllerToWrist;
-    destination.position = gripEditorWorkingPosition_;
-    destination.rotationDegrees = gripEditorWorkingRotation_;
-    destination.gripClosurePercent = gripEditorWorkingClosurePercent_;
-    destination.thumbCurvePercent = gripEditorWorkingThumbCurvePercent_;
-    fit.gripOffsetsInitialized = true;
-    settings::ValidateAndRepair(root_.Settings().Edit());
-    root_.Avatar().ApplyAvatarSettings(avatarSettings);
-    root_.Settings().Save(nullptr);
-    Logging::Logger.info("Saved {} avatar grip adjustment", gripEditorSide_ == 0 ? "left" : "right");
-    DestroyGripEditor(false);
-}
-
-void MenuController::MirrorGripEditorToOtherHand() {
-    if (gripEditorSide_ < 0) return;
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    auto& fit = settings::EditRetargetingForSelectedAvatar(avatarSettings);
-    auto& current = gripEditorSide_ == 0
-        ? fit.leftControllerToWrist : fit.rightControllerToWrist;
-    auto& opposite = gripEditorSide_ == 0
-        ? fit.rightControllerToWrist : fit.leftControllerToWrist;
-    current.position = gripEditorWorkingPosition_;
-    current.rotationDegrees = gripEditorWorkingRotation_;
-    current.gripClosurePercent = gripEditorWorkingClosurePercent_;
-    current.thumbCurvePercent = gripEditorWorkingThumbCurvePercent_;
-
-    // The adjustment is controller-local, not a world-space transform. Quest
-    // left/right controller frames mirror lateral translation and roll while
-    // retaining pitch and yaw (the same convention used by Qavatars' proven
-    // per-frame controller targets). Treating this as a world sagittal-plane
-    // quaternion reflection inverted yaw and placed the copied hand on a
-    // visibly different part of the opposite pointer.
-    opposite.position = {
-        -gripEditorWorkingPosition_.x,
-        gripEditorWorkingPosition_.y,
-        gripEditorWorkingPosition_.z};
-    opposite.rotationDegrees = {
-        gripEditorWorkingRotation_.x,
-        gripEditorWorkingRotation_.y,
-        -gripEditorWorkingRotation_.z};
-    opposite.gripClosurePercent = gripEditorWorkingClosurePercent_;
-    opposite.thumbCurvePercent = gripEditorWorkingThumbCurvePercent_;
-    fit.gripOffsetsInitialized = true;
-    settings::ValidateAndRepair(root_.Settings().Edit());
-    root_.Avatar().ApplyAvatarSettings(avatarSettings);
-    root_.Settings().Save(nullptr);
-    Logging::Logger.info(
-        "Saved {} avatar grip adjustment and mirrored it to the {} hand",
-        gripEditorSide_ == 0 ? "left" : "right",
-        gripEditorSide_ == 0 ? "right" : "left");
-    DestroyGripEditor(false);
-}
-
-void MenuController::DestroyGripEditor(bool restoreOriginal) noexcept {
-    // This panel's controls may have been hidden throughout their lifetime.
-    // Remove their BSML lookup entries before Unity releases their addresses.
-    if (IsAlive(gripEditorScreen_) && !ReleaseSliderRegistrations(
-            gripEditorScreen_->get_gameObject(), "grip editor teardown")) return;
-    if (gripEditorSide_ >= 0 && restoreOriginal) {
-        const camera::Pose original{
-            gripEditorOriginalPosition_,
-            camera::FromEulerDegrees(gripEditorOriginalRotation_)};
-        root_.Avatar().SetGripAdjustmentPreview(
-            gripEditorSide_, ToAvatar(original), gripEditorOriginalClosurePercent_,
-            gripEditorOriginalThumbCurvePercent_);
-    }
-    root_.Avatar().SetGripEditingPreview(-1, false);
-    for (auto*& screen : gripAxisHandles_) {
-        if (IsAlive(screen)) UnityEngine::Object::Destroy(screen->get_gameObject());
-        screen = nullptr;
-    }
-    gripAxisRings_.fill(nullptr);
-    for (auto*& material : gripAxisMaterials_) {
-        if (IsAlive(material)) UnityEngine::Object::Destroy(material);
-        material = nullptr;
-    }
-    for (auto*& material : gripAxisRingMaterials_) {
-        if (IsAlive(material)) UnityEngine::Object::Destroy(material);
-        material = nullptr;
-    }
-    if (IsAlive(gripEditorScreen_)) UnityEngine::Object::Destroy(gripEditorScreen_->get_gameObject());
-    gripEditorScreen_ = nullptr;
-    gripEditorTitleText_ = nullptr;
-    gripEditorShowArmToggle_ = nullptr;
-    gripEditorSliders_.fill(nullptr);
-    gripEditorOriginalClosurePercent_ = 100.0F;
-    gripEditorWorkingClosurePercent_ = 100.0F;
-    gripEditorOriginalThumbCurvePercent_ = 100.0F;
-    gripEditorWorkingThumbCurvePercent_ = 100.0F;
-    gripEditorWorkingRotationQuaternion_ = {};
-    gripEditorGizmoRotation_ = {};
-    gripAxisDrag_ = -1;
-    gripAxisDragRotating_ = false;
-    gripAxisDragControllerStart_ = {};
-    gripAxisDragControllerRotationStart_ = {};
-    gripAxisDragOriginAdjustment_ = {};
-    gripAxisDragOriginAdjustmentRotation_ = {};
-    gripAxisDragWorldDirection_ = {};
-    gripEditorSide_ = -1;
-    gripEditorShowAvatarArm_ = true;
-    refreshingGripEditor_ = false;
-}
-
-void MenuController::RecenterGripEditor() {
-    if (!IsAlive(gripEditorScreen_)) return;
-    auto* camera = UnityEngine::Camera::get_main().ptr();
-    if (!IsAlive(camera)) return;
-    auto* head = camera->get_transform().ptr();
-    const auto headPosition = head->get_position();
-    const auto euler = head->get_rotation().get_eulerAngles();
-    const auto rotation = UnityEngine::Quaternion::Euler({0.0F, euler.y, 0.0F});
-    const auto forward = UnityEngine::Quaternion::op_Multiply(rotation, UnityEngine::Vector3::get_forward());
-    gripEditorScreen_->get_transform()->SetPositionAndRotation(
-        UnityEngine::Vector3::op_Addition(
-            headPosition, UnityEngine::Vector3::op_Multiply(forward, kGripEditorPanelDistance)),
-        rotation);
-}
-
-void MenuController::SyncGripTargetGizmo() noexcept {
-    if (gripEditorSide_ < 0 || !root_.Avatar().IsBound()) return;
-    const auto base = ToCamera(root_.Avatar().Diagnostics().handBaseTarget[gripEditorSide_]);
-    if (!camera::IsFinite(base.position) || !camera::IsFinite(base.rotation)) return;
-    const camera::Pose adjustment{
-        gripEditorWorkingPosition_,
-        gripEditorWorkingRotationQuaternion_};
-    const auto target = camera::Compose(base, adjustment);
-    for (auto* screen : gripAxisHandles_) {
-        if (!IsAlive(screen)) continue;
-        screen->get_transform()->SetPositionAndRotation(
-            ToUnity(target.position), ToUnity(gripEditorGizmoRotation_));
-    }
-}
-
-void MenuController::TickGripEditor() noexcept {
-    if (gripEditorSide_ < 0) return;
-    EnsureGripEditor();
-    EnsureGripTargetGizmo();
-    int grabbedAxis = -1;
-    int highlightedAxis = -1;
-    BSML::FloatingScreenHandle* grabbedHandle = nullptr;
-    UnityW<GlobalNamespace::VRController> grabbedController;
-    for (int axis = 0; axis < 3; ++axis) {
-        auto* screen = gripAxisHandles_[axis];
-        if (!IsAlive(screen) || !IsAlive(screen->handle)) continue;
-        auto* handle = screen->handle->GetComponent<BSML::FloatingScreenHandle*>();
-        if (!IsAlive(handle)) continue;
-
-        // FloatingScreenHandle::Update owns the native hover sphere and can
-        // turn its renderer back on after construction. The sphere is useful
-        // for ordinary movable panels but blocks the hand/controller here.
-        // Suppress both references every frame; the custom thin axis band is
-        // the only grab-state visual allowed to appear.
-        if (IsAlive(handle->_renderer.ptr())) handle->_renderer->set_enabled(false);
-        if (auto* renderer = screen->handle->GetComponent<UnityEngine::MeshRenderer*>()) {
-            renderer->set_enabled(false);
-        }
-
-        // FloatingScreenHandle exposes no public hover flag, but its proven
-        // input path writes alpha 1 to its private display material on pointer
-        // enter/grab and alpha 0 on exit. The cube renderer stays disabled;
-        // this read only controls the matching colored guide ring.
-        bool highlighted = false;
-        if (handle->_material) {
-            highlighted = handle->_material->GetColor("_Color").a > 0.5F;
-        }
-        if (highlighted && highlightedAxis < 0) highlightedAxis = axis;
-        const auto heldBy = handle->__get__grabbingController();
-        if (heldBy) {
-            highlighted = true;
-            grabbedAxis = axis;
-            grabbedHandle = handle;
-            grabbedController = heldBy;
-            highlightedAxis = axis;
-        }
-        auto* ring = gripAxisRings_[axis];
-        if (IsAlive(ring) && ring->get_gameObject()->get_activeSelf() != highlighted) {
-            ring->get_gameObject()->SetActive(highlighted);
-        }
-    }
-
-    auto* oppositeController = OppositeGripEditorController(gripEditorSide_);
-    const bool rotating = highlightedAxis >= 0 &&
-        GripRotationButtonHeld(oppositeController);
-    const auto activeAxis = rotating ? highlightedAxis : grabbedAxis;
-    auto* controller = rotating
-        ? oppositeController
-        : (grabbedController ? grabbedController.ptr() : nullptr);
-
-    // Trigger activates the native handle for constrained translation. The
-    // controller's side Grip button activates constrained rotation while the
-    // same arrow is merely hovered. With neither input active, keep the target
-    // locked to the solved hand rather than allowing BSML's free panel motion.
-    if (activeAxis < 0 || !IsAlive(controller)) {
-        gripAxisDrag_ = -1;
-        gripAxisDragRotating_ = false;
-        SyncGripTargetGizmo();
+    const auto missingPage = std::any_of(
+        active_->centerDebugTabViewRoots_.begin(),
+        active_->centerDebugTabViewRoots_.end(),
+        [](auto* page) { return page == nullptr; });
+    if (missingPage) {
+        Logging::Logger.error(
+            "Could not create all three center-panel debug tab pages");
         return;
     }
 
-    const auto node = controller->get_node();
-    const bool sameHand =
-        (gripEditorSide_ == 0 && node.value__ == UnityEngine::XR::XRNode::LeftHand.value__) ||
-        (gripEditorSide_ == 1 && node.value__ == UnityEngine::XR::XRNode::RightHand.value__);
-    if (sameHand) {
-        // Calibration must be manipulated by the opposite controller. Letting
-        // the tracked hand drag its own target creates a feedback loop in which
-        // both source and destination move together and no useful offset can
-        // be measured.
-        if (grabbedHandle) grabbedHandle->_grabbingController = nullptr;
-        gripAxisDrag_ = -1;
-        gripAxisDragRotating_ = false;
-        SyncGripTargetGizmo();
-        Logging::Logger.warn("Use the opposite controller to move the {} hand axis target",
-            gripEditorSide_ == 0 ? "left" : "right");
-        return;
+    active_->ShowCenterDebugTab(0);
+    if (active_->centerDebugTabs_) {
+        active_->centerDebugTabs_->SelectCellWithNumber(0);
     }
-
-    const auto base = ToCamera(root_.Avatar().Diagnostics().handBaseTarget[gripEditorSide_]);
-    auto anchor = controller->get_viewAnchorTransform();
-    if (!camera::IsFinite(base.position) || !camera::IsFinite(base.rotation) || !anchor) return;
-    const auto controllerPosition = ToCamera(anchor->get_position());
-    const auto controllerRotation = ToCamera(anchor->get_rotation());
-    if (gripAxisDrag_ != activeAxis || gripAxisDragRotating_ != rotating) {
-        gripAxisDrag_ = activeAxis;
-        gripAxisDragRotating_ = rotating;
-        gripAxisDragControllerStart_ = controllerPosition;
-        gripAxisDragControllerRotationStart_ = controllerRotation;
-        gripAxisDragOriginAdjustment_ = gripEditorWorkingPosition_;
-        gripAxisDragOriginAdjustmentRotation_ = gripEditorWorkingRotationQuaternion_;
-        const camera::Vec3 localAxes[3]{{1.0F, 0.0F, 0.0F}, {0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, 1.0F}};
-        gripAxisDragWorldDirection_ = camera::Rotate(
-            gripEditorGizmoRotation_, localAxes[activeAxis]);
-    }
-
-    if (rotating) {
-        // Extract only the controller's twist around the selected visible
-        // axis. Swing on the other two axes is discarded, preventing a small
-        // grip-button movement from flipping the wrist or elbow. Convert the
-        // world-axis result back into the hand-base local adjustment stored by
-        // the solver so it remains fixed to the pointer as tracking moves.
-        const auto angle = SignedControllerTwistDegrees(
-            gripAxisDragControllerRotationStart_, controllerRotation,
-            gripAxisDragWorldDirection_);
-        const auto originTargetRotation = camera::Multiply(
-            base.rotation, gripAxisDragOriginAdjustmentRotation_);
-        const auto targetRotation = camera::Multiply(
-            AxisAngle(gripAxisDragWorldDirection_, angle), originTargetRotation);
-        gripEditorWorkingRotationQuaternion_ = camera::Multiply(
-            camera::Inverse(base.rotation), targetRotation);
-        gripEditorWorkingRotation_ = EulerDegrees(gripEditorWorkingRotationQuaternion_);
-    } else {
-        // Project displacement onto one intuitive player-space axis. Convert
-        // the resulting world displacement into the hand base's local frame,
-        // because the persisted correction is one rigid local transform.
-        const auto delta = controllerPosition - gripAxisDragControllerStart_;
-        const float distance = delta.x * gripAxisDragWorldDirection_.x +
-            delta.y * gripAxisDragWorldDirection_.y +
-            delta.z * gripAxisDragWorldDirection_.z;
-        const auto localDirection = camera::Rotate(
-            camera::Inverse(base.rotation), gripAxisDragWorldDirection_);
-        gripEditorWorkingPosition_ = gripAxisDragOriginAdjustment_ + localDirection * distance;
-        gripEditorWorkingPosition_.x = camera::Clamp(gripEditorWorkingPosition_.x, -0.25F, 0.25F);
-        gripEditorWorkingPosition_.y = camera::Clamp(gripEditorWorkingPosition_.y, -0.25F, 0.25F);
-        gripEditorWorkingPosition_.z = camera::Clamp(gripEditorWorkingPosition_.z, -0.25F, 0.25F);
-    }
-    ApplyGripEditorPreview();
-    RefreshGripEditorControls();
-    SyncGripTargetGizmo();
 }
 
-std::filesystem::path MenuController::ConfiguredAvatarPath() const {
-    const auto& profile = root_.Settings().Get().avatar;
-    auto path = !profile.selectedPath.empty()
-        ? std::filesystem::path(profile.selectedPath)
-        : profile.selectedFile.empty()
-            ? std::filesystem::path{}
-            : root_.Settings().Path().parent_path() / "Avatars" / profile.selectedFile;
-    if (path.empty()) return {};
-    std::error_code error;
-    return std::filesystem::is_regular_file(path, error) && !error ? path : std::filesystem::path{};
+void MenuController::TickRuntimePanels() noexcept {
+    // One persistent main-thread driver services deferred settings saves,
+    // Twitch state, and the movable recording/chat panels even while the
+    // SaberStage menu is closed. Network workers never touch Unity objects.
+    std::string deferredSaveError;
+    if (!root_.Settings().TickPendingSave(&deferredSaveError)) {
+        if (deferredSaveError != lastDeferredSettingsSaveError_) {
+            lastDeferredSettingsSaveError_ = deferredSaveError;
+            Logging::Logger.error(
+                "Could not persist deferred SaberStage settings; retrying in one second: {}",
+                deferredSaveError);
+        }
+    } else if (!deferredSaveError.empty() || !lastDeferredSettingsSaveError_.empty()) {
+        lastDeferredSettingsSaveError_.clear();
+    }
+
+    root_.Twitch().Tick();
+    const auto twitch = root_.Twitch().Snapshot();
+    if (pendingLiveTwitchTitleUpdate_ && twitch.titleUpdateComplete) {
+        pendingLiveTwitchTitleUpdate_ = false;
+        if (!twitch.titleUpdateSucceeded) {
+            ShowLivestreamActionError(twitch.titleUpdateStatus, true);
+        }
+        RefreshTwitchControls();
+    }
+
+    twitchUiRefreshSeconds_ += std::max(
+        0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+    if (twitchUiRefreshSeconds_ >= 0.5F) {
+        twitchUiRefreshSeconds_ = 0.0F;
+        RefreshTwitchControls();
+    }
+
+    TickRecordingWorldPanel();
+    TickChatWorldPanel();
+    if (chatControls_) chatControls_->Tick();
 }
+
 
 void MenuController::BuildCameraListPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
@@ -5005,18 +2518,23 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
     if (active_->settingsTabs_) active_->settingsTabs_->SelectCellWithNumber(0);
 }
 
-void MenuController::ShowAvatarTab(int index) {
-    index = std::clamp(index, 0, 3);
-    selectedAvatarTab_ = index;
-    for (int page = 0; page < static_cast<int>(avatarTabViewRoots_.size()); ++page) {
-        if (avatarTabViewRoots_[page]) avatarTabViewRoots_[page]->SetActive(page == selectedAvatarTab_);
+void MenuController::ShowCenterDebugTab(int index) {
+    index = std::clamp(index, 0, 2);
+    selectedCenterDebugTab_ = index;
+    for (int page = 0;
+         page < static_cast<int>(centerDebugTabViewRoots_.size());
+         ++page) {
+        if (centerDebugTabViewRoots_[page]) {
+            centerDebugTabViewRoots_[page]->SetActive(
+                page == selectedCenterDebugTab_);
+        }
     }
-    // ForceUpdateCanvases alone does not rebuild the content hierarchy of a
-    // scroll page that was disabled before Unity's first layout pass. Rebuild
-    // the selected page explicitly after its viewport is active; otherwise a
-    // valid collection of BSML controls can appear as a completely empty tab.
+
+    // A page built inactive has no final viewport geometry until it is first
+    // selected. Rebuild after activation so the native vertical scroll group
+    // fills the colored debug viewport on that first visible frame.
     UnityEngine::Canvas::ForceUpdateCanvases();
-    if (auto* content = avatarTabContentRoots_[selectedAvatarTab_]) {
+    if (auto* content = centerDebugTabContentRoots_[selectedCenterDebugTab_]) {
         auto rect = content->get_transform().cast<UnityEngine::RectTransform>();
         UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(rect);
     }
@@ -6470,14 +3988,14 @@ void MenuController::EnsureChatWorldPanel() {
             });
         });
     if (IsAlive(chatWorldPanelResizeButton_)) {
-        BSML::Lite::SetButtonTextSize(chatWorldPanelResizeButton_, 2.6F);
+        BSML::Lite::SetButtonTextSize(chatWorldPanelResizeButton_, 3.0F);
     }
     if (IsAlive(chatWorldPanelControlButton_)) {
-        BSML::Lite::SetButtonTextSize(chatWorldPanelControlButton_, 2.6F);
+        BSML::Lite::SetButtonTextSize(chatWorldPanelControlButton_, 3.0F);
         chatWorldPanelControlButton_->set_interactable(true);
     }
     chatWorldPanelViewerText_ = BSML::Lite::CreateText(
-        parent, "♟ --", TMPro::FontStyles::Bold, 3.4F);
+        parent, "♟ --", TMPro::FontStyles::Bold, 4.0F);
     if (IsAlive(chatWorldPanelViewerText_)) {
         chatWorldPanelViewerText_->set_alignment(TMPro::TextAlignmentOptions::Center);
         chatWorldPanelViewerText_->set_enableWordWrapping(false);
@@ -6610,6 +4128,23 @@ void MenuController::UpdateChatWorldPanelLayout() {
     const auto& chat = root_.Settings().Get().chat;
     const float width = chat.width;
     const float height = chat.height;
+    // Header controls belong to the resizable display rather than a fixed HUD.
+    // Use the geometric mean of the two dimension ratios so changing either
+    // axis has a sensible effect. Clamping keeps extreme panel shapes from
+    // making the controls consume the entire message area.
+    const float headerScale = std::clamp(
+        std::sqrt((width * height) /
+                  (kChatPanelReferenceWidth * kChatPanelReferenceHeight)),
+        kChatPanelHeaderMinimumScale,
+        kChatPanelHeaderMaximumScale);
+    const float headerHeight = kChatPanelHeaderHeight * headerScale;
+    // Twenty units is the widest base that still leaves the viewer indicator
+    // clear at the supported 45-unit minimum panel width. It also gives both
+    // single-line captions real padding instead of sizing the blue surface to
+    // the text's exact advance width.
+    const float headerButtonWidth = 20.0F * headerScale;
+    const float headerButtonHeight = 7.0F * headerScale;
+    const float headerEdgeMargin = 2.0F * headerScale;
     chatWorldPanelScreen_->set_ScreenSize({width, height});
     HideAndFitWorldPanelHandleBehindContent(
         chatWorldPanelScreen_, {width, height});
@@ -6633,6 +4168,47 @@ void MenuController::UpdateChatWorldPanelLayout() {
         rect->set_anchoredPosition(position);
         rect->set_sizeDelta(size);
     };
+    const auto setHeaderButtonRect = [&setRect](
+            UnityEngine::UI::Button* button,
+            UnityEngine::Vector2 position,
+            UnityEngine::Vector2 size,
+            float textSize) {
+        if (!IsAlive(button)) return;
+
+        // CreateUIButton clones a stock Beat Saber button whose fitter and
+        // layout element retain the prefab's original dimensions. Changing
+        // only the outer RectTransform therefore moves the button but leaves
+        // its visible background and label at nearly their original width.
+        // Make the resized panel the sole layout owner for this header button.
+        NeutralizeContentSizeFitter(button);
+        if (auto* layout = button->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+            layout->set_ignoreLayout(true);
+            layout->set_minWidth(size.x);
+            layout->set_minHeight(size.y);
+            layout->set_preferredWidth(size.x);
+            layout->set_preferredHeight(size.y);
+            layout->set_flexibleWidth(0.0F);
+            layout->set_flexibleHeight(0.0F);
+        }
+        setRect(button, position, size);
+        BSML::Lite::SetButtonTextSize(button, textSize);
+
+        // The prefab label also has a fixed text region. Stretch it inside the
+        // resized button and prohibit wrapping so "Resize Panel" and
+        // "Chat Control" always remain deliberate single-line actions.
+        if (auto* label = button->GetComponentInChildren<TMPro::TextMeshProUGUI*>(true)) {
+            label->set_alignment(TMPro::TextAlignmentOptions::Center);
+            label->set_enableWordWrapping(false);
+            label->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+            auto labelRect = label->get_rectTransform();
+            labelRect->set_anchorMin({0.0F, 0.0F});
+            labelRect->set_anchorMax({1.0F, 1.0F});
+            labelRect->set_pivot({0.5F, 0.5F});
+            labelRect->set_anchoredPosition({0.0F, 0.0F});
+            labelRect->set_offsetMin({0.75F, 0.25F});
+            labelRect->set_offsetMax({-0.75F, -0.25F});
+        }
+    };
     // Generated Unity Vector2's default constructor does not zero its fields.
     // An empty initializer here sent the backdrop to an arbitrary world position.
     setRect(chatWorldPanelBackground_, {0.0F, 0.0F}, {width - 1.0F, height - 1.0F});
@@ -6647,15 +4223,21 @@ void MenuController::UpdateChatWorldPanelLayout() {
     setRect(chatWorldPanelBorders_[3], {width * 0.5F - inset, 0.0F},
         {borderThickness, height});
 
-    const float headerY = height * 0.5F - kChatPanelHeaderHeight * 0.5F;
+    const float headerY = height * 0.5F - headerHeight * 0.5F;
     setRect(chatWorldPanelHeaderDivider_,
-        {0.0F, height * 0.5F - kChatPanelHeaderHeight},
+        {0.0F, height * 0.5F - headerHeight},
         {width - 3.0F, 0.6F});
-    setRect(chatWorldPanelResizeButton_,
-        {-width * 0.5F + 11.0F, headerY}, {18.0F, 7.0F});
-    setRect(chatWorldPanelControlButton_,
-        {width * 0.5F - 11.0F, headerY}, {18.0F, 7.0F});
-    setRect(chatWorldPanelViewerText_, {0.0F, headerY}, {15.0F, 6.0F});
+    setHeaderButtonRect(chatWorldPanelResizeButton_,
+        {-width * 0.5F + headerEdgeMargin + headerButtonWidth * 0.5F, headerY},
+        {headerButtonWidth, headerButtonHeight}, 3.0F * headerScale);
+    setHeaderButtonRect(chatWorldPanelControlButton_,
+        {width * 0.5F - headerEdgeMargin - headerButtonWidth * 0.5F, headerY},
+        {headerButtonWidth, headerButtonHeight}, 3.0F * headerScale);
+    setRect(chatWorldPanelViewerText_, {0.0F, headerY},
+        {15.0F * headerScale, 6.0F * headerScale});
+    if (IsAlive(chatWorldPanelViewerText_)) {
+        chatWorldPanelViewerText_->set_fontSize(4.0F * headerScale);
+    }
 
     struct ResizeGripStroke { UnityEngine::Vector2 offset; };
     constexpr ResizeGripStroke resizeGripStrokes[] = {
@@ -6671,7 +4253,7 @@ void MenuController::UpdateChatWorldPanelLayout() {
             {index == 0 ? 3.0F : (index == 1 ? 5.2F : 7.4F), 0.75F});
     }
 
-    const float bodyTop = height * 0.5F - kChatPanelHeaderHeight - 1.0F;
+    const float bodyTop = height * 0.5F - headerHeight - 1.0F;
     const float bodyBottom = -height * 0.5F + 2.0F;
     const float bodyHeight = std::max(10.0F, bodyTop - bodyBottom);
     if (IsAlive(chatWorldPanelScrollView_)) {
@@ -7330,1217 +4912,6 @@ void MenuController::TickChatWorldPanel() noexcept {
     } catch (...) {
         chatWorldPanelDiagnostics_.ReportUpdateFailure("unknown exception");
     }
-}
-
-void MenuController::EnsureStandinProxy(int slot) {
-    if (slot < 0 || slot >= static_cast<int>(standinProxyScreens_.size())) return;
-    if (IsAlive(standinProxyScreens_[slot]) || !FloatingUiServicesReady()) return;
-    const auto& avatarSettings = root_.Settings().Get().avatar;
-    const auto& slotPosition = settings::StandinSlotPosition(avatarSettings, slot);
-    const auto slotYaw = settings::StandinSlotYaw(avatarSettings, slot);
-    const UnityEngine::Vector3 proxyPosition{
-        slotPosition.x,
-        slotPosition.y + kStandinProxyHeightMeters,
-        slotPosition.z};
-    auto* screen = BSML::FloatingScreen::CreateFloatingScreen(
-        kStandinProxySize,
-        true,
-        proxyPosition,
-        UnityEngine::Quaternion::Euler({0.0F, slotYaw, 0.0F}),
-        0.0F,
-        false);
-    if (!IsAlive(screen)) {
-        if (!standinProxyCreationFailureLogged_) {
-            standinProxyCreationFailureLogged_ = true;
-            Logging::Logger.error("Could not create an avatar display clone grab handle");
-        }
-        return;
-    }
-    standinProxyCreationFailureLogged_ = false;
-    auto* screenObject = screen->get_gameObject().ptr();
-    if (!IsAlive(screenObject)) return;
-    standinProxyScreens_[slot] = screen;
-    screenObject->set_name(
-        "SaberStage Avatar Display Grab Handle " + std::to_string(slot + 1));
-    UnityEngine::Object::DontDestroyOnLoad(screenObject);
-    screen->set_HandleSide(BSML::Side::Top);
-    screen->set_HighlightHandle(false);
-    screen->get_transform()->set_localScale({
-        kStandinProxyScale, kStandinProxyScale, kStandinProxyScale});
-    // No visuals at all: the visible "thing to grab" is the clone's own body,
-    // and this screen only supplies the invisible body-sized physics handle.
-    standinProxyAppliedScale_ = avatarSettings.standinScale;
-    FitStandinProxyHandleToBody(screen, standinProxyAppliedScale_);
-    // The physics grab handle must stay on the UI layer (5): the game's
-    // pointer raycast mask hits that layer, which is what makes the grab
-    // work. Its MeshRenderer is disabled, so no view ever draws the box.
-    if (IsAlive(screen->handle)) {
-        screen->handle->set_layer(5);
-    }
-
-    standinProxyLastPoses_[slot] = ReadWorldPose(screen->get_transform().ptr());
-    standinProxyPoseDirty_[slot] = false;
-    standinProxyStableSeconds_[slot] = 0.0F;
-    Logging::Logger.info(
-        "Created invisible body-sized grab handle for avatar display clone {}", slot + 1);
-}
-
-void MenuController::DestroyStandinProxy(int slot) noexcept {
-    if (slot < 0 || slot >= static_cast<int>(standinProxyScreens_.size())) return;
-    if (IsAlive(standinProxyScreens_[slot])) {
-        UnityEngine::Object::Destroy(standinProxyScreens_[slot]->get_gameObject().ptr());
-    }
-    standinProxyScreens_[slot] = nullptr;
-    standinProxyPoseDirty_[slot] = false;
-    standinProxyStableSeconds_[slot] = 0.0F;
-}
-
-void MenuController::DestroyAllStandinProxies() noexcept {
-    for (int slot = 0; slot < static_cast<int>(standinProxyScreens_.size()); ++slot) {
-        DestroyStandinProxy(slot);
-    }
-}
-
-void MenuController::TickAvatarStandinProxy() noexcept {
-    try {
-        const auto& avatarSettings = root_.Settings().Get().avatar;
-        const bool anyWanted = avatarSettings.standinEnabled && root_.Avatar().StandinActive();
-        const int wantedCount = anyWanted
-            ? std::clamp(avatarSettings.standinCount, 1, 3)
-            : 0;
-        const bool scaleChanged =
-            std::abs(standinProxyAppliedScale_ - avatarSettings.standinScale) > 0.001F;
-        if (scaleChanged) standinProxyAppliedScale_ = avatarSettings.standinScale;
-        for (int slot = 0; slot < static_cast<int>(standinProxyScreens_.size()); ++slot) {
-            if (slot >= wantedCount) {
-                DestroyStandinProxy(slot);
-                continue;
-            }
-            EnsureStandinProxy(slot);
-            auto* screen = standinProxyScreens_[slot];
-            if (!IsAlive(screen)) continue;
-            // Track the scale slider live so the grab volume always matches
-            // the body the user is reaching for.
-            if (scaleChanged) {
-                FitStandinProxyHandleToBody(screen, standinProxyAppliedScale_);
-            }
-            UpdateWorldPanelHandleRotation(screen);
-            auto* transform = screen->get_transform().ptr();
-            // The clone must stay upright: keep the grabbed yaw, discard
-            // pitch and roll from the controller's wrist angle.
-            const auto position = transform->get_position();
-            const auto yaw = camera::NormalizeDegrees(transform->get_rotation().get_eulerAngles().y);
-            transform->set_rotation(UnityEngine::Quaternion::Euler({0.0F, yaw, 0.0F}));
-            // The handle's screen origin floats a fixed height above the
-            // clone's feet.
-            root_.Avatar().SetStandinWorldPose(
-                static_cast<std::size_t>(slot),
-                {position.x, position.y - kStandinProxyHeightMeters, position.z},
-                yaw);
-
-            // Same debounced persistence as the other movable panels: save
-            // once this handle has been still for half a second after a move.
-            const auto pose = ReadWorldPose(transform);
-            if (WorldPoseDifference(pose, standinProxyLastPoses_[slot]) > 0.000001F) {
-                standinProxyLastPoses_[slot] = pose;
-                standinProxyPoseDirty_[slot] = true;
-                standinProxyStableSeconds_[slot] = 0.0F;
-            } else if (standinProxyPoseDirty_[slot]) {
-                standinProxyStableSeconds_[slot] += std::max(
-                    0.0F, UnityEngine::Time::get_unscaledDeltaTime());
-                if (standinProxyStableSeconds_[slot] >= 0.5F) {
-                    auto& editable = root_.Settings().Edit().avatar;
-                    settings::StandinSlotPosition(editable, slot) = {
-                        pose.position.x,
-                        pose.position.y - kStandinProxyHeightMeters,
-                        pose.position.z};
-                    settings::StandinSlotYaw(editable, slot) = yaw;
-                    std::string error;
-                    if (!root_.Settings().Save(&error)) {
-                        Logging::Logger.error("Could not save avatar display clone placement: {}", error);
-                    } else {
-                        Logging::Logger.info("Saved avatar display clone {} placement", slot + 1);
-                    }
-                    standinProxyPoseDirty_[slot] = false;
-                }
-            }
-        }
-        standinProxyTickFailureLogged_ = false;
-    } catch (const std::exception& exception) {
-        DestroyAllStandinProxies();
-        if (!standinProxyTickFailureLogged_) {
-            standinProxyTickFailureLogged_ = true;
-            Logging::Logger.error("Avatar display grab-handle update failed: {}", exception.what());
-        }
-    } catch (...) {
-        DestroyAllStandinProxies();
-        if (!standinProxyTickFailureLogged_) {
-            standinProxyTickFailureLogged_ = true;
-            Logging::Logger.error("Avatar display grab-handle update failed with a non-standard exception");
-        }
-    }
-}
-
-void MenuController::RefreshAvatarStatus() {
-    const auto& profile = root_.Settings().Get().avatar;
-    refreshingAvatarSetupControls_ = true;
-    if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(profile.enabled);
-    refreshingAvatarSetupControls_ = false;
-    if (!avatarStatusText_) return;
-    if (root_.Avatar().IsLoadingVrmAvatar()) {
-        avatarStatusText_->set_text(std::string("Loading avatar: ") + root_.Avatar().AvatarLoadPhase() +
-            "\nConstruction is spread across frames. Unload cancels the request.");
-        return;
-    }
-    const auto path = ConfiguredAvatarPath();
-    if (avatarSelectionText_) {
-        avatarSelectionText_->set_text(path.empty()
-            ? "No avatar file selected"
-            : "Selected: " + path.filename().string());
-    }
-    const auto* asset = root_.Avatar().LoadedVrmAsset();
-    const auto* stats = root_.Avatar().LoadedVrmStatistics();
-    if (!asset || !stats) {
-        if (path.empty()) {
-            avatarStatusText_->set_text("Not loaded\nChoose a .vrm file from the headset.");
-        } else if (!root_.Avatar().PlayerProfile().valid) {
-            avatarStatusText_->set_text(
-                "Calibration required\nRun Basic or Advanced Calibration before enabling this avatar.");
-        } else {
-            avatarStatusText_->set_text("Ready to load\n" + path.filename().string());
-        }
-        return;
-    }
-    std::ostringstream text;
-    text << "Loaded: " << (asset->meta.title.empty() ? profile.selectedFile : asset->meta.title)
-         << "\n" << stats->asset.triangleCount << " triangles, " << stats->rendererCount
-         << " renderers, " << stats->decodedTextureCount << " textures"
-         << "\nParse " << std::fixed << std::setprecision(0) << stats->parseMilliseconds
-         << " ms, Unity " << stats->unityConstructionMilliseconds << " ms";
-    if (!root_.Avatar().PlayerProfile().valid) text << "\nCalibration staging only; avatar hidden";
-    else if (!profile.enabled) text << "\nAvatar disabled";
-    if (!root_.Avatar().IsBound()) text << ", solver not bound";
-    else if (!root_.Avatar().Player().valid) text << ", solver waiting for tracking";
-    else text << ", solver tracking";
-    avatarStatusText_->set_text(text.str());
-}
-
-bool MenuController::LoadSelectedAvatar(bool calibrationOnly, std::string* error, std::function<void()> ready) {
-    const auto path = ConfiguredAvatarPath();
-    if (path.empty()) {
-        if (error) *error = "choose a VRM avatar file first";
-        return false;
-    }
-
-    const auto initialCalibration = !root_.Avatar().PlayerProfile().valid;
-    if (!calibrationOnly && initialCalibration) {
-        if (error) *error = "player calibration is required before this avatar can be enabled";
-        return false;
-    }
-
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    // This is the complete normal load workflow. Binding during load performs
-    // the humanoid rest-pose measurement before any saved fit is applied.
-    // Apply the selected player's avatar settings next, then perform one final
-    // neutral reset. Users no longer need to know or remember this order.
-    if (!root_.Avatar().LoadVrmAvatar(
-            path,
-            static_cast<std::uint32_t>(avatarSettings.maximumTextureDimension),
-            error,
-            true,
-            [menu = this, calibrationOnly, initialCalibration, ready = std::move(ready)](bool success, const std::string& loadError) {
-                // MenuController may have been torn down while the native
-                // parser ran. Profile switches/unload also cancel this callback.
-                if (active_ != menu) return;
-                std::string completionError = loadError;
-                if (success) success = menu->FinishSelectedAvatarLoad(calibrationOnly, initialCalibration, &completionError);
-                menu->RefreshAvatarStatus();
-                if (!success) {
-                    Logging::Logger.error("Avatar load failed: {}", completionError);
-                    if (menu->avatarStatusText_) menu->avatarStatusText_->set_text("Avatar load failed\n" + completionError);
-                    ErrorManager::Instance().ReportUserVisible("Avatar load failed", completionError);
-                    return;
-                }
-                menu->RequestAvatarSettingsRebuild();
-                if (ready) ready();
-            })) {
-        return false;
-    }
-    return true;
-}
-
-bool MenuController::FinishSelectedAvatarLoad(bool calibrationOnly, bool initialCalibration, std::string* error) {
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    root_.Avatar().ApplyAvatarSettings(avatarSettings);
-    if (!root_.Avatar().RecalibrateNeutral()) {
-        Logging::Logger.info(
-            "Avatar loaded and bound; neutral reset is waiting for tracked HMD/controllers");
-    }
-
-    // Calibration needs a bound humanoid because the existing capture session
-    // consumes the same validated HMD/controller sources as the solver. For a
-    // brand-new player profile, stage that humanoid invisibly: it is loaded
-    // only as calibration infrastructure and is never presented as a usable,
-    // badly scaled avatar. Completing calibration activates it below.
-    if (calibrationOnly && initialCalibration) {
-        avatarSettings.enabled = false;
-        root_.Avatar().SetAvatarVisible(false);
-    } else {
-        avatarSettings.enabled = true;
-        root_.Avatar().SetAvatarVisible(avatarSettings.visible);
-    }
-
-    std::string saveError;
-    if (!root_.Settings().Save(&saveError)) {
-        // Do not leave a live avatar whose master switch cannot be restored on
-        // the next launch. Returning failure after keeping it loaded would
-        // also make the visible toggle disagree with the runtime state.
-        root_.Avatar().UnloadVrmAvatar();
-        avatarSettings.enabled = false;
-        if (error) *error = "avatar settings could not be saved: " + saveError;
-        return false;
-    }
-    return true;
-}
-
-void MenuController::SetAvatarMasterEnabled(bool enabled) {
-    if (refreshingAvatarSetupControls_) return;
-    if (!enabled) {
-        DestroyGripEditor(true);
-        DestroyAllStandinProxies();
-        root_.Avatar().UnloadVrmAvatar();
-        root_.Settings().Edit().avatar.enabled = false;
-        std::string error;
-        if (!root_.Settings().Save(&error)) {
-            Logging::Logger.error("Could not disable avatar system: {}", error);
-        }
-        RefreshAvatarStatus();
-        return;
-    }
-
-    if (!root_.Avatar().PlayerProfile().valid) {
-        // Enabling an uncalibrated profile starts the required setup instead
-        // of displaying a distorted avatar or leaving the toggle in a lying
-        // state. The master switch becomes active after calibration is saved.
-        refreshingAvatarSetupControls_ = true;
-        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
-        refreshingAvatarSetupControls_ = false;
-        BeginPlayerCalibration(false);
-        return;
-    }
-
-    std::string error;
-    if (!LoadSelectedAvatar(false, &error)) {
-        Logging::Logger.error("Could not enable selected avatar: {}", error);
-        refreshingAvatarSetupControls_ = true;
-        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
-        refreshingAvatarSetupControls_ = false;
-        RefreshAvatarStatus();
-        if (avatarStatusText_) {
-            avatarStatusText_->set_text("Avatar could not be enabled\n" + error);
-        }
-        return;
-    }
-    RefreshAvatarStatus();
-    RequestAvatarSettingsRebuild();
-}
-
-void MenuController::BeginPlayerCalibration(bool advanced) {
-    std::string error;
-    if (!root_.Avatar().HasLoadedVrmAvatar() || !root_.Avatar().IsBound()) {
-        if (!LoadSelectedAvatar(true, &error, [menu = this, advanced] {
-                if (active_ == menu) menu->BeginPlayerCalibration(advanced);
-            })) {
-            Logging::Logger.warn("Could not prepare avatar for player calibration: {}", error);
-            RefreshAvatarStatus();
-            RefreshCalibrationStatus();
-            if (avatarStatusText_) {
-                avatarStatusText_->set_text("Calibration could not start\n" + error);
-            }
-            return;
-        }
-        RefreshAvatarStatus();
-        return; // The ready callback opens calibration after binding finishes.
-    }
-    if (!root_.Avatar().PreparePlayerCalibration(
-            advanced ? avatar::calibration::CalibrationMode::Advanced
-                     : avatar::calibration::CalibrationMode::Basic,
-            &error)) {
-        Logging::Logger.warn("Could not open player calibration: {}", error);
-        RefreshAvatarStatus();
-        RefreshCalibrationStatus();
-        if (avatarStatusText_) {
-            avatarStatusText_->set_text("Calibration could not start\n" + error);
-        }
-        return;
-    }
-    RefreshAvatarStatus();
-    RefreshCalibrationStatus();
-}
-
-bool MenuController::CompletePlayerCalibrationWorkflow(std::string* error) {
-    if (!root_.Avatar().CompletePlayerCalibration(error)) return false;
-
-    auto& avatarSettings = root_.Settings().Edit().avatar;
-    avatarSettings.enabled = true;
-    root_.Avatar().ApplyAvatarSettings(avatarSettings);
-    root_.Avatar().SetAvatarVisible(avatarSettings.visible);
-    if (!root_.Avatar().RecalibrateNeutral()) {
-        Logging::Logger.info(
-            "Saved player calibration; neutral avatar reset is waiting for tracked HMD/controllers");
-    }
-    if (!root_.Settings().Save(error)) return false;
-
-    refreshingAvatarSetupControls_ = true;
-    if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(true);
-    refreshingAvatarSetupControls_ = false;
-    RefreshAvatarStatus();
-    RefreshCalibrationStatus();
-    return true;
-}
-
-void MenuController::CancelPlayerCalibrationWorkflow() noexcept {
-    root_.Avatar().CancelPlayerCalibration();
-    if (!root_.Avatar().PlayerProfile().valid) {
-        // A first-time calibration stage is deliberately invisible and has no
-        // useful runtime state once the wizard is cancelled.
-        root_.Avatar().UnloadVrmAvatar();
-        root_.Settings().Edit().avatar.enabled = false;
-        root_.Settings().Save(nullptr);
-        refreshingAvatarSetupControls_ = true;
-        if (avatarEnabledToggle_) avatarEnabledToggle_->set_Value(false);
-        refreshingAvatarSetupControls_ = false;
-    }
-    RefreshAvatarStatus();
-    RefreshCalibrationStatus();
-}
-
-void MenuController::ShowAvatarSetupConfirmation(int action) {
-    pendingAvatarSetupConfirmation_ = action;
-    if (!avatarSetupConfirmationModal_) {
-        if (!IsAlive(avatarSettingsView_)) return;
-        avatarSetupConfirmationModal_ = BSML::Lite::CreateModal(
-            avatarSettingsView_, {82.0F, 46.0F}, nullptr, true);
-        if (!avatarSetupConfirmationModal_) return;
-        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
-            avatarSetupConfirmationModal_->get_transform());
-        layout->set_spacing(2.0F);
-        layout->set_childControlWidth(true);
-        layout->set_childControlHeight(true);
-        layout->set_childForceExpandWidth(true);
-        layout->set_childForceExpandHeight(false);
-        avatarSetupConfirmationText_ = BSML::Lite::CreateText(
-            layout->get_transform(), "", 3.8F, {0.0F, 0.0F}, {74.0F, 27.0F});
-        avatarSetupConfirmationText_->set_enableWordWrapping(true);
-        avatarSetupConfirmationText_->set_alignment(TMPro::TextAlignmentOptions::Center);
-        ConfigureLayout(avatarSetupConfirmationText_, 74.0F, 27.0F, 1.0F);
-        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
-        actions->set_spacing(2.0F);
-        actions->set_childControlWidth(true);
-        actions->set_childForceExpandWidth(true);
-        ConfigureLayout(actions, 72.0F, 8.0F, 1.0F);
-        WithHint(BSML::Lite::CreateUIButton(actions, "Cancel", [] {
-            if (active_) active_->ResolveAvatarSetupConfirmation(false);
-        }), "Closes this confirmation without changing any saved data.");
-        WithHint(BSML::Lite::CreateUIButton(actions, "Confirm", [] {
-            if (active_) active_->ResolveAvatarSetupConfirmation(true);
-        }), "Performs the clearly described reset for the active player profile.");
-    }
-    if (!avatarSetupConfirmationModal_ || !avatarSetupConfirmationText_) return;
-    avatarSetupConfirmationText_->set_text(action == 1
-        ? "Reset this player profile's calibration? The saved body, reach, grip, and movement measurements will be deleted. Avatar files and avatar-specific settings will be kept. The avatar will remain disabled until calibration is completed again."
-        : "Clear all saved avatar data for this player profile? The selected avatar, fit, grip, display, material, and quality settings will return to defaults. The VRM file itself and the player's calibration measurements will not be deleted.");
-    avatarSetupConfirmationModal_->Show();
-}
-
-void MenuController::ResolveAvatarSetupConfirmation(bool accepted) {
-    const auto action = pendingAvatarSetupConfirmation_;
-    pendingAvatarSetupConfirmation_ = 0;
-    if (avatarSetupConfirmationModal_) avatarSetupConfirmationModal_->Hide();
-    if (!accepted || action == 0) return;
-
-    DestroyGripEditor(true);
-    DestroyAllStandinProxies();
-    root_.Avatar().CancelPlayerCalibration();
-    root_.Avatar().UnloadVrmAvatar();
-    std::string error;
-    if (action == 1) {
-        if (!root_.Avatar().ResetPlayerCalibration(&error)) {
-            Logging::Logger.warn("Could not reset player calibration: {}", error);
-            return;
-        }
-        root_.Settings().Edit().avatar.enabled = false;
-    } else {
-        root_.Settings().Edit().avatar = settings::AvatarSettings{};
-    }
-    if (!root_.Settings().Save(&error)) {
-        Logging::Logger.error("Could not save avatar setup reset: {}", error);
-        return;
-    }
-    RefreshAvatarStatus();
-    RefreshCalibrationStatus();
-    RequestAvatarSettingsRebuild();
-}
-
-void MenuController::EnsureCalibrationPanel() {
-    if (IsAlive(calibrationPanelScreen_)) return;
-    if (!FloatingUiServicesReady()) return;
-    calibrationPanelScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
-        kCalibrationPanelSize,
-        true,
-        {0.0F, 0.0F, 0.0F},
-        {0.0F, 0.0F, 0.0F, 1.0F},
-        0.0F,
-        false);
-    if (!IsAlive(calibrationPanelScreen_)) {
-        if (!calibrationPanelCreationFailureLogged_) {
-            calibrationPanelCreationFailureLogged_ = true;
-            Logging::Logger.error("Could not create the floating player-calibration panel");
-        }
-        calibrationPanelScreen_ = nullptr;
-        return;
-    }
-    calibrationPanelCreationFailureLogged_ = false;
-    auto* screenObject = calibrationPanelScreen_->get_gameObject().ptr();
-    if (!IsAlive(screenObject)) {
-        calibrationPanelScreen_ = nullptr;
-        return;
-    }
-    screenObject->set_name("SaberStage Player Calibration");
-    screenObject->set_layer(5);
-    UnityEngine::Object::DontDestroyOnLoad(screenObject);
-    calibrationPanelScreen_->set_HandleSide(BSML::Side::Top);
-    calibrationPanelScreen_->set_HighlightHandle(false);
-    HideAndFitCalibrationPanelHandleAboveControls(calibrationPanelScreen_);
-    // BSML's default 0.02 world scale makes this canvas too large at arm's
-    // length. Keep the expanded, readable layout while presenting it at a
-    // practical physical size at the normal 1.4 m viewing distance.
-    calibrationPanelScreen_->get_transform()->set_localScale({
-        kCalibrationPanelScale, kCalibrationPanelScale, kCalibrationPanelScale});
-
-    // Use explicit non-raycasting artwork instead of FloatingScreen's stock
-    // background graphic. Native buttons and the invisible reading-surface
-    // handle are therefore the only pointer targets.
-    const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
-    if (!whitePixel) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    auto* artworkParent = calibrationPanelScreen_->get_transform().ptr();
-    const UnityEngine::Color panelColor{0.025F, 0.055F, 0.095F, 0.98F};
-    const UnityEngine::Color borderColor{0.0F, 0.80F, 1.0F, 1.0F};
-    ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(artworkParent, whitePixel),
-        {0.0F, 0.0F},
-        {kCalibrationPanelSize.x - 2.0F, kCalibrationPanelSize.y - 2.0F},
-        panelColor);
-    ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(artworkParent, whitePixel),
-        {0.0F, kCalibrationPanelSize.y * 0.5F - 0.5F},
-        {kCalibrationPanelSize.x, 1.0F}, borderColor);
-    ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(artworkParent, whitePixel),
-        {0.0F, -kCalibrationPanelSize.y * 0.5F + 0.5F},
-        {kCalibrationPanelSize.x, 1.0F}, borderColor);
-    ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(artworkParent, whitePixel),
-        {-kCalibrationPanelSize.x * 0.5F + 0.5F, 0.0F},
-        {1.0F, kCalibrationPanelSize.y}, borderColor);
-    ConfigureWorldPanelImage(
-        BSML::Lite::CreateImage(artworkParent, whitePixel),
-        {kCalibrationPanelSize.x * 0.5F - 0.5F, 0.0F},
-        {1.0F, kCalibrationPanelSize.y}, borderColor);
-
-    // Match Big Screen's working performance panel structurally, not merely
-    // visually: one fixed-size root VerticalLayoutGroup controls the width of
-    // every persistent TMP row. The previous direct children were manually
-    // assigned RectTransforms that BSML's later layout pass collapsed on Quest,
-    // producing the photographed single glyph and line-shaped button captions.
-    // Only this fixed root receives manual rectangle geometry.
-    auto* panelParent = calibrationPanelScreen_->get_transform().ptr();
-    const float contentWidth = kCalibrationPanelSize.x - 8.0F;
-
-    auto* rootLayout = BSML::Lite::CreateVerticalLayoutGroup(panelParent);
-    if (!IsAlive(rootLayout)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    NeutralizeContentSizeFitter(rootLayout);
-    rootLayout->set_spacing(0.75F);
-    rootLayout->set_padding(UnityEngine::RectOffset::New_ctor(4, 4, 4, 4));
-    rootLayout->set_childControlWidth(true);
-    rootLayout->set_childControlHeight(true);
-    rootLayout->set_childForceExpandWidth(true);
-    rootLayout->set_childForceExpandHeight(false);
-    rootLayout->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
-    auto rootRect = rootLayout->get_transform().cast<UnityEngine::RectTransform>();
-    rootRect->set_anchorMin({0.5F, 0.5F});
-    rootRect->set_anchorMax({0.5F, 0.5F});
-    rootRect->set_pivot({0.5F, 0.5F});
-    rootRect->set_anchoredPosition({0.0F, 0.0F});
-    rootRect->set_sizeDelta(kCalibrationPanelSize);
-    rootRect->set_localPosition({0.0F, 0.0F, 0.0F});
-    rootRect->set_localRotation(UnityEngine::Quaternion::get_identity());
-    rootRect->set_localScale({1.0F, 1.0F, 1.0F});
-    calibrationPanelContentRoot_ = rootRect.ptr();
-
-    auto* contentParent = rootLayout->get_transform().ptr();
-    calibrationPanelTitleText_ = BSML::Lite::CreateText(
-        contentParent, "Player Calibration", TMPro::FontStyles::Bold, 6.0F);
-    ConfigureCalibrationPanelText(calibrationPanelTitleText_, 7.0F, 4.8F, 6.3F, false);
-    if (IsAlive(calibrationPanelTitleText_)) {
-        calibrationPanelTitleText_->set_color({0.0F, 0.82F, 1.0F, 1.0F});
-    }
-    calibrationPanelProgressText_ = BSML::Lite::CreateText(
-        contentParent, "", TMPro::FontStyles::Bold, 4.2F);
-    ConfigureCalibrationPanelText(calibrationPanelProgressText_, 5.0F, 3.3F, 4.2F, false);
-    if (IsAlive(calibrationPanelProgressText_)) {
-        calibrationPanelProgressText_->set_color({0.65F, 0.82F, 0.92F, 1.0F});
-    }
-    calibrationPanelInstructionText_ = BSML::Lite::CreateText(
-        contentParent, "", TMPro::FontStyles::Normal, 4.8F);
-    ConfigureCalibrationPanelText(calibrationPanelInstructionText_, 11.0F, 3.6F, 5.1F, true);
-    if (IsAlive(calibrationPanelInstructionText_)) {
-        calibrationPanelInstructionText_->set_color({1.0F, 1.0F, 1.0F, 1.0F});
-    }
-    calibrationPanelPhaseText_ = BSML::Lite::CreateText(
-        contentParent, "", TMPro::FontStyles::Bold, 5.0F);
-    ConfigureCalibrationPanelText(calibrationPanelPhaseText_, 8.0F, 3.8F, 5.0F, true);
-    if (IsAlive(calibrationPanelPhaseText_)) {
-        calibrationPanelPhaseText_->set_color({1.0F, 0.72F, 0.20F, 1.0F});
-    }
-    calibrationPanelDetailsText_ = BSML::Lite::CreateText(
-        contentParent, "", TMPro::FontStyles::Normal, 3.7F);
-    ConfigureCalibrationPanelText(
-        calibrationPanelDetailsText_, 30.0F, 2.9F, 4.0F, true, 1.0F);
-    if (IsAlive(calibrationPanelDetailsText_)) {
-        calibrationPanelDetailsText_->set_color({0.82F, 0.90F, 0.96F, 1.0F});
-    }
-
-    const auto createActionContainer = [contentParent, contentWidth](
-                                           std::string_view name,
-                                           float spacing) {
-        auto* row = BSML::Lite::CreateHorizontalLayoutGroup(contentParent);
-        if (!IsAlive(row)) return static_cast<UnityEngine::GameObject*>(nullptr);
-        row->get_gameObject()->set_name(StringW(name));
-        row->get_gameObject()->set_layer(5);
-        NeutralizeContentSizeFitter(row);
-        row->set_spacing(spacing);
-        row->set_padding(UnityEngine::RectOffset::New_ctor(0, 0, 0, 0));
-        row->set_childControlWidth(true);
-        row->set_childControlHeight(true);
-        row->set_childForceExpandWidth(false);
-        row->set_childForceExpandHeight(false);
-        row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
-        ConfigureLayout(row, contentWidth, 8.0F, 0.0F, 0.0F);
-        return row->get_gameObject().ptr();
-    };
-
-    auto* recenterActions = createActionContainer(
-        "SaberStage Calibration Recenter Action", 0.0F);
-    if (!IsAlive(recenterActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    auto* recenter = WithHint(BSML::Lite::CreateUIButton(
-        recenterActions->get_transform(), "Recenter Panel", [] {
-            if (active_) active_->RecenterCalibrationPanel();
-        }), "Places the calibration guide at eye level in front of you again.");
-    ConfigureCalibrationButton(recenter, {38.0F, 7.0F});
-
-    auto* introductionActions = createActionContainer(
-        "SaberStage Calibration Introduction Actions", 2.0F);
-    if (!IsAlive(introductionActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelIntroductionActions_ = introductionActions;
-    auto* introductionCancel = WithHint(BSML::Lite::CreateUIButton(
-        introductionActions->get_transform(), "Cancel", [] {
-            if (active_) active_->CancelPlayerCalibrationWorkflow();
-        }), "Closes the guide without starting a countdown or changing the saved profile.");
-    ConfigureCalibrationButton(introductionCancel, {25.0F, 7.0F});
-    calibrationPanelAutomaticStartButton_ = WithHint(BSML::Lite::CreateUIButton(
-        introductionActions->get_transform(), "Start Automatic", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Avatar().StartPreparedPlayerCalibration(
-                    avatar::calibration::CalibrationProgression::Automatic, &error)) {
-                Logging::Logger.warn("Could not start automatic player calibration: {}", error);
-            }
-        }), "Runs every countdown and capture in sequence with no pause between accepted steps.");
-    ConfigureCalibrationButton(calibrationPanelAutomaticStartButton_, {42.0F, 7.0F});
-    calibrationPanelStepByStepStartButton_ = WithHint(BSML::Lite::CreateUIButton(
-        introductionActions->get_transform(), "Start Step-by-Step", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Avatar().StartPreparedPlayerCalibration(
-                    avatar::calibration::CalibrationProgression::StepByStep, &error)) {
-                Logging::Logger.warn("Could not start step-by-step player calibration: {}", error);
-            }
-        }), "Pauses before every countdown and after every accepted step so you can read at your own pace.");
-    ConfigureCalibrationButton(calibrationPanelStepByStepStartButton_, {47.0F, 7.0F});
-
-    auto* stepStartActions = createActionContainer(
-        "SaberStage Calibration Step Start Actions", 4.0F);
-    if (!IsAlive(stepStartActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelStepStartActions_ = stepStartActions;
-    auto* stepStartCancel = WithHint(BSML::Lite::CreateUIButton(
-        stepStartActions->get_transform(), "Cancel", [] {
-            if (active_) active_->CancelPlayerCalibrationWorkflow();
-        }), "Stops calibration without replacing your previously saved player profile.");
-    ConfigureCalibrationButton(stepStartCancel, {34.0F, 7.0F});
-    auto* startStep = WithHint(BSML::Lite::CreateUIButton(
-        stepStartActions->get_transform(), "Start Step", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Avatar().StartPlayerCalibrationStep(&error)) {
-                Logging::Logger.warn("Could not start player calibration step: {}", error);
-            }
-        }), "Starts the countdown for the instruction currently shown above.");
-    ConfigureCalibrationButton(startStep, {42.0F, 7.0F});
-
-    auto* continueActions = createActionContainer(
-        "SaberStage Calibration Continue Actions", 4.0F);
-    if (!IsAlive(continueActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelContinueActions_ = continueActions;
-    auto* continueCancel = WithHint(BSML::Lite::CreateUIButton(
-        continueActions->get_transform(), "Cancel", [] {
-            if (active_) active_->CancelPlayerCalibrationWorkflow();
-        }), "Stops calibration without replacing your previously saved player profile.");
-    ConfigureCalibrationButton(continueCancel, {34.0F, 7.0F});
-    auto* continueButton = WithHint(BSML::Lite::CreateUIButton(
-        continueActions->get_transform(), "Continue", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Avatar().ContinuePlayerCalibration(&error)) {
-                Logging::Logger.warn("Could not continue player calibration: {}", error);
-            }
-        }), "Shows the next instruction without starting its countdown.");
-    ConfigureCalibrationButton(continueButton, {42.0F, 7.0F});
-
-    auto* activeActions = createActionContainer("SaberStage Calibration Active Actions", 0.0F);
-    if (!IsAlive(activeActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelActiveActions_ = activeActions;
-    auto* activeCancel = WithHint(BSML::Lite::CreateUIButton(
-        activeActions->get_transform(), "Cancel", [] {
-        if (active_) active_->CancelPlayerCalibrationWorkflow();
-    }), "Stops calibration without replacing your previously saved player profile.");
-    ConfigureCalibrationButton(activeCancel, {34.0F, 7.0F});
-
-    auto* failureActions = createActionContainer("SaberStage Calibration Failure Actions", 4.0F);
-    if (!IsAlive(failureActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelFailureActions_ = failureActions;
-    auto* failureCancel = WithHint(BSML::Lite::CreateUIButton(
-        failureActions->get_transform(), "Cancel", [] {
-        if (active_) active_->CancelPlayerCalibrationWorkflow();
-    }), "Stops calibration without replacing your previously saved player profile.");
-    ConfigureCalibrationButton(failureCancel, {34.0F, 7.0F});
-    auto* failureRetry = WithHint(BSML::Lite::CreateUIButton(
-        failureActions->get_transform(), "Retry", [] {
-        if (!active_) return;
-        const auto& status = active_->root_.Avatar().CalibrationStatus();
-        std::string error;
-        bool succeeded = false;
-        if (status.phase == avatar::calibration::CalibrationPhase::AwaitingRetry) {
-            succeeded = active_->root_.Avatar().RetryPlayerCalibration(&error);
-        } else if (status.pendingProfileReady) {
-            succeeded = active_->CompletePlayerCalibrationWorkflow(&error);
-        } else {
-            succeeded = active_->root_.Avatar().RestartPlayerCalibration(&error);
-        }
-        if (!succeeded) Logging::Logger.warn("Player calibration retry failed: {}", error);
-    }), "Repeats the failed pose or resumes the last step after you correct your position.");
-    ConfigureCalibrationButton(failureRetry, {34.0F, 7.0F});
-
-    auto* reviewActions = createActionContainer("SaberStage Calibration Review Actions", 2.0F);
-    if (!IsAlive(reviewActions)) {
-        DestroyCalibrationPanel();
-        return;
-    }
-    calibrationPanelReviewActions_ = reviewActions;
-    auto* reviewCancel = WithHint(BSML::Lite::CreateUIButton(
-        reviewActions->get_transform(), "Cancel", [] {
-        if (active_) active_->CancelPlayerCalibrationWorkflow();
-    }), "Discards these measurements and keeps your previously saved player profile.");
-    ConfigureCalibrationButton(reviewCancel, {30.0F, 7.0F});
-    auto* reviewRestart = WithHint(BSML::Lite::CreateUIButton(
-        reviewActions->get_transform(), "Restart", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Avatar().RestartPlayerCalibration(&error)) {
-            Logging::Logger.warn("Player calibration restart failed: {}", error);
-        }
-    }), "Discards the current measurements and starts the calibration sequence again.");
-    ConfigureCalibrationButton(reviewRestart, {30.0F, 7.0F});
-    auto* reviewComplete = WithHint(BSML::Lite::CreateUIButton(
-        reviewActions->get_transform(), "Complete", [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->CompletePlayerCalibrationWorkflow(&error)) {
-            Logging::Logger.warn("Player calibration save failed: {}", error);
-        }
-    }), "Saves the reviewed measurements as your new player calibration profile.");
-    ConfigureCalibrationButton(reviewComplete, {30.0F, 7.0F});
-
-    if (!IsAlive(calibrationPanelTitleText_) || !IsAlive(calibrationPanelProgressText_) ||
-            !IsAlive(calibrationPanelInstructionText_) || !IsAlive(calibrationPanelPhaseText_) ||
-            !IsAlive(calibrationPanelDetailsText_) ||
-            !IsAlive(calibrationPanelIntroductionActions_) ||
-            !IsAlive(calibrationPanelStepStartActions_) ||
-            !IsAlive(calibrationPanelContinueActions_) ||
-            !IsAlive(calibrationPanelActiveActions_) ||
-            !IsAlive(calibrationPanelFailureActions_) || !IsAlive(calibrationPanelReviewActions_)) {
-        Logging::Logger.error("Player-calibration panel controls were incomplete");
-        DestroyCalibrationPanel();
-        return;
-    }
-
-    calibrationPanelStatusRevision_ = std::numeric_limits<std::uint64_t>::max();
-    // Audit after two LateUpdate/layout passes rather than trusting the values
-    // assigned during construction. The screenshot proves something later in
-    // the live canvas lifecycle is collapsing or obscuring this hierarchy.
-    calibrationPanelGeometryAuditFrames_ = 2;
-    RecenterCalibrationPanel();
-    RefreshCalibrationPanel();
-    UnityEngine::Canvas::ForceUpdateCanvases();
-    Logging::Logger.info("Created interactive floating player-calibration wizard");
-}
-
-void MenuController::DestroyCalibrationPanel() noexcept {
-    if (IsAlive(calibrationPanelScreen_)) {
-        auto* screenObject = calibrationPanelScreen_->get_gameObject().ptr();
-        UnityEngine::Object::Destroy(screenObject);
-    }
-    calibrationPanelScreen_ = nullptr;
-    calibrationPanelContentRoot_ = nullptr;
-    calibrationPanelTitleText_ = nullptr;
-    calibrationPanelProgressText_ = nullptr;
-    calibrationPanelInstructionText_ = nullptr;
-    calibrationPanelPhaseText_ = nullptr;
-    calibrationPanelDetailsText_ = nullptr;
-    calibrationPanelAutomaticStartButton_ = nullptr;
-    calibrationPanelStepByStepStartButton_ = nullptr;
-    calibrationPanelIntroductionActions_ = nullptr;
-    calibrationPanelStepStartActions_ = nullptr;
-    calibrationPanelContinueActions_ = nullptr;
-    calibrationPanelActiveActions_ = nullptr;
-    calibrationPanelFailureActions_ = nullptr;
-    calibrationPanelReviewActions_ = nullptr;
-    calibrationPanelStatusRevision_ = 0;
-    calibrationPanelTrackingReady_ = false;
-    calibrationPanelGeometryAuditFrames_ = 0;
-}
-
-void MenuController::LogCalibrationPanelGeometry() const {
-    const auto logRect = [](std::string_view name, UnityEngine::RectTransform* rect) {
-        if (!IsAlive(rect)) {
-            Logging::Logger.warn("Calibration UI geometry {}: missing", name);
-            return;
-        }
-        const auto size = rect->get_sizeDelta();
-        auto bounds = rect->get_rect();
-        const auto anchorsMin = rect->get_anchorMin();
-        const auto anchorsMax = rect->get_anchorMax();
-        const auto localScale = rect->get_localScale();
-        Logging::Logger.info(
-            "Calibration UI geometry {}: size=({:.2f},{:.2f}) rect=({:.2f},{:.2f}) "
-            "anchors=({:.2f},{:.2f})-({:.2f},{:.2f}) scale=({:.3f},{:.3f},{:.3f}) active={}",
-            name,
-            size.x,
-            size.y,
-            bounds.get_width(),
-            bounds.get_height(),
-            anchorsMin.x,
-            anchorsMin.y,
-            anchorsMax.x,
-            anchorsMax.y,
-            localScale.x,
-            localScale.y,
-            localScale.z,
-            rect->get_gameObject()->get_activeInHierarchy());
-    };
-    const auto textRect = [](TMPro::TextMeshProUGUI* text) -> UnityEngine::RectTransform* {
-        return IsAlive(text)
-            ? text->get_transform().cast<UnityEngine::RectTransform>().ptr()
-            : nullptr;
-    };
-    logRect("root", calibrationPanelContentRoot_);
-    logRect("title", textRect(calibrationPanelTitleText_));
-    logRect("progress", textRect(calibrationPanelProgressText_));
-    logRect("instruction", textRect(calibrationPanelInstructionText_));
-    logRect("phase", textRect(calibrationPanelPhaseText_));
-    logRect("details", textRect(calibrationPanelDetailsText_));
-    if (IsAlive(calibrationPanelScreen_)) {
-        auto screenRect = calibrationPanelScreen_->get_transform().cast<UnityEngine::RectTransform>();
-        logRect("screen", screenRect.ptr());
-    }
-}
-
-void MenuController::RecenterCalibrationPanel() {
-    if (!IsAlive(calibrationPanelScreen_)) return;
-    auto* camera = UnityEngine::Camera::get_main().ptr();
-    if (!IsAlive(camera)) return;
-    auto* head = camera->get_transform().ptr();
-    if (!IsAlive(head)) return;
-    const auto headPosition = head->get_position();
-    const auto headEuler = head->get_rotation().get_eulerAngles();
-    const auto horizontalHeadRotation = UnityEngine::Quaternion::Euler({
-        0.0F, headEuler.y, 0.0F});
-    const auto forward = UnityEngine::Quaternion::op_Multiply(
-        horizontalHeadRotation, UnityEngine::Vector3::get_forward());
-    const auto targetPosition = UnityEngine::Vector3::op_Addition(
-        headPosition, UnityEngine::Vector3::op_Multiply(forward, kCalibrationPanelDistance));
-    // A FloatingScreen canvas at positive local Z presents its TMP face with
-    // the same yaw as the viewer. Rotating it another 180 degrees exposes the
-    // canvas back: UI Image shaders still draw the panel and border from that
-    // side, but TextMeshPro culls every glyph. That exact mismatch produced a
-    // correctly sized, fully active hierarchy with no visible captions.
-    const auto targetRotation = UnityEngine::Quaternion::Euler({
-        0.0F, headEuler.y, 0.0F});
-    auto* transform = calibrationPanelScreen_->get_transform().ptr();
-    transform->SetPositionAndRotation(targetPosition, targetRotation);
-}
-
-void MenuController::RefreshCalibrationPanel() {
-    if (!IsAlive(calibrationPanelScreen_)) return;
-    const auto& status = root_.Avatar().CalibrationStatus();
-    const auto& profile = root_.Avatar().PlayerProfile();
-    const auto trackingReady = root_.Avatar().IsPlayerCalibrationReady();
-    calibrationPanelStatusRevision_ = status.revision;
-    calibrationPanelTrackingReady_ = trackingReady;
-    const auto isIntroduction = status.phase == avatar::calibration::CalibrationPhase::Introduction;
-    const auto isStepStart = status.phase == avatar::calibration::CalibrationPhase::AwaitingStepStart;
-    const auto isContinue = status.phase == avatar::calibration::CalibrationPhase::AwaitingContinue;
-    const auto isReview = status.phase == avatar::calibration::CalibrationPhase::Review;
-    const auto isFailure = status.phase == avatar::calibration::CalibrationPhase::AwaitingRetry ||
-        status.phase == avatar::calibration::CalibrationPhase::Failed;
-    const auto isActiveCapture = !isIntroduction && !isStepStart && !isContinue &&
-        !isReview && !isFailure;
-    if (calibrationPanelIntroductionActions_) {
-        calibrationPanelIntroductionActions_->SetActive(isIntroduction);
-    }
-    if (calibrationPanelStepStartActions_) calibrationPanelStepStartActions_->SetActive(isStepStart);
-    if (calibrationPanelContinueActions_) calibrationPanelContinueActions_->SetActive(isContinue);
-    if (calibrationPanelActiveActions_) calibrationPanelActiveActions_->SetActive(isActiveCapture);
-    if (calibrationPanelFailureActions_) calibrationPanelFailureActions_->SetActive(isFailure);
-    if (calibrationPanelReviewActions_) calibrationPanelReviewActions_->SetActive(isReview);
-    if (calibrationPanelAutomaticStartButton_) {
-        calibrationPanelAutomaticStartButton_->set_interactable(trackingReady);
-    }
-    if (calibrationPanelStepByStepStartButton_) {
-        calibrationPanelStepByStepStartButton_->set_interactable(trackingReady);
-    }
-
-    calibrationPanelTitleText_->set_text(status.mode == avatar::calibration::CalibrationMode::Basic
-        ? "Basic Player Calibration" : "Advanced Player Calibration");
-    if (isIntroduction) {
-        calibrationPanelProgressText_->set_text(
-            "BEFORE YOU BEGIN  |  " + std::to_string(status.stepCount) + " CAPTURE STEPS");
-        calibrationPanelInstructionText_->set_text(
-            "CHOOSE HOW YOU WANT TO RUN THIS CALIBRATION");
-        if (trackingReady) {
-            calibrationPanelPhaseText_->set_text(
-                "STATUS\nREADY - NO COUNTDOWN IS RUNNING");
-            calibrationPanelDetailsText_->set_text(
-                "NATURAL READY POSE\nStand comfortably upright and face forward. Keep your feet in a normal stance and hold both controllers naturally in front of your waist or lower chest with relaxed elbows.\n\n"
-                "TIMING\nFor a POSE, move into position during the countdown and be ready before MEASURING begins. For a MOVEMENT, stay in the natural ready pose through the countdown and move only after MEASURING and the tone begin.\n\n"
-                "AUTOMATIC runs continuously. STEP-BY-STEP waits for you before and after every capture.");
-        } else {
-            calibrationPanelPhaseText_->set_text(
-                "STATUS\nWAITING FOR AVATAR TRACKING");
-            calibrationPanelDetailsText_->set_text(
-                "The guide is open, but capture cannot start yet. Load an avatar, bind its solver, and make sure the headset and both controllers are tracked.\n\n"
-                "The start buttons will become available automatically when tracking is ready.");
-        }
-        return;
-    }
-    if (isReview) {
-        calibrationPanelProgressText_->set_text("CALIBRATION CAPTURE COMPLETE");
-        calibrationPanelInstructionText_->set_text(
-            "REVIEW RESULTS");
-        calibrationPanelPhaseText_->set_text("STATUS\nREADY TO SAVE AND ACTIVATE");
-        calibrationPanelDetailsText_->set_text(
-            "Nothing has been saved yet. Complete saves these measurements; Restart measures again; Cancel keeps the previous profile.\n\n" +
-            CalibrationReviewDetails(profile));
-        return;
-    }
-    if (status.phase == avatar::calibration::CalibrationPhase::Failed) {
-        calibrationPanelProgressText_->set_text("CALIBRATION PAUSED");
-        calibrationPanelInstructionText_->set_text(status.pendingProfileReady
-            ? "RESULT READY - SAVE FAILED"
-            : "RESULT COULD NOT BE PRODUCED");
-        calibrationPanelPhaseText_->set_text("STATUS\nACTION REQUIRED");
-        calibrationPanelDetailsText_->set_text(
-            status.message + (status.pendingProfileReady
-                ? "\nRetry attempts to save again. Cancel keeps the previous profile."
-                : "\nRetry restarts the same calibration mode."));
-        return;
-    }
-
-    std::ostringstream progress;
-    progress << "STEP " << status.stepIndex + 1 << " OF " << status.stepCount;
-    calibrationPanelProgressText_->set_text(progress.str());
-    const auto stepName = std::string(avatar::calibration::CalibrationStepName(status.step));
-    const auto instruction = std::string(avatar::calibration::CalibrationInstruction(status.step));
-    const auto isStaticPose = avatar::calibration::IsStaticCalibrationStep(status.step);
-    if (isStepStart) {
-        calibrationPanelInstructionText_->set_text("CURRENT STEP\n" + stepName);
-        calibrationPanelPhaseText_->set_text("STATUS\nREADY - SELECT START STEP");
-        calibrationPanelDetailsText_->set_text(isStaticPose
-            ? "POSE TIMING\nAfter selecting Start Step, move into the requested pose during the countdown. Be in the final pose before MEASURING begins, then hold still until the shutter.\n\nPOSE\n" + instruction
-            : "MOVEMENT TIMING\nAfter selecting Start Step, remain in the natural ready pose for the entire countdown. Do not begin moving until MEASURING and the tone start.\n\nMOVEMENT\n" + instruction);
-        return;
-    }
-    if (isContinue) {
-        calibrationPanelInstructionText_->set_text("STEP CAPTURED\n" + stepName);
-        calibrationPanelPhaseText_->set_text("STATUS\nACCEPTED - SELECT CONTINUE WHEN READY");
-        calibrationPanelDetailsText_->set_text(
-            "The next instruction will be shown after Continue. Its countdown will not begin until you select Start Step.");
-        return;
-    }
-    if (status.phase == avatar::calibration::CalibrationPhase::AwaitingRetry) {
-        calibrationPanelInstructionText_->set_text("CAPTURE NOT ACCEPTED\n" + stepName);
-        calibrationPanelPhaseText_->set_text("STATUS\nRETRY WHEN YOU ARE READY");
-        std::ostringstream details;
-        details << "WHAT TO CORRECT\n" << status.message << "\nLast capture quality "
-                << std::fixed << std::setprecision(0)
-                << status.lastSampleConfidence * 100.0F << "%";
-        calibrationPanelDetailsText_->set_text(details.str());
-        return;
-    }
-    if (status.phase == avatar::calibration::CalibrationPhase::Capturing) {
-        calibrationPanelInstructionText_->set_text(
-            "CURRENT STEP\n" + stepName);
-        std::ostringstream phase;
-        phase << (isStaticPose ? "STATUS\nMEASURING - HOLD STILL  "
-                              : "STATUS\nMEASURING - MOVE NOW  ")
-              << std::fixed << std::setprecision(0)
-              << status.phaseProgress * 100.0F << "%";
-        calibrationPanelPhaseText_->set_text(phase.str());
-        calibrationPanelDetailsText_->set_text(
-            (isStaticPose ? "HOLD THIS POSE\n" : "MOVE NOW\n") +
-            std::string(avatar::calibration::CalibrationCaptureInstruction(status.step)) +
-            "\nKeep the headset and both controllers tracked. The shutter sound means the measurement is finished.");
-        return;
-    }
-    calibrationPanelInstructionText_->set_text("CURRENT STEP\n" + stepName);
-    calibrationPanelPhaseText_->set_text(status.countdownSecondsRemaining > 0
-        ? "STATUS\nSTARTING IN " + std::to_string(status.countdownSecondsRemaining)
-        : "STATUS\nGET READY");
-    calibrationPanelDetailsText_->set_text(isStaticPose
-        ? "MOVE INTO THE POSE DURING THIS COUNTDOWN\nBe in the final pose before MEASURING starts. Then hold still until the shutter.\n\nPOSE\n" + instruction
-        : "DO NOT MOVE DURING THIS COUNTDOWN\nStay in the natural ready pose. Begin the requested movement only when MEASURING and the tone start.\n\nMOVEMENT\n" + instruction);
-}
-
-void MenuController::TickCalibrationPanel() noexcept {
-    // This persistent driver also services the independent movable recording
-    // controls, Twitch channel/chat state, display-clone handles, and the
-    // hand-placement IK target so those world-space controls keep updating
-    // outside the center panel. Network workers never touch Unity directly;
-    // TwitchService::Tick is their main-thread handoff point.
-    std::string deferredSaveError;
-    if (!root_.Settings().TickPendingSave(&deferredSaveError)) {
-        if (deferredSaveError != lastDeferredSettingsSaveError_) {
-            lastDeferredSettingsSaveError_ = deferredSaveError;
-            Logging::Logger.error(
-                "Could not persist deferred SaberStage settings; retrying in one second: {}",
-                deferredSaveError);
-        }
-    } else if (!deferredSaveError.empty() || !lastDeferredSettingsSaveError_.empty()) {
-        lastDeferredSettingsSaveError_.clear();
-    }
-    root_.Twitch().Tick();
-    const auto twitch = root_.Twitch().Snapshot();
-    if (pendingLiveTwitchTitleUpdate_ && twitch.titleUpdateComplete) {
-        pendingLiveTwitchTitleUpdate_ = false;
-        if (!twitch.titleUpdateSucceeded) {
-            ShowLivestreamActionError(twitch.titleUpdateStatus, true);
-        }
-        // Success and failure text are both retained beneath the Twitch
-        // account controls; a failure additionally receives a topmost popup.
-        RefreshTwitchControls();
-    }
-    twitchUiRefreshSeconds_ += std::max(
-        0.0F, UnityEngine::Time::get_unscaledDeltaTime());
-    if (twitchUiRefreshSeconds_ >= 0.5F) {
-        twitchUiRefreshSeconds_ = 0.0F;
-        RefreshTwitchControls();
-        if (root_.Avatar().IsLoadingVrmAvatar()) RefreshAvatarStatus();
-    }
-    TickRecordingWorldPanel();
-    TickChatWorldPanel();
-    if (chatControls_) chatControls_->Tick();
-    TickAvatarStandinProxy();
-    TickGripEditor();
-    try {
-        if (avatarSettingsRebuildPending_) RebuildAvatarSettingsPanel();
-        const auto phase = root_.Avatar().CalibrationStatus().phase;
-        if (phase == avatar::calibration::CalibrationPhase::Idle ||
-                phase == avatar::calibration::CalibrationPhase::Complete) {
-            DestroyCalibrationPanel();
-            return;
-        }
-        EnsureCalibrationPanel();
-        if (!IsAlive(calibrationPanelScreen_)) return;
-        if (calibrationPanelGeometryAuditFrames_ > 0 &&
-                --calibrationPanelGeometryAuditFrames_ == 0) {
-            UnityEngine::Canvas::ForceUpdateCanvases();
-            LogCalibrationPanelGeometry();
-        }
-        if (calibrationPanelStatusRevision_ != root_.Avatar().CalibrationStatus().revision ||
-                calibrationPanelTrackingReady_ != root_.Avatar().IsPlayerCalibrationReady()) {
-            RefreshCalibrationPanel();
-        }
-        calibrationPanelTickFailureLogged_ = false;
-    } catch (const std::exception& exception) {
-        DestroyCalibrationPanel();
-        if (!calibrationPanelTickFailureLogged_) {
-            calibrationPanelTickFailureLogged_ = true;
-            Logging::Logger.error("Player-calibration panel update failed: {}", exception.what());
-        }
-    } catch (...) {
-        DestroyCalibrationPanel();
-        if (!calibrationPanelTickFailureLogged_) {
-            calibrationPanelTickFailureLogged_ = true;
-            Logging::Logger.error("Player-calibration panel update failed with a non-standard exception");
-        }
-    }
-}
-
-void MenuController::RequestAvatarSettingsRebuild() noexcept {
-    avatarSettingsRebuildPending_ = true;
-}
-
-void MenuController::RebuildAvatarSettingsPanel() {
-    avatarSettingsRebuildPending_ = false;
-    if (!IsAlive(avatarSettingsView_)) return;
-    Logging::Logger.info("AvatarSettingsRebuild begin selectedTab={}", selectedAvatarTab_);
-    // Do this before clearing fields or destroying any children. In particular,
-    // unopened Fit/Quality tabs are not guaranteed to receive OnDestroy.
-    if (!ReleaseSliderRegistrations(avatarSettingsView_->get_gameObject(), "avatar settings rebuild")) return;
-    DestroyGripEditor(true);
-    DestroyCalibrationPanel();
-    avatarTabs_ = nullptr;
-    avatarTabViewRoots_.fill(nullptr);
-    avatarTabContentRoots_.fill(nullptr);
-    avatarStatusText_ = nullptr;
-    calibrationStatusText_ = nullptr;
-    avatarEnabledToggle_ = nullptr;
-    avatarSetupConfirmationModal_ = nullptr;
-    avatarSetupConfirmationText_ = nullptr;
-    pendingAvatarSetupConfirmation_ = 0;
-    matchPlayerHeightToggle_ = nullptr;
-    heightAdjustmentBalanceSlider_ = nullptr;
-    armSpanSizingToggle_ = nullptr;
-    manualAvatarScaleToggle_ = nullptr;
-    manualAvatarScaleSlider_ = nullptr;
-    bodyProportionToggle_ = nullptr;
-    torsoWidthSlider_ = nullptr;
-    autoShoulderWidthToggle_ = nullptr;
-    shoulderWidthSlider_ = nullptr;
-    waistHipWidthSlider_ = nullptr;
-    lowerTorsoWidthSlider_ = nullptr;
-    neckBaseWidthSlider_ = nullptr;
-    headSizeSlider_ = nullptr;
-    torsoHeightSlider_ = nullptr;
-    upperLegLengthSlider_ = nullptr;
-    lowerLegLengthSlider_ = nullptr;
-    legWidthSlider_ = nullptr;
-    neutralKneeBendSlider_ = nullptr;
-    attackPoseSlider_ = nullptr;
-    backStiffnessSlider_ = nullptr;
-    floorOffsetSlider_ = nullptr;
-    heightAdjustmentBalanceResetButton_ = nullptr;
-    manualAvatarScaleResetButton_ = nullptr;
-    torsoWidthResetButton_ = nullptr;
-    shoulderWidthResetButton_ = nullptr;
-    waistHipWidthResetButton_ = nullptr;
-    lowerTorsoWidthResetButton_ = nullptr;
-    neckBaseWidthResetButton_ = nullptr;
-    headSizeResetButton_ = nullptr;
-    torsoHeightResetButton_ = nullptr;
-    upperLegLengthResetButton_ = nullptr;
-    lowerLegLengthResetButton_ = nullptr;
-    legWidthResetButton_ = nullptr;
-    neutralKneeBendResetButton_ = nullptr;
-    attackPoseResetButton_ = nullptr;
-    backStiffnessResetButton_ = nullptr;
-    floorOffsetResetButton_ = nullptr;
-    keepHandsOnSabersToggle_ = nullptr;
-    armBodyCollisionToggle_ = nullptr;
-    armSpringCollisionToggle_ = nullptr;
-    alphaToMaskToggle_ = nullptr;
-    avatarFitWarningModal_ = nullptr;
-    avatarFitWarningText_ = nullptr;
-    pendingAvatarFitWarning_ = 0;
-    avatarPickerModal_ = nullptr;
-    avatarPickerListContent_ = nullptr;
-    avatarPickerRows_.clear();
-    auto* root = avatarSettingsView_->get_transform().ptr();
-    while (root->get_childCount() > 0) {
-        auto* child = root->GetChild(root->get_childCount() - 1)->get_gameObject().ptr();
-        UnityEngine::Object::DestroyImmediate(child);
-    }
-    BuildSettingsPanel(avatarSettingsView_);
-    // Rebuilding is used by avatar and player-profile changes. Preserve the
-    // page the user was actually working on instead of silently jumping from
-    // Setup, Display, or Quality to Fit after every rebuild.
-    selectedAvatarTab_ = std::clamp(selectedAvatarTab_, 0, 3);
-    ShowAvatarTab(selectedAvatarTab_);
-    if (avatarTabs_) avatarTabs_->SelectCellWithNumber(selectedAvatarTab_);
-    Logging::Logger.info("AvatarSettingsRebuild complete selectedTab={}", selectedAvatarTab_);
-}
-
-void MenuController::RefreshCalibrationStatus() {
-    const auto& status = root_.Avatar().CalibrationStatus();
-    const auto& profile = root_.Avatar().PlayerProfile();
-    if (calibrationStatusText_) {
-        std::ostringstream text;
-        if (status.phase == avatar::calibration::CalibrationPhase::Idle) {
-            if (profile.valid) {
-                text << "Saved player profile active\nQuality " << std::fixed << std::setprecision(0)
-                     << profile.overallConfidence * 100.0F << "%";
-            } else {
-                text << "Calibration required\nAvatar loading remains disabled until setup is complete";
-            }
-        } else if (status.phase == avatar::calibration::CalibrationPhase::Introduction) {
-            text << "Calibration guide open\nChoose Automatic or Step-by-Step on the floating panel";
-        } else if (status.phase == avatar::calibration::CalibrationPhase::AwaitingStepStart) {
-            text << (status.stepIndex + 1) << '/' << status.stepCount << " - "
-                 << avatar::calibration::CalibrationStepName(status.step)
-                 << "\nWaiting for Start Step";
-        } else if (status.phase == avatar::calibration::CalibrationPhase::AwaitingContinue) {
-            text << (status.stepIndex + 1) << '/' << status.stepCount << " - "
-                 << avatar::calibration::CalibrationStepName(status.step)
-                 << "\nAccepted; waiting for Continue";
-        } else if (status.phase == avatar::calibration::CalibrationPhase::Review) {
-            text << "Calibration awaiting review\nNothing has been saved or activated";
-        } else if (status.phase == avatar::calibration::CalibrationPhase::Complete) {
-            text << "Calibration saved and active\nQuality " << std::fixed << std::setprecision(0)
-                 << profile.overallConfidence * 100.0F << "%";
-        } else if (status.phase == avatar::calibration::CalibrationPhase::Failed) {
-            text << "Calibration paused\nUse the floating panel to retry or cancel";
-        } else {
-            text << (status.stepIndex + 1) << '/' << status.stepCount << " - "
-                 << avatar::calibration::CalibrationStepName(status.step)
-                 << "\nFollow the floating calibration panel";
-        }
-        calibrationStatusText_->set_text(text.str());
-    }
-    if (IsAlive(calibrationPanelScreen_)) RefreshCalibrationPanel();
 }
 
 void MenuController::ApplyLivestreamReferenceLayout() {

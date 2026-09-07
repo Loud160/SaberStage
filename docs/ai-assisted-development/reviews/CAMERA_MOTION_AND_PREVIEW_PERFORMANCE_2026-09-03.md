@@ -3,10 +3,10 @@
 ## Scope and evidence
 
 User reports that enabling **Enable Script** roughly halves menu FPS, without
-recording, streaming or an avatar. Read-only support capture:
+recording or streaming. Read-only support capture:
 `diagnostics/camera-motion-performance/SaberStage-Support-Logs-20260903-035407.zip`.
 Keep support files and settings private. The log identifies
-`AvatarBodyInspectionOrbit.json` (241 frames, song-synchronized, looping).
+a 241-frame song-synchronized, looping movement script.
 
 Confirmed source problems:
 
@@ -59,7 +59,7 @@ accounts for must be measured on the headset after the fix.
 ## Boundaries
 
 - Preserve Claude Code's and all existing uncommitted work. BigScreen read-only.
-- No unrelated UI layout, avatar, grip, encoder or shader changes.
+- No unrelated UI layout, encoder, or shader changes.
 - No deployment or new commit requested in this turn.
 - Do not claim FPS recovery or visual correctness from host/build checks alone.
 
@@ -129,7 +129,7 @@ introduce two independent renders.
 ### Headset verification still required
 
 1. Compare Enable Script off/on in the same menu, with identical previews,
-   avatar/capture state and headset refresh rate. With Diagnostics enabled,
+   capture state and headset refresh rate. With Diagnostics enabled,
    `CameraWork` must show zero `songLookups`/`playerLookups` in the menu and no
    repeated `fileLoads` when changing unrelated camera settings.
 2. Enter a map and verify the song-synchronized path still moves/seeks/loops
@@ -145,4 +145,4 @@ introduce two independent renders.
    quality, with neither preview monitor appearing in the captured image.
 
 No FPS improvement or on-headset layout has been claimed from host tests.
-No deployment, commit, avatar changes or unrelated menu edits were performed.
+No deployment, commit, or unrelated menu edits were performed.

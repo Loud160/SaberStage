@@ -49,9 +49,7 @@ class TextMeshProUGUI;
 
 namespace UnityEngine {
 class GameObject;
-class LineRenderer;
 class Material;
-class RectTransform;
 }
 
 namespace UnityEngine::UI {
@@ -83,7 +81,7 @@ public:
     MenuController& operator=(const MenuController&) = delete;
 
     void Register();
-    void TickCalibrationPanel() noexcept;
+    void TickRuntimePanels() noexcept;
 
 private:
     std::unique_ptr<ChatControls> chatControls_;
@@ -94,7 +92,6 @@ private:
     static void BuildTabbedSettings(HMUI::ViewController* view);
     static void BuildPreviewPanel(HMUI::ViewController* view);
     static void BuildRecordingPanel(HMUI::ViewController* view);
-    void BuildAvatarFilePicker(HMUI::ViewController* view);
     void BuildAfkFilePicker(HMUI::ViewController* view);
     static void SetEditorPreviewActive(bool active);
     void EditCamera(const std::function<void(camera::CameraProfile&)>& edit, std::string_view reason);
@@ -142,49 +139,7 @@ private:
     void TickChatWorldPanelResize();
     void UpdateChatWorldPanelPersistence();
     void TickChatWorldPanel() noexcept;
-    void RefreshAvatarStatus();
-    void RefreshCalibrationStatus();
-    bool LoadSelectedAvatar(bool calibrationOnly, std::string* error = nullptr, std::function<void()> ready = {});
-    bool FinishSelectedAvatarLoad(bool calibrationOnly, bool initialCalibration, std::string* error);
-    void SetAvatarMasterEnabled(bool enabled);
-    void BeginPlayerCalibration(bool advanced);
-    bool CompletePlayerCalibrationWorkflow(std::string* error = nullptr);
-    void CancelPlayerCalibrationWorkflow() noexcept;
-    void ShowAvatarSetupConfirmation(int action);
-    void ResolveAvatarSetupConfirmation(bool accepted);
-    void RefreshRetargetingControls();
-    void ShowAvatarFitWarning(int warningKind);
-    void ResolveAvatarFitWarning(bool accepted);
-    void OpenGripEditor(int side);
-    void EnsureGripEditor();
-    void EnsureGripTargetGizmo();
-    void DestroyGripEditor(bool restoreOriginal) noexcept;
-    void RecenterGripEditor();
-    void TickGripEditor() noexcept;
-    void SyncGripTargetGizmo() noexcept;
-    void ApplyGripEditorPreview();
-    void RefreshGripEditorControls();
-    void SetGripEditorComponent(int component, float value);
-    void SetGripEditorShowAvatarArm(bool visible);
-    void SaveGripEditor();
-    void MirrorGripEditorToOtherHand();
-    void ResetGripEditor();
-    void RequestAvatarSettingsRebuild() noexcept;
-    void RebuildAvatarSettingsPanel();
-    void EnsureStandinProxy(int slot);
-    void DestroyStandinProxy(int slot) noexcept;
-    void DestroyAllStandinProxies() noexcept;
-    void TickAvatarStandinProxy() noexcept;
-    void EnsureCalibrationPanel();
-    void DestroyCalibrationPanel() noexcept;
-    void RefreshCalibrationPanel();
-    void RecenterCalibrationPanel();
-    void LogCalibrationPanelGeometry() const;
-    void OpenAvatarFilePicker();
-    void BrowseAvatarDirectory(const std::filesystem::path& directory);
-    void SelectAvatarFile(const std::filesystem::path& path);
-    [[nodiscard]] std::filesystem::path ConfiguredAvatarPath() const;
-    void ShowAvatarTab(int index);
+    void ShowCenterDebugTab(int index);
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     void ApplyLivestreamReferenceLayout();
@@ -192,12 +147,12 @@ private:
     app::ApplicationRoot& root_;
     TMPro::TextMeshProUGUI* scriptStatusText_ = nullptr;
     UnityEngine::UI::RawImage* dockedPreviewImage_ = nullptr;
-    HMUI::TextSegmentedControl* avatarTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 4> avatarTabViewRoots_{};
-    // The scroll-view root controls visibility, while the content root owns
-    // the actual settings layout. Keep both so a page that was hidden during
-    // its first canvas pass can be rebuilt when selected.
-    std::array<UnityEngine::GameObject*, 4> avatarTabContentRoots_{};
+    // Temporary center-panel layout scaffold. The separate page and content
+    // roots let the debug colors expose both bounds while tab visibility and
+    // native scroll layout remain independently controlled.
+    HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
+    std::array<UnityEngine::GameObject*, 3> centerDebugTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 3> centerDebugTabContentRoots_{};
     HMUI::TextSegmentedControl* settingsTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 4> tabViewRoots_{};
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
@@ -238,101 +193,6 @@ private:
     TMPro::TextMeshProUGUI* recordingWorldPanelFpsText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelDropText_ = nullptr;
     BSML::ToggleSetting* recordingWorldPanelModeToggle_ = nullptr;
-    TMPro::TextMeshProUGUI* avatarStatusText_ = nullptr;
-    TMPro::TextMeshProUGUI* calibrationStatusText_ = nullptr;
-    BSML::ToggleSetting* avatarEnabledToggle_ = nullptr;
-    BSML::ModalView* avatarSetupConfirmationModal_ = nullptr;
-    TMPro::TextMeshProUGUI* avatarSetupConfirmationText_ = nullptr;
-    int pendingAvatarSetupConfirmation_ = 0;
-    HMUI::ViewController* avatarSettingsView_ = nullptr;
-    BSML::ToggleSetting* matchPlayerHeightToggle_ = nullptr;
-    BSML::SliderSetting* heightAdjustmentBalanceSlider_ = nullptr;
-    BSML::ToggleSetting* armSpanSizingToggle_ = nullptr;
-    BSML::ToggleSetting* manualAvatarScaleToggle_ = nullptr;
-    BSML::SliderSetting* manualAvatarScaleSlider_ = nullptr;
-    BSML::ToggleSetting* bodyProportionToggle_ = nullptr;
-    BSML::SliderSetting* torsoWidthSlider_ = nullptr;
-    BSML::ToggleSetting* autoShoulderWidthToggle_ = nullptr;
-    BSML::SliderSetting* shoulderWidthSlider_ = nullptr;
-    BSML::SliderSetting* waistHipWidthSlider_ = nullptr;
-    BSML::SliderSetting* lowerTorsoWidthSlider_ = nullptr;
-    BSML::SliderSetting* neckBaseWidthSlider_ = nullptr;
-    BSML::SliderSetting* headSizeSlider_ = nullptr;
-    BSML::SliderSetting* torsoHeightSlider_ = nullptr;
-    BSML::SliderSetting* upperLegLengthSlider_ = nullptr;
-    BSML::SliderSetting* lowerLegLengthSlider_ = nullptr;
-    BSML::SliderSetting* legWidthSlider_ = nullptr;
-    BSML::SliderSetting* neutralKneeBendSlider_ = nullptr;
-    BSML::SliderSetting* attackPoseSlider_ = nullptr;
-    BSML::SliderSetting* backStiffnessSlider_ = nullptr;
-    BSML::SliderSetting* floorOffsetSlider_ = nullptr;
-    UnityEngine::UI::Button* heightAdjustmentBalanceResetButton_ = nullptr;
-    UnityEngine::UI::Button* manualAvatarScaleResetButton_ = nullptr;
-    UnityEngine::UI::Button* torsoWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* shoulderWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* waistHipWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* lowerTorsoWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* neckBaseWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* headSizeResetButton_ = nullptr;
-    UnityEngine::UI::Button* torsoHeightResetButton_ = nullptr;
-    UnityEngine::UI::Button* upperLegLengthResetButton_ = nullptr;
-    UnityEngine::UI::Button* lowerLegLengthResetButton_ = nullptr;
-    UnityEngine::UI::Button* legWidthResetButton_ = nullptr;
-    UnityEngine::UI::Button* neutralKneeBendResetButton_ = nullptr;
-    UnityEngine::UI::Button* attackPoseResetButton_ = nullptr;
-    UnityEngine::UI::Button* backStiffnessResetButton_ = nullptr;
-    UnityEngine::UI::Button* floorOffsetResetButton_ = nullptr;
-    BSML::ToggleSetting* keepHandsOnSabersToggle_ = nullptr;
-    BSML::ToggleSetting* armBodyCollisionToggle_ = nullptr;
-    BSML::ToggleSetting* armSpringCollisionToggle_ = nullptr;
-    BSML::ToggleSetting* alphaToMaskToggle_ = nullptr;
-    BSML::ModalView* avatarFitWarningModal_ = nullptr;
-    TMPro::TextMeshProUGUI* avatarFitWarningText_ = nullptr;
-    int pendingAvatarFitWarning_ = 0;
-    BSML::FloatingScreen* gripEditorScreen_ = nullptr;
-    // Three independent native BSML handles provide reliable Quest pointer
-    // input. Each handle represents one translation axis; the editor projects
-    // the opposite controller's motion onto only that axis while it is held.
-    std::array<BSML::FloatingScreen*, 3> gripAxisHandles_{};
-    std::array<UnityEngine::LineRenderer*, 3> gripAxisRings_{};
-    std::array<UnityEngine::Material*, 3> gripAxisMaterials_{};
-    std::array<UnityEngine::Material*, 3> gripAxisRingMaterials_{};
-    TMPro::TextMeshProUGUI* gripEditorTitleText_ = nullptr;
-    BSML::ToggleSetting* gripEditorShowArmToggle_ = nullptr;
-    std::array<BSML::SliderSetting*, 8> gripEditorSliders_{};
-    camera::Vec3 gripEditorOriginalPosition_{};
-    camera::Vec3 gripEditorOriginalRotation_{};
-    camera::Vec3 gripEditorWorkingPosition_{};
-    camera::Vec3 gripEditorWorkingRotation_{};
-    camera::Quaternion gripEditorWorkingRotationQuaternion_{};
-    float gripEditorOriginalClosurePercent_ = 100.0F;
-    float gripEditorWorkingClosurePercent_ = 100.0F;
-    float gripEditorOriginalThumbCurvePercent_ = 100.0F;
-    float gripEditorWorkingThumbCurvePercent_ = 100.0F;
-    camera::Quaternion gripEditorGizmoRotation_{};
-    camera::Vec3 gripAxisDragControllerStart_{};
-    camera::Quaternion gripAxisDragControllerRotationStart_{};
-    camera::Vec3 gripAxisDragOriginAdjustment_{};
-    camera::Quaternion gripAxisDragOriginAdjustmentRotation_{};
-    camera::Vec3 gripAxisDragWorldDirection_{};
-    int gripAxisDrag_ = -1;
-    int gripEditorSide_ = -1;
-    bool gripAxisDragRotating_ = false;
-    bool gripEditorShowAvatarArm_ = true;
-    bool refreshingGripEditor_ = false;
-    TMPro::TextMeshProUGUI* calibrationPanelTitleText_ = nullptr;
-    TMPro::TextMeshProUGUI* calibrationPanelProgressText_ = nullptr;
-    TMPro::TextMeshProUGUI* calibrationPanelInstructionText_ = nullptr;
-    TMPro::TextMeshProUGUI* calibrationPanelPhaseText_ = nullptr;
-    TMPro::TextMeshProUGUI* calibrationPanelDetailsText_ = nullptr;
-    UnityEngine::UI::Button* calibrationPanelAutomaticStartButton_ = nullptr;
-    UnityEngine::UI::Button* calibrationPanelStepByStepStartButton_ = nullptr;
-    TMPro::TextMeshProUGUI* avatarSelectionText_ = nullptr;
-    TMPro::TextMeshProUGUI* avatarPickerPathText_ = nullptr;
-    BSML::ModalView* avatarPickerModal_ = nullptr;
-    UnityEngine::GameObject* avatarPickerListContent_ = nullptr;
-    std::vector<UnityEngine::GameObject*> avatarPickerRows_;
-    std::filesystem::path avatarPickerDirectory_;
     TMPro::TextMeshProUGUI* afkPickerPathText_ = nullptr;
     TMPro::TextMeshProUGUI* afkSelectionText_ = nullptr;
     BSML::ModalView* afkPickerModal_ = nullptr;
@@ -364,7 +224,7 @@ private:
     UnityEngine::UI::Button* recordingWorldPanelGameAudioButton_ = nullptr;
     UnityEngine::UI::RawImage* recordingWorldPanelGameAudioIcon_ = nullptr;
     // Per-panel material instances use the embedded zero-bloom alpha shader.
-    // They are not shared with avatar or preview surfaces, so destroying or
+    // They are not shared with preview surfaces, so destroying or
     // rebuilding one floating panel cannot mutate another panel's UI state.
     UnityEngine::Material* recordingWorldPanelBorderMaterial_ = nullptr;
     BSML::FloatingScreen* chatWorldPanelScreen_ = nullptr;
@@ -440,33 +300,9 @@ private:
     std::uint32_t chatWorldPanelStyle_ = 0;
     std::array<float, 12> chatWorldPanelColors_{};
     bool chatWorldPanelCreationFailureLogged_ = false;
-    // Invisible body-sized grab handles for the free-standing avatar display
-    // clones, one per slot (up to three), each driving its clone's placement.
-    std::array<BSML::FloatingScreen*, 3> standinProxyScreens_{};
-    std::array<camera::Pose, 3> standinProxyLastPoses_{};
-    std::array<float, 3> standinProxyStableSeconds_{};
-    std::array<bool, 3> standinProxyPoseDirty_{};
-    // Clone scale the grab handles were last fitted to; the tick refits every
-    // handle when the scale setting changes.
-    float standinProxyAppliedScale_ = 1.0F;
-    bool standinProxyCreationFailureLogged_ = false;
-    bool standinProxyTickFailureLogged_ = false;
     bool recordingWorldPanelCreationFailureLogged_ = false;
     bool recordingWorldPanelTickFailureLogged_ = false;
-    UnityEngine::GameObject* calibrationPanelDriverObject_ = nullptr;
-    BSML::FloatingScreen* calibrationPanelScreen_ = nullptr;
-    UnityEngine::RectTransform* calibrationPanelContentRoot_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelIntroductionActions_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelStepStartActions_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelContinueActions_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelActiveActions_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelFailureActions_ = nullptr;
-    UnityEngine::GameObject* calibrationPanelReviewActions_ = nullptr;
-    std::uint64_t calibrationPanelStatusRevision_ = 0;
-    bool calibrationPanelTrackingReady_ = false;
-    int calibrationPanelGeometryAuditFrames_ = 0;
-    bool calibrationPanelCreationFailureLogged_ = false;
-    bool calibrationPanelTickFailureLogged_ = false;
+    UnityEngine::GameObject* menuRuntimeDriverObject_ = nullptr;
     bool livestreamKeyVisible_ = false;
     // Distinguishes an in-place title change from the title update that must
     // finish before a new Twitch stream is allowed to start.
@@ -475,13 +311,7 @@ private:
     // Used to suppress one identical deferred-save error per frame while the
     // settings service performs its bounded one-second retry cadence.
     std::string lastDeferredSettingsSaveError_;
-    bool refreshingRetargetingControls_ = false;
-    bool refreshingAvatarSetupControls_ = false;
-    bool avatarSettingsRebuildPending_ = false;
-    // Deliberately session-only diagnostic used while tuning neck/spine
-    // behavior. It is never serialized into a player or avatar profile.
-    bool debugHideAvatarHair_ = false;
-    int selectedAvatarTab_ = 0;
+    int selectedCenterDebugTab_ = 0;
     int selectedTab_ = 0;
     int selectedRecordingTab_ = 0;
     bool registered_ = false;

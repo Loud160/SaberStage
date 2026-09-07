@@ -41,9 +41,10 @@ dependency graph can be reviewed and reproduced.
 
 Rich chat adds the pinned Quest SongCore 1.1.26 dependency for this game version.
 It also adds a viewport-clipped chat sprite shader to the shared Android bundle.
-After editing shader source, run `scripts/build-avatar-shaders.ps1` before the
-native build. Unity verifies all six addressable shaders in the produced bundle;
-the existing avatar/preview shaders remain in the same archive. A source-only
+After editing shader source, run `scripts/build-runtime-shaders.ps1` before the
+native build. Unity verifies the three addressable runtime shaders in
+`assets/saberstage_runtime_shaders`: video preview, non-bloom UI, and chat
+sprites. A source-only
 deployment must not substitute an unverified SongCore build or overwrite another
 mod's dependencies; use the normal QMOD dependency installation when needed.
 

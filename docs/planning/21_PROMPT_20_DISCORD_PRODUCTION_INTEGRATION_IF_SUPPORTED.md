@@ -24,7 +24,7 @@ Provider-specific behavior must not leak into the panel implementation.
 Only if a supported method exists for feeding the broadcast camera to a local Discord client:
 
 - reuse the existing broadcast camera/compositor;
-- preserve the selected scene and integrated-avatar visibility;
+- preserve the selected scene;
 - reuse the capture timeline;
 - reuse encoded media where compatible;
 - avoid second full scene render;
@@ -46,8 +46,7 @@ Once Discord integration is configured:
 
 - restore the selected behavior on launch;
 - reconnect where appropriate;
-- keep camera/avatar orientation correct;
-- require no repeated calibration.
+- keep camera orientation correct;
 
 Provide:
 

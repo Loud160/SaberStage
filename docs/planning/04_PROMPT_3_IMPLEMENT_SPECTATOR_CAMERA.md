@@ -68,12 +68,11 @@ Preserve a generic subject/anchor concept for future:
 - player root;
 - head;
 - waist/root;
-- avatar anchor;
-- full-body tracking anchors.
+- other generic scene anchors.
 
-Keep avatar, encoding, networking, chat, and Discord out of the camera implementation.
+Keep encoding, networking, chat, and Discord out of the camera implementation.
 
-The camera may expose generic subject and visibility interfaces needed by SaberStage's integrated avatar later, but it must not own avatar loading, IK, or calibration.
+The camera may expose generic subject and visibility interfaces for other scene content, but it must not own that content.
 
 ## Motion composition and scripts
 

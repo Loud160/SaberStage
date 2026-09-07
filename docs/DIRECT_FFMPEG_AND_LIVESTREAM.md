@@ -40,7 +40,7 @@ The first submitted video frame and first nonempty Unity audio callback are meas
 - A 90-frame refresh cadence replaces per-frame global AudioListener enumeration; the capture listener still follows the HMD pose each frame.
 - Optional 2x/4x camera MSAA renders the third-person camera into a private multisampled target and resolves once into the backend's single-sample encoder texture. It does not change Beat Saber's headset MSAA; Off remains the conservative default.
 
-These changes address identified structural stalls, but they do not establish a Quest performance result. Quest 2/3 testing must measure camera-only, avatar-only, each backend at 720p30 and 1080p30, combined avatar/recording, and controlled test broadcasts. 1080p30 remains the conservative default; 60 FPS and 1440p require evidence before being recommended.
+These changes address identified structural stalls, but they do not establish a Quest performance result. Quest 2/3 testing must measure camera-only, each backend at 720p30 and 1080p30, representative heavy gameplay/mod scenes, and controlled test broadcasts. 1080p30 remains the conservative default; 60 FPS and 1440p require evidence before being recommended.
 
 ## Private runtime and licensing
 
@@ -62,5 +62,5 @@ The zero-byte Direct capture incident is now diagnosable and locally recoverable
 - Twitch and custom endpoint connection behavior using test channels;
 - the visible block and explanatory error for the unsupported YouTube and Kick presets;
 - FLV H.264 sequence headers/access units, AAC, A/V sync, stop/trailer handling, TLS certificates, and reconnect;
-- queue depth, dropped-media telemetry, memory growth, thermals, and gameplay frame rate with the avatar enabled;
+- queue depth, dropped-media telemetry, memory growth, thermals, and gameplay frame rate in representative heavy scenes;
 - whether 1080p60 or 1440p modes are acceptable on each supported Quest generation.

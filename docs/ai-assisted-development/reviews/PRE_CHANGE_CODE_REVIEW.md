@@ -94,7 +94,7 @@ available yet at this early loader callback.
 
 **Severity:** Medium
 
-Camera sliders and several live/avatar adjustment controls synchronously call
+Camera sliders and several live adjustment controls synchronously call
 the atomic `SettingsService::Save()` path on every value event. Each save writes
 and flushes a temporary JSON file, renames the current file to a backup, promotes
 the temporary file, and removes the backup. This is real main-thread filesystem

@@ -1,20 +1,19 @@
-# SaberStage Project Charter — Quest-Native Beat Saber Camera, Avatar, Recorder, and Broadcast System
+# SaberStage Project Charter — Quest-Native Beat Saber Camera, Recorder, and Broadcast System
 
 ## Purpose
 
-Build **SaberStage**, a new clean-room native Meta Quest Beat Saber mod whose core product is a Camera2-familiar independent spectator/broadcast camera with integrated avatar, recording, and output capabilities.
+Build **SaberStage**, a new clean-room native Meta Quest Beat Saber mod whose core product is a Camera2-familiar independent spectator/broadcast camera with recording and output capabilities.
 
 The player must continue to play Beat Saber normally through the headset's first-person VR cameras while the mod renders a separate camera that can be used for:
 
 1. local on-Quest recording from the selected third-person camera;
-2. an integrated full-player avatar rendered primarily in third-person outputs;
-3. Wi-Fi/USB streaming to a cross-platform desktop companion for viewing and recording;
-4. OBS integration through that companion;
-5. direct third-person viewing on compatible TVs/receivers where a practical supported approach exists;
-6. lightweight Beat-Saber-specific broadcast composition features similar to the useful parts of OBS;
-7. direct livestreaming from Quest to services such as Twitch, YouTube, or a custom RTMP/RTMPS endpoint;
-8. in-game stream-chat display;
-9. integration with a **local Discord client running on the Quest** where supported, including chat/status integration and, only if technically feasible through supported/current APIs, using the selected third-person broadcast view as a Discord livestream source.
+2. Wi-Fi/USB streaming to a cross-platform desktop companion for viewing and recording;
+3. OBS integration through that companion;
+4. direct third-person viewing on compatible TVs/receivers where a practical supported approach exists;
+5. lightweight Beat-Saber-specific broadcast composition features similar to the useful parts of OBS;
+6. direct livestreaming from Quest to services such as Twitch, YouTube, or a custom RTMP/RTMPS endpoint;
+7. in-game stream-chat display;
+8. integration with a **local Discord client running on the Quest** where supported, including chat/status integration and, only if technically feasible through supported/current APIs, using the selected third-person broadcast view as a Discord livestream source.
 
 The optional **SaberStage Companion** will be written in **C#/.NET with Avalonia** and must run on:
 
@@ -38,7 +37,7 @@ SaberStage is for players who cannot or do not want to run Beat Saber through PC
 
 # Product philosophy: set it once, then forget it
 
-A primary product requirement is the same quality that makes well-designed PC Camera2 + Custom Avatar workflows pleasant:
+A primary product requirement is the same quality that makes well-designed PC Camera2 workflows pleasant:
 
 > **Once configured correctly, the system should restore itself on every Beat Saber launch and normally require no setup at all.**
 
@@ -51,13 +50,12 @@ Launch Beat Saber
 → broadcast scene is already correct
 → livestream service/profile is already correct
 → chat panel is already positioned/configured
-→ avatar is already selected and calibrated
 → press Record or Go Live
 ```
 
 The technical complexity belongs inside the implementation, not in the user's daily workflow.
 
-Set-it-and-forget-it does **not** mean stripped down. Users should retain meaningful control over every camera, avatar, recording, output, and broadcast setting that can be exposed safely. Normal workflows use sensible durable defaults; specialized and low-level controls belong in coherent advanced sections.
+Set-it-and-forget-it does **not** mean stripped down. Users should retain meaningful control over every camera, recording, output, and broadcast setting that can be exposed safely. Normal workflows use sensible durable defaults; specialized and low-level controls belong in coherent advanced sections.
 
 Manual reset/recenter/reconfigure actions must exist as recovery tools, but normal operation should not depend on them.
 
@@ -65,7 +63,7 @@ Manual reset/recenter/reconfigure actions must exist as recovery tools, but norm
 
 # Clean-room requirement
 
-This is **not** a port, fork, translation, or code copy of Camera2, Camera Plus, ReeCamera, MRCPlus, Replay, Hollywood, LIV, Qavatars, or any other existing project.
+This is **not** a port, fork, translation, or code copy of Camera2, Camera Plus, ReeCamera, MRCPlus, Replay, Hollywood, LIV, or any other existing project.
 
 Other projects may be studied to understand:
 
@@ -73,7 +71,7 @@ Other projects may be studied to understand:
 - Quest/Unity/Android platform constraints;
 - media encoding and timing;
 - streaming concepts;
-- avatar/tracking constraints;
+- tracking constraints;
 - camera UX expectations.
 - familiar user-visible terminology and workflows.
 
@@ -163,11 +161,10 @@ After Stage 1 is stable:
 - investigate direct selected-camera output to compatible TVs/receivers;
 - add a stable cross-platform OBS handoff.
 
-## Stage 3 — Avatar and full broadcast production
+## Stage 3 — Full broadcast production
 
 After the capture and remote-output foundations are stable:
 
-- implement the integrated SaberStage avatar system;
 - add Quest-native broadcast scenes and lightweight OBS-like production controls;
 - add direct Quest livestreaming;
 - add in-HMD stream chat;
@@ -189,7 +186,7 @@ The long-term system should conceptually look like:
                 Selected SaberStage Camera
                               │
                               ▼
-             Integrated Avatar / Broadcast Compositor
+                    Broadcast Compositor
                               │
                               ▼
                       GPU RenderTexture
@@ -267,10 +264,6 @@ ApplicationRoot
  │    ├── CameraRig / Motion
  │    └── BroadcastRenderController
  ├── PreviewPanelController
- ├── AvatarManager
- │    ├── AvatarProfile / Asset
- │    ├── Tracking / IK
- │    └── Calibration / Visibility
  ├── BroadcastCompositor
  │    ├── BroadcastScene
  │    └── BroadcastSource(s)
@@ -393,7 +386,6 @@ The first implementation may be only the game camera.
 The architecture must later support low-overhead Beat-Saber-specific sources such as:
 
 - game camera;
-- integrated full avatar;
 - song title;
 - mapper;
 - difficulty;
@@ -440,7 +432,6 @@ Bad:
 ```text
 cameraWorldYaw = 173.2°
 cameraWorldPosition = arbitrary scene coordinates
-avatarWorldYaw = 151.4°
 ```
 
 Better:
@@ -449,7 +440,6 @@ Better:
 camera = 2.8m behind current player forward
 camera height = 1.6m
 look at player root
-avatar faces current player-forward
 ```
 
 On each launch:
@@ -461,7 +451,6 @@ load config
 → recreate camera from semantic profile
 → restore requested resolution, anchored-float settings, and selected movement script
 → restore stream/chat/broadcast settings
-→ avatar loads and rebinds
 → ready
 ```
 
@@ -477,20 +466,17 @@ Separate concepts:
 - current player forward;
 - scene/world space;
 - camera-relative offsets;
-- avatar model correction;
-- avatar calibration;
-- body tracking anchors.
+- player tracking anchors.
 
 Investigate current Quest/OpenXR/Unity behavior for recenter/reference-space changes.
 
 Desired behavior:
 
-> If the player uses the normal Quest recenter/reset-view action, the player-relative camera and integrated avatar should remain logically aligned without requiring a separate recalibration ceremony.
+> If the player uses the normal Quest recenter/reset-view action, the player-relative camera should remain logically aligned without requiring a separate recalibration ceremony.
 
 Provide manual recovery actions such as:
 
 - Recenter Camera to Current Forward
-- Recenter Avatar to Current Forward
 
 but normal operation should not need them.
 
@@ -508,8 +494,6 @@ Every persistent subsystem needs a clear reset path:
 - Reset Broadcast Scene
 - Reset Chat Panel
 - Clear/Change Stream Credentials
-- Reset Avatar Calibration
-- Reset Avatar Profile
 - Reset Discord Integration
 - Factory Reset Mod
 
@@ -812,7 +796,6 @@ presentation first
 
 Eventually the user may choose to reduce visual work in the HMD while keeping richer presentation in the broadcast:
 
-- integrated avatar;
 - particles;
 - mirrors;
 - bloom;
@@ -823,39 +806,6 @@ Eventually the user may choose to reduce visual work in the HMD while keeping ri
 Do not silently alter other mods' settings.
 
 Remember that camera culling removes render cost but not necessarily simulation/update cost.
-
----
-
-# Integrated SaberStage avatar system
-
-A later phase will add SaberStage's own Quest avatar system after camera, recording, and remote-output foundations are stable.
-
-The full avatar primarily exists for the broadcast view.
-
-```text
-Tracking
- HMD + controllers + future FBT
-            ↓
-        Avatar Rig
-          /     \
-         /       \
-   HMD View    Broadcast View
- hidden/minimal   full avatar
-```
-
-Do not implement the avatar in the initial recorder phases. Design the seams early, then add it inside SaberStage rather than publishing a separate general-purpose avatar mod.
-
-Preserve clean seams:
-
-- avatar is a broadcast/rendering concern;
-- encoder does not know an avatar exists;
-- network transport does not know an avatar exists;
-- camera can follow generic player/subject anchors;
-- avatar forward is based on current player/tracking intent, not an opaque absolute calibration;
-- changing avatars must not require rewriting the camera/capture pipeline;
-- the supported scope is third-person SaberStage presentation, not unrelated avatar use cases.
-
-The avatar UX must follow the same set-it-and-forget-it rule and restore per-avatar selection, calibration, scale, model-forward correction, and visibility safely.
 
 ---
 
@@ -1027,7 +977,6 @@ Stress workloads should eventually include:
 - particle-heavy maps;
 - hardware video decode from another mod;
 - Replay installed;
-- integrated avatar;
 - direct livestream;
 - chat panel;
 - Wi-Fi/USB output.
@@ -1050,10 +999,6 @@ Quest recording:
 
 - HollywoodQuest — `https://github.com/Fernthedev/HollywoodQuest`
 - Replay — `https://github.com/Metalit/Replay`
-
-Avatar research reference:
-
-- VRM Qavatars — `https://github.com/BSQ-VRM/VRM-Qavatars`
 
 Quest tooling:
 
@@ -1094,13 +1039,12 @@ Also use current official documentation for:
 15. Direct Quest livestreaming must not require the desktop companion.
 16. Chat integration must not leak credentials or block gameplay.
 17. Discord integration must use supported/public mechanisms; do not patch the Discord client.
-18. The integrated avatar must remain separate from encoder/network layers.
-19. Keep style/comments consistent.
-20. After every phase, summarize changed files, decisions, tests, device results, risks, and the exact next step.
-21. Implement one user camera first, but preserve stable identity and ownership seams for additional cameras later.
-22. Keep saved base placement separate from temporary and scripted motion layers.
-23. Camera2 script compatibility must be clean-room, deterministic, bounded, and safe for untrusted input.
-24. Scripted motion, smoothing, and anchored float must have one documented composition order.
+18. Keep style/comments consistent.
+19. After every phase, summarize changed files, decisions, tests, device results, risks, and the exact next step.
+20. Implement one user camera first, but preserve stable identity and ownership seams for additional cameras later.
+21. Keep saved base placement separate from temporary and scripted motion layers.
+22. Camera2 script compatibility must be clean-room, deterministic, bounded, and safe for untrusted input.
+23. Scripted motion, smoothing, and anchored float must have one documented composition order.
 
 ---
 
@@ -1112,6 +1056,6 @@ Do not think of this as:
 
 Think of it as:
 
-> **SaberStage: a Camera2-familiar native Quest camera and integrated-avatar system whose first useful release records third-person gameplay locally, whose next stage streams that view to cross-platform companions and compatible receivers, and whose final stage provides Quest-native broadcast scenes, direct livestreaming, chat, and supported Discord integration.**
+> **SaberStage: a Camera2-familiar native Quest camera whose first useful release records third-person gameplay locally, whose next stage streams that view to cross-platform companions and compatible receivers, and whose final stage provides Quest-native broadcast scenes, direct livestreaming, chat, and supported Discord integration.**
 
 Camera2 is a deliberate behavioral and UX reference. SaberStage must be independently implemented around Quest constraints while preserving the familiar, full-control, set-it-and-forget-it experience from the beginning.

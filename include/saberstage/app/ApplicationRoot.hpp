@@ -17,7 +17,6 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <string_view>
 
 namespace saberstage::ui {
 class MenuController;
@@ -33,10 +32,6 @@ class PreviewManager;
 
 namespace saberstage::recording {
 class RecordingController;
-}
-
-namespace saberstage::avatar {
-class AvatarManager;
 }
 
 namespace saberstage::broadcast {
@@ -63,24 +58,15 @@ public:
     camera::CameraManager& Camera() noexcept;
     preview::PreviewManager& Preview() noexcept;
     recording::RecordingController& Recording() noexcept;
-    avatar::AvatarManager& Avatar() noexcept;
     broadcast::TwitchService& Twitch() noexcept;
-    bool SwitchAvatarPlayerProfile(std::string_view profileId, std::string* error = nullptr);
-    bool CreateAvatarPlayerProfile(std::string* error = nullptr);
-    bool DeleteActiveAvatarPlayerProfile(std::string* error = nullptr);
 
 private:
-    // Profile calibration lives beside settings but uses a separate file per
-    // player profile so switching profiles never rewrites unrelated preferences.
-    [[nodiscard]] std::filesystem::path AvatarCalibrationPath(std::string_view profileId) const;
-    bool ApplyConfiguredAvatar(std::string* error = nullptr);
     bool started_ = false;
     settings::SettingsService settings_;
     std::unique_ptr<camera::CameraManager> camera_;
     std::unique_ptr<preview::PreviewManager> preview_;
     std::unique_ptr<recording::RecordingController> recording_;
     std::unique_ptr<broadcast::TwitchService> twitch_;
-    std::unique_ptr<avatar::AvatarManager> avatar_;
     std::unique_ptr<ui::MenuController> menu_;
 };
 

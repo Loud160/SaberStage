@@ -32,7 +32,7 @@ saved base local pose
 
 Script and anchored-float output never modify the saved base pose. Recenter rebinds the forward/static anchor and clears both smoothing and float velocity.
 
-Player anchoring uses the active Beat Saber `PlayerTransforms` origin associated with the HMD camera. Head following uses the HMD camera transform. World-relative profiles use the current Unity tracking/world frame. Future waist/avatar/full-body subjects currently fall back to the player-root provider without introducing avatar ownership into the camera subsystem.
+Player anchoring uses the active Beat Saber `PlayerTransforms` origin associated with the HMD camera. Head following uses the HMD camera transform. World-relative profiles use the current Unity tracking/world frame. Other generic subject anchors currently fall back to the player-root provider without introducing scene-content ownership into the camera subsystem.
 
 ## Camera2 movement-script compatibility
 

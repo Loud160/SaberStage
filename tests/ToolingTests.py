@@ -180,16 +180,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("FindObjectsOfTypeAll", lifetime)
         self.assertIn("ownership mismatch", lifetime)
         self.assertIn("wrappers={} removed={} unregistered={} mismatches={}", lifetime)
-        rebuild = menu.split("void MenuController::RebuildAvatarSettingsPanel()", 1)[1].split(
-            "void MenuController::RefreshCalibrationStatus()", 1)[0]
-        self.assertLess(rebuild.index("ReleaseSliderRegistrations"), rebuild.index("DestroyImmediate"))
-        self.assertLess(rebuild.index("ReleaseSliderRegistrations"), rebuild.index("avatarTabs_ = nullptr"))
-        self.assertLess(rebuild.index("DestroyImmediate"), rebuild.index("BuildSettingsPanel"))
-        self.assertIn("AvatarSettingsRebuild begin", rebuild)
-        self.assertIn("AvatarSettingsRebuild complete", rebuild)
-        grip = menu.split("void MenuController::DestroyGripEditor(bool restoreOriginal)", 1)[1].split(
-            "void MenuController::RecenterGripEditor()", 1)[0]
-        self.assertLess(grip.index("ReleaseSliderRegistrations"), grip.index("Object::Destroy"))
         navigation = chat.split("void BuildControls()", 1)[1].split("controls.content = Content", 1)[0]
         self.assertLess(navigation.index("ReleaseSliderRegistrations"), navigation.index("Object::Destroy"))
         surface = chat.split("void Destroy(Surface &surface)", 1)[1].split("void FitHandle", 1)[0]
@@ -474,7 +464,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_chat_virtual_content_has_one_layout_owner_and_visible_native_controls(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         chat = menu[menu.index("void MenuController::EnsureChatWorldPanel()"):
-                    menu.index("void MenuController::EnsureStandinProxy(")]
+                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
         self.assertIn("disableContentLayout(scrollContent)", chat)
         self.assertIn("disableContentLayout(outerContent->get_gameObject())", chat)
         self.assertIn("GetComponent<BSML::ScrollViewContent*>()", chat)
@@ -505,7 +495,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_idle_chat_does_not_reassign_sprite_assets_at_headset_rate(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::EnsureStandinProxy(")]
+                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
         # TMP's setter dirties geometry/layout even when the pointer is unchanged.
         # Atlas revision changes already enter the bounded reflow/reuse path.
         self.assertNotIn("set_spriteAsset(", tick)
@@ -545,41 +535,192 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("get_text()", diagnostic)
         self.assertIn("get_renderQueue()", diagnostic)
 
-    def test_face_and_grip_readback_is_bounded_and_observational(self):
-        manager = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
-        runtime = (ROOT / "src/avatar/vrm/VrmUnityRuntime.cpp").read_text(encoding="utf-8")
-        gate = manager[manager.index("if (now - lastPerformanceLogTime_ >= 5.0)"):
-                       manager.index("lastPerformanceLogTime_ = now;")]
-        self.assertIn("LogFaceAndGripReadback();", gate)
-        self.assertEqual(manager.count("LogFaceAndGripReadback();"), 1)
-        readback = manager[manager.index("void LogFaceAndGripReadback()"):
-                           manager.index("void ResetAutomaticExpressionState()")]
-        weights = runtime[runtime.index("void LogFaceDiagnostics() const noexcept"):
-                          runtime.index("bool SupportsAlphaToMask() const noexcept")]
-        for diagnostic in (readback, weights):
-            self.assertNotIn("SetBlendShapeWeight", diagnostic)
-            self.assertNotIn("SetExpression", diagnostic)
-            self.assertNotIn("->set_", diagnostic)
-            self.assertNotIn("FindObjectsOfTypeAll", diagnostic)
-        self.assertIn("GetBlendShapeWeight", weights)
-        self.assertIn("sample_.saberGrip[side].valid", readback)
-        self.assertIn("automaticExpressionsEnabled_", readback)
-        self.assertIn("RelativeTo(source.pose, handPose)", readback)
+    def test_chat_controls_keep_pc_sections_readable_on_one_quest_surface(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        self.assertIn("kChatControlBodyTextSize = 3.8F", source)
+        self.assertIn("kChatControlButtonTextSize = 3.6F", source)
+        self.assertIn("Page { Appearance, Filters, Requests", source)
+        appearance = source[source.index("if (page == Page::Appearance)"):
+                            source.index("} else if (page == Page::Filters)")]
+        filters = source[source.index("} else if (page == Page::Filters)"):
+                         source.index("} else if (page == Page::Requests")]
+        self.assertNotIn('Text(parent, "Filters"', appearance)
+        self.assertIn('Text(parent, "Chat | Filters"', filters)
+        self.assertIn('Button(parent, "Filters"', source)
+        self.assertIn('Slider(parent, "Chat text size"', appearance)
+        self.assertIn("settings.fontSize, 2.5F, 10", appearance)
 
-    def test_pointer_and_saber_sampling_preserves_the_calibrated_grip_reference(self):
-        manager = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
-        # Runtime sampling complements the native pose tests: do not insert a
-        # blade-derived palm translation before the solver sees the real handle.
-        self.assertNotIn("SampleSaberGripPose", manager)
-        self.assertNotIn("get_saberBladeBottomPos", manager)
-        self.assertIn("SamplePose(saberGripTransforms_[side], previous.saberGrip[side], timestamp)", manager)
-        self.assertIn("sample_.handIsSaberGrip[side] = hand.valid;", manager)
-        self.assertIn("? sample_.saberGrip[side] : sample_.controllerHand[side]", manager)
+    def test_chat_control_sliders_and_switches_remain_visible_on_black(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        slider = source[source.index("    void Slider(Transform *parent"):
+                        source.index("    void Navigation()")]
+        toggle = source[source.index("    BSML::ToggleSetting *Toggle("):
+                        source.index("    void StackToggle(")]
+
+        # SliderSetting::Setup aliases setting->text to the live value text.
+        # Never hide it; use the native formatter/Refresh path so every value
+        # remains synchronized without a second callback-owned label.
+        self.assertNotIn("setting->text->get_gameObject()->set_active(false)", slider)
+        self.assertIn('return fmt::format("Value: {}"', slider)
+        self.assertIn('return fmt::format("Value: {:.{}f}"', slider)
+        # Custom unit labels such as cooldown minutes need a wider native
+        # handle value field; ordinary numeric sliders retain the compact size.
+        self.assertIn(
+            "setting->slider->set_valueSize(hasCustomFormatter ? 24.0F : 18.0F)",
+            slider,
+        )
+        self.assertIn("valueText->get_gameObject()->set_active(true)", slider)
+        self.assertIn("setting->slider->Refresh()", slider)
+
+        # Only the idle color changes. Native highlighted/pressed/selected
+        # colors remain untouched, preserving the existing hover feedback.
+        self.assertIn("colors.set_normalColor(", slider)
+        self.assertNotIn("set_highlightedColor", slider)
+        self.assertNotIn("set_pressedColor", slider)
+        self.assertIn("__cordl_internal_get__offColors()", toggle)
+        self.assertIn("__cordl_internal_set_backgroundColor0", toggle)
+        self.assertNotIn("__cordl_internal_get__offHighlightedColors", toggle)
+        self.assertIn("__cordl_internal_get__onColors", toggle)
+
+    def test_chat_hover_hints_replace_prefab_hints_and_follow_the_flat_canvas(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        replacement = source[source.index("HMUI::HoverHint *ReplaceHoverHint("):
+                             source.index("struct Surface {")]
+        refresh = source[source.index("    void RefreshHoverHintGeometry()"):
+                         source.index("    void Navigation()")]
+
+        # PlayButton and other native prefabs can carry a localized hint with
+        # an empty key. Leaving it beside the SaberStage hint lets two pointer
+        # handlers fight over the one shared panel and produces blank boxes.
+        self.assertIn("GetComponentsInChildren<GlobalNamespace::LocalizedHoverHint *>", replacement)
+        self.assertIn("GetComponentsInChildren<HMUI::HoverHint *>", replacement)
+        self.assertIn("hint->set_enabled(false)", replacement)
+        self.assertIn("if (text.empty())", replacement)
+        self.assertEqual(source.count("BSML::Lite::AddHoverHint("), 1)
+
+        # HMUI reuses and reparents one tooltip panel. Rebuild its cached curve
+        # data only while it is on a SaberStage chat surface, plus once when it
+        # returns to a stock screen, so other Beat Saber hints are untouched.
+        self.assertIn("panel->__cordl_internal_get__isShown_k__BackingField()", refresh)
+        self.assertNotIn("panel->get_isShown()", refresh)
+        self.assertIn("Resources::FindObjectsOfTypeAll<HMUI::HoverHintController *>()", refresh)
+        self.assertNotIn("BSML::Helpers::GetHoverHintController", refresh)
+        self.assertIn("panelTransform->IsChildOf(controls.screen->get_transform())", refresh)
+        self.assertIn("panelTransform->IsChildOf(requests.screen->get_transform())", refresh)
+        self.assertIn("!belongsToChat && !hoverHintOwnedByChat", refresh)
+        self.assertIn("HMUI::CurvedCanvasSettings::RebuildAndSetup(panelTransform)", refresh)
+        self.assertIn("hoverHintOwnedByChat = belongsToChat", refresh)
+
+    def test_chat_color_controls_are_visible_and_not_misrepresented_as_sliders(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        color = source[source.index("    void ColorPicker(Transform *parent"):
+                       source.index("    void Slider(Transform *parent")]
+
+        # ColorSetting is a button that opens RGB/HSV controls, not a linear
+        # slider. Give the row an explicit action plus a synchronized hex value
+        # instead of leaving an unexplained dot on an almost-black strip.
+        self.assertIn('OPEN COLOR PICKER   #{:02X}{:02X}{:02X}', source)
+        self.assertIn("valueLabel->ptr()->set_text(ColorSelectionText(selected))", color)
+        self.assertIn("colors.set_normalColor({0.55F, 0.58F, 0.62F, 0.50F})", color)
+        self.assertIn("picker->colorImage->get_rectTransform()", color)
+        self.assertIn("frame->set_color({0.78F, 0.81F, 0.86F, 1.0F})", color)
+        self.assertIn('This row is a button, not a slider.', color)
+        self.assertIn("labeled RGB and HSV color", color)
+
+    def test_song_request_list_and_selected_map_are_visually_separate_sections(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        build = source[source.index("    void BuildRequests()"):
+                       source.index("    void BuildModeration(Transform *parent)")]
+
+        # These are sibling graphics, not layout containers, so making the two
+        # work areas legible cannot move or resize their interactive children.
+        self.assertIn('"SaberStage Request List Border"', build)
+        self.assertIn('"SaberStage Request List Section"', build)
+        self.assertIn('"SaberStage Selected Map Border"', build)
+        self.assertIn('"SaberStage Selected Map Section"', build)
+        self.assertIn('Text(parent, "Request list"', build)
+        self.assertIn('Text(parent, "Selected map"', build)
+        self.assertIn("plate->set_raycastTarget(false)", source)
+        self.assertIn("MakeList(parent, -38.5F, -6.0F, 67, 58", build)
+
+    def test_song_request_buttons_dispatch_actions_and_disable_no_op_states(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        build = source[source.index("    void BuildRequests()"):
+                       source.index("    void BuildModeration(Transform *parent)")]
+        refresh = source[source.index("    void RefreshRequests()"):
+                         source.index("    bool MenuAvailable() const")]
+
+        # Keep references to every stateful request action. A blue native
+        # button must always represent an action that can currently succeed;
+        # otherwise a legitimate no-op looks like a missing callback.
+        for field, caption in (
+            ("openQueueButton", "Open queue"),
+            ("closeQueueButton", "Close queue"),
+            ("moveTopButton", "Move to top"),
+            ("allowlistButton", "Allowlist"),
+            ("blocklistButton", "Blocklist"),
+            ("cancelDownloadButton", "Cancel download"),
+        ):
+            self.assertIn(f'{field} = Button(parent, "{caption}"', build)
+            self.assertIn(f"{field}->set_interactable(", refresh)
+
+        self.assertIn("DispatchRequestAction(RequestAction::Open", build)
+        self.assertIn("DispatchRequestAction(RequestAction::Close", build)
+        self.assertIn("DispatchRequestAction(RequestAction::MoveTop", build)
+        self.assertIn("DispatchRequestAction(RequestAction::Allow", build)
+        self.assertIn("DispatchRequestAction(RequestAction::Block", build)
+        self.assertIn("requestTab == 0 ? RequestAction::Skip : RequestAction::Requeue", build)
+        self.assertIn("pending != snapshot.queue.pending.begin()", refresh)
+        self.assertIn("pending->state != broadcast::RequestState::Playing", refresh)
+        self.assertIn("cancelDownloadButton->set_interactable(download.Busy())", refresh)
+        self.assertIn("root.Settings().Get().chat.requests.enabled", refresh)
+        self.assertIn("Song request panel action was not queued", source)
+
+    def test_chat_message_field_is_visible_and_opens_keyboard_in_front(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        moderation = source[source.index("    void BuildModeration(Transform *parent)"):
+                            source.index("    void RefreshRequests()")]
+
+        self.assertIn('{0.0F, -36.0F, 0.0F}', moderation)
+        self.assertIn("inputColors.set_normalColor(inputIdle)", moderation)
+        self.assertIn("input->set_colors(inputColors)", moderation)
+        self.assertIn("target->set_color(inputIdle)", moderation)
+        self.assertNotIn("inputBackground", moderation)
+
+    def test_chat_stream_configuration_scales_the_complete_panel_and_reuses_twitch_oauth(self):
+        source = (ROOT / "src/ui/ChatControls.cpp").read_text(encoding="utf-8")
+        settings = (ROOT / "include/saberstage/settings/SettingsModel.hpp").read_text(encoding="utf-8")
+
+        self.assertIn("Page { Appearance, Filters, Requests, Commands, Cooldown, Moderation, Configuration }", source)
+        self.assertIn('Button(parent, "Stream configuration"', source)
+        self.assertIn('Slider(parent, "Control panel scale"', source)
+        self.assertIn("settings.controlsScale", source)
+        self.assertIn("void ApplyControlPanelScale(float requestedScale)", source)
+        self.assertIn("controls.screen->get_transform()->set_localScale", source)
+        self.assertIn("root.Twitch().BeginDeviceAuthorization(&error)", source)
+        self.assertIn("Application::OpenURL(snapshot.verificationUri)", source)
+        self.assertIn("float controlsScale = 1.0F", settings)
+
+    def test_chat_header_controls_scale_with_the_resizable_panel(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        layout = menu[menu.index("void MenuController::UpdateChatWorldPanelLayout()"):
+                      menu.index("void MenuController::RefreshChatWorldPanelScrollControls()")]
+        self.assertIn("std::sqrt((width * height)", layout)
+        self.assertIn("kChatPanelHeaderMinimumScale", layout)
+        self.assertIn("kChatPanelHeaderMaximumScale", layout)
+        self.assertIn("headerButtonWidth = 20.0F * headerScale", layout)
+        self.assertIn("NeutralizeContentSizeFitter(button)", layout)
+        self.assertIn("layout->set_preferredWidth(size.x)", layout)
+        self.assertIn("label->set_enableWordWrapping(false)", layout)
+        self.assertIn("labelRect->set_anchorMax({1.0F, 1.0F})", layout)
+        self.assertIn("3.0F * headerScale", layout)
+        self.assertIn("4.0F * headerScale", layout)
+        self.assertIn("height * 0.5F - headerHeight - 1.0F", layout)
 
     def test_chat_missing_pointer_does_not_abort_message_processing(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::EnsureStandinProxy(")]
+                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
         input_path = tick[tick.index('SetOperation("read current UI event system")'):
                           tick.index('SetOperation("assign native chat scroll hover state")')]
         self.assertIn("if (eventSystem)", input_path)
@@ -593,7 +734,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_chat_hover_wakes_native_scroll_without_button_selection(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::EnsureStandinProxy(")]
+                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
         hover = tick[tick.index('SetOperation("assign native chat scroll hover state")'):
                      tick.index("// The stock BSML scroll control")]
         # HMUI stops its Update when idle. A hover flag alone cannot restart it;
@@ -684,7 +825,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertEqual(fixture["camera"]["fovDegrees"], 92.0)
         self.assertEqual(fixture["camera"]["profileId"], "primary")
         self.assertIs(fixture["preview"]["visible"], False)
-        self.assertFalse(any(fixture[name]["enabled"] for name in ("companion", "avatar", "scenes", "broadcast", "chat")))
+        self.assertFalse(any(fixture[name]["enabled"] for name in ("companion", "scenes", "broadcast", "chat")))
 
     def test_left_camera_menu_uses_native_side_panel_controls_only(self):
         source = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -797,17 +938,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("activeBackend_ = settings::RecordingBackend::Hollywood", controller)
         self.assertIn("Direct encoder was unavailable; recording is continuing with Hollywood.", controller)
         self.assertIn("Capture stream finalization check", controller)
-
-    def test_avatar_picker_uses_absolute_headset_paths_without_filename_entry(self):
-        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        settings = (ROOT / "src/settings/SettingsModel.cpp").read_text(encoding="utf-8")
-        self.assertIn('"Choose Avatar File"', menu)
-        self.assertIn('"Shared Storage"', menu)
-        self.assertIn('"System Root"', menu)
-        self.assertIn("std::filesystem::directory_iterator", menu)
-        self.assertIn("selectedPath", menu)
-        self.assertNotIn("CreateStringSetting(container", menu)
-        self.assertIn("selected.is_absolute()", settings)
 
     def test_recording_buttons_have_explicit_native_layout_size(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -1003,33 +1133,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("static_assert(12.8F - kRecordingPanelAudioButtonSize.y * 0.5F > 8.0F)", menu)
         self.assertIn("static_assert(12.8F + kRecordingPanelAudioButtonSize.y * 0.5F < kRecordingPanelButtonBandHeight)", menu)
 
-    def test_avatar_is_mandatory_in_primary_camera_and_preview_uses_primary_output(self):
-        profile = (ROOT / "src/camera/CameraProfile.cpp").read_text(encoding="utf-8")
-        layers = (ROOT / "include/saberstage/camera/CameraProfile.hpp").read_text(encoding="utf-8")
-        preview = (ROOT / "src/preview/PreviewManager.cpp").read_text(encoding="utf-8")
-        runtime = (ROOT / "src/avatar/vrm/VrmUnityRuntime.cpp").read_text(encoding="utf-8")
-        self.assertIn("kAvatarLayerMask", layers)
-        self.assertIn("kUiLayerMask | kAvatarLayerMask", profile)
-        self.assertIn("OutputTexture(camera::kPrimaryCameraId)", preview)
-        self.assertGreaterEqual(runtime.count("set_layer(options_.avatarLayer)"), 2)
-
-    def test_avatar_runtime_has_menu_tracking_fallback_and_vrm_texture_st_order(self):
-        manager = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
-        runtime = (ROOT / "src/avatar/vrm/VrmUnityRuntime.cpp").read_text(encoding="utf-8")
-        self.assertIn("FindObjectsOfTypeAll<GlobalNamespace::VRController*>", manager)
-        self.assertIn("UnityEngine::Camera::get_main()", manager)
-        self.assertIn("SampleControllerPose", manager)
-        self.assertIn("tracking_->get_isActiveAndEnabled()", manager)
-        self.assertIn("mainCamera->get_transform().ptr() != headTransform_", manager)
-        self.assertIn("trackingSceneHandle_", manager)
-        self.assertIn("headTransform_->IsChildOf(directXrTrackingRoot_)", manager)
-        self.assertIn("RebasePlayerCalibration(player_, currentOrigin)", manager)
-        self.assertIn("!player_.valid || !trackingWasReady_", manager)
-        self.assertIn("!controller->get_poseValid()", manager)
-        self.assertIn("transformReference ? transformReference.ptr() : nullptr", manager)
-        self.assertIn("set_mainTextureOffset({transform->second.x, transform->second.y})", runtime)
-        self.assertIn("set_mainTextureScale({transform->second.z, transform->second.w})", runtime)
-
     def test_capture_losses_remain_session_scoped_and_stage_specific(self):
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         snapshot = controller.split("RecordingSnapshot RecordingController::Snapshot() const", 1)[1].split(
@@ -1078,6 +1181,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         guard = (ROOT / "src/camera/SpectatorRenderGuard.cpp").read_text(encoding="utf-8")
         self.assertIn("excludedLayersMask = 0", profile)
         self.assertIn("kStandardSpectatorLayersMask", profile)
+        self.assertIn("kExternalAvatarLayerMask", profile)
+        self.assertIn("kUiLayerMask | kExternalAvatarLayerMask", (
+            ROOT / "src/camera/CameraProfile.cpp"
+        ).read_text(encoding="utf-8"))
         self.assertIn("ResolveSpectatorCullingMask(profile, mainMask)", camera)
         self.assertIn("ResetWorldToCameraMatrix()", camera)
         self.assertIn("set_useOcclusionCulling(false)", camera)
@@ -1119,7 +1226,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         # The camera monitor must participate in Canvas UI ordering. A Geometry
         # queue pass renders before the panel's backdrop and is then hidden by
         # that backdrop even though the texture and multiview shader are valid.
-        preview_shader = (ROOT / "tools/avatar-shader/Assets/SaberStageVideoPreview.shader").read_text(
+        preview_shader = (ROOT / "tools/runtime-shaders/Assets/SaberStageVideoPreview.shader").read_text(
             encoding="utf-8"
         )
         self.assertIn('"Queue"="Transparent"', preview_shader)
@@ -1130,15 +1237,27 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("fixed4(tex2D(_MainTex, input.uv).rgb * _Color.rgb, 0.0)", preview_shader)
         self.assertNotIn("Blend SrcAlpha OneMinusSrcAlpha", preview_shader)
         self.assertNotIn('"Queue"="Geometry"', preview_shader)
-        non_bloom_shader = (ROOT / "tools/avatar-shader/Assets/SaberStageNonBloomUI.shader").read_text(
+        non_bloom_shader = (ROOT / "tools/runtime-shaders/Assets/SaberStageNonBloomUI.shader").read_text(
             encoding="utf-8"
         )
         self.assertIn('Shader "SaberStage/NonBloomUI"', non_bloom_shader)
         self.assertIn("Blend SrcAlpha OneMinusSrcAlpha, Zero Zero", non_bloom_shader)
         self.assertIn("STEREO_MULTIVIEW_ON", non_bloom_shader)
-        self.assertIn("saberstage-non-bloom-ui", (
-            ROOT / "tools/avatar-shader/Assets/Editor/BuildSaberStageAvatarShaders.cs"
-        ).read_text(encoding="utf-8"))
+        runtime_shader_builder = (
+            ROOT / "tools/runtime-shaders/Assets/Editor/BuildSaberStageRuntimeShaders.cs"
+        ).read_text(encoding="utf-8")
+        for required_address in (
+            "saberstage-video-preview",
+            "saberstage-non-bloom-ui",
+            "saberstage-chat-sprite",
+        ):
+            self.assertIn(required_address, runtime_shader_builder)
+        for removed_address in (
+            "saberstage-mtoon",
+            "saberstage-mtoon-outline",
+            "saberstage-grip-target",
+        ):
+            self.assertNotIn(removed_address, runtime_shader_builder)
         self.assertIn("EmbeddedNonBloomUiShader", preview)
         self.assertNotIn("YawDegrees(FromUnity(headRotation)) + 180.0F", preview)
         self.assertNotIn("GameObject::CreatePrimitive(UnityEngine::PrimitiveType::Quad)", preview)
@@ -1153,7 +1272,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("previewMaterial_->set_mainTexture(texture)", preview)
         self.assertIn("image->set_material(previewMaterial_.ptr())", preview)
         self.assertIn("kFirstPersonLayerMask", profile)
-        self.assertNotIn("(1 << 6) |  // first-person avatar", profile)
         self.assertIn("set_depth(1.0F)", camera)
         self.assertIn("ResetCullingMatrix", guard)
         self.assertIn("get_isInTransition()", guard)
@@ -1292,106 +1410,6 @@ class RepositoryInvariantTests(unittest.TestCase):
                        source.index("void ApplySettings()")]
         self.assertIn("auto reset = settings_.Get().preview;", reset)
 
-    def test_calibration_wizard_uses_bigscreen_panel_and_is_review_gated(self):
-        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        avatar = (ROOT / "src/avatar/AvatarManager.cpp").read_text(encoding="utf-8")
-        session = (ROOT / "src/avatar/calibration/PlayerCalibrationSession.cpp").read_text(encoding="utf-8")
-        self.assertIn('"SaberStage Player Calibration"', menu)
-        self.assertIn("HideAndFitCalibrationPanelHandleAboveControls", menu)
-        self.assertIn("calibrationPanelScreen_->set_HandleSide(BSML::Side::Top)", menu)
-        self.assertIn("calibrationPanelScreen_->set_HighlightHandle(false)", menu)
-        self.assertIn("a physics hit there wins over Unity's UI raycast", menu)
-        self.assertIn('"Recenter Panel",', menu)
-        self.assertIn('introductionActions->get_transform(), "Start Automatic"', menu)
-        self.assertIn('introductionActions->get_transform(), "Start Step-by-Step"', menu)
-        self.assertIn("WAITING FOR AVATAR TRACKING", menu)
-        self.assertIn("NATURAL READY POSE", menu)
-        self.assertIn("MOVE INTO THE POSE DURING THIS COUNTDOWN", menu)
-        self.assertIn("DO NOT MOVE DURING THIS COUNTDOWN", menu)
-        self.assertIn("MEASURING - HOLD STILL", menu)
-        self.assertIn("MEASURING - MOVE NOW", menu)
-        self.assertIn("calibrationPanelAutomaticStartButton_->set_interactable(trackingReady)", menu)
-        self.assertIn("calibrationPanelStepByStepStartButton_->set_interactable(trackingReady)", menu)
-        self.assertIn("IsPlayerCalibrationReady()", menu)
-        self.assertIn("Preparing only opens the explanatory calibration wizard", avatar)
-        self.assertIn('if (!bound_ || !trackingWasReady_) {\n            if (error) *error = "valid HMD/controller tracking is required to start calibration";', avatar)
-        self.assertIn('stepStartActions->get_transform(), "Start Step"', menu)
-        self.assertIn('continueActions->get_transform(), "Continue"', menu)
-        self.assertIn('reviewActions->get_transform(), "Complete"', menu)
-        self.assertIn(
-            'createActionContainer("SaberStage Calibration Review Actions", 2.0F)', menu)
-        self.assertIn("ConfigureCalibrationButton(reviewComplete, {30.0F, 7.0F})", menu)
-        self.assertIn("BSML::Lite::SetButtonTextSize(button, 3.4F)", menu)
-        self.assertIn("kCalibrationPanelScale", menu)
-        self.assertIn("ConfigureCalibrationPanelText", menu)
-        self.assertIn("const float contentWidth = kCalibrationPanelSize.x - 8.0F", menu)
-        self.assertIn("auto* rootLayout = BSML::Lite::CreateVerticalLayoutGroup(panelParent)", menu)
-        self.assertIn("NeutralizeContentSizeFitter(rootLayout)", menu)
-        self.assertIn("rootRect->set_sizeDelta(kCalibrationPanelSize)", menu)
-        self.assertIn("SaberStage \" VERSION \"  |  Build \" SABERSTAGE_BUILD_NUMBER", menu)
-        self.assertIn("calibrationPanelGeometryAuditFrames_ = 2", menu)
-        self.assertIn("LogCalibrationPanelGeometry()", menu)
-        self.assertIn("rootLayout->set_childControlWidth(true)", menu)
-        self.assertIn("ConfigureLayout(text, -1.0F, preferredHeight", menu)
-        self.assertNotIn('"SaberStage Calibration Content"', menu)
-        self.assertNotIn("curved->SetRadius(10000.0F)", menu)
-        self.assertNotIn("text->SetAllDirty()", menu)
-        self.assertIn("photographed single glyph and line-shaped button captions", menu)
-        self.assertNotIn("UpdateCalibrationPanelFollow", menu)
-        self.assertNotIn("kCalibrationPanelFollowSeconds", menu)
-        self.assertIn("horizontalHeadRotation", menu)
-        self.assertNotIn("headEuler.y + 180.0F", menu)
-        self.assertIn("transform->SetPositionAndRotation(targetPosition, targetRotation)", menu)
-        self.assertIn("PlayCalibrationClip(calibrationTickClip_)", avatar)
-        self.assertIn("PlayCalibrationClip(calibrationShutterClip_)", avatar)
-        self.assertIn("set_ignoreListenerPause(true)", avatar)
-        self.assertNotIn("PlayOneShot(calibration", avatar)
-        self.assertIn("status_.phase = CalibrationPhase::Review", session)
-        self.assertIn("status_.phase = CalibrationPhase::Introduction", session)
-        self.assertIn("status_.phase = CalibrationPhase::AwaitingStepStart", session)
-        self.assertIn("status_.phase = CalibrationPhase::AwaitingContinue", session)
-        self.assertIn("bool PlayerCalibrationSession::Complete", session)
-        self.assertLess(
-            session.index("bool PlayerCalibrationSession::Complete"),
-            session.index("SavePlayerCalibrationProfile(profilePath_, profile_"),
-        )
-
-    def test_avatar_setup_is_one_click_calibration_gated_and_task_grouped(self):
-        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        application = (ROOT / "src/app/ApplicationRoot.cpp").read_text(encoding="utf-8")
-        self.assertIn(
-            'std::array<std::string_view, 4> tabNames{"Setup", "Display", "Quality", "Fit"}',
-            menu,
-        )
-        for control in (
-            '"Enable Avatar"',
-            '"Basic Calibration"',
-            '"Advanced Calibration"',
-            '"Reset Profile Calibration"',
-            '"Choose Avatar File"',
-            '"Load Avatar"',
-            '"Unload Avatar"',
-            '"Bind Tracking"',
-            '"Reset Avatar Pose"',
-            '"Clear Avatar Data"',
-        ):
-            self.assertIn(control, menu)
-        self.assertIn("LoadSelectedAvatar(false, &error)", menu)
-        self.assertIn("LoadVrmAvatar(\n            path,", menu)
-        self.assertIn("root_.Avatar().ApplyAvatarSettings(avatarSettings)", menu)
-        self.assertIn("root_.Avatar().RecalibrateNeutral()", menu)
-        self.assertIn("Calibration staging only; avatar hidden", menu)
-        self.assertIn("if (!avatar_->PlayerProfile().valid)", application)
-        self.assertIn("CreateCenterThreeColumnRow(container->get_transform())", menu)
-        self.assertIn('setupQuickActions,\n        "",', menu)
-        self.assertIn('CreateCenterPanelSubheader(container->get_transform(), "Avatar Controls")', menu)
-        self.assertIn("constexpr float kCenterThreeColumnRowWidth = 116.0F;", menu)
-        self.assertIn("constexpr float kCenterThreeColumnWidth = 38.0F;", menu)
-        self.assertNotIn("Choose a player profile and avatar once.", menu)
-        self.assertNotIn('CreateCenterPanelSubheader(container->get_transform(), "Tracking Recovery")', menu)
-        self.assertNotIn("To change avatars: 1) Choose Avatar File", menu)
-        self.assertNotIn('CreateUIButton(loadActions, "Attach Tracking"', menu)
-
     def test_recording_side_panel_overrides_center_panel_prefab_widths(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         self.assertIn("layout->set_preferredWidth(kRightPanelRowWidth)", menu)
@@ -1478,7 +1496,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_livestream_action_groups_fit_inside_service_content_edges(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         fit = menu.split("void FitLivestreamActionRow(", 1)[1]
-        fit = fit.split("void ConfigureCalibrationPanelText", 1)[0]
+        fit = fit.split("std::string Lower", 1)[0]
         self.assertIn("std::lround(leftInset)", fit)
         self.assertIn("std::lround(rightInset)", fit)
         self.assertIn("rowWidth - leftPadding - rightPadding", fit)
@@ -1646,11 +1664,10 @@ class RepositoryInvariantTests(unittest.TestCase):
             ROOT / "src": ("*.c", "*.cpp", "*.h", "*.hpp"),
             ROOT / "scripts": ("*.ps1", "*.sh", "*.py"),
             ROOT / "tests": ("*.c", "*.cpp", "*.h", "*.hpp", "*.py"),
-            # Unity writes third-party packages under tools/avatar-shader/Library
+            # Unity writes third-party packages under tools/runtime-shaders/Library
             # during a shader build. Restrict tooling checks to the two authored
             # source trees so a local build cache can never become license input.
-            ROOT / "tools" / "avatar-shader" / "Assets": ("*.cs", "*.shader"),
-            ROOT / "tools" / "pc-pose-analyzer": ("*.cs", "*.ps1"),
+            ROOT / "tools" / "runtime-shaders" / "Assets": ("*.cs", "*.shader"),
         }
         generated_directory_names = {
             "Library", "Temp", "Logs", "obj", "bin", "build", "build-host",

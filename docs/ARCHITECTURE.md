@@ -4,11 +4,11 @@ Status: camera/editor/preview baseline plus an unvalidated Stage 1 Hollywood rec
 
 ## Product boundary and delivery stages
 
-SaberStage is one clean-room Quest-native product: a Camera2-familiar third-person camera and integrated avatar presentation system with recording and broadcast outputs. Beat Saber remains native on Quest; the optional companion is a receiver, recorder, and OBS handoff, not PCVR.
+SaberStage is one clean-room Quest-native product: a Camera2-familiar third-person camera with recording and broadcast outputs. Beat Saber remains native on Quest; the optional companion is a receiver, recorder, and OBS handoff, not PCVR.
 
 1. **Stage 1:** one independently rendered camera, movable HMD-only preview, synchronized local recording, and Quest 2 hardening.
 2. **Stage 2:** one versioned Wi-Fi/USB protocol, Avalonia viewing/recording, receiver/TV experiments, and OBS handoff.
-3. **Stage 3:** the integrated avatar, compositor/scenes, direct livestreaming, chat, and only Discord features supported by public APIs.
+3. **Stage 3:** compositor/scenes, direct livestreaming, chat, and only Discord features supported by public APIs.
 
 Later sections get stable service and configuration boundaries now, but no nonfunctional controls appear in the UI.
 
@@ -21,7 +21,6 @@ ApplicationRoot (created once from late_load; game-thread owned)
 |-- CameraManager
 |   `-- CameraInstance[id] -> CameraProfile + CameraRig + MotionPipeline
 |-- PreviewPanelController
-|-- AvatarManager (Stage 3)
 |-- BroadcastCompositor
 |-- CaptureController
 |   `-- CaptureSession
@@ -81,7 +80,7 @@ The clean-room Camera2 compatibility reader accepts the documented public keyfra
 
 ## Preview
 
-The preview has its own semantic placement, scale, visibility, camera ID, and reset-to-visible action. Both the docked editor surface and the persistent world-space surface use the same native UI `RawImage` path, the same alpha-independent preview material, and the same spectator texture assignment. Keeping the two consumers on one proven rendering path avoids the Quest-only blank popout failure caused by the earlier standalone `MeshRenderer` quad. Both monitors are excluded from broadcast output: the docked/floor surface through its existing exclusion, and the movable popout through the same `CanvasGroup` alpha path plus a `RawImage` cull snapshot. (The popout was temporarily left camera-visible as a recursion diagnostic; that state put an infinite picture-in-picture feed into recordings and is no longer used.) Each monitor owns its own opaque preview material instance, and both prefer the embedded `SaberStage/VideoPreview` shader from the avatar shader bundle: it forces opaque output (the camera texture's alpha is bloom weight, not opacity) and — decisively — carries guaranteed `STEREO_MULTIVIEW_ON` variants. A stock shader located with `Shader.Find` can silently lack its multiview variants in Beat Saber's build and then binds without error while rasterizing nothing in the headset, even though the mono spectator camera still sees it; this is the mechanism behind every earlier "popout blank in HMD while the floor works" attempt, including the original standalone quad. (Lesson imported from the author's Big Screen mod.) The embedded pass remains in the Transparent UI queue with depth writes disabled: its output alpha is still forced to one, but Canvas sibling order must draw the live image after the dark panel backdrop instead of letting that backdrop cover it. `FloatingScreen` presents its UI face along local negative Z, so panels spawned in front of the HMD use the viewer's yaw rather than adding 180 degrees. `Unlit/Texture` remains only as a fallback when the bundle asset is missing. Hiding the panel releases its demand; if capture also is idle, no spectator render is scheduled. Grabbing the camera may temporarily enlarge the preview, matching the useful Camera2 workflow without copying implementation.
+The preview has its own semantic placement, scale, visibility, camera ID, and reset-to-visible action. Both the docked editor surface and the persistent world-space surface use the same native UI `RawImage` path, the same alpha-independent preview material, and the same spectator texture assignment. Keeping the two consumers on one proven rendering path avoids the Quest-only blank popout failure caused by the earlier standalone `MeshRenderer` quad. Both monitors are excluded from broadcast output: the docked/floor surface through its existing exclusion, and the movable popout through the same `CanvasGroup` alpha path plus a `RawImage` cull snapshot. (The popout was temporarily left camera-visible as a recursion diagnostic; that state put an infinite picture-in-picture feed into recordings and is no longer used.) Each monitor owns its own preview material instance, and both prefer the embedded `SaberStage/VideoPreview` shader from the runtime shader bundle. The shader ignores the camera texture's bloom-weight alpha and carries guaranteed `STEREO_MULTIVIEW_ON` variants. A stock shader located with `Shader.Find` can silently lack its multiview variants in Beat Saber's build and then binds without error while rasterizing nothing in the headset, even though the mono spectator camera still sees it; this is the mechanism behind every earlier "popout blank in HMD while the floor works" attempt, including the original standalone quad. (Lesson imported from the author's Big Screen mod.) The embedded pass remains in the Transparent UI queue with depth writes disabled, and Canvas sibling order draws the live image after the dark panel backdrop instead of letting that backdrop cover it. `FloatingScreen` presents its UI face along local negative Z, so panels spawned in front of the HMD use the viewer's yaw rather than adding 180 degrees. `Unlit/Texture` remains only as a fallback when the bundle asset is missing. Hiding the panel releases its demand; if capture also is idle, no spectator render is scheduled. Grabbing the camera may temporarily enlarge the preview, matching the useful Camera2 workflow without copying implementation.
 
 ## Capture architecture
 
@@ -135,7 +134,7 @@ in addition to its runtime catches.
 
 ## Failure containment and rejected alternatives
 
-- Reject copying or porting existing camera/recording/avatar code; public projects are behavior and feasibility references only.
+- Reject copying or porting existing camera or recording code; public projects are behavior and feasibility references only.
 - Reject Meta MRC as the core: it needs external tooling, is not the desired local recorder, and does not provide the required unified packet fan-out.
 - Hollywood is an accepted Stage 1 dependency for local H.264/audio capture and FFmpeg MP4 finalization. Do not mistake that adapter for the later timestamped packet fan-out required by streaming.
 - Reject CPU readback/software H.264 as a production fallback.

@@ -14,7 +14,7 @@
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include "saberstage/Logging.hpp"
-#include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
+#include "saberstage/rendering/ShaderResources.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/preview/PreviewRuntimeDriver.hpp"
@@ -518,7 +518,7 @@ private:
             // Do not clear or directly cull CanvasRenderer geometry. A newly
             // created world-space Canvas can legitimately report itself culled
             // before its first rebuild; restoring that value every spectator
-            // frame permanently stranded the popup preview and calibration UI
+            // frame permanently stranded the popup preview and other world UI
             // in a blank/partially-built state on Quest. CanvasGroup alpha is
             // the same non-destructive path used for transient Beat Saber UI:
             // the HMD has already rendered, the spectator sees alpha zero, and
@@ -630,7 +630,7 @@ private:
         // headset while the mono spectator camera still sees it — the exact
         // "popout invisible in HMD but floor works" failure. (Lesson imported
         // from the author's Big Screen mod, which hit the same stripping.)
-        auto* embedded = avatar::vrm::EmbeddedVideoPreviewShader();
+        auto* embedded = rendering::EmbeddedVideoPreviewShader();
         UnityEngine::Shader* shader = embedded;
         if (!IsAlive(shader)) shader = UnityEngine::Shader::Find("Unlit/Texture");
         if (!IsAlive(shader)) {
@@ -693,7 +693,7 @@ private:
 
     bool EnsureFloatingBorderMaterial() {
         if (floatingBorderMaterial_) return true;
-        auto* shader = avatar::vrm::EmbeddedNonBloomUiShader();
+        auto* shader = rendering::EmbeddedNonBloomUiShader();
         if (!IsAlive(shader)) {
             Logging::Logger.warn(
                 "Camera preview border is using the stock UI material because the embedded non-bloom shader is unavailable");

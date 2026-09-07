@@ -24,26 +24,28 @@ inline constexpr std::string_view kPrimaryCameraId = "primary";
 inline constexpr std::int32_t kUiLayerMask = 1 << 5;
 // Beat Saber's first-person-only layer: the HMD renders it, and
 // ResolveSpectatorCullingMask always excludes it from the third-person
-// camera. SaberStage uses it for HMD-only world objects (grab handles, a
-// headset-only display clone).
+// camera. SaberStage uses it for HMD-only world objects such as grab handles.
 inline constexpr std::int32_t kFirstPersonLayer = 6;
 inline constexpr std::int32_t kFirstPersonLayerMask = 1 << kFirstPersonLayer;
-inline constexpr std::int32_t kAvatarLayer = 3;
-inline constexpr std::int32_t kAvatarLayerMask = 1 << kAvatarLayer;
-// Layer 0 (Default) is rendered by the HMD and inherited into the spectator
-// mask, so it is the "visible in both views" home for worn avatar geometry
-// and for the display clone's default visibility.
-inline constexpr std::int32_t kBothViewsLayer = 0;
+
+// Qavatars and other Camera2-compatible avatar mods place the complete
+// third-person avatar on Unity layer 3 while the headset sees a separate
+// first-person copy on layer 6. This is an external camera compatibility
+// contract, not part of SaberStage's removed built-in avatar runtime. Keep it
+// explicit so removing internal avatar code cannot accidentally remove the
+// avatar supplied by another mod from previews, recordings, or streams.
+inline constexpr std::int32_t kExternalAvatarLayer = 3;
+inline constexpr std::int32_t kExternalAvatarLayerMask = 1 << kExternalAvatarLayer;
 
 // Beat Saber uses dedicated layers for objects that a headset camera may
 // intentionally omit but a Camera2-style spectator view normally shows.
 inline constexpr std::int32_t kStandardSpectatorLayersMask =
-    kAvatarLayerMask | // SaberStage/third-person avatar
+    kExternalAvatarLayerMask |
     (1 << 4) |  // floor
     kUiLayerMask |
     (1 << 8) |  // notes
     (1 << 9) |  // debris
-    (1 << 10) | // avatar
+    (1 << 10) | // player models
     (1 << 11) | // walls
     (1 << 12) | // sabers
     (1 << 16) | // cut particles
@@ -66,7 +68,6 @@ enum class SubjectAnchor {
     PlayerRoot,
     Head,
     Waist,
-    Avatar,
     FullBody,
 };
 

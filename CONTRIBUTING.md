@@ -56,7 +56,7 @@ grant above is a separate condition of intentional submission.
 - Use bounded queues and joinable owned workers. Never make gameplay wait for
   file, network, codec-drain, or mux work.
 - Preserve atomic settings and media promotion. Do not delete user recordings,
-  avatars, movement scripts, or other user-owned files.
+  movement scripts or other user-owned files.
 - Do not weaken source-deployment receipts, QMOD validation, secret redaction,
   TLS verification, archive validation, or native dependency checks.
 

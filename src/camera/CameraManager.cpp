@@ -716,8 +716,8 @@ private:
         if (profile.referenceFrame == ReferenceFrame::WorldRelative) return {};
         if (profile.followMode == FollowMode::Static) return staticAnchor_;
         if (profile.followMode == FollowMode::Head || profile.subjectAnchor == SubjectAnchor::Head) return headPose;
-        // Waist/avatar/full-body anchors intentionally fall back to the stable
-        // player-root contract until their providers exist in the avatar stage.
+        // Waist/full-body anchors intentionally fall back to the stable
+        // player-root contract until a generic tracking provider supplies them.
         auto playerAnchor = CurrentPlayerAnchor(headPose);
         playerAnchor.rotation = FromEulerDegrees({0.0F, forwardYawDegrees_, 0.0F});
         return playerAnchor;

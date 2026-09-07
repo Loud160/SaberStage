@@ -17,7 +17,7 @@ Run this checklist only after the complete host/build/package gate passes. The g
 4. The left mod menu contains exactly one `SaberStage` entry.
 5. Opening SaberStage matches Camera2's topology: a `Cameras` panel on the left containing `Primary`, and `SaberStage | Primary` selected-camera settings in the center with Beat Saber's normal Back button. The bottom and right screens remain unused in Prompt 2.
 6. The complete eight-line description is visible without horizontal/vertical clipping or overlap with either reset button.
-7. The center settings page exposes exactly `Reset general settings` and `Factory reset SaberStage`; the left panel exposes no premature camera actions, and no preview, recording, companion, avatar, scene, broadcast, chat, or Discord controls appear.
+7. The center settings page exposes exactly `Reset general settings` and `Factory reset SaberStage`; the left panel exposes no premature camera actions, and no preview, recording, companion, scene, broadcast, chat, or Discord controls appear.
 
 ## Reset proof in the same launch
 

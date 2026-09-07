@@ -1275,11 +1275,27 @@ void TwitchService::SetChatEnabled(bool enabled) noexcept {
 void TwitchService::RetryChatConnections() {
     // Explicit chat-only retry. It neither stops the stream nor discards the
     // request queue, and permits retry while requests keep IRC enabled.
-    chatStop_ = true; restartChatAfterCredentialUpdate_ = true;
-    chatAuthenticationRejected_ = false; chatRetryAttempts_ = 0; nextChatRetry_ = {};
+    chatStop_.store(true, std::memory_order_release);
+    restartChatAfterCredentialUpdate_ = true;
+    chatRetryBlocked_.store(false, std::memory_order_release);
+    chatAuthenticationRejected_.store(false, std::memory_order_release);
+    chatRetryAttempts_ = 0;
+    nextChatRetry_ = {};
+    chatHealthySince_ = {};
+    nextViewerCountAtUnixSeconds_ = 0;
     assets_.Configure({}, {}, {}, false);
     notices_->Configure({}, {}, {}, false, false);
-    Logging::Logger.info("User requested Twitch chat/assets/notices reconnect");
+    {
+        std::lock_guard lock(mutex_);
+        snapshot_.status = chatRequested_.load(std::memory_order_acquire)
+                               ? "Restarting Twitch chat connections..."
+                               : "Reconnect requested. Enable the chat panel or song requests to start chat.";
+        snapshot_.noticeStatus.clear();
+        snapshot_.viewerCountKnown = false;
+    }
+    Logging::Logger.info(
+        "User requested Twitch chat/assets/notices reconnect chatRequested={} workerActive={}",
+        chatRequested_.load(std::memory_order_acquire), chatWorker_.joinable());
 }
 
 void TwitchService::StartChatIfReady() noexcept {

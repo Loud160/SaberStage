@@ -4,7 +4,7 @@
 
 This focused pass started from `Avatar-Framework` commit
 `c8f785092cab8e3c27b8bbefd7bf23921b1cfe98`. It did not redesign SaberStage's
-camera, avatar, recording, streaming, or menu behavior. It replaced the mod's
+camera, recording, streaming, or menu behavior. It replaced the mod's
 direct Paper2 logging path, contained confirmed native failure boundaries,
 removed repeated settings-file work from continuous sliders, and brought the
 repository's public engineering documentation in line with the current system.
@@ -56,16 +56,16 @@ revision rather than copied into SaberStage.
   releases or escapes its `noexcept` destructor path.
 - Menu destruction clears the globally discoverable controller before Unity
   objects are released, removes callbacks independently, and guards each
-  floating-panel/calibration/preview cleanup.
-- Avatar and recording shutdown now preserve the exact failure context and
-  execute their binding cleanup even when an earlier release fails.
+  floating-panel and preview cleanup.
+- Recording shutdown now preserves the exact failure context and executes its
+  cleanup even when an earlier release fails.
 - Completed Twitch workers are reaped through a named non-throwing boundary so
   one platform join error is recorded instead of silently terminating from a
   `noexcept` tick or shutdown path.
 
 ### Main-thread responsiveness
 
-- Camera, avatar-fit/posture/quality, clone-scale, and live audio-volume sliders
+- Camera and live audio-volume sliders
   still update their runtime state immediately.
 - Their JSON encoding, flush, backup rename, and atomic replacement are now
   coalesced behind a 300 ms main-thread timer. A temporary write failure retries
@@ -92,9 +92,6 @@ revision rather than copied into SaberStage.
   creation in one menu action. Correctly moving this requires a two-phase
   worker-data/main-thread-texture design; wrapping the current Unity-coupled
   method in a thread would be unsafe and was not attempted in this focused pass.
-- VRM parsing/import remains user-triggered and can be expensive for complex
-  assets. It is part of the still-evolving avatar workflow and needs a separate
-  measured import pipeline review rather than speculative thread movement.
 - This pass cannot catch native memory corruption, faults before Android loads
   `libsaberstage.so`, or failures inside another mod. Package/ELF validation and
   dependency support logs are the available boundaries for those cases.

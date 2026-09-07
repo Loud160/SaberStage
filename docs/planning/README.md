@@ -1,6 +1,6 @@
 # SaberStage Planning Prompt Set
 
-These files describe **SaberStage**, a clean-room native Quest Beat Saber camera, avatar, recording, and broadcast system with a cross-platform desktop companion.
+These files describe **SaberStage**, a clean-room native Quest Beat Saber camera, recording, and broadcast system with a cross-platform desktop companion.
 
 Use the files in one long-running Codex conversation, in order. Treat each prompt as a gated phase: complete, test, review, and explicitly approve it before continuing.
 
@@ -37,20 +37,18 @@ The first working release is not complete until users can position the camera, p
 
 The companion receives native Quest gameplay. It does not run Beat Saber, require PCVR, or depend on Meta's Windows software.
 
-### Avatar and full broadcast production
+### Full broadcast production
 
-15. Integrated SaberStage avatar system
-16. Lightweight Quest-native broadcast compositor and scenes
-17. Direct Quest livestreaming
-18. In-game Twitch/YouTube chat panel
-19. Discord feasibility study
-20. Production Discord integration only for capabilities proven supported
-21. Full-system Quest 2 performance and beta hardening
+15. Lightweight Quest-native broadcast compositor and scenes
+16. Direct Quest livestreaming
+17. In-game Twitch/YouTube chat panel
+18. Discord feasibility study
+19. Production Discord integration only for capabilities proven supported
+20. Full-system Quest 2 performance and beta hardening
 
 ## Product principles
 
 - Match Camera2's familiar user-visible behavior, concepts, and workflow where practical without copying its implementation.
-- Treat the avatar as an integrated SaberStage capability, not a general-purpose standalone mod.
 - Quest 2 is the baseline.
 - Use GPU-native hardware encoding.
 - Never use unbounded queues.
@@ -62,5 +60,5 @@ The companion receives native Quest gameplay. It does not run Beat Saber, requir
 - TV output uses the selected SaberStage view rather than the HMD mirror when technically possible.
 - Chat belongs in an HMD-only panel by default.
 - Discord integration uses supported/public mechanisms only; never patch or modify Discord.
-- Camera, avatar, preview, output, and broadcast configuration should be set once and restore automatically.
+- Camera, preview, output, and broadcast configuration should be set once and restore automatically.
 - Design the menu and settings architecture for the complete product from the start without exposing fake or nonfunctional controls.

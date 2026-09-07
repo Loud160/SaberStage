@@ -2,7 +2,7 @@
 
 Treat the camera, movable preview, game audio, local recorder, and recording controls as one complete Quest-only product stage.
 
-Do not begin companion, TV, avatar, compositor, livestream, chat, or Discord implementation in this phase.
+Do not begin companion, TV, compositor, livestream, chat, or Discord implementation in this phase.
 
 ## Required user outcome
 

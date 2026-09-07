@@ -9,7 +9,7 @@ Potential goals:
 1. Discord status/presence.
 2. Discord text/message integration where officially supported.
 3. Display selected Discord messages in the existing HMD chat panel where permitted.
-4. Use the selected SaberStage camera/scene, including the integrated avatar when enabled, as the video source for Discord livestreaming **if a supported/current mechanism exists**.
+4. Use the selected SaberStage camera/scene as the video source for Discord livestreaming **if a supported/current mechanism exists**.
 
 Do not assume all four are possible.
 

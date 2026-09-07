@@ -14,19 +14,11 @@
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 
 #include <algorithm>
-#include <array>
-#include <cctype>
 #include <cmath>
-#include <filesystem>
 #include <utility>
 
 namespace saberstage::settings {
 namespace {
-
-constexpr std::array<std::string_view, 5> kAvatarPlayerProfileIds{
-    "default", "player-2", "player-3", "player-4", "player-5"};
-constexpr std::array<std::string_view, 5> kAvatarPlayerProfileNames{
-    "Profile 1", "Profile 2", "Profile 3", "Profile 4", "Profile 5"};
 
 template <typename T>
 void RepairEnum(T& value, T first, T last, T fallback, ValidationResult& result) {
@@ -124,114 +116,6 @@ bool IsValidStreamKey(std::string_view value) noexcept {
     return std::none_of(value.begin(), value.end(), [](unsigned char character) {
         return character <= 0x20 || character == 0x7F;
     });
-}
-
-std::string AvatarRetargetingKey(const AvatarSettings& settings) {
-    if (!settings.selectedPath.empty()) {
-        return std::filesystem::path(settings.selectedPath).lexically_normal().generic_string();
-    }
-    return settings.selectedFile;
-}
-
-AvatarRetargetingSettings RetargetingForSelectedAvatar(const AvatarSettings& settings) {
-    const auto key = AvatarRetargetingKey(settings);
-    for (const auto& profile : settings.retargetingProfiles) {
-        if (profile.avatarKey == key) return profile;
-    }
-    AvatarRetargetingSettings result{};
-    result.avatarKey = key;
-    result.gripOffsetsInitialized = true;
-    result.leftControllerToWrist = settings.leftControllerToWrist;
-    result.rightControllerToWrist = settings.rightControllerToWrist;
-    return result;
-}
-
-AvatarRetargetingSettings& EditRetargetingForSelectedAvatar(AvatarSettings& settings) {
-    const auto key = AvatarRetargetingKey(settings);
-    for (auto& profile : settings.retargetingProfiles) {
-        if (profile.avatarKey == key) return profile;
-    }
-    AvatarRetargetingSettings created{};
-    created.avatarKey = key;
-    created.gripOffsetsInitialized = true;
-    created.leftControllerToWrist = settings.leftControllerToWrist;
-    created.rightControllerToWrist = settings.rightControllerToWrist;
-    settings.retargetingProfiles.push_back(std::move(created));
-    return settings.retargetingProfiles.back();
-}
-
-void SyncActiveAvatarPlayerProfile(SettingsDocument& settings) {
-    const auto iterator = std::find_if(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
-    if (iterator != settings.avatarPlayerProfiles.end()) {
-        iterator->avatar = settings.avatar;
-        return;
-    }
-
-    AvatarPlayerProfile profile{};
-    profile.id = settings.activeAvatarPlayerProfileId.empty()
-        ? "default"
-        : settings.activeAvatarPlayerProfileId;
-    profile.displayName = profile.id == "default" ? "Default" : "Player";
-    profile.avatar = settings.avatar;
-    settings.activeAvatarPlayerProfileId = profile.id;
-    settings.avatarPlayerProfiles.push_back(std::move(profile));
-}
-
-bool SwitchAvatarPlayerProfile(SettingsDocument& settings, std::string_view profileId) {
-    const auto target = std::find_if(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == profileId; });
-    if (target == settings.avatarPlayerProfiles.end()) return false;
-
-    SyncActiveAvatarPlayerProfile(settings);
-    // Sync may append and reallocate, so resolve the target again before
-    // copying its Avatar-only settings into the active working view.
-    const auto resolved = std::find_if(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == profileId; });
-    if (resolved == settings.avatarPlayerProfiles.end()) return false;
-    settings.activeAvatarPlayerProfileId = resolved->id;
-    settings.avatar = resolved->avatar;
-    return true;
-}
-
-AvatarPlayerProfile& CreateAvatarPlayerProfile(SettingsDocument& settings) {
-    SyncActiveAvatarPlayerProfile(settings);
-    std::uint32_t suffix = 2;
-    std::string id;
-    do {
-        id = "player-" + std::to_string(suffix++);
-    } while (std::any_of(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == id; }));
-
-    AvatarPlayerProfile profile{};
-    profile.id = id;
-    profile.displayName = "Player " + id.substr(7);
-    profile.avatar = AvatarSettings{};
-    settings.avatarPlayerProfiles.push_back(std::move(profile));
-    settings.activeAvatarPlayerProfileId = id;
-    settings.avatar = settings.avatarPlayerProfiles.back().avatar;
-    return settings.avatarPlayerProfiles.back();
-}
-
-bool DeleteActiveAvatarPlayerProfile(SettingsDocument& settings) {
-    if (settings.avatarPlayerProfiles.size() <= 1) return false;
-    const auto active = std::find_if(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
-    if (active == settings.avatarPlayerProfiles.end()) return false;
-    settings.avatarPlayerProfiles.erase(active);
-    settings.activeAvatarPlayerProfileId = settings.avatarPlayerProfiles.front().id;
-    settings.avatar = settings.avatarPlayerProfiles.front().avatar;
-    return true;
 }
 
 ValidationResult ValidateAndRepair(SettingsDocument& settings) {
@@ -377,211 +261,6 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
             ++result.repairedFields;
         }
     }
-    if (settings.avatar.selectedFile.empty() || settings.avatar.selectedFile.size() > 128 ||
-        settings.avatar.selectedFile.find('/') != std::string::npos ||
-        settings.avatar.selectedFile.find('\\') != std::string::npos ||
-        settings.avatar.selectedFile.find("..") != std::string::npos ||
-        !settings.avatar.selectedFile.ends_with(".vrm")) {
-        settings.avatar.selectedFile = defaults.avatar.selectedFile;
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    if (!settings.avatar.selectedPath.empty()) {
-        const std::filesystem::path selected(settings.avatar.selectedPath);
-        auto extension = selected.extension().string();
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char value) {
-            return static_cast<char>(std::tolower(value));
-        });
-        if (settings.avatar.selectedPath.size() > 1024 || !selected.is_absolute() ||
-            extension != ".vrm" || settings.avatar.selectedPath.find('\0') != std::string::npos) {
-            settings.avatar.selectedPath.clear();
-            result.changed = true;
-            ++result.repairedFields;
-        } else {
-            const auto normalized = selected.lexically_normal().string();
-            if (normalized != settings.avatar.selectedPath) {
-                settings.avatar.selectedPath = normalized;
-                result.changed = true;
-                ++result.repairedFields;
-            }
-        }
-    }
-    RepairRange(settings.avatar.maximumTextureDimension, 256, 4096,
-                defaults.avatar.maximumTextureDimension, result);
-    RepairEnum(settings.avatar.qualityPreset, AvatarQualityPreset::Performance,
-               AvatarQualityPreset::Custom, defaults.avatar.qualityPreset, result);
-    RepairEnum(settings.avatar.outlines, AvatarOutlineMode::Off,
-               AvatarOutlineMode::Full, defaults.avatar.outlines, result);
-    RepairEnum(settings.avatar.cutoutSmoothing, AvatarCutoutSmoothing::Off,
-               AvatarCutoutSmoothing::High, defaults.avatar.cutoutSmoothing, result);
-    RepairEnum(settings.avatar.materialStage, AvatarMaterialStage::Configured,
-               AvatarMaterialStage::Outlines, defaults.avatar.materialStage, result);
-    RepairEnum(settings.avatar.lightingMode, AvatarLightingMode::Environment,
-               AvatarLightingMode::Studio, defaults.avatar.lightingMode, result);
-    RepairEnum(settings.avatar.springBoneQuality, SpringBoneQuality::Off,
-               SpringBoneQuality::Custom, defaults.avatar.springBoneQuality, result);
-    RepairEnum(settings.avatar.springCollisions, SpringCollisionQuality::Off,
-               SpringCollisionQuality::Full, defaults.avatar.springCollisions, result);
-    RepairEnum(settings.avatar.standinVisibility, AvatarStandinVisibility::Both,
-               AvatarStandinVisibility::HeadsetOnly, defaults.avatar.standinVisibility, result);
-    RepairRange(settings.avatar.standinScale, 0.25F, 3.0F,
-                defaults.avatar.standinScale, result);
-    RepairRange(settings.avatar.standinCount, 1, 3,
-                defaults.avatar.standinCount, result);
-    RepairRange(settings.avatar.springUpdateRateHz, 12, 90,
-                defaults.avatar.springUpdateRateHz, result);
-    RepairRange(settings.avatar.springSubsteps, 1, 4,
-                defaults.avatar.springSubsteps, result);
-    RepairRange(settings.avatar.maximumSpringChains, 1, 256,
-                defaults.avatar.maximumSpringChains, result);
-    RepairRange(settings.avatar.maximumSpringJoints, 1, 1024,
-                defaults.avatar.maximumSpringJoints, result);
-    RepairFloat(settings.avatar.sideStepLeanLimitPercent, 40.0F, 100.0F,
-                defaults.avatar.sideStepLeanLimitPercent, result);
-    RepairFloat(settings.avatar.plantedLegLeanLimitPercent, 20.0F, 100.0F,
-                defaults.avatar.plantedLegLeanLimitPercent, result);
-    RepairFloat(settings.avatar.stanceWidthPercent, 75.0F, 400.0F,
-                defaults.avatar.stanceWidthPercent, result);
-    RepairFloat(settings.avatar.backwardSpineCurveLimitPercent, 0.0F, 100.0F,
-                defaults.avatar.backwardSpineCurveLimitPercent, result);
-    if (settings.avatar.retargetingProfiles.size() > 64) {
-        settings.avatar.retargetingProfiles.resize(64);
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    std::vector<AvatarRetargetingSettings> repairedRetargeting;
-    repairedRetargeting.reserve(settings.avatar.retargetingProfiles.size());
-    for (auto profile : settings.avatar.retargetingProfiles) {
-        if (profile.avatarKey.empty() || profile.avatarKey.size() > 1024 ||
-            profile.avatarKey.find('\0') != std::string::npos) {
-            result.changed = true;
-            ++result.repairedFields;
-            continue;
-        }
-        if (!std::isfinite(profile.heightAdjustmentBalance) ||
-            profile.heightAdjustmentBalance < -1.0F ||
-            profile.heightAdjustmentBalance > 1.0F) {
-            profile.heightAdjustmentBalance = 0.0F;
-            result.changed = true;
-            ++result.repairedFields;
-        }
-        RepairFloat(profile.manualAvatarScalePercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.torsoWidthPercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.shoulderWidthPercent, 50.0F, 300.0F, 100.0F, result);
-        RepairFloat(profile.waistHipWidthPercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.lowerTorsoWidthPercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.neckBaseWidthPercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.headSizePercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.torsoHeightPercent, 50.0F, 150.0F, 100.0F, result);
-        RepairFloat(profile.upperLegLengthPercent, 50.0F, 150.0F, 100.0F, result);
-        RepairFloat(profile.lowerLegLengthPercent, 50.0F, 150.0F, 100.0F, result);
-        RepairFloat(profile.legWidthPercent, 50.0F, 200.0F, 100.0F, result);
-        RepairFloat(profile.neutralKneeBendDegrees, 0.0F, 20.0F, 0.0F, result);
-        RepairFloat(profile.attackPoseDegrees, -20.0F, 20.0F, 0.0F, result);
-        RepairFloat(profile.backStiffnessPercent, 0.0F, 100.0F, 50.0F, result);
-        RepairFloat(profile.floorOffsetMeters, -0.25F, 0.25F, 0.0F, result);
-        RepairVector(profile.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
-        RepairVector(profile.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
-        RepairFloat(profile.leftControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
-        RepairFloat(profile.leftControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
-        RepairVector(profile.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
-        RepairVector(profile.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
-        RepairFloat(profile.rightControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
-        RepairFloat(profile.rightControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
-        if (!profile.gripOffsetsInitialized) {
-            // Schema 14 stored one offset pair directly on AvatarSettings.
-            // Copy it into every existing avatar fit once so an upgrade cannot
-            // move the visible hands relative to the user's controllers.
-            profile.leftControllerToWrist = settings.avatar.leftControllerToWrist;
-            profile.rightControllerToWrist = settings.avatar.rightControllerToWrist;
-            profile.gripOffsetsInitialized = true;
-            result.changed = true;
-            ++result.repairedFields;
-        }
-        const auto duplicate = std::find_if(
-            repairedRetargeting.begin(), repairedRetargeting.end(),
-            [&](const auto& prior) { return prior.avatarKey == profile.avatarKey; });
-        if (duplicate != repairedRetargeting.end()) {
-            *duplicate = std::move(profile);
-            result.changed = true;
-            ++result.repairedFields;
-        } else {
-            repairedRetargeting.push_back(std::move(profile));
-        }
-    }
-    settings.avatar.retargetingProfiles = std::move(repairedRetargeting);
-    RepairVector(settings.avatar.leftControllerToWrist.position, defaults.avatar.leftControllerToWrist.position, result);
-    RepairVector(settings.avatar.leftControllerToWrist.rotationDegrees, defaults.avatar.leftControllerToWrist.rotationDegrees, result);
-    RepairFloat(settings.avatar.leftControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
-    RepairFloat(settings.avatar.leftControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
-    RepairVector(settings.avatar.rightControllerToWrist.position, defaults.avatar.rightControllerToWrist.position, result);
-    RepairVector(settings.avatar.rightControllerToWrist.rotationDegrees, defaults.avatar.rightControllerToWrist.rotationDegrees, result);
-    RepairFloat(settings.avatar.rightControllerToWrist.gripClosurePercent, 0.0F, 150.0F, 100.0F, result);
-    RepairFloat(settings.avatar.rightControllerToWrist.thumbCurvePercent, 0.0F, 150.0F, 100.0F, result);
-    // The active AvatarSettings object is the editable working copy. Preserve
-    // it in its current slot before normalizing older dynamic-profile files to
-    // the five fixed slots exposed by the dropdown.
-    SyncActiveAvatarPlayerProfile(settings);
-    std::vector<AvatarPlayerProfile> repairedProfiles;
-    repairedProfiles.reserve(settings.avatarPlayerProfiles.size());
-    for (auto profile : settings.avatarPlayerProfiles) {
-        const bool invalidId = profile.id.empty() || profile.id.size() > 64 ||
-            profile.id.find('\0') != std::string::npos ||
-            !std::all_of(profile.id.begin(), profile.id.end(), [](unsigned char value) {
-                return std::isalnum(value) || value == '-' || value == '_';
-            });
-        if (invalidId || std::any_of(
-                repairedProfiles.begin(), repairedProfiles.end(),
-                [&](const auto& prior) { return prior.id == profile.id; })) {
-            result.changed = true;
-            ++result.repairedFields;
-            continue;
-        }
-        if (profile.displayName.empty() || profile.displayName.size() > 32 ||
-            profile.displayName.find('\0') != std::string::npos) {
-            profile.displayName = profile.id == "default" ? "Profile 1" : "Profile";
-            result.changed = true;
-            ++result.repairedFields;
-        }
-        repairedProfiles.push_back(std::move(profile));
-    }
-    std::vector<AvatarPlayerProfile> fixedProfiles;
-    fixedProfiles.reserve(kAvatarPlayerProfileIds.size());
-    for (std::size_t slot = 0; slot < kAvatarPlayerProfileIds.size(); ++slot) {
-        const auto existing = std::find_if(
-            repairedProfiles.begin(), repairedProfiles.end(),
-            [&](const auto& profile) { return profile.id == kAvatarPlayerProfileIds[slot]; });
-        if (existing != repairedProfiles.end()) {
-            fixedProfiles.push_back(std::move(*existing));
-        } else {
-            fixedProfiles.push_back({
-                .id = std::string(kAvatarPlayerProfileIds[slot]),
-                .displayName = std::string(kAvatarPlayerProfileNames[slot]),
-                .avatar = AvatarSettings{}});
-            result.changed = true;
-            ++result.repairedFields;
-        }
-        if (fixedProfiles.back().displayName != kAvatarPlayerProfileNames[slot]) {
-            fixedProfiles.back().displayName = std::string(kAvatarPlayerProfileNames[slot]);
-            result.changed = true;
-            ++result.repairedFields;
-        }
-    }
-    if (repairedProfiles.size() != fixedProfiles.size()) {
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    settings.avatarPlayerProfiles = std::move(fixedProfiles);
-    const auto activeProfile = std::find_if(
-        settings.avatarPlayerProfiles.begin(),
-        settings.avatarPlayerProfiles.end(),
-        [&](const auto& profile) { return profile.id == settings.activeAvatarPlayerProfileId; });
-    if (activeProfile == settings.avatarPlayerProfiles.end()) {
-        settings.activeAvatarPlayerProfileId = settings.avatarPlayerProfiles.front().id;
-        settings.avatar = settings.avatarPlayerProfiles.front().avatar;
-        result.changed = true;
-        ++result.repairedFields;
-    }
     RepairEnum(
         settings.broadcast.provider,
         LivestreamProvider::Twitch,
@@ -664,11 +343,12 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         ++result.repairedFields;
     }
     RepairVector(settings.chat.position, defaults.chat.position, result);
-    RepairFloat(settings.chat.fontSize, 2.5F, 6.0F, 3.3F, result);
+    RepairFloat(settings.chat.fontSize, 2.5F, 10.0F, defaults.chat.fontSize, result);
     for (auto* color : {&settings.chat.backgroundColor, &settings.chat.textColor, &settings.chat.highlightColor, &settings.chat.pingColor}) {
         RepairFloat(color->x, 0, 1, 1, result); RepairFloat(color->y, 0, 1, 1, result); RepairFloat(color->z, 0, 1, 1, result);
     }
     RepairFloat(settings.chat.requestsScale, 0.6F, 2.0F, 1.0F, result);
+    RepairFloat(settings.chat.controlsScale, 0.6F, 2.0F, 1.0F, result);
     RepairVector(settings.chat.controlsPosition, defaults.chat.controlsPosition, result);
     RepairVector(settings.chat.controlsRotation, defaults.chat.controlsRotation, result);
     RepairVector(settings.chat.requestsPosition, defaults.chat.requestsPosition, result);
@@ -752,6 +432,15 @@ bool Migrate(SettingsDocument& settings, std::uint32_t sourceSchemaVersion) {
         }
     }
 
+    if (sourceSchemaVersion < 31 &&
+            std::abs(settings.chat.fontSize - 3.3F) <= 0.001F) {
+        // Schema 30 shipped the first rich-chat panel with a desktop-derived
+        // 3.3 font default. Upgrade only that exact default so existing users
+        // get the readable Quest value while deliberate custom sizes remain
+        // untouched.
+        settings.chat.fontSize = 4.6F;
+    }
+
     // Earlier versions otherwise map directly; newly introduced fields retain
     // their safe defaults.
     settings.schemaVersion = kCurrentSchemaVersion;
@@ -766,7 +455,6 @@ void ResetSubsystem(SettingsDocument& settings, Subsystem subsystem) {
         case Subsystem::Preview: settings.preview = defaults.preview; break;
         case Subsystem::Recording: settings.recording = defaults.recording; break;
         case Subsystem::Companion: settings.companion = defaults.companion; break;
-        case Subsystem::Avatar: settings.avatar = defaults.avatar; break;
         case Subsystem::Scenes: settings.scenes = defaults.scenes; break;
         case Subsystem::Broadcast: settings.broadcast = defaults.broadcast; break;
         case Subsystem::Chat: settings.chat = defaults.chat; break;
@@ -783,7 +471,6 @@ std::string_view SubsystemName(Subsystem subsystem) {
         case Subsystem::Preview: return "Preview";
         case Subsystem::Recording: return "Recording";
         case Subsystem::Companion: return "Companion";
-        case Subsystem::Avatar: return "Avatar";
         case Subsystem::Scenes: return "Scenes";
         case Subsystem::Broadcast: return "Broadcast";
         case Subsystem::Chat: return "Chat";
@@ -857,91 +544,6 @@ std::string_view ToString(LivestreamProvider value) noexcept {
     return "twitch";
 }
 
-std::string_view ToString(AvatarQualityPreset value) noexcept {
-    switch (value) {
-        case AvatarQualityPreset::Performance: return "performance";
-        case AvatarQualityPreset::Balanced: return "balanced";
-        case AvatarQualityPreset::Quality: return "quality";
-        case AvatarQualityPreset::Custom: return "custom";
-    }
-    return "balanced";
-}
-
-std::string_view ToString(AvatarOutlineMode value) noexcept {
-    switch (value) {
-        case AvatarOutlineMode::Off: return "off";
-        case AvatarOutlineMode::Reduced: return "reduced";
-        case AvatarOutlineMode::Full: return "full";
-    }
-    return "off";
-}
-
-std::string_view ToString(AvatarCutoutSmoothing value) noexcept {
-    switch (value) {
-        case AvatarCutoutSmoothing::Off: return "off";
-        case AvatarCutoutSmoothing::Low: return "low";
-        case AvatarCutoutSmoothing::Medium: return "medium";
-        case AvatarCutoutSmoothing::High: return "high";
-    }
-    return "low";
-}
-
-std::string_view ToString(AvatarMaterialStage value) noexcept {
-    switch (value) {
-        case AvatarMaterialStage::Configured: return "configured";
-        case AvatarMaterialStage::MainTextureOnly: return "main_texture_only";
-        case AvatarMaterialStage::MainTextureColor: return "main_texture_color";
-        case AvatarMaterialStage::ToonLighting: return "toon_lighting";
-        case AvatarMaterialStage::ToonShadeTexture: return "toon_shade_texture";
-        case AvatarMaterialStage::NormalMaps: return "normal_maps";
-        case AvatarMaterialStage::RimLighting: return "rim_lighting";
-        case AvatarMaterialStage::MatCap: return "matcap";
-        case AvatarMaterialStage::Emission: return "emission";
-        case AvatarMaterialStage::Outlines: return "outlines";
-    }
-    return "configured";
-}
-
-std::string_view ToString(AvatarLightingMode value) noexcept {
-    switch (value) {
-        case AvatarLightingMode::Environment: return "environment";
-        case AvatarLightingMode::Balanced: return "balanced";
-        case AvatarLightingMode::Studio: return "studio";
-    }
-    return "balanced";
-}
-
-std::string_view ToString(SpringBoneQuality value) noexcept {
-    switch (value) {
-        case SpringBoneQuality::Off: return "off";
-        case SpringBoneQuality::VeryLow: return "very_low";
-        case SpringBoneQuality::Low: return "low";
-        case SpringBoneQuality::Medium: return "medium";
-        case SpringBoneQuality::High: return "high";
-        case SpringBoneQuality::Ultra: return "ultra";
-        case SpringBoneQuality::Custom: return "custom";
-    }
-    return "medium";
-}
-
-std::string_view ToString(SpringCollisionQuality value) noexcept {
-    switch (value) {
-        case SpringCollisionQuality::Off: return "off";
-        case SpringCollisionQuality::Reduced: return "reduced";
-        case SpringCollisionQuality::Full: return "full";
-    }
-    return "reduced";
-}
-
-std::string_view ToString(AvatarStandinVisibility value) noexcept {
-    switch (value) {
-        case AvatarStandinVisibility::Both: return "both";
-        case AvatarStandinVisibility::CameraOnly: return "camera_only";
-        case AvatarStandinVisibility::HeadsetOnly: return "headset_only";
-    }
-    return "both";
-}
-
 #define SABERSTAGE_PARSE_ENUM_CASE(text, member) \
     if (value == text) { result = member; return true; }
 
@@ -990,114 +592,6 @@ bool TryParse(std::string_view value, LivestreamProvider& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("custom", LivestreamProvider::Custom)
     return false;
 }
-bool TryParse(std::string_view value, AvatarQualityPreset& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("performance", AvatarQualityPreset::Performance)
-    SABERSTAGE_PARSE_ENUM_CASE("balanced", AvatarQualityPreset::Balanced)
-    SABERSTAGE_PARSE_ENUM_CASE("quality", AvatarQualityPreset::Quality)
-    SABERSTAGE_PARSE_ENUM_CASE("custom", AvatarQualityPreset::Custom)
-    return false;
-}
-bool TryParse(std::string_view value, AvatarOutlineMode& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("off", AvatarOutlineMode::Off)
-    SABERSTAGE_PARSE_ENUM_CASE("reduced", AvatarOutlineMode::Reduced)
-    SABERSTAGE_PARSE_ENUM_CASE("full", AvatarOutlineMode::Full)
-    return false;
-}
-bool TryParse(std::string_view value, AvatarCutoutSmoothing& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("off", AvatarCutoutSmoothing::Off)
-    SABERSTAGE_PARSE_ENUM_CASE("low", AvatarCutoutSmoothing::Low)
-    SABERSTAGE_PARSE_ENUM_CASE("medium", AvatarCutoutSmoothing::Medium)
-    SABERSTAGE_PARSE_ENUM_CASE("high", AvatarCutoutSmoothing::High)
-    return false;
-}
-bool TryParse(std::string_view value, AvatarMaterialStage& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("configured", AvatarMaterialStage::Configured)
-    SABERSTAGE_PARSE_ENUM_CASE("main_texture_only", AvatarMaterialStage::MainTextureOnly)
-    SABERSTAGE_PARSE_ENUM_CASE("main_texture_color", AvatarMaterialStage::MainTextureColor)
-    SABERSTAGE_PARSE_ENUM_CASE("toon_lighting", AvatarMaterialStage::ToonLighting)
-    SABERSTAGE_PARSE_ENUM_CASE("toon_shade_texture", AvatarMaterialStage::ToonShadeTexture)
-    SABERSTAGE_PARSE_ENUM_CASE("normal_maps", AvatarMaterialStage::NormalMaps)
-    SABERSTAGE_PARSE_ENUM_CASE("rim_lighting", AvatarMaterialStage::RimLighting)
-    SABERSTAGE_PARSE_ENUM_CASE("matcap", AvatarMaterialStage::MatCap)
-    SABERSTAGE_PARSE_ENUM_CASE("emission", AvatarMaterialStage::Emission)
-    SABERSTAGE_PARSE_ENUM_CASE("outlines", AvatarMaterialStage::Outlines)
-    return false;
-}
-bool TryParse(std::string_view value, AvatarLightingMode& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("environment", AvatarLightingMode::Environment)
-    SABERSTAGE_PARSE_ENUM_CASE("balanced", AvatarLightingMode::Balanced)
-    SABERSTAGE_PARSE_ENUM_CASE("studio", AvatarLightingMode::Studio)
-    return false;
-}
-bool TryParse(std::string_view value, SpringBoneQuality& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("off", SpringBoneQuality::Off)
-    SABERSTAGE_PARSE_ENUM_CASE("very_low", SpringBoneQuality::VeryLow)
-    SABERSTAGE_PARSE_ENUM_CASE("low", SpringBoneQuality::Low)
-    SABERSTAGE_PARSE_ENUM_CASE("medium", SpringBoneQuality::Medium)
-    SABERSTAGE_PARSE_ENUM_CASE("high", SpringBoneQuality::High)
-    SABERSTAGE_PARSE_ENUM_CASE("ultra", SpringBoneQuality::Ultra)
-    SABERSTAGE_PARSE_ENUM_CASE("custom", SpringBoneQuality::Custom)
-    return false;
-}
-bool TryParse(std::string_view value, SpringCollisionQuality& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("off", SpringCollisionQuality::Off)
-    SABERSTAGE_PARSE_ENUM_CASE("reduced", SpringCollisionQuality::Reduced)
-    SABERSTAGE_PARSE_ENUM_CASE("full", SpringCollisionQuality::Full)
-    return false;
-}
-bool TryParse(std::string_view value, AvatarStandinVisibility& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("both", AvatarStandinVisibility::Both)
-    SABERSTAGE_PARSE_ENUM_CASE("camera_only", AvatarStandinVisibility::CameraOnly)
-    SABERSTAGE_PARSE_ENUM_CASE("headset_only", AvatarStandinVisibility::HeadsetOnly)
-    return false;
-}
-
-void ApplyAvatarQualityPreset(AvatarSettings& settings, AvatarQualityPreset preset) noexcept {
-    settings.qualityPreset = preset;
-    settings.materialStage = AvatarMaterialStage::Configured;
-    settings.toonLighting = true;
-    switch (preset) {
-        case AvatarQualityPreset::Performance:
-            settings.lightingMode = AvatarLightingMode::Balanced;
-            settings.maximumTextureDimension = 512;
-            settings.normalMaps = false;
-            settings.rimLighting = false;
-            settings.matcap = false;
-            settings.emission = true;
-            settings.outlines = AvatarOutlineMode::Off;
-            settings.springBones = true;
-            settings.springBoneQuality = SpringBoneQuality::Low;
-            settings.springCollisions = SpringCollisionQuality::Off;
-            return;
-        case AvatarQualityPreset::Balanced:
-            settings.lightingMode = AvatarLightingMode::Balanced;
-            settings.maximumTextureDimension = 1024;
-            settings.normalMaps = true;
-            settings.rimLighting = true;
-            settings.matcap = false;
-            settings.emission = true;
-            settings.outlines = AvatarOutlineMode::Off;
-            settings.springBones = true;
-            settings.springBoneQuality = SpringBoneQuality::Medium;
-            settings.springCollisions = SpringCollisionQuality::Reduced;
-            return;
-        case AvatarQualityPreset::Quality:
-            settings.lightingMode = AvatarLightingMode::Balanced;
-            settings.maximumTextureDimension = 2048;
-            settings.normalMaps = true;
-            settings.rimLighting = true;
-            settings.matcap = true;
-            settings.emission = true;
-            settings.outlines = AvatarOutlineMode::Full;
-            settings.springBones = true;
-            settings.springBoneQuality = SpringBoneQuality::High;
-            settings.springCollisions = SpringCollisionQuality::Full;
-            return;
-        case AvatarQualityPreset::Custom:
-            return;
-    }
-}
-
 #undef SABERSTAGE_PARSE_ENUM_CASE
 
 void ResolutionDimensions(

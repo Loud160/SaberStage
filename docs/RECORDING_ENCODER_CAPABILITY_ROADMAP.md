@@ -502,7 +502,7 @@ HEVC should initially be a local-recording option. It should not be exposed for 
 
 ### Phase 6 - Device comparison and preset selection
 
-42. Establish a controlled Quest 2 AVC baseline using the same map, camera, avatar, renderer settings, resolution, and FPS.
+42. Establish a controlled Quest 2 AVC baseline using the same map, camera, renderer settings, mod stack, resolution, and FPS.
 43. Compare AVC baseline, AVC high bitrate, HEVC efficiency bitrate, HEVC equal bitrate, and Reduced-effort variants where supported.
 44. Record game CPU/GPU timing, capture drops, encoder submit/drain behavior, backpressure, storage throughput, thermals, battery observations, file size, bitrate, and visual quality.
 45. Repeat core capability and AVC/HEVC comparisons on Quest 3 when hardware is available; do not infer Quest 3 or Quest 3S results from Quest 2.
@@ -510,7 +510,7 @@ HEVC should initially be a local-recording option. It should not be exposed for 
 
 ## Required validation gates
 
-Each phase should preserve ordinary camera, avatar, MToon, SpringBone, audio, and menu behavior unless that phase explicitly changes recording behavior.
+Each phase should preserve ordinary camera, preview, audio, streaming, chat, and menu behavior unless that phase explicitly changes recording behavior.
 
 Before a new recording format or codec becomes a normal user option, verify:
 

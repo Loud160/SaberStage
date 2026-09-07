@@ -38,7 +38,7 @@ Verify current:
 - whether Android/Horizon OS provides a supported way for one app to present an arbitrary synthetic video source to Discord;
 - standards-based or receiver-app approaches for sending SaberStage's selected third-person view to common TVs without Meta's Windows software.
 
-Do not copy source implementation from another camera/recording/avatar mod.
+Do not copy source implementation from another camera or recording mod.
 
 ## Discord feasibility must be explicit
 
@@ -78,7 +78,6 @@ docs/PRODUCT_AND_UX_COMPATIBILITY.md
 docs/RECORDING_PIPELINE.md
 docs/STREAMING_ARCHITECTURE.md
 docs/BROADCAST_COMPOSITOR.md
-docs/AVATAR_ARCHITECTURE.md
 docs/TV_OUTPUT_FEASIBILITY.md
 docs/CHAT_AND_DISCORD_INTEGRATION.md
 docs/TRACKING_AND_RECENTER.md
@@ -116,7 +115,6 @@ docs/TEST_PLAN.md
 - HMD chat panel;
 - stream credential storage;
 - Discord integration boundary;
-- integrated avatar ownership, tracking, calibration, persistence, and broadcast-visibility boundary;
 - Avalonia companion boundary;
 - companion-side viewing and recording;
 - TV/receiver output boundary;
@@ -141,7 +139,7 @@ Pay particular attention to Hollywood: evaluate whether depending on it helps or
 
 ## Set-it-and-forget-it design
 
-The architecture must explicitly show how configuration restores correctly on every launch and how tracking/recenter changes avoid breaking camera/avatar orientation.
+The architecture must explicitly show how configuration restores correctly on every launch and how tracking/recenter changes avoid breaking camera orientation.
 
 Explain:
 
@@ -161,7 +159,7 @@ Define three delivery stages:
 
 1. camera, movable preview, synchronized local recording, and first-release Quest 2 hardening;
 2. versioned Wi-Fi/USB transport, cross-platform companion viewing/recording, TV-output feasibility, and OBS handoff;
-3. integrated avatar, Quest-native compositor/scenes, direct livestreaming, chat, and only supported Discord capabilities.
+3. Quest-native compositor/scenes, direct livestreaming, chat, and only supported Discord capabilities.
 
 Behavioral and workflow familiarity with Camera2 is intentional. Clean-room means independently engineered source and internals; it does not require inventing an unfamiliar user experience.
 

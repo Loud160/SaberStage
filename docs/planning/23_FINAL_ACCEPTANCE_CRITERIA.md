@@ -46,14 +46,9 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 ✓ Remote receiver failure does not freeze gameplay or poison local recording.
 ```
 
-## Stage 3 — Integrated avatar and full broadcast production
+## Stage 3 — Full broadcast production
 
 ```text
-✓ Integrated full avatar renders in selected third-person outputs without encoder or transport redesign.
-✓ Avatar selection and per-avatar calibration persist across launches.
-✓ Normal Quest recenter keeps camera and avatar logically aligned.
-✓ Avatar is hidden or non-obstructive in the HMD by default and visible in output as configured.
-✓ Changing avatars does not leak incompatible model-specific calibration.
 ✓ Broadcast scenes switch without rebuilding the encoder.
 ✓ Lightweight Quest-native overlays and production controls fit the existing SaberStage UI coherently.
 ✓ Direct Quest livestreaming works without a PC.
@@ -63,7 +58,7 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 ✓ Twitch/YouTube chat can be displayed in an HMD-only panel.
 ✓ Chat restores/reconnects without repeated placement or setup.
 ✓ Discord integration uses only supported/public mechanisms.
-✓ If Quest-local Discord video injection is supported, it reuses the selected SaberStage camera/scene and avatar without a second full scene render.
+✓ If Quest-local Discord video injection is supported, it reuses the selected SaberStage camera/scene without a second full scene render.
 ✓ If Discord video injection is unsupported, the limitation is documented and no private API, client patch, self-bot, or unsafe workaround is used.
 ✓ Full-system Quest 2 stress and repeated-session tests pass for every supported combination.
 ```
@@ -71,7 +66,7 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 ## Architecture and product acceptance
 
 ```text
-✓ Camera, preview, avatar, compositor, capture, output, chat, and Discord responsibilities remain separated.
+✓ Camera, preview, compositor, capture, output, chat, and Discord responsibilities remain separated.
 ✓ One camera/compositor and encoded-media architecture feeds compatible sinks.
 ✓ No unbounded queue or uncontrolled hot-path allocation is accepted.
 ✓ Gameplay is favored over capture or receiver quality under overload.
@@ -84,4 +79,4 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 
 The finished product should feel like an appliance without behaving like a stripped-down tool:
 
-> **Set it up once, retain full control when wanted, launch Beat Saber later, and SaberStage is already ready to present, record, or broadcast the player and avatar.**
+> **Set it up once, retain full control when wanted, launch Beat Saber later, and SaberStage is already ready to present, record, or broadcast the selected third-person view.**

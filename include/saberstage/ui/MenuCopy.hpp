@@ -25,7 +25,7 @@ inline constexpr std::string_view kScaffoldDescription =
     "Early development scaffold\n\n"
     "Not implemented yet:\n"
     "Camera, preview, and recording\n"
-    "Companion, avatar, and broadcast\n"
+    "Companion and broadcast\n"
     "Chat and Discord";
 
 inline constexpr std::string_view kResetButton = "Reset general settings";

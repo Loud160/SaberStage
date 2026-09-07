@@ -31,7 +31,7 @@ another request. Preserve unrelated work and leave other mods read-only.
    and ELF/QMOD validation. Stop Beat Saber before receipt-guarded deployment
    and verify installed hashes. Leave the game closed for the user's test.
 
-Do not change panel geometry, shaders, avatar behavior, recording settings,
+Do not change panel geometry, shaders, recording settings,
 render demand, quality choices, or the previous slider-lifetime fix.
 
 ## Headset follow-up
@@ -58,7 +58,7 @@ Implemented in `src/preview/PreviewManager.cpp`:
 
 Validation: 15/15 host suites passed; 65/65 tooling tests passed; diff whitespace
 check passed; ARM64 build, private logger ELF boundary, and QMOD verification
-passed. No shader, layout, settings, or avatar changes were made in this pass.
+passed. No shader, layout, or settings changes were made in this pass.
 
 Deployed to Quest 2 `1WMHH840QJ1046`. Beat Saber was stopped and verified stopped
 before the receipt-guarded update; all four installed library hashes matched.

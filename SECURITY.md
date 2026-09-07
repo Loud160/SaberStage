@@ -16,12 +16,12 @@ deployment-ownership issue.
 Include the SaberStage build number, Beat Saber version, Quest model,
 reproduction steps, and the smallest relevant excerpt from
 `saberstage-native.log`. Do not attach stream keys, OAuth tokens, private
-avatars, recordings, complete settings files, or unrelated headset logs.
+recordings, complete settings files, or unrelated headset logs.
 
 ## Relevant boundaries
 
 Especially useful reports include native memory corruption, cross-thread Unity
 access, unsafe worker shutdown, path traversal, unbounded media/network input,
 secret disclosure, TLS verification bypass, source-deployment ownership
-bypass, or a malformed VRM/movement script/settings document escaping its
+bypass, or a malformed movement script/settings document escaping its
 documented limits.

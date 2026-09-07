@@ -47,32 +47,10 @@ if(SABERSTAGE_HOST_TESTS)
     target_compile_definitions(saberstage_settings PRIVATE SABERSTAGE_HOST_BUILD=1)
     target_link_libraries(saberstage_settings PUBLIC saberstage_camera_core)
 
-    add_library(saberstage_avatar_core STATIC
-        src/avatar/AvatarSolver.cpp
-        src/avatar/Calibration.cpp
-        src/avatar/FabrikSpine.cpp
-        src/avatar/Math.cpp
-        src/avatar/PoseTypes.cpp
-        src/avatar/TwoBoneIK.cpp
-        src/avatar/calibration/PlayerCalibrationProfile.cpp
-        src/avatar/calibration/PlayerCalibrationSession.cpp
-    )
-    target_include_directories(saberstage_avatar_core PUBLIC include "${SABERSTAGE_RAPIDJSON_DIR}")
-    target_compile_definitions(saberstage_avatar_core PRIVATE SABERSTAGE_HOST_BUILD=1)
-
-    add_library(saberstage_vrm_core STATIC
-        src/avatar/vrm/Vrm0Parser.cpp
-    )
-    target_include_directories(saberstage_vrm_core PUBLIC include "${SABERSTAGE_RAPIDJSON_DIR}")
-    target_compile_definitions(saberstage_vrm_core PRIVATE SABERSTAGE_HOST_BUILD=1)
-
     enable_testing()
     add_executable(saberstage_slider_lifetime_tests tests/SliderLifetimeTests.cpp)
     target_include_directories(saberstage_slider_lifetime_tests PRIVATE include)
     add_test(NAME saberstage.slider_lifetime COMMAND saberstage_slider_lifetime_tests)
-    add_executable(saberstage_avatar_runtime_policy_tests tests/AvatarRuntimePolicyTests.cpp)
-    target_include_directories(saberstage_avatar_runtime_policy_tests PRIVATE include)
-    add_test(NAME saberstage.avatar_runtime_policy COMMAND saberstage_avatar_runtime_policy_tests)
     add_executable(saberstage_chat_asset_tests tests/ChatAssetTests.cpp src/broadcast/ChatAssets.cpp)
     target_include_directories(saberstage_chat_asset_tests PRIVATE include "${SABERSTAGE_RAPIDJSON_DIR}")
     target_compile_definitions(saberstage_chat_asset_tests PRIVATE SABERSTAGE_HOST_BUILD=1)
@@ -115,17 +93,6 @@ if(SABERSTAGE_HOST_TESTS)
     target_include_directories(saberstage_chat_scroll_tests PRIVATE include)
     add_test(NAME saberstage.chat_scroll COMMAND saberstage_chat_scroll_tests)
 
-    add_executable(saberstage_avatar_tests tests/AvatarSolverTests.cpp)
-    target_link_libraries(saberstage_avatar_tests PRIVATE saberstage_avatar_core)
-    add_test(NAME saberstage.avatar COMMAND saberstage_avatar_tests)
-
-    add_executable(saberstage_player_calibration_tests tests/PlayerCalibrationTests.cpp)
-    target_link_libraries(saberstage_player_calibration_tests PRIVATE saberstage_avatar_core)
-    add_test(NAME saberstage.player_calibration COMMAND saberstage_player_calibration_tests)
-
-    add_executable(saberstage_vrm_tests tests/VrmParserTests.cpp)
-    target_link_libraries(saberstage_vrm_tests PRIVATE saberstage_vrm_core)
-    add_test(NAME saberstage.vrm COMMAND saberstage_vrm_tests)
     return()
 endif()
 
@@ -206,31 +173,31 @@ target_link_libraries(${COMPILE_ID} PRIVATE
     -lmediandk)
 
 # The game cannot compile ShaderLab at runtime. Embed the deterministic Android
-# AssetBundle produced by scripts/build-avatar-shaders.ps1 so MToon is always
-# deployed atomically with the mod and cannot become a stale sidecar file.
-set(SABERSTAGE_AVATAR_SHADER_ASSET
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/saberstage_avatar_shaders")
-if(NOT EXISTS "${SABERSTAGE_AVATAR_SHADER_ASSET}")
+# AssetBundle produced by scripts/build-runtime-shaders.ps1 so the camera and
+# chat shaders are deployed atomically and cannot become stale sidecar files.
+set(SABERSTAGE_RUNTIME_SHADER_ASSET
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/saberstage_runtime_shaders")
+if(NOT EXISTS "${SABERSTAGE_RUNTIME_SHADER_ASSET}")
     message(FATAL_ERROR
-        "Missing embedded avatar shader bundle. Run scripts/build-avatar-shaders.ps1 first.")
+        "Missing embedded runtime shader bundle. Run scripts/build-runtime-shaders.ps1 first.")
 endif()
-set(SABERSTAGE_AVATAR_SHADER_OBJECT
-    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_avatar_shaders.o")
+set(SABERSTAGE_RUNTIME_SHADER_OBJECT
+    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_runtime_shaders.o")
 add_custom_command(
-    OUTPUT "${SABERSTAGE_AVATAR_SHADER_OBJECT}"
+    OUTPUT "${SABERSTAGE_RUNTIME_SHADER_OBJECT}"
     COMMAND ${CMAKE_OBJCOPY}
-        saberstage_avatar_shaders
-        "${SABERSTAGE_AVATAR_SHADER_OBJECT}"
+        saberstage_runtime_shaders
+        "${SABERSTAGE_RUNTIME_SHADER_OBJECT}"
         --input-target binary
         --output-target elf64-aarch64
         --set-section-flags binary=alloc,load,readonly,data,contents
-    DEPENDS "${SABERSTAGE_AVATAR_SHADER_ASSET}"
+    DEPENDS "${SABERSTAGE_RUNTIME_SHADER_ASSET}"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets"
-    COMMENT "Embedding SaberStage Quest MToon shader bundle")
-set_source_files_properties("${SABERSTAGE_AVATAR_SHADER_OBJECT}" PROPERTIES
+    COMMENT "Embedding SaberStage Quest runtime shader bundle")
+set_source_files_properties("${SABERSTAGE_RUNTIME_SHADER_OBJECT}" PROPERTIES
     GENERATED TRUE
     EXTERNAL_OBJECT TRUE)
-target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AVATAR_SHADER_OBJECT}")
+target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_RUNTIME_SHADER_OBJECT}")
 
 # Keep the default pause image inside the native library for every install
 # path (source deploy and QMOD). This avoids a separately deployed asset that

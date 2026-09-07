@@ -14,7 +14,7 @@
 #include "saberstage/ui/RichChatRenderer.hpp"
 #include "saberstage/broadcast/ChatAssets.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
-#include "saberstage/avatar/vrm/VrmUnityRuntime.hpp"
+#include "saberstage/rendering/ShaderResources.hpp"
 #include "saberstage/Logging.hpp"
 #include "UnityEngine/ScriptableObject.hpp"
 #include "UnityEngine/Texture2D.hpp"
@@ -73,7 +73,7 @@ struct RichChatRenderer::Impl {
             return;
         if (sprites || material || texture)
             throw std::runtime_error("Chat atlas initialization was incomplete; reopen chat to retry");
-        auto *shader = avatar::vrm::EmbeddedChatSpriteShader();
+        auto *shader = rendering::EmbeddedChatSpriteShader();
         if (!shader)
             throw std::runtime_error("Embedded ChatSprite shader is unavailable; rebuild the shader bundle");
         texture = Texture2D::New_ctor(1024, 1024, TextureFormat::RGBA32, false);
@@ -301,7 +301,7 @@ void RichChatRenderer::Decorate(TMPro::TextMeshProUGUI *row, float width, float 
     if (found == p.accents.end()) {
         auto *bar = BSML::Lite::CreateImage(row->get_transform(), BSML::Utilities::ImageResources::GetWhitePixel());
         if (!p.accentMaterial) {
-            auto *shader = avatar::vrm::EmbeddedChatSpriteShader();
+            auto *shader = rendering::EmbeddedChatSpriteShader();
             if (shader) {
                 p.accentMaterial = Material::New_ctor(shader);
                 Object::DontDestroyOnLoad(p.accentMaterial);

@@ -24,7 +24,6 @@ Avoid CPU readback.
 Implement architecture for:
 
 - Game Camera — required;
-- Integrated Avatar — controlled through the avatar subsystem and camera visibility, not duplicated by the compositor;
 - Text;
 - Image/Logo;
 - Song Metadata;

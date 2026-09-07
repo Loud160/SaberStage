@@ -11,7 +11,7 @@ Date: 2026-09-02. Baseline: `1a70f3b`, branch `logger-hardening-and-repo-audit`.
 The user first requested detailed logging using Native Logger Quest and an
 explanation for the missing chat scrollbar, then authorized fixing the confirmed
 defects. The repair retains the existing native scrollbar and chat-update
-diagnostics. No unrelated menus, recording/streaming behavior, or avatar code
+diagnostics. No unrelated menus or recording/streaming behavior
 are changed.
 
 The instrumented Quest run now confirms an inactive native indicator, content

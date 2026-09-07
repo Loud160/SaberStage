@@ -145,9 +145,12 @@ std::int32_t ResolveSpectatorCullingMask(
     // entire UI layer. UI therefore remains mandatory even if an old or
     // hand-edited profile asks to exclude it.
     // Camera2 and Quest's MRC path both keep Beat Saber's first-person-only
-    // layer out of a third-person camera so HMD-only avatar geometry does not
+    // layer out of a third-person camera so HMD-only helper geometry does not
     // leak into a displaced spectator view.
-    const auto mandatoryBroadcastLayers = kUiLayerMask | kAvatarLayerMask;
+    // Layer 3 is the established third-person output contract used by
+    // Qavatars. It must remain visible even when the headset camera excludes
+    // it or a legacy profile contains a stale exclusion for that layer.
+    const auto mandatoryBroadcastLayers = kUiLayerMask | kExternalAvatarLayerMask;
     const auto exclusions =
         (profile.excludedLayersMask & ~mandatoryBroadcastLayers) | kFirstPersonLayerMask;
     return ((baseMask | kStandardSpectatorLayersMask) & ~exclusions) | mandatoryBroadcastLayers;
@@ -179,7 +182,6 @@ std::string_view ToString(SubjectAnchor value) noexcept {
         case SubjectAnchor::PlayerRoot: return "playerRoot";
         case SubjectAnchor::Head: return "head";
         case SubjectAnchor::Waist: return "waist";
-        case SubjectAnchor::Avatar: return "avatar";
         case SubjectAnchor::FullBody: return "fullBody";
     }
     return "playerRoot";
@@ -204,7 +206,6 @@ bool TryParseSubjectAnchor(std::string_view value, SubjectAnchor& result) noexce
     if (value == "playerRoot") result = SubjectAnchor::PlayerRoot;
     else if (value == "head") result = SubjectAnchor::Head;
     else if (value == "waist") result = SubjectAnchor::Waist;
-    else if (value == "avatar") result = SubjectAnchor::Avatar;
     else if (value == "fullBody") result = SubjectAnchor::FullBody;
     else return false;
     return true;

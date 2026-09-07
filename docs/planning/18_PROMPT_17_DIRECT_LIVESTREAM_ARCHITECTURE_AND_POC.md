@@ -85,4 +85,4 @@ Measure:
 - memory;
 - A/V sync.
 
-Use the completed compositor and scene controls. Verify that avatar visibility, overlays, and scene changes do not rebuild the encoder or compromise gameplay.
+Use the completed compositor and scene controls. Verify that overlays and scene changes do not rebuild the encoder or compromise gameplay.

@@ -12,7 +12,7 @@ workflow, design, and layout. That latest instruction supersedes the earlier
 custom screen/grouping proposals; it is not merely a request for similar styling.
 
 **Status: implementation authorized by the user on 2026-09-02.** Starting
-checkpoint: `7628a89`. The user is testing the preceding recording/avatar build;
+checkpoint: `7628a89`. The user is testing the preceding recording build;
 do not deploy, stop the game, or perform live account actions without a new
 go-ahead. Track implementation and verification in
 [the implementation record](../ai-assisted-development/reviews/TWITCH_CHAT_IMPLEMENTATION.md).
@@ -67,7 +67,7 @@ Confirmed requirements:
   third-person camera, or both have not been decided.
 - Leave YouTube and Kick exactly as they are. No new provider implementation,
   connection flow, destination-setting changes, or claims of new support.
-- Do not change avatars, IK, camera settings, encoding, stream audio, or other
+- Do not change camera settings, encoding, stream audio, or other
   unrelated controls as part of this work.
 
 The confirmed choices above and in section 10 supersede earlier proposals.
@@ -448,7 +448,7 @@ The exact command aliases beyond `!bsr`/`!link` can follow the PC conventions.
   The previously suggested 2-per-viewer and 30-second cooldown are not confirmed
   constants. Keep policy adjustable and distinguish overall pending capacity
   from any per-viewer allowance.
-- Persist queue/history/settings separately from avatar/player calibration
+- Persist queue/history/settings separately from camera and recording settings
   profiles and separately from the 128-message display buffer.
 - Partition saved requests by Twitch channel/account. Switching accounts must
   not expose or execute another channel's pending requests.
@@ -607,7 +607,7 @@ Headset acceptance (cannot be replaced by source-string tests):
   preserve the intended state without duplicate requests or stale resources.
 - [ ] Busy chat and extended streaming remain bounded; animation-off behaves as
   expected; no visible UI hitch from network/decode/download callbacks.
-- [ ] Avatar/camera/recording settings and unrelated menu layouts are unchanged.
+- [ ] Camera/recording settings and unrelated menu layouts are unchanged.
 - [ ] Compare actual Quest captures/interaction against the PC chat, settings,
   request manager, notices, and moderation views. Verify screen structure,
   grouping/order, alignment/proportions, styling/labels, selection/action flow,

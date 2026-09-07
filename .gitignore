@@ -37,15 +37,11 @@ SaberStage Device Backups/
 diagnostics/
 artifacts/
 
-# Unity is used only to produce the embedded Android MToon shader bundle.
+# Unity is used only to produce the embedded Android runtime shader bundle.
 # Track the small source project, never its machine-local import/build caches.
-tools/avatar-shader/Library/
-tools/avatar-shader/Logs/
-tools/avatar-shader/Temp/
-tools/avatar-shader/obj/
-tools/avatar-shader/Build/
-tools/avatar-shader/UserSettings/
-
-# PC-only IK observation tool build output. Keep source and presets, never local binaries.
-tools/pc-pose-analyzer/bin/
-tools/pc-pose-analyzer/obj/
+tools/runtime-shaders/Library/
+tools/runtime-shaders/Logs/
+tools/runtime-shaders/Temp/
+tools/runtime-shaders/obj/
+tools/runtime-shaders/Build/
+tools/runtime-shaders/UserSettings/

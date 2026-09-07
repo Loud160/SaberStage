@@ -8,7 +8,7 @@
   "version": "${version}",
   "packageId": "com.beatgames.beatsaber",
   "packageVersion": "1.40.8_7379",
-  "description": "Early-development clean-room Quest camera, avatar, recording, and broadcast foundation.",
+  "description": "Quest-native third-person camera, recording, streaming, and Twitch chat for Beat Saber.",
   "isLibrary": false,
   "dependencies": [],
   "modFiles": ["${binary}"],
