@@ -391,6 +391,59 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         200.0F,
         defaults.broadcast.microphoneVolumePercent,
         result);
+    RepairEnum(settings.audio.microphoneMode, MicrophoneMode::Open,
+               MicrophoneMode::VoiceActivated, defaults.audio.microphoneMode, result);
+    RepairEnum(settings.audio.pushToTalkHand, PushToTalkHand::Left,
+               PushToTalkHand::Either, defaults.audio.pushToTalkHand, result);
+    RepairFloat(settings.audio.gateOpenThresholdDb, -60.0F, -5.0F,
+                defaults.audio.gateOpenThresholdDb, result);
+    RepairFloat(settings.audio.gateCloseThresholdDb, -70.0F, -5.0F,
+                defaults.audio.gateCloseThresholdDb, result);
+    if (settings.audio.gateCloseThresholdDb > settings.audio.gateOpenThresholdDb) {
+        settings.audio.gateCloseThresholdDb = settings.audio.gateOpenThresholdDb - 3.0F;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    RepairFloat(settings.audio.gateAttackMilliseconds, 1.0F, 100.0F,
+                defaults.audio.gateAttackMilliseconds, result);
+    RepairFloat(settings.audio.gateHoldMilliseconds, 0.0F, 1000.0F,
+                defaults.audio.gateHoldMilliseconds, result);
+    RepairFloat(settings.audio.gateReleaseMilliseconds, 10.0F, 2000.0F,
+                defaults.audio.gateReleaseMilliseconds, result);
+    RepairFloat(settings.audio.gatePreRollMilliseconds, 0.0F, 80.0F,
+                defaults.audio.gatePreRollMilliseconds, result);
+    RepairFloat(settings.audio.compressorThresholdDb, -60.0F, 0.0F,
+                defaults.audio.compressorThresholdDb, result);
+    RepairFloat(settings.audio.compressorRatio, 1.0F, 20.0F,
+                defaults.audio.compressorRatio, result);
+    RepairFloat(settings.audio.compressorAttackMilliseconds, 1.0F, 200.0F,
+                defaults.audio.compressorAttackMilliseconds, result);
+    RepairFloat(settings.audio.compressorReleaseMilliseconds, 10.0F, 2000.0F,
+                defaults.audio.compressorReleaseMilliseconds, result);
+    RepairFloat(settings.audio.compressorMakeupDb, -12.0F, 24.0F,
+                defaults.audio.compressorMakeupDb, result);
+    RepairFloat(settings.audio.limiterCeilingDb, -12.0F, 0.0F,
+                defaults.audio.limiterCeilingDb, result);
+    RepairFloat(settings.audio.limiterReleaseMilliseconds, 10.0F, 2000.0F,
+                defaults.audio.limiterReleaseMilliseconds, result);
+    RepairEnum(settings.tts.outputRoute, TtsOutputRoute::HeadsetOnly,
+               TtsOutputRoute::HeadsetAndBroadcast, defaults.tts.outputRoute, result);
+    RepairRange(settings.tts.maximumCharacters, 32, 500,
+                defaults.tts.maximumCharacters, result);
+    RepairRange(settings.tts.queueCapacity, 1, 12,
+                defaults.tts.queueCapacity, result);
+    RepairFloat(settings.tts.staleAfterSeconds, 2.0F, 60.0F,
+                defaults.tts.staleAfterSeconds, result);
+    RepairFloat(settings.tts.volumePercent, 0.0F, 200.0F,
+                defaults.tts.volumePercent, result);
+    RepairFloat(settings.tts.speechRate, 0.5F, 2.0F,
+                defaults.tts.speechRate, result);
+    if (settings.tts.voice.empty() || settings.tts.voice.size() > 64 ||
+            settings.tts.voice.find('\0') != std::string::npos) {
+        settings.tts.voice = defaults.tts.voice;
+        result.changed = true;
+        ++result.repairedFields;
+    }
     return result;
 }
 
@@ -544,6 +597,33 @@ std::string_view ToString(LivestreamProvider value) noexcept {
     return "twitch";
 }
 
+std::string_view ToString(MicrophoneMode value) noexcept {
+    switch (value) {
+        case MicrophoneMode::Open: return "open";
+        case MicrophoneMode::PushToTalk: return "push_to_talk";
+        case MicrophoneMode::VoiceActivated: return "voice_activated";
+    }
+    return "open";
+}
+
+std::string_view ToString(PushToTalkHand value) noexcept {
+    switch (value) {
+        case PushToTalkHand::Left: return "left";
+        case PushToTalkHand::Right: return "right";
+        case PushToTalkHand::Either: return "either";
+    }
+    return "either";
+}
+
+std::string_view ToString(TtsOutputRoute value) noexcept {
+    switch (value) {
+        case TtsOutputRoute::HeadsetOnly: return "headset";
+        case TtsOutputRoute::BroadcastOnly: return "broadcast";
+        case TtsOutputRoute::HeadsetAndBroadcast: return "both";
+    }
+    return "headset";
+}
+
 #define SABERSTAGE_PARSE_ENUM_CASE(text, member) \
     if (value == text) { result = member; return true; }
 
@@ -590,6 +670,24 @@ bool TryParse(std::string_view value, LivestreamProvider& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("youtube", LivestreamProvider::YouTube)
     SABERSTAGE_PARSE_ENUM_CASE("kick", LivestreamProvider::Kick)
     SABERSTAGE_PARSE_ENUM_CASE("custom", LivestreamProvider::Custom)
+    return false;
+}
+bool TryParse(std::string_view value, MicrophoneMode& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("open", MicrophoneMode::Open)
+    SABERSTAGE_PARSE_ENUM_CASE("push_to_talk", MicrophoneMode::PushToTalk)
+    SABERSTAGE_PARSE_ENUM_CASE("voice_activated", MicrophoneMode::VoiceActivated)
+    return false;
+}
+bool TryParse(std::string_view value, PushToTalkHand& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("left", PushToTalkHand::Left)
+    SABERSTAGE_PARSE_ENUM_CASE("right", PushToTalkHand::Right)
+    SABERSTAGE_PARSE_ENUM_CASE("either", PushToTalkHand::Either)
+    return false;
+}
+bool TryParse(std::string_view value, TtsOutputRoute& result) noexcept {
+    SABERSTAGE_PARSE_ENUM_CASE("headset", TtsOutputRoute::HeadsetOnly)
+    SABERSTAGE_PARSE_ENUM_CASE("broadcast", TtsOutputRoute::BroadcastOnly)
+    SABERSTAGE_PARSE_ENUM_CASE("both", TtsOutputRoute::HeadsetAndBroadcast)
     return false;
 }
 #undef SABERSTAGE_PARSE_ENUM_CASE

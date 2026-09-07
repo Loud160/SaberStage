@@ -36,6 +36,7 @@ class RecordingController;
 
 namespace saberstage::broadcast {
 class TwitchService;
+class TtsService;
 }
 
 namespace saberstage::app {
@@ -59,12 +60,16 @@ public:
     preview::PreviewManager& Preview() noexcept;
     recording::RecordingController& Recording() noexcept;
     broadcast::TwitchService& Twitch() noexcept;
+    broadcast::TtsService& Tts() noexcept;
 
 private:
     bool started_ = false;
     settings::SettingsService settings_;
     std::unique_ptr<camera::CameraManager> camera_;
     std::unique_ptr<preview::PreviewManager> preview_;
+    std::unique_ptr<broadcast::TtsService> tts_;
+    // Recording references TTS for mixer input, so TTS is declared first and
+    // therefore destroyed after RecordingController during exceptional unwind.
     std::unique_ptr<recording::RecordingController> recording_;
     std::unique_ptr<broadcast::TwitchService> twitch_;
     std::unique_ptr<ui::MenuController> menu_;

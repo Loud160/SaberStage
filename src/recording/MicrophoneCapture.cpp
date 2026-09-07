@@ -235,8 +235,19 @@ std::uint64_t MicrophoneCapture::UnderflowFrameCount() const noexcept {
     return underflowFrames_.load(std::memory_order_relaxed);
 }
 
+std::size_t MicrophoneCapture::AvailableFrameCount() const noexcept {
+    const auto read = readIndex_.load(std::memory_order_acquire);
+    const auto write = writeIndex_.load(std::memory_order_acquire);
+    return std::min<std::size_t>(
+        static_cast<std::size_t>(write - read), ring_.size());
+}
+
 std::int32_t MicrophoneCapture::SampleRate() const noexcept {
     return sampleRate_.load(std::memory_order_acquire);
+}
+
+std::int32_t MicrophoneCapture::CallbackError() const noexcept {
+    return callbackError_.load(std::memory_order_acquire);
 }
 
 bool MicrophoneCapture::Failed() const noexcept {

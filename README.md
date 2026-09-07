@@ -32,8 +32,11 @@ Twitch-first livestreaming reuses the same camera and hardware encode path.
 SaberStage supports service-specific RTMP/RTMPS settings, encrypted OAuth tokens
 backed by Android Keystore, title updates, automatic token refresh, an HMD-only
 movable chat panel, current-map announcements, AFK media, stream audio mixing,
-and bounded reconnect behavior. YouTube and Kick remain visible but are marked
-unsupported. Rich Twitch chat and song-request work is still under development.
+bounded reconnect behavior, optional OBS-style Quest microphone processing, and
+fully local bounded Twitch chat speech. YouTube and Kick remain visible but are
+marked unsupported. Rich Twitch chat and song-request work is still under
+development. TTS defaults off; microphone capture requires Beat Saber to be
+patched with MBF's Microphone Access permission.
 
 SaberStage no longer owns avatar loading, rendering, IK, calibration, or avatar
 profiles. Compatible standalone avatar mods may place their output in the game
@@ -97,6 +100,7 @@ tools/runtime-shaders/ Minimal Unity project for Quest runtime shader bundles
 - [Direct FFmpeg and livestreaming](docs/DIRECT_FFMPEG_AND_LIVESTREAM.md)
 - [Streaming architecture](docs/STREAMING_ARCHITECTURE.md)
 - [Twitch chat and song requests](docs/TWITCH_CHAT_AND_REQUESTS.md)
+- [Twitch TTS and Quest microphone audio](docs/TWITCH_TTS_AND_MICROPHONE_AUDIO.md)
 - [Third-party notices](docs/THIRD_PARTY_NOTICES.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security reporting](SECURITY.md)

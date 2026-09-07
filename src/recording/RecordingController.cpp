@@ -18,6 +18,7 @@
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/camera/FrameDemand.hpp"
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
+#include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
 #include "saberstage/recording/AsyncVideoWriter.hpp"
 #include "saberstage/recording/AfkMediaSource.hpp"
@@ -192,9 +193,11 @@ std::size_t LivestreamProviderIndex(settings::LivestreamProvider provider) noexc
 RecordingController::RecordingController(
     settings::SettingsService& settings,
     camera::CameraManager& camera,
+    broadcast::TtsService& tts,
     std::filesystem::path outputDirectory)
     : settings_(settings),
       camera_(camera),
+      tts_(tts),
       outputDirectory_(std::move(outputDirectory)),
       afkMedia_(std::make_unique<AfkMediaSource>()) {
     RegisterRecordingRuntimeDriverType();
@@ -207,6 +210,10 @@ RecordingController::RecordingController(
     camera_.SetRuntimeCameraInvalidatedHandler([this] { HandleRuntimeCameraInvalidated(); });
     camera_.SetRuntimeCameraReadyHandler([this] { HandleRuntimeCameraReady(); });
     camera_.SetAfterRenderHandler([this] { HandleSpectatorRendered(); });
+    livestreamMixScratch_.resize(8192U);
+    livestreamMicrophoneScratch_.resize(8192U);
+    ttsMixScratch_.resize(8192U);
+    RefreshAudioConfiguration();
 }
 
 RecordingController::~RecordingController() { Shutdown(); }
@@ -679,6 +686,7 @@ void RecordingController::Shutdown() noexcept {
         {
             std::lock_guard lock(livestreamMutex_);
             livestreamSink_.reset();
+            StopLivestreamMicrophoneLocked();
             for (auto& key : streamKeyOverrides_) {
                 std::fill(key.begin(), key.end(), '\0');
                 key.clear();
@@ -766,6 +774,42 @@ bool RecordingController::HandleDirectCaptureHealth() noexcept {
 
 void RecordingController::Tick() noexcept {
     HandleControllerShortcut();
+    // PTT is sampled on Unity's main thread. The audio worker consumes only
+    // the resulting atomic state through MicrophoneDsp, never OVRInput itself.
+    try {
+        const auto& audio = settings_.Get().audio;
+        const auto left = GlobalNamespace::OVRInput::Get(
+            GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
+            GlobalNamespace::OVRInput::Controller::LTouch);
+        const auto right = GlobalNamespace::OVRInput::Get(
+            GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
+            GlobalNamespace::OVRInput::Controller::RTouch);
+        const bool pressed = audio.pushToTalkHand == settings::PushToTalkHand::Left
+            ? left
+            : audio.pushToTalkHand == settings::PushToTalkHand::Right ? right : left || right;
+        microphoneDsp_.SetPushToTalk(pressed);
+    } catch (...) {
+        microphoneDsp_.SetPushToTalk(false);
+    }
+    // When no recording/stream audio worker exists, drain captured microphone
+    // PCM here in bounded chunks so the Audio tab's level/gate meter remains
+    // useful and the persistent ring cannot fill. Never compete with the
+    // recording worker; both consumer paths are serialized by this mutex.
+    try {
+        std::lock_guard lock(livestreamMutex_);
+        if (livestreamMicrophone_ && !IsUnityObjectAlive(audioCapture_)) {
+            const auto frames = std::min(
+                livestreamMicrophone_->AvailableFrameCount(),
+                livestreamMicrophoneScratch_.size());
+            if (frames > 0U) {
+                livestreamMicrophone_->ReadForMix(
+                    livestreamMicrophoneScratch_.data(), frames);
+                microphoneDsp_.Process(livestreamMicrophoneScratch_.data(), frames);
+            }
+        }
+    } catch (...) {
+        microphoneDsp_.SetPushToTalk(false);
+    }
     if (livestreamAfk_.load(std::memory_order_acquire) && afkMedia_) {
         afkMedia_->Tick();
     }
@@ -1046,14 +1090,14 @@ bool RecordingController::StartLivestream(std::string* error) {
                 UnityEngine::Android::Permission::RequestUserPermission(
                     kMicrophonePermission, nullptr);
             }
-            if (error) {
-                *error = permissionStatus == MicrophonePermissionStatus::MissingFromApplication
-                    ? "Beat Saber was patched without Microphone Access. Enable Microphone Access in MBF, repatch Beat Saber, and then try the stream again."
-                    : "Quest microphone access is waiting for approval. Accept the Android microphone prompt, then try the stream again.";
-            }
-            return false;
+            Logging::Logger.warn(
+                "Live stream will continue without Quest microphone input: {}",
+                permissionStatus == MicrophonePermissionStatus::MissingFromApplication
+                    ? "Beat Saber was patched without RECORD_AUDIO"
+                    : "Android microphone permission has not been granted");
         }
     }
+    RefreshAudioConfiguration();
     {
         std::lock_guard lock(livestreamMutex_);
         auto livestreamSettings = settings_.Get().broadcast;
@@ -1077,7 +1121,6 @@ bool RecordingController::StartLivestream(std::string* error) {
             return false;
         }
         livestreamSink_.reset();
-        StopLivestreamMicrophoneLocked();
         livestreamGameAudioEnabled_ = livestreamSettings.gameAudioEnabled;
         livestreamGameAudioGain_ = std::clamp(
             livestreamSettings.gameAudioVolumePercent / 100.0F, 0.0F, 2.0F);
@@ -1089,20 +1132,6 @@ bool RecordingController::StartLivestream(std::string* error) {
         // RealtimeAudioCapture drains at most 8192 interleaved samples per
         // worker batch. Reserve once during the explicit Go Live action so
         // normal audio mixing never allocates after the stream has started.
-        livestreamMixScratch_.reserve(8192U);
-        livestreamMicrophoneScratch_.reserve(8192U);
-        if (livestreamMicrophoneEnabled_) {
-            livestreamMicrophone_ = std::make_unique<MicrophoneCapture>();
-            const auto sampleRate = UnityEngine::AudioSettings::get_outputSampleRate();
-            std::string microphoneError;
-            if (!livestreamMicrophone_->Start(sampleRate, &microphoneError)) {
-                livestreamMicrophone_.reset();
-                if (error) {
-                    *error = "Quest microphone could not start: " + microphoneError;
-                }
-                return false;
-            }
-        }
         livestreamSink_ = std::make_unique<broadcast::DirectLivestreamSink>(
             recording,
             std::move(livestreamSettings),
@@ -1110,7 +1139,6 @@ bool RecordingController::StartLivestream(std::string* error) {
             [this] { statusVersion_.fetch_add(1); });
         if (!livestreamSink_->Start(error)) {
             livestreamSink_.reset();
-            StopLivestreamMicrophoneLocked();
             return false;
         }
     }
@@ -1363,14 +1391,117 @@ void RecordingController::SetLivestreamMicrophoneVolumePercent(float value) {
     statusVersion_.fetch_add(1);
 }
 
+bool SameAudioProcessingSettings(
+    const settings::AudioProcessingSettings& left,
+    const settings::AudioProcessingSettings& right) noexcept {
+    return left.microphoneMode == right.microphoneMode &&
+        left.pushToTalkHand == right.pushToTalkHand &&
+        left.includeMicrophoneInRecordings == right.includeMicrophoneInRecordings &&
+        left.includeMicrophoneInLivestreams == right.includeMicrophoneInLivestreams &&
+        left.highPassEnabled == right.highPassEnabled &&
+        left.gateOpenThresholdDb == right.gateOpenThresholdDb &&
+        left.gateCloseThresholdDb == right.gateCloseThresholdDb &&
+        left.gateAttackMilliseconds == right.gateAttackMilliseconds &&
+        left.gateHoldMilliseconds == right.gateHoldMilliseconds &&
+        left.gateReleaseMilliseconds == right.gateReleaseMilliseconds &&
+        left.gatePreRollMilliseconds == right.gatePreRollMilliseconds &&
+        left.compressorEnabled == right.compressorEnabled &&
+        left.compressorThresholdDb == right.compressorThresholdDb &&
+        left.compressorRatio == right.compressorRatio &&
+        left.compressorAttackMilliseconds == right.compressorAttackMilliseconds &&
+        left.compressorReleaseMilliseconds == right.compressorReleaseMilliseconds &&
+        left.compressorMakeupDb == right.compressorMakeupDb &&
+        left.limiterEnabled == right.limiterEnabled &&
+        left.limiterCeilingDb == right.limiterCeilingDb &&
+        left.limiterReleaseMilliseconds == right.limiterReleaseMilliseconds;
+}
+
+void RecordingController::RefreshAudioConfiguration() noexcept {
+    try {
+        // SettingsService belongs to the Unity/main-thread side of the mod.
+        // Take value copies before entering the worker-owned critical section
+        // so SubmitLivestreamAudioLocked never races the settings document.
+        const auto broadcast = settings_.Get().broadcast;
+        const auto audio = settings_.Get().audio;
+        const auto sampleRate = UnityEngine::AudioSettings::get_outputSampleRate();
+        std::lock_guard lock(livestreamMutex_);
+        const auto processingChanged = activeAudioDspSampleRate_ != sampleRate ||
+            !SameAudioProcessingSettings(activeAudioSettings_, audio);
+        activeAudioSettings_ = audio;
+        livestreamGameAudioEnabled_ = broadcast.gameAudioEnabled;
+        livestreamGameAudioGain_ = std::clamp(
+            broadcast.gameAudioVolumePercent / 100.0F, 0.0F, 2.0F);
+        livestreamMicrophoneEnabled_ = broadcast.microphoneEnabled;
+        livestreamMicrophoneGain_ = std::clamp(
+            broadcast.microphoneVolumePercent / 100.0F, 0.0F, 2.0F);
+        microphoneDsp_.Configure(activeAudioSettings_, sampleRate);
+        activeAudioDspSampleRate_ = sampleRate;
+        if (processingChanged) {
+            // Mode, timing, or format changes are a processing boundary. A
+            // reset prevents a previously-open gate or envelope from leaking
+            // into the newly selected mode while capture itself stays open.
+            microphoneDsp_.SetPushToTalk(false);
+            microphoneDsp_.Reset();
+            Logging::Logger.info(
+                "Microphone DSP configuration applied (mode={}, sampleRate={}, highPass={}, compressor={}, limiter={})",
+                settings::ToString(activeAudioSettings_.microphoneMode), sampleRate,
+                activeAudioSettings_.highPassEnabled,
+                activeAudioSettings_.compressorEnabled,
+                activeAudioSettings_.limiterEnabled);
+        }
+        if (!broadcast.microphoneEnabled) {
+            StopLivestreamMicrophoneLocked();
+            return;
+        }
+        if (livestreamMicrophone_ && !livestreamMicrophone_->Failed()) return;
+        StopLivestreamMicrophoneLocked();
+        if (QueryMicrophonePermission() != MicrophonePermissionStatus::Granted) return;
+        auto microphone = std::make_unique<MicrophoneCapture>();
+        std::string error;
+        if (!microphone->Start(sampleRate, &error)) {
+            livestreamMicrophoneFailureReported_ = true;
+            Logging::Logger.error(
+                "Persistent Quest microphone could not start; recording and streaming will continue without it: {}",
+                error);
+            return;
+        }
+        microphoneDsp_.Reset();
+        livestreamMicrophoneFailureReported_ = false;
+        livestreamMicrophone_ = std::move(microphone);
+        Logging::Logger.info(
+            "Persistent Quest microphone is ready (mode={}, local={}, livestream={})",
+            settings::ToString(activeAudioSettings_.microphoneMode),
+            activeAudioSettings_.includeMicrophoneInRecordings,
+            activeAudioSettings_.includeMicrophoneInLivestreams);
+    } catch (const std::exception& error) {
+        Logging::Logger.error("Could not refresh Quest microphone configuration: {}", error.what());
+    } catch (...) {
+        Logging::Logger.error("Could not refresh Quest microphone configuration due to an unknown error");
+    }
+}
+
+MicrophoneSnapshot RecordingController::MicrophoneState() const noexcept {
+    try {
+        std::lock_guard lock(livestreamMutex_);
+        const auto dsp = microphoneDsp_.Snapshot();
+        return {
+            QueryMicrophonePermission(),
+            livestreamMicrophoneEnabled_,
+            livestreamMicrophone_ && !livestreamMicrophone_->Failed(),
+            livestreamMicrophone_ && livestreamMicrophone_->Failed(),
+            dsp.levelDb,
+            dsp.compressorReductionDb,
+            dsp.limiterReductionDb,
+            dsp.gateOpen};
+    } catch (...) {
+        return {};
+    }
+}
+
 void RecordingController::SetLocalRecordingGameAudioMuted(bool muted) noexcept {
     localRecordingGameAudioMuted_.store(muted, std::memory_order_release);
-    // RealtimeAudioCapture owns the audio-thread boundary. Its setter is an
-    // atomic flag update, so this remains safe while the background writer is
-    // draining a local recording and does not disturb a simultaneous stream.
-    if (IsUnityObjectAlive(audioCapture_) && !streamOnlySession_) {
-        audioCapture_->SetFileMuted(muted);
-    }
+    // The worker mixer applies this only to the game source. Muting the WAV
+    // sink itself would incorrectly silence microphone and TTS sources too.
     statusVersion_.fetch_add(1);
     Logging::Logger.info(
         "Local recording game sound {} from movable controls",
@@ -1387,10 +1518,8 @@ bool RecordingController::SetLivestreamGameAudioMuted(
         if (error) *error = "Game sound is locked while the AFK screen is active.";
         return false;
     }
-    const auto& configured = settings_.Get().broadcast;
-    const bool gameAudioAvailable = streamActive
-        ? livestreamGameAudioEnabled_ && livestreamGameAudioGain_ > 0.0001F
-        : configured.gameAudioEnabled && configured.gameAudioVolumePercent > 0.0001F;
+    const bool gameAudioAvailable =
+        livestreamGameAudioEnabled_ && livestreamGameAudioGain_ > 0.0001F;
     if (!gameAudioAvailable) {
         if (error) {
             *error = "Enable Game Sound and set its volume above 0% before using game-sound mute.";
@@ -1463,7 +1592,6 @@ void RecordingController::StopLivestream() noexcept {
     {
         std::lock_guard lock(livestreamMutex_);
         if (livestreamSink_) livestreamSink_->Stop();
-        StopLivestreamMicrophoneLocked();
         livestreamMicrophoneMuted_ = false;
     }
     if (captureTransitioned) {
@@ -1588,8 +1716,9 @@ void RecordingController::CreatePersistentAudioCapture() {
     if (!IsUnityObjectAlive(audioCapture_)) throw std::runtime_error("cannot attach persistent game-audio capture");
 
     RefreshAudioListenerOwnership();
+    tts_.ResetBroadcastOutput();
     auto networkConsumer =
-        [this](const float* samples, std::size_t count, std::int32_t channels, std::int32_t sampleRate) {
+        [this](float* samples, std::size_t count, std::int32_t channels, std::int32_t sampleRate) {
             std::lock_guard lock(livestreamMutex_);
             SubmitLivestreamAudioLocked(samples, count, channels, sampleRate);
         };
@@ -1597,8 +1726,9 @@ void RecordingController::CreatePersistentAudioCapture() {
         audioCapture_->OpenConsumerOnly(std::move(networkConsumer));
     } else {
         audioCapture_->OpenFile(rawAudioPath_, std::move(networkConsumer));
-        audioCapture_->SetFileMuted(localRecordingGameAudioMuted_.load(
-            std::memory_order_acquire));
+        // Game mute is applied inside the worker mixer so microphone and TTS
+        // remain audible in the local file while only game sound is muted.
+        audioCapture_->SetFileMuted(false);
     }
     audioObject_->SetActive(true);
     RefreshAudioListenerOwnership();
@@ -1608,71 +1738,99 @@ void RecordingController::CreatePersistentAudioCapture() {
 }
 
 void RecordingController::SubmitLivestreamAudioLocked(
-    const float* samples,
+    float* samples,
     std::size_t count,
     std::int32_t channels,
     std::int32_t sampleRate) noexcept {
-    if (!livestreamSink_ || !samples || count == 0 || channels <= 0 || sampleRate <= 0) return;
-
-    // Preserve the zero-cost legacy path when the stream uses unmodified game
-    // audio and no microphone. Local WAV output always receives the original
-    // samples before this consumer is called, so no stream mix can alter it.
-    if (livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_ &&
-            (!livestreamMicrophoneEnabled_ || livestreamMicrophoneMuted_ ||
-             livestreamMicrophoneGain_ <= 0.0001F) &&
-            std::abs(livestreamGameAudioGain_ - 1.0F) <= 0.0001F) {
-        livestreamSink_->SubmitAudio(samples, count, channels, sampleRate);
-        return;
-    }
-
+    if (!samples || count == 0 || channels <= 0 || sampleRate <= 0) return;
     const auto channelCount = static_cast<std::size_t>(channels);
     const auto frameCount = count / channelCount;
-    if (frameCount == 0) return;
+    if (frameCount == 0 || count > livestreamMixScratch_.size() ||
+            frameCount > livestreamMicrophoneScratch_.size() || frameCount > ttsMixScratch_.size()) {
+        if (frameCount > 0 && !oversizedAudioBlockReported_) {
+            oversizedAudioBlockReported_ = true;
+            Logging::Logger.error(
+                "Audio worker received an oversized block (samples={}, frames={}); microphone/TTS mix skipped",
+                count, frameCount);
+        }
+        return;
+    }
     const auto usableSampleCount = frameCount * channelCount;
-    livestreamMixScratch_.resize(usableSampleCount);
+    const auto& audioSettings = activeAudioSettings_;
 
     const float* microphone = nullptr;
-    if (livestreamMicrophoneEnabled_ && !livestreamMicrophoneMuted_ &&
-            livestreamMicrophoneGain_ > 0.0001F && livestreamMicrophone_) {
-        livestreamMicrophoneScratch_.resize(frameCount);
+    if (livestreamMicrophoneEnabled_ && livestreamMicrophone_) {
         livestreamMicrophone_->ReadForMix(livestreamMicrophoneScratch_.data(), frameCount);
+        microphoneDsp_.Process(livestreamMicrophoneScratch_.data(), frameCount);
         microphone = livestreamMicrophoneScratch_.data();
         if (livestreamMicrophone_->Failed() && !livestreamMicrophoneFailureReported_) {
             livestreamMicrophoneFailureReported_ = true;
             Logging::Logger.error(
-                "Quest microphone input failed during the live stream; game audio will continue and microphone input will be silent");
+                "Quest microphone input callback failed (AAudio result={}); recording/streaming will continue and microphone input will be silent",
+                livestreamMicrophone_->CallbackError());
         }
     }
 
-    for (std::size_t frame = 0; frame < frameCount; ++frame) {
-        const auto microphoneSample = microphone
-            ? microphone[frame] * livestreamMicrophoneGain_
-            : 0.0F;
-        for (std::size_t channel = 0; channel < channelCount; ++channel) {
-            const auto index = frame * channelCount + channel;
-            const auto gameSample = livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_
-                ? samples[index] * livestreamGameAudioGain_
-                : 0.0F;
-            livestreamMixScratch_[index] = std::clamp(
-                gameSample + microphoneSample, -1.0F, 1.0F);
+    if (sampleRate == 48'000) {
+        tts_.ReadBroadcast(ttsMixScratch_.data(), frameCount);
+    } else {
+        std::fill_n(ttsMixScratch_.data(), frameCount, 0.0F);
+        if (!unsupportedTtsMixRateReported_) {
+            unsupportedTtsMixRateReported_ = true;
+            Logging::Logger.error(
+                "Twitch TTS broadcast routing requires the 48 kHz Quest mixer but received {} Hz; microphone/game audio continue and TTS broadcast output is muted",
+                sampleRate);
         }
     }
-    livestreamSink_->SubmitAudio(
-        livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+    const auto localOutput = !streamOnlySession_;
+    const auto streamOutput = livestreamSink_ != nullptr;
+    const auto localGameMuted = localRecordingGameAudioMuted_.load(std::memory_order_acquire);
+
+    for (std::size_t frame = 0; frame < frameCount; ++frame) {
+        const auto mic = microphone ? microphone[frame] : 0.0F;
+        const auto speech = ttsMixScratch_[frame];
+        for (std::size_t channel = 0; channel < channelCount; ++channel) {
+            const auto index = frame * channelCount + channel;
+            const auto game = samples[index];
+            if (streamOutput) {
+                const auto streamGame = livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_
+                    ? game * livestreamGameAudioGain_ : 0.0F;
+                const auto streamMic = microphone && audioSettings.includeMicrophoneInLivestreams &&
+                        !livestreamMicrophoneMuted_
+                    ? mic * livestreamMicrophoneGain_ : 0.0F;
+                livestreamMixScratch_[index] = std::clamp(streamGame + streamMic + speech, -1.0F, 1.0F);
+            }
+            if (localOutput) {
+                const auto localGame = localGameMuted ? 0.0F : game;
+                const auto localMic = microphone && audioSettings.includeMicrophoneInRecordings
+                    ? mic * livestreamMicrophoneGain_
+                    : 0.0F;
+                samples[index] = std::clamp(localGame + localMic + speech, -1.0F, 1.0F);
+            }
+        }
+    }
+    if (streamOutput) {
+        livestreamSink_->SubmitAudio(
+            livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+    }
 }
 
 void RecordingController::StopLivestreamMicrophoneLocked() noexcept {
+    microphoneDsp_.SetPushToTalk(false);
+    microphoneDsp_.Reset();
     if (!livestreamMicrophone_) return;
     const auto dropped = livestreamMicrophone_->DroppedFrameCount();
     const auto underflow = livestreamMicrophone_->UnderflowFrameCount();
     const auto failed = livestreamMicrophone_->Failed();
+    const auto callbackError = livestreamMicrophone_->CallbackError();
     livestreamMicrophone_->Stop();
     livestreamMicrophone_.reset();
     Logging::Logger.info(
-        "Quest microphone capture stopped (droppedFrames={}, underflowFrames={}, failed={})",
+        "Quest microphone capture stopped (droppedFrames={}, underflowFrames={}, failed={}, callbackError={})",
         dropped,
         underflow,
-        failed);
+        failed,
+        callbackError);
 }
 
 void RecordingController::RefreshAudioListenerOwnership() noexcept {

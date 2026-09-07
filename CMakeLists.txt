@@ -85,6 +85,19 @@ if(SABERSTAGE_HOST_TESTS)
     target_include_directories(saberstage_recording_state_tests PRIVATE include)
     add_test(NAME saberstage.recording_state COMMAND saberstage_recording_state_tests)
 
+    add_executable(saberstage_microphone_dsp_tests
+        tests/MicrophoneDspTests.cpp
+        src/recording/MicrophoneDsp.cpp)
+    target_include_directories(saberstage_microphone_dsp_tests PRIVATE include)
+    add_test(NAME saberstage.microphone_dsp COMMAND saberstage_microphone_dsp_tests)
+
+    add_executable(saberstage_tts_policy_tests
+        tests/TtsPolicyTests.cpp
+        src/broadcast/TtsPolicy.cpp
+        src/broadcast/ChatProtocol.cpp)
+    target_include_directories(saberstage_tts_policy_tests PRIVATE include)
+    add_test(NAME saberstage.tts_policy COMMAND saberstage_tts_policy_tests)
+
     add_executable(saberstage_chat_diagnostics_tests tests/ChatPanelDiagnosticsTests.cpp)
     target_include_directories(saberstage_chat_diagnostics_tests PRIVATE include)
     add_test(NAME saberstage.chat_diagnostics COMMAND saberstage_chat_diagnostics_tests)
@@ -150,6 +163,45 @@ target_link_libraries(${COMPILE_ID} PRIVATE
     -llog -lz)
 native_logger_quest_enable_paper2_abort_bridge(${COMPILE_ID})
 include(extern.cmake)
+
+# eSpeak NG is built into SaberStage so Twitch TTS remains fully local on a
+# standalone Quest. The pinned source and generated English data are prepared
+# outside QPM because neither Android nor Beat Saber guarantees a system TTS
+# service. Async/playback support stays disabled: SaberStage owns the bounded
+# worker and AAudio output paths and uses eSpeak only as a synchronous PCM
+# synthesizer.
+set(SABERSTAGE_ESPEAK_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng/source")
+set(SABERSTAGE_ESPEAK_DATA
+    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng/english-data.zip")
+if(NOT EXISTS "${SABERSTAGE_ESPEAK_DIR}/CMakeLists.txt" OR
+        NOT EXISTS "${SABERSTAGE_ESPEAK_DATA}")
+    message(FATAL_ERROR
+        "Pinned eSpeak NG source/data is missing. Run scripts/prepare-espeak-ng.py first.")
+endif()
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(USE_ASYNC OFF CACHE BOOL "" FORCE)
+set(USE_LIBPCAUDIO OFF CACHE BOOL "" FORCE)
+set(USE_LIBSONIC OFF CACHE BOOL "" FORCE)
+set(USE_MBROLA OFF CACHE BOOL "" FORCE)
+set(USE_SPEECHPLAYER OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+    "${SABERSTAGE_ESPEAK_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/espeak-ng"
+    EXCLUDE_FROM_ALL)
+# eSpeak's public CMake interface includes its libc compatibility directory.
+# Exporting that directory into SaberStage would shadow Android's <wctype.h>
+# while compiling unrelated mod sources. Preserve those paths privately for
+# eSpeak itself, clear them from its interface target, and let SaberStage
+# explicitly import only the public speech API.
+target_include_directories(espeak-ng BEFORE PRIVATE
+    "${SABERSTAGE_ESPEAK_DIR}/src/include"
+    "${SABERSTAGE_ESPEAK_DIR}/src/include/compat")
+set_property(TARGET espeak-include PROPERTY INTERFACE_INCLUDE_DIRECTORIES "")
+target_include_directories(${COMPILE_ID} SYSTEM PRIVATE
+    "${SABERSTAGE_ESPEAK_DIR}/src/include")
+target_link_libraries(${COMPILE_ID} PRIVATE espeak-ng)
 
 set(SABERSTAGE_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/ffmpeg-hardware")
 set(SABERSTAGE_FFMPEG_LIBS
@@ -226,6 +278,27 @@ set_source_files_properties("${SABERSTAGE_AFK_IMAGE_OBJECT}" PROPERTIES
     GENERATED TRUE
     EXTERNAL_OBJECT TRUE)
 target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AFK_IMAGE_OBJECT}")
+
+# Bundle the exact generated dictionaries beside the synthesizer code. Runtime
+# extraction is versioned and bounded; users never need to install a separate
+# Android speech service or copy voice files by hand.
+set(SABERSTAGE_ESPEAK_DATA_OBJECT
+    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_espeak_english_data.o")
+add_custom_command(
+    OUTPUT "${SABERSTAGE_ESPEAK_DATA_OBJECT}"
+    COMMAND ${CMAKE_OBJCOPY}
+        english-data.zip
+        "${SABERSTAGE_ESPEAK_DATA_OBJECT}"
+        --input-target binary
+        --output-target elf64-aarch64
+        --set-section-flags binary=alloc,load,readonly,data,contents
+    DEPENDS "${SABERSTAGE_ESPEAK_DATA}"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng"
+    COMMENT "Embedding SaberStage English TTS data")
+set_source_files_properties("${SABERSTAGE_ESPEAK_DATA_OBJECT}" PROPERTIES
+    GENERATED TRUE
+    EXTERNAL_OBJECT TRUE)
+target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_ESPEAK_DATA_OBJECT}")
 
 # The movable recording panel uses authored PNG glyphs rather than assembling
 # approximate microphones and speakers from UI rectangles. Embed every state

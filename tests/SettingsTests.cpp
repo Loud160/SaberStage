@@ -110,6 +110,16 @@ int main() {
           "recording defaults protect gameplay with 1080p30 output");
     Check(defaults.recording.peakBitrateBitsPerSecond >= defaults.recording.bitrateBitsPerSecond,
           "default peak bitrate is not below target bitrate");
+    Check(!defaults.broadcast.microphoneEnabled &&
+              defaults.audio.microphoneMode == MicrophoneMode::Open &&
+              defaults.audio.includeMicrophoneInRecordings &&
+              defaults.audio.includeMicrophoneInLivestreams,
+          "Quest microphone capture defaults off while routing defaults remain ready");
+    Check(!defaults.tts.enabled && defaults.tts.ignoreKnownBots &&
+              defaults.tts.ignoreCommands && !defaults.tts.speakUrls &&
+              !defaults.tts.speakEmoteNames && defaults.tts.queueCapacity == 4 &&
+              defaults.tts.outputRoute == TtsOutputRoute::HeadsetOnly,
+          "local Twitch TTS defaults off with conservative filtering and queue bounds");
     Check(defaults.broadcast.provider == LivestreamProvider::Twitch &&
               defaults.broadcast.twitch.serverUrl.rfind("rtmp://", 0) == 0 &&
               defaults.broadcast.youtube.serverUrl.rfind("rtmps://", 0) == 0 &&
@@ -163,6 +173,13 @@ int main() {
     invalid.broadcast.microphoneVolumePercent = 500.0F;
     invalid.broadcast.youtube.serverUrl = "https://not-an-rtmp-endpoint";
     invalid.broadcast.kick.streamKey = "invalid key with spaces";
+    invalid.audio.gateOpenThresholdDb = std::numeric_limits<float>::quiet_NaN();
+    invalid.audio.gateCloseThresholdDb = 4.0F;
+    invalid.audio.compressorRatio = -2.0F;
+    invalid.audio.limiterCeilingDb = 6.0F;
+    invalid.tts.maximumCharacters = 50'000;
+    invalid.tts.queueCapacity = 0;
+    invalid.tts.speechRate = std::numeric_limits<float>::infinity();
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -180,6 +197,15 @@ int main() {
     Check(invalid.broadcast.youtube.serverUrl == defaults.broadcast.youtube.serverUrl &&
               invalid.broadcast.kick.streamKey.empty(),
           "invalid service-specific livestream destinations repair without exposing credentials");
+    Check(invalid.audio.gateOpenThresholdDb == defaults.audio.gateOpenThresholdDb &&
+              invalid.audio.gateCloseThresholdDb <= invalid.audio.gateOpenThresholdDb &&
+              invalid.audio.compressorRatio == defaults.audio.compressorRatio &&
+              invalid.audio.limiterCeilingDb == defaults.audio.limiterCeilingDb,
+          "invalid microphone DSP values repair to safe finite settings");
+    Check(invalid.tts.maximumCharacters == defaults.tts.maximumCharacters &&
+              invalid.tts.queueCapacity == defaults.tts.queueCapacity &&
+              invalid.tts.speechRate == defaults.tts.speechRate,
+          "invalid Twitch TTS bounds repair to disabled-safe defaults");
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
     futureProfile.profileId = "future-secondary";
@@ -277,6 +303,30 @@ int main() {
     first.Edit().broadcast.microphoneEnabled = true;
     first.Edit().broadcast.microphoneVolumePercent = 135.0F;
     first.Edit().broadcast.postMapInfoToChat = true;
+    first.Edit().audio.microphoneMode = MicrophoneMode::VoiceActivated;
+    first.Edit().audio.pushToTalkHand = PushToTalkHand::Right;
+    first.Edit().audio.includeMicrophoneInRecordings = false;
+    first.Edit().audio.includeMicrophoneInLivestreams = true;
+    first.Edit().audio.highPassEnabled = false;
+    first.Edit().audio.gateOpenThresholdDb = -33.0F;
+    first.Edit().audio.gateCloseThresholdDb = -44.0F;
+    first.Edit().audio.gatePreRollMilliseconds = 50.0F;
+    first.Edit().audio.compressorRatio = 4.0F;
+    first.Edit().audio.compressorMakeupDb = 4.0F;
+    first.Edit().audio.limiterCeilingDb = -2.0F;
+    first.Edit().tts.enabled = true;
+    first.Edit().tts.speakUsernames = false;
+    first.Edit().tts.ignoreKnownBots = false;
+    first.Edit().tts.ignoreCommands = false;
+    first.Edit().tts.speakUrls = true;
+    first.Edit().tts.speakEmoteNames = true;
+    first.Edit().tts.maximumCharacters = 300;
+    first.Edit().tts.queueCapacity = 6;
+    first.Edit().tts.staleAfterSeconds = 20.0F;
+    first.Edit().tts.volumePercent = 90.0F;
+    first.Edit().tts.speechRate = 1.25F;
+    first.Edit().tts.voice = "en-gb";
+    first.Edit().tts.outputRoute = TtsOutputRoute::HeadsetAndBroadcast;
     // Saving migrates any alpha-era per-user Client ID to SaberStage's
     // registered public application identifier.
     first.Edit().broadcast.twitchAccount.clientId = "legacy-client-id";
@@ -374,6 +424,29 @@ int main() {
               second.Get().broadcast.twitchAccount.expiresAtUnixSeconds == 1'800'000'000 &&
               second.Get().broadcast.twitchAccount.chatWriteAuthorized,
           "livestream destinations, AFK media, and protected Twitch account state survive restart");
+    Check(second.Get().audio.microphoneMode == MicrophoneMode::VoiceActivated &&
+              second.Get().audio.pushToTalkHand == PushToTalkHand::Right &&
+              !second.Get().audio.includeMicrophoneInRecordings &&
+              second.Get().audio.includeMicrophoneInLivestreams &&
+              !second.Get().audio.highPassEnabled &&
+              second.Get().audio.gateOpenThresholdDb == -33.0F &&
+              second.Get().audio.gateCloseThresholdDb == -44.0F &&
+              second.Get().audio.gatePreRollMilliseconds == 50.0F &&
+              second.Get().audio.compressorRatio == 4.0F &&
+              second.Get().audio.compressorMakeupDb == 4.0F &&
+              second.Get().audio.limiterCeilingDb == -2.0F,
+          "microphone modes, routing, and DSP values survive restart");
+    Check(second.Get().tts.enabled && !second.Get().tts.speakUsernames &&
+              !second.Get().tts.ignoreKnownBots && !second.Get().tts.ignoreCommands &&
+              second.Get().tts.speakUrls && second.Get().tts.speakEmoteNames &&
+              second.Get().tts.maximumCharacters == 300 &&
+              second.Get().tts.queueCapacity == 6 &&
+              second.Get().tts.staleAfterSeconds == 20.0F &&
+              second.Get().tts.volumePercent == 90.0F &&
+              second.Get().tts.speechRate == 1.25F &&
+              second.Get().tts.voice == "en-gb" &&
+              second.Get().tts.outputRoute == TtsOutputRoute::HeadsetAndBroadcast,
+          "Twitch TTS filtering, voice, queue, and routing survive restart");
     Check(second.Get().chat.enabled && second.Get().chat.position.x == -0.32F &&
               second.Get().chat.rotationDegrees.y == 170.0F &&
               second.Get().chat.width == 240.0F && second.Get().chat.height == 200.0F,

@@ -1,5 +1,23 @@
 # Third-party notices
 
+## eSpeak NG
+
+SaberStage statically builds [eSpeak NG](https://github.com/espeak-ng/espeak-ng)
+version `1.52.0` from immutable revision
+`4870adfa25b1a32b4361592f1be8a40337c58d6c`. The expected official source
+archive SHA-256 is
+`096f0915470c3bba4f9e3ba274485e453f26dedccb5c28a33f871a84f5e064a9`
+and the deterministic English data SHA-256 is
+`45d577818dc877ac5f8d62b1290b4efe92308512afa8f135a9b535745f0b2446`.
+Both are recorded in `dependencies/espeak-ng.json`. SaberStage uses its
+synchronous in-memory PCM API and a generated English-only voice-data set; it
+does not install a system speech service or invoke cloud TTS.
+
+eSpeak NG is distributed under GPL-3.0-or-later. Its copyright notices and
+complete license are preserved in the pinned upstream source prepared during a
+build. SaberStage distributes the combined work under GPL version 3 and the
+additional project terms in the repository root.
+
 ## Native Logger Quest
 
 SaberStage statically builds [Native Logger Quest](https://github.com/Loud160/NativeLoggerQuest)

@@ -22,7 +22,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 31;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 32;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.
@@ -72,6 +72,26 @@ enum class LivestreamProvider {
     YouTube,
     Kick,
     Custom,
+};
+
+// The microphone capture remains open while enabled; this mode controls only
+// whether captured samples are admitted to the recording/stream mixer.
+enum class MicrophoneMode {
+    Open,
+    PushToTalk,
+    VoiceActivated,
+};
+
+enum class PushToTalkHand {
+    Left,
+    Right,
+    Either,
+};
+
+enum class TtsOutputRoute {
+    HeadsetOnly,
+    BroadcastOnly,
+    HeadsetAndBroadcast,
 };
 
 enum class Subsystem {
@@ -217,6 +237,47 @@ struct LivestreamSettings {
     TwitchAccountSettings twitchAccount;
 };
 
+struct AudioProcessingSettings {
+    // Microphone enable and input gain retain the established broadcast fields
+    // for settings compatibility. These fields describe routing and DSP only.
+    MicrophoneMode microphoneMode = MicrophoneMode::Open;
+    PushToTalkHand pushToTalkHand = PushToTalkHand::Either;
+    bool includeMicrophoneInRecordings = true;
+    bool includeMicrophoneInLivestreams = true;
+    bool highPassEnabled = true;
+    float gateOpenThresholdDb = -38.0F;
+    float gateCloseThresholdDb = -43.0F;
+    float gateAttackMilliseconds = 10.0F;
+    float gateHoldMilliseconds = 200.0F;
+    float gateReleaseMilliseconds = 150.0F;
+    float gatePreRollMilliseconds = 40.0F;
+    bool compressorEnabled = true;
+    float compressorThresholdDb = -18.0F;
+    float compressorRatio = 3.0F;
+    float compressorAttackMilliseconds = 8.0F;
+    float compressorReleaseMilliseconds = 120.0F;
+    float compressorMakeupDb = 3.0F;
+    bool limiterEnabled = true;
+    float limiterCeilingDb = -1.0F;
+    float limiterReleaseMilliseconds = 60.0F;
+};
+
+struct TtsSettings {
+    bool enabled = false;
+    bool speakUsernames = true;
+    bool ignoreKnownBots = true;
+    bool ignoreCommands = true;
+    bool speakUrls = false;
+    bool speakEmoteNames = false;
+    std::int32_t maximumCharacters = 220;
+    std::int32_t queueCapacity = 4;
+    float staleAfterSeconds = 12.0F;
+    float volumePercent = 80.0F;
+    float speechRate = 1.0F;
+    std::string voice = "en-us";
+    TtsOutputRoute outputRoute = TtsOutputRoute::HeadsetOnly;
+};
+
 struct FeatureSettings {
     bool enabled = false;
 };
@@ -278,6 +339,8 @@ struct SettingsDocument {
     FeatureSettings companion;
     FeatureSettings scenes;
     LivestreamSettings broadcast;
+    AudioProcessingSettings audio;
+    TtsSettings tts;
     ChatSettings chat;
 };
 
@@ -307,6 +370,9 @@ std::string_view ToString(EncoderPriority value) noexcept;
 std::string_view ToString(H264Profile value) noexcept;
 std::string_view ToString(H264Level value) noexcept;
 std::string_view ToString(LivestreamProvider value) noexcept;
+std::string_view ToString(MicrophoneMode value) noexcept;
+std::string_view ToString(PushToTalkHand value) noexcept;
+std::string_view ToString(TtsOutputRoute value) noexcept;
 bool TryParse(std::string_view value, RecordingBackend& result) noexcept;
 bool TryParse(std::string_view value, RecordingResolution& result) noexcept;
 bool TryParse(std::string_view value, RateControlMode& result) noexcept;
@@ -314,6 +380,9 @@ bool TryParse(std::string_view value, EncoderPriority& result) noexcept;
 bool TryParse(std::string_view value, H264Profile& result) noexcept;
 bool TryParse(std::string_view value, H264Level& result) noexcept;
 bool TryParse(std::string_view value, LivestreamProvider& result) noexcept;
+bool TryParse(std::string_view value, MicrophoneMode& result) noexcept;
+bool TryParse(std::string_view value, PushToTalkHand& result) noexcept;
+bool TryParse(std::string_view value, TtsOutputRoute& result) noexcept;
 void ResolutionDimensions(RecordingResolution resolution, std::int32_t& width, std::int32_t& height) noexcept;
 
 } // namespace saberstage::settings

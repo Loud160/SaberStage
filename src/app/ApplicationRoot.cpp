@@ -16,6 +16,7 @@
 #include "saberstage/ErrorManager.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
+#include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
 #include "saberstage/recording/RecordingController.hpp"
 #include "saberstage/ui/MenuController.hpp"
@@ -45,30 +46,35 @@ bool ApplicationRoot::Start() {
                              settings_.Get().schemaVersion, load.migrated, load.repaired, load.recoveredBackup);
     }
 
+    // Mark the composition root active before constructing fallible runtime
+    // services. If a later constructor or UI registration throws, the owner
+    // reset in late_load invokes Stop and unwinds the partial graph in the same
+    // dependency order as a normal shutdown.
+    started_ = true;
     camera_ = std::make_unique<camera::CameraManager>(
         settings_, settings_.Path().parent_path() / "MovementScripts");
     if (!camera_->Start()) {
         Logging::Logger.error("Camera manager failed to start");
-        camera_.reset();
+        Stop();
         return false;
     }
 
     preview_ = std::make_unique<preview::PreviewManager>(settings_, *camera_);
     if (!preview_->Start()) {
         Logging::Logger.error("Preview manager failed to start");
-        preview_.reset();
-        camera_->Stop();
-        camera_.reset();
+        Stop();
         return false;
     }
 
+    tts_ = std::make_unique<broadcast::TtsService>(
+        settings_.Path().parent_path() / "Tts");
+    tts_->ApplySettings(settings_.Get().tts);
     recording_ = std::make_unique<recording::RecordingController>(
-        settings_, *camera_, kQuestVideoShotsDirectory);
-    twitch_ = std::make_unique<broadcast::TwitchService>(settings_);
+        settings_, *camera_, *tts_, kQuestVideoShotsDirectory);
+    twitch_ = std::make_unique<broadcast::TwitchService>(settings_, *tts_);
 
     menu_ = std::make_unique<ui::MenuController>(*this);
     menu_->Register();
-    started_ = true;
     Logging::Logger.info("Application root started");
     return true;
 }
@@ -99,6 +105,10 @@ void ApplicationRoot::Stop() noexcept {
         if (twitch_) twitch_->Shutdown();
         twitch_.reset();
     });
+    errors.Guard("stopping Twitch text-to-speech", [this] {
+        if (tts_) tts_->Shutdown();
+        tts_.reset();
+    });
     errors.Guard("stopping the spectator camera", [this] {
         if (camera_) camera_->Stop();
         camera_.reset();
@@ -112,5 +122,6 @@ camera::CameraManager& ApplicationRoot::Camera() noexcept { return *camera_; }
 preview::PreviewManager& ApplicationRoot::Preview() noexcept { return *preview_; }
 recording::RecordingController& ApplicationRoot::Recording() noexcept { return *recording_; }
 broadcast::TwitchService& ApplicationRoot::Twitch() noexcept { return *twitch_; }
+broadcast::TtsService& ApplicationRoot::Tts() noexcept { return *tts_; }
 
 } // namespace saberstage::app

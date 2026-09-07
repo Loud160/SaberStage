@@ -25,6 +25,8 @@ Push-Location $repo
 try {
     & python (Join-Path $PSScriptRoot 'prepare-native-logger.py')
     if ($LASTEXITCODE -ne 0) { throw "Native Logger Quest preparation failed with exit code $LASTEXITCODE" }
+    & python (Join-Path $PSScriptRoot 'prepare-espeak-ng.py')
+    if ($LASTEXITCODE -ne 0) { throw "eSpeak NG preparation failed with exit code $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $ffmpegReady)) {
         & (Join-Path $PSScriptRoot 'build-ffmpeg-hardware.ps1')
         if ($LASTEXITCODE -ne 0) { throw "private FFmpeg hardware runtime build failed with exit code $LASTEXITCODE" }

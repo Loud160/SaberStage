@@ -477,6 +477,57 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             }
         }
     }
+    if (const auto* audio = Member(document, "audio")) {
+        if (!audio->IsObject()) {
+            repaired = true;
+        } else {
+            settings.audio.microphoneMode = EnumValue(
+                *audio, "microphoneMode", settings.audio.microphoneMode,
+                [](std::string_view value, MicrophoneMode& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.audio.pushToTalkHand = EnumValue(
+                *audio, "pushToTalkHand", settings.audio.pushToTalkHand,
+                [](std::string_view value, PushToTalkHand& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.audio.includeMicrophoneInRecordings = Bool(*audio, "includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, repaired);
+            settings.audio.includeMicrophoneInLivestreams = Bool(*audio, "includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, repaired);
+            settings.audio.highPassEnabled = Bool(*audio, "highPassEnabled", settings.audio.highPassEnabled, repaired);
+            settings.audio.gateOpenThresholdDb = Float(*audio, "gateOpenThresholdDb", settings.audio.gateOpenThresholdDb, repaired);
+            settings.audio.gateCloseThresholdDb = Float(*audio, "gateCloseThresholdDb", settings.audio.gateCloseThresholdDb, repaired);
+            settings.audio.gateAttackMilliseconds = Float(*audio, "gateAttackMilliseconds", settings.audio.gateAttackMilliseconds, repaired);
+            settings.audio.gateHoldMilliseconds = Float(*audio, "gateHoldMilliseconds", settings.audio.gateHoldMilliseconds, repaired);
+            settings.audio.gateReleaseMilliseconds = Float(*audio, "gateReleaseMilliseconds", settings.audio.gateReleaseMilliseconds, repaired);
+            settings.audio.gatePreRollMilliseconds = Float(*audio, "gatePreRollMilliseconds", settings.audio.gatePreRollMilliseconds, repaired);
+            settings.audio.compressorEnabled = Bool(*audio, "compressorEnabled", settings.audio.compressorEnabled, repaired);
+            settings.audio.compressorThresholdDb = Float(*audio, "compressorThresholdDb", settings.audio.compressorThresholdDb, repaired);
+            settings.audio.compressorRatio = Float(*audio, "compressorRatio", settings.audio.compressorRatio, repaired);
+            settings.audio.compressorAttackMilliseconds = Float(*audio, "compressorAttackMilliseconds", settings.audio.compressorAttackMilliseconds, repaired);
+            settings.audio.compressorReleaseMilliseconds = Float(*audio, "compressorReleaseMilliseconds", settings.audio.compressorReleaseMilliseconds, repaired);
+            settings.audio.compressorMakeupDb = Float(*audio, "compressorMakeupDb", settings.audio.compressorMakeupDb, repaired);
+            settings.audio.limiterEnabled = Bool(*audio, "limiterEnabled", settings.audio.limiterEnabled, repaired);
+            settings.audio.limiterCeilingDb = Float(*audio, "limiterCeilingDb", settings.audio.limiterCeilingDb, repaired);
+            settings.audio.limiterReleaseMilliseconds = Float(*audio, "limiterReleaseMilliseconds", settings.audio.limiterReleaseMilliseconds, repaired);
+        }
+    }
+    if (const auto* tts = Member(document, "tts")) {
+        if (!tts->IsObject()) {
+            repaired = true;
+        } else {
+            settings.tts.enabled = Bool(*tts, "enabled", settings.tts.enabled, repaired);
+            settings.tts.speakUsernames = Bool(*tts, "speakUsernames", settings.tts.speakUsernames, repaired);
+            settings.tts.ignoreKnownBots = Bool(*tts, "ignoreKnownBots", settings.tts.ignoreKnownBots, repaired);
+            settings.tts.ignoreCommands = Bool(*tts, "ignoreCommands", settings.tts.ignoreCommands, repaired);
+            settings.tts.speakUrls = Bool(*tts, "speakUrls", settings.tts.speakUrls, repaired);
+            settings.tts.speakEmoteNames = Bool(*tts, "speakEmoteNames", settings.tts.speakEmoteNames, repaired);
+            settings.tts.maximumCharacters = Int(*tts, "maximumCharacters", settings.tts.maximumCharacters, repaired);
+            settings.tts.queueCapacity = Int(*tts, "queueCapacity", settings.tts.queueCapacity, repaired);
+            settings.tts.staleAfterSeconds = Float(*tts, "staleAfterSeconds", settings.tts.staleAfterSeconds, repaired);
+            settings.tts.volumePercent = Float(*tts, "volumePercent", settings.tts.volumePercent, repaired);
+            settings.tts.speechRate = Float(*tts, "speechRate", settings.tts.speechRate, repaired);
+            settings.tts.voice = String(*tts, "voice", settings.tts.voice, repaired);
+            settings.tts.outputRoute = EnumValue(
+                *tts, "outputRoute", settings.tts.outputRoute,
+                [](std::string_view value, TtsOutputRoute& parsed) { return TryParse(value, parsed); }, repaired);
+        }
+    }
     if (const auto* chat = Member(document, "chat")) {
         if (!chat->IsObject()) {
             repaired = true;
@@ -646,6 +697,46 @@ std::string Encode(const SettingsDocument& settings) {
         "chatWriteAuthorized", settings.broadcast.twitchAccount.chatWriteAuthorized, allocator);
     broadcast.AddMember("twitchAccount", twitchAccount, allocator);
     document.AddMember("broadcast", broadcast, allocator);
+
+    Value audio(rapidjson::kObjectType);
+    audio.AddMember("microphoneMode", Value(ToString(settings.audio.microphoneMode).data(), allocator), allocator);
+    audio.AddMember("pushToTalkHand", Value(ToString(settings.audio.pushToTalkHand).data(), allocator), allocator);
+    audio.AddMember("includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, allocator);
+    audio.AddMember("includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, allocator);
+    audio.AddMember("highPassEnabled", settings.audio.highPassEnabled, allocator);
+    audio.AddMember("gateOpenThresholdDb", settings.audio.gateOpenThresholdDb, allocator);
+    audio.AddMember("gateCloseThresholdDb", settings.audio.gateCloseThresholdDb, allocator);
+    audio.AddMember("gateAttackMilliseconds", settings.audio.gateAttackMilliseconds, allocator);
+    audio.AddMember("gateHoldMilliseconds", settings.audio.gateHoldMilliseconds, allocator);
+    audio.AddMember("gateReleaseMilliseconds", settings.audio.gateReleaseMilliseconds, allocator);
+    audio.AddMember("gatePreRollMilliseconds", settings.audio.gatePreRollMilliseconds, allocator);
+    audio.AddMember("compressorEnabled", settings.audio.compressorEnabled, allocator);
+    audio.AddMember("compressorThresholdDb", settings.audio.compressorThresholdDb, allocator);
+    audio.AddMember("compressorRatio", settings.audio.compressorRatio, allocator);
+    audio.AddMember("compressorAttackMilliseconds", settings.audio.compressorAttackMilliseconds, allocator);
+    audio.AddMember("compressorReleaseMilliseconds", settings.audio.compressorReleaseMilliseconds, allocator);
+    audio.AddMember("compressorMakeupDb", settings.audio.compressorMakeupDb, allocator);
+    audio.AddMember("limiterEnabled", settings.audio.limiterEnabled, allocator);
+    audio.AddMember("limiterCeilingDb", settings.audio.limiterCeilingDb, allocator);
+    audio.AddMember("limiterReleaseMilliseconds", settings.audio.limiterReleaseMilliseconds, allocator);
+    document.AddMember("audio", audio, allocator);
+
+    Value tts(rapidjson::kObjectType);
+    tts.AddMember("enabled", settings.tts.enabled, allocator);
+    tts.AddMember("speakUsernames", settings.tts.speakUsernames, allocator);
+    tts.AddMember("ignoreKnownBots", settings.tts.ignoreKnownBots, allocator);
+    tts.AddMember("ignoreCommands", settings.tts.ignoreCommands, allocator);
+    tts.AddMember("speakUrls", settings.tts.speakUrls, allocator);
+    tts.AddMember("speakEmoteNames", settings.tts.speakEmoteNames, allocator);
+    tts.AddMember("maximumCharacters", settings.tts.maximumCharacters, allocator);
+    tts.AddMember("queueCapacity", settings.tts.queueCapacity, allocator);
+    tts.AddMember("staleAfterSeconds", settings.tts.staleAfterSeconds, allocator);
+    tts.AddMember("volumePercent", settings.tts.volumePercent, allocator);
+    tts.AddMember("speechRate", settings.tts.speechRate, allocator);
+    tts.AddMember("voice", Value(settings.tts.voice.c_str(), allocator), allocator);
+    tts.AddMember("outputRoute", Value(ToString(settings.tts.outputRoute).data(), allocator), allocator);
+    document.AddMember("tts", tts, allocator);
+
     Value chat(rapidjson::kObjectType);
     chat.AddMember("enabled", settings.chat.enabled, allocator);
     AddVector(chat, "position", settings.chat.position, allocator);

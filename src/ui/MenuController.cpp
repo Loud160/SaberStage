@@ -21,6 +21,7 @@
 #include "saberstage/app/ApplicationRoot.hpp"
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
+#include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
@@ -914,6 +915,8 @@ MenuController::~MenuController() noexcept {
             (void)ReleaseSliderRegistrations(recordingView_->get_gameObject(), "recording menu shutdown");
         for (auto* page : tabViewRoots_)
             if (IsAlive(page)) (void)ReleaseSliderRegistrations(page, "camera menu shutdown");
+        for (auto* page : centerDebugTabViewRoots_)
+            if (IsAlive(page)) (void)ReleaseSliderRegistrations(page, "center menu shutdown");
     });
     errors.Guard("clearing recording UI callbacks", [this] {
         root_.Recording().SetStatusChangedHandler({});
@@ -1146,32 +1149,52 @@ void MenuController::SelectAfkFile(const std::filesystem::path& selected) {
     if (afkPickerModal_) afkPickerModal_->Hide();
 }
 
+void MenuController::ApplyAudioSettings(bool requestPermission) {
+    auto& document = root_.Settings().Edit();
+    settings::ValidateAndRepair(document);
+    root_.Settings().RequestSave();
+    if (requestPermission && document.broadcast.microphoneEnabled) {
+        const auto permission = recording::RecordingController::QueryMicrophonePermission();
+        if (permission == recording::MicrophonePermissionStatus::MissingFromApplication) {
+            ShowLivestreamActionError(
+                "Beat Saber was patched without Microphone Access. Enable it in MBF and repatch Beat Saber; recording and streaming will continue without microphone audio until then.");
+        } else if (permission != recording::MicrophonePermissionStatus::Granted) {
+            UnityEngine::Android::Permission::RequestUserPermission(
+                "android.permission.RECORD_AUDIO", nullptr);
+            ShowLivestreamActionError(
+                "Android microphone access was requested. Accept the system prompt; SaberStage will start capture without restarting the game.");
+        }
+    }
+    root_.Recording().RefreshAudioConfiguration();
+    RefreshRecordingStatus();
+}
+
+void MenuController::ApplyTtsSettings() {
+    auto& document = root_.Settings().Edit();
+    settings::ValidateAndRepair(document);
+    root_.Settings().RequestSave();
+    root_.Tts().ApplySettings(document.tts);
+}
+
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
 
     static std::array<std::string_view, 3> tabNames{
-        "Tab 1", "Tab 2", "Tab 3"};
+        "Overview", "Audio", "Twitch TTS"};
     active_->centerDebugTabViewRoots_.fill(nullptr);
     active_->centerDebugTabContentRoots_.fill(nullptr);
     active_->selectedCenterDebugTab_ = 0;
+    active_->audioInputStatusText_ = nullptr;
+    active_->ttsStatusText_ = nullptr;
 
-    // DEBUG LAYOUT VISUALIZATION -- intentionally temporary. Keep this marker
-    // searchable so every diagnostic color and inset can be removed together
-    // after headset screenshots verify the center-panel geometry.
-    constexpr float kDebugPageInset = 5.0F;
-    constexpr float kDebugScrollHorizontalInset = 3.0F;
-    constexpr float kDebugScrollVerticalInset = 0.0F;
-    constexpr float kDebugTabStripHeight = 10.0F;
-    const std::array<UnityEngine::Color, 3> debugPageColors{
-        UnityEngine::Color{0.82F, 0.08F, 0.08F, 0.82F}, // Tab 1 page: red
-        UnityEngine::Color{0.08F, 0.72F, 0.16F, 0.82F}, // Tab 2 page: green
-        UnityEngine::Color{0.08F, 0.22F, 0.88F, 0.82F}  // Tab 3 page: blue
-    };
-    const std::array<UnityEngine::Color, 3> debugScrollColors{
-        UnityEngine::Color{0.04F, 0.82F, 0.92F, 0.88F}, // Tab 1 scroll: cyan
-        UnityEngine::Color{0.92F, 0.10F, 0.78F, 0.88F}, // Tab 2 scroll: magenta
-        UnityEngine::Color{0.96F, 0.76F, 0.06F, 0.88F}  // Tab 3 scroll: yellow
-    };
+    // These are the exact page/viewport dimensions verified in-headset before
+    // feature controls were introduced. Do not "correct" the three-unit side
+    // inset using nested-container math; it is the proven visible mask margin.
+    constexpr float kPageInset = 5.0F;
+    constexpr float kScrollHorizontalInset = 3.0F;
+    constexpr float kScrollVerticalInset = 0.0F;
+    constexpr float kTabStripHeight = 10.0F;
+    constexpr float kContentWidth = 60.0F;
 
     const auto fitInsideParent = [](
         UnityEngine::RectTransform* rect,
@@ -1186,26 +1209,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         rect->set_offsetMin({left, bottom});
         rect->set_offsetMax({-right, -top});
     };
-    const auto createDebugBackground = [&fitInsideParent](
-        UnityEngine::Transform* parent,
-        std::string_view name,
-        UnityEngine::Color color) -> HMUI::ImageView* {
-        auto* image = BSML::Lite::CreateImage(
-            parent, BSML::Utilities::ImageResources::GetWhitePixel());
-        if (!image) return nullptr;
-        image->get_gameObject()->set_name(name);
-        image->set_color(color);
-        image->set_preserveAspect(false);
-        image->set_raycastTarget(false);
-        fitInsideParent(
-            image->get_transform().cast<UnityEngine::RectTransform>(),
-            0.0F, 0.0F, 0.0F, 0.0F);
-        image->get_transform()->SetAsFirstSibling();
-        return image;
-    };
-
     // This is the same native segmented-control pattern the pre-removal avatar
-    // center menu used. Only its page contents are the empty debug scaffold.
+    // center menu used, now populated without changing the verified geometry.
     active_->centerDebugTabs_ = BSML::Lite::CreateTextSegmentedControl(
         view,
         {0.0F, 0.0F},
@@ -1225,8 +1230,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     }
 
     for (std::size_t index = 0; index < tabNames.size(); ++index) {
-        const auto pageName =
-            "SaberStage Center Debug Tab Page " + std::to_string(index + 1);
+        const auto pageName = "SaberStage Center Tab Page " + std::to_string(index + 1);
         auto* page = UnityEngine::GameObject::New_ctor(StringW(pageName));
         if (!page) continue;
         auto* pageRect = page->AddComponent<UnityEngine::RectTransform*>();
@@ -1236,14 +1240,10 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         // native tab strip while retaining the same five-unit gap below it.
         fitInsideParent(
             pageRect,
-            kDebugPageInset,
-            kDebugPageInset,
-            kDebugPageInset,
-            kDebugTabStripHeight);
-        createDebugBackground(
-            page->get_transform(),
-            "DEBUG Tab Page Background " + std::to_string(index + 1),
-            debugPageColors[index]);
+            kPageInset,
+            kPageInset,
+            kPageInset,
+            kTabStripHeight);
 
         auto* content = BSML::Lite::CreateScrollableSettingsContainer(
             page->get_transform());
@@ -1264,14 +1264,10 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             // guarantees the viewport cannot exceed either visible side.
             fitInsideParent(
                 scrollRect,
-                kDebugScrollHorizontalInset,
-                kDebugScrollVerticalInset,
-                kDebugScrollHorizontalInset,
-                kDebugScrollVerticalInset);
-            createDebugBackground(
-                scrollRect,
-                "DEBUG Vertical Scroll Background " + std::to_string(index + 1),
-                debugScrollColors[index]);
+                kScrollHorizontalInset,
+                kScrollVerticalInset,
+                kScrollHorizontalInset,
+                kScrollVerticalInset);
         }
 
         if (auto* rows = content->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
@@ -1281,8 +1277,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             rows->set_childForceExpandHeight(false);
             rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
             rows->set_spacing(1.0F);
-            // Keep future diagnostic children five units inside the scroll
-            // content so the container color remains visible around them too.
+            // Five-unit content padding was also verified with the scroll
+            // viewport. Controls below use the remaining width explicitly.
             rows->set_padding(UnityEngine::RectOffset::New_ctor(5, 5, 5, 5));
         }
     }
@@ -1293,9 +1289,386 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         [](auto* page) { return page == nullptr; });
     if (missingPage) {
         Logging::Logger.error(
-            "Could not create all three center-panel debug tab pages");
+            "Could not create all three center-panel tab pages");
         return;
     }
+
+    const auto makeSection = [](UnityEngine::GameObject* parent, std::string_view title) {
+        auto* section = BSML::Lite::CreateVerticalLayoutGroup(parent->get_transform());
+        section->set_spacing(0.35F);
+        section->set_childControlWidth(true);
+        section->set_childControlHeight(true);
+        section->set_childForceExpandWidth(false);
+        section->set_childForceExpandHeight(false);
+        section->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
+        ConfigureLayout(section, kContentWidth, -1.0F, 0.0F, 0.0F);
+        auto* heading = BSML::Lite::CreateText(
+            section->get_transform(), StringW(title), TMPro::FontStyles::Bold, 3.6F);
+        heading->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+        heading->set_color({0.35F, 0.72F, 1.0F, 1.0F});
+        ConfigureLayout(heading, kContentWidth, 5.0F, 0.0F, 0.0F);
+        return section->get_gameObject().ptr();
+    };
+    const auto makePair = [](UnityEngine::GameObject* section) {
+        auto* row = BSML::Lite::CreateHorizontalLayoutGroup(section->get_transform());
+        row->set_spacing(1.0F);
+        row->set_childControlWidth(true);
+        row->set_childControlHeight(true);
+        row->set_childForceExpandWidth(false);
+        row->set_childForceExpandHeight(false);
+        row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+        ConfigureLayout(row, kContentWidth, 8.0F, 0.0F, 0.0F);
+        return row;
+    };
+    const auto fitFull = [](auto* control) {
+        if (!control) return control;
+        ConstrainRightPanelRow(control);
+        ConfigureLayout(control, kContentWidth, 8.0F, 0.0F, 0.0F);
+        if (auto* layout = control->get_gameObject()->template GetComponent<UnityEngine::UI::LayoutElement*>()) {
+            layout->set_minWidth(kContentWidth);
+        }
+        return control;
+    };
+    const auto fitHalfToggle = [](BSML::ToggleSetting* control) {
+        if (!control) return control;
+        constexpr float width = (kContentWidth - 1.0F) * 0.5F;
+        ConfigureLayout(control, width, 8.0F, 0.0F, 0.0F);
+        FlattenFlatPanelDepth(control->get_transform());
+        FitLivestreamToggle(control, 0.25F, 0.25F);
+        if (control->text) control->text->set_fontSize(2.65F);
+        return control;
+    };
+    const auto fitHalfButton = [](UnityEngine::UI::Button* control) {
+        if (!control) return control;
+        constexpr float width = (kContentWidth - 1.0F) * 0.5F;
+        NeutralizeContentSizeFitter(control);
+        ConfigureLayout(control, width, 7.0F, 0.0F, 0.0F);
+        BSML::Lite::SetButtonTextSize(control, 2.8F);
+        return control;
+    };
+    const auto makeStatus = [](UnityEngine::GameObject* parent, std::string_view text) {
+        auto* status = BSML::Lite::CreateText(
+            parent->get_transform(), StringW(text), 2.8F);
+        status->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+        status->set_enableWordWrapping(true);
+        status->set_color({0.76F, 0.84F, 0.92F, 1.0F});
+        ConfigureLayout(status, kContentWidth, 9.0F, 0.0F, 0.0F);
+        return status;
+    };
+
+    auto* overview = active_->centerDebugTabContentRoots_[0];
+    auto* overviewSection = makeSection(overview, "Broadcast Sound");
+    makeStatus(
+        overviewSection,
+        "Audio contains the Quest microphone, gate, compressor, limiter, and recording/stream routing. Twitch TTS contains fully local chat speech and output routing.");
+    auto* safetySection = makeSection(overview, "Quest Performance and Privacy");
+    makeStatus(
+        safetySection,
+        "Both systems are optional. TTS is off by default and uses a bounded queue. The microphone remains captured only while its master switch is enabled; disabling it releases Android audio input.");
+
+    auto* audioPage = active_->centerDebugTabContentRoots_[1];
+    const auto& initialBroadcast = active_->root_.Settings().Get().broadcast;
+    const auto& initialAudio = active_->root_.Settings().Get().audio;
+
+    auto* mixSection = makeSection(audioPage, "Sources and Routing");
+    auto* sourceRow = makePair(mixSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        sourceRow->get_gameObject(), "Game Sound", initialBroadcast.gameAudioEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.gameAudioEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Includes Beat Saber's sound in the live-stream mix. This does not change the volume heard in the headset."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        sourceRow->get_gameObject(), "Quest Microphone", initialBroadcast.microphoneEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.microphoneEnabled = value;
+            active_->ApplyAudioSettings(value);
+        }), "Keeps the Quest microphone capture open while enabled. Requires Microphone Access in MBF and Android permission."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        mixSection, "Game Sound Volume", 5.0F, initialBroadcast.gameAudioVolumePercent,
+        0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
+            active_->root_.Recording().SetLivestreamGameAudioVolumePercent(value);
+            active_->ApplyAudioSettings();
+        }), "Live-stream game sound level. It remains adjustable while a stream is active."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        mixSection, "Microphone Volume", 5.0F, initialBroadcast.microphoneVolumePercent,
+        0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
+            active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
+            active_->ApplyAudioSettings();
+        }), "Microphone level after gate, compression, and limiting. It remains adjustable while live."));
+    auto* routeRow = makePair(mixSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        routeRow->get_gameObject(), "Mic in Recordings", initialAudio.includeMicrophoneInRecordings, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.includeMicrophoneInRecordings = value;
+            active_->ApplyAudioSettings();
+        }), "Routes the processed Quest microphone into local SaberStage recordings."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        routeRow->get_gameObject(), "Mic in Streams", initialAudio.includeMicrophoneInLivestreams, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.includeMicrophoneInLivestreams = value;
+            active_->ApplyAudioSettings();
+        }), "Routes the processed Quest microphone into live streams."));
+    active_->audioInputStatusText_ = makeStatus(mixSection, "Microphone status: checking...");
+
+    auto* modeSection = makeSection(audioPage, "Microphone Mode and Gate");
+    static std::array<std::string_view, 3> microphoneModes{
+        "Open", "Push to Talk", "Voice Activated"};
+    static std::array<std::string_view, 3> pttHands{"Left Grip", "Right Grip", "Either Grip"};
+    const auto modeLabel = initialAudio.microphoneMode == settings::MicrophoneMode::PushToTalk
+        ? "Push to Talk" : initialAudio.microphoneMode == settings::MicrophoneMode::VoiceActivated
+            ? "Voice Activated" : "Open";
+    fitFull(WithHint(BSML::Lite::CreateDropdown(
+        modeSection, "Microphone Mode", modeLabel, microphoneModes, [](StringW value) {
+            if (!active_) return;
+            const auto selected = static_cast<std::string>(value);
+            active_->root_.Settings().Edit().audio.microphoneMode = selected == "Push to Talk"
+                ? settings::MicrophoneMode::PushToTalk
+                : selected == "Voice Activated" ? settings::MicrophoneMode::VoiceActivated
+                                                  : settings::MicrophoneMode::Open;
+            active_->ApplyAudioSettings();
+        }), "Open passes the microphone continuously. Push to Talk uses a controller grip. Voice Activated uses the thresholds below."));
+    const auto handLabel = initialAudio.pushToTalkHand == settings::PushToTalkHand::Left
+        ? "Left Grip" : initialAudio.pushToTalkHand == settings::PushToTalkHand::Right
+            ? "Right Grip" : "Either Grip";
+    fitFull(WithHint(BSML::Lite::CreateDropdown(
+        modeSection, "Push to Talk Control", handLabel, pttHands, [](StringW value) {
+            if (!active_) return;
+            const auto selected = static_cast<std::string>(value);
+            active_->root_.Settings().Edit().audio.pushToTalkHand = selected == "Left Grip"
+                ? settings::PushToTalkHand::Left
+                : selected == "Right Grip" ? settings::PushToTalkHand::Right
+                                             : settings::PushToTalkHand::Either;
+            active_->ApplyAudioSettings();
+        }), "Selects which controller grip opens Push to Talk. Either Grip accepts either hand."));
+    fitFull(WithHint(BSML::Lite::CreateToggle(
+        modeSection, "High-pass Filter", initialAudio.highPassEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.highPassEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Reduces headset rumble and low-frequency breath noise before gate detection."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        modeSection, "Gate Open (dBFS)", 1.0F, initialAudio.gateOpenThresholdDb,
+        -60.0F, -10.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateOpenThresholdDb = value;
+            active_->ApplyAudioSettings();
+        }), "Voice Activated opens when the measured microphone level reaches this value."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        modeSection, "Gate Close (dBFS)", 1.0F, initialAudio.gateCloseThresholdDb,
+        -70.0F, -12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateCloseThresholdDb = value;
+            active_->ApplyAudioSettings();
+        }), "The gate closes below this lower value, preventing rapid chatter around one threshold."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        modeSection, "Gate Attack (ms)", 1.0F, initialAudio.gateAttackMilliseconds,
+        1.0F, 100.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateAttackMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How quickly the voice gate fades open."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        modeSection, "Hold / Release (ms)", 10.0F, initialAudio.gateHoldMilliseconds,
+        0.0F, 1000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateHoldMilliseconds = value;
+            active_->root_.Settings().Edit().audio.gateReleaseMilliseconds = std::max(10.0F, value * 0.75F);
+            active_->ApplyAudioSettings();
+        }), "Keeps the gate open between words; release follows at 75% of this value."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        modeSection, "Voice Pre-roll (ms)", 5.0F, initialAudio.gatePreRollMilliseconds,
+        0.0F, 80.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gatePreRollMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "Delays output by a small fixed amount so the start of a word is retained when the voice gate opens."));
+
+    auto* dynamicsSection = makeSection(audioPage, "Dynamics and Safety");
+    auto* dynamicsRow = makePair(dynamicsSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        dynamicsRow->get_gameObject(), "Limiter", initialAudio.limiterEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.limiterEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Prevents the processed microphone from exceeding the selected ceiling."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        dynamicsRow->get_gameObject(), "Compressor", initialAudio.compressorEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Reduces loud microphone peaks before output makeup and limiting."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        dynamicsSection, "Compressor Threshold", 1.0F, initialAudio.compressorThresholdDb,
+        -40.0F, -6.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorThresholdDb = value;
+            active_->ApplyAudioSettings();
+        }), "Compression begins above this dBFS level."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        dynamicsSection, "Compressor Ratio", 0.5F, initialAudio.compressorRatio,
+        1.0F, 10.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorRatio = value;
+            active_->ApplyAudioSettings();
+        }), "Controls how strongly loud speech is reduced above the threshold."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        dynamicsSection, "Makeup Gain (dB)", 0.5F, initialAudio.compressorMakeupDb,
+        0.0F, 12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorMakeupDb = value;
+            active_->ApplyAudioSettings();
+        }), "Raises the compressed microphone before the limiter."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        dynamicsSection, "Limiter Ceiling (dBFS)", 0.5F, initialAudio.limiterCeilingDb,
+        -12.0F, -0.5F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.limiterCeilingDb = value;
+            active_->ApplyAudioSettings();
+        }), "Maximum microphone peak before it is mixed with game sound."));
+    auto* presetRow = makePair(dynamicsSection);
+    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(presetRow, "Normal Voice", [] {
+        if (!active_) return;
+        auto& audio = active_->root_.Settings().Edit().audio;
+        const auto defaults = settings::AudioProcessingSettings{};
+        const auto mode = audio.microphoneMode;
+        const auto hand = audio.pushToTalkHand;
+        const auto local = audio.includeMicrophoneInRecordings;
+        const auto stream = audio.includeMicrophoneInLivestreams;
+        audio = defaults;
+        audio.microphoneMode = mode;
+        audio.pushToTalkHand = hand;
+        audio.includeMicrophoneInRecordings = local;
+        audio.includeMicrophoneInLivestreams = stream;
+        active_->ApplyAudioSettings();
+    }), "Restores the documented normal-voice gate, compressor, and limiter values without changing routing."));
+    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(presetRow, "Open Mic", [] {
+        if (!active_) return;
+        active_->root_.Settings().Edit().audio.microphoneMode = settings::MicrophoneMode::Open;
+        active_->ApplyAudioSettings();
+    }), "Uses continuous microphone input while retaining compression and limiting."));
+
+    auto* ttsPage = active_->centerDebugTabContentRoots_[2];
+    const auto& initialTts = active_->root_.Settings().Get().tts;
+    auto* ttsMainSection = makeSection(ttsPage, "Local Twitch Speech");
+    auto* ttsMainRow = makePair(ttsMainSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        ttsMainRow->get_gameObject(), "Enable TTS", initialTts.enabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.enabled = value;
+            active_->ApplyTtsSettings();
+        }), "Speaks new Twitch chat locally using the embedded offline voice. Off has no per-frame speech work."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        ttsMainRow->get_gameObject(), "Speak Usernames", initialTts.speakUsernames, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.speakUsernames = value;
+            active_->ApplyTtsSettings();
+        }), "Prefixes each spoken message with its Twitch display name."));
+    active_->ttsStatusText_ = makeStatus(ttsMainSection, "TTS status: checking...");
+    auto* ttsActions = makePair(ttsMainSection);
+    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(ttsActions, "Test Voice", [] {
+        if (!active_) return;
+        broadcast::TwitchChatMessage test;
+        test.author = "SaberStage";
+        test.login = "saberstage";
+        test.text = "Twitch text to speech is ready.";
+        active_->root_.Tts().Enqueue(test);
+    }), "Queues one local test phrase through the same bounded worker used by Twitch chat."));
+    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(ttsActions, "Clear Queue", [] {
+        if (active_) active_->root_.Tts().ClearQueue();
+    }), "Drops queued and buffered speech without disconnecting Twitch chat."));
+
+    auto* contentSection = makeSection(ttsPage, "Message Content");
+    auto* contentRowOne = makePair(contentSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        contentRowOne->get_gameObject(), "Ignore Bots", initialTts.ignoreKnownBots, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.ignoreKnownBots = value;
+            active_->ApplyTtsSettings();
+        }), "Skips common automated Twitch bot accounts."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        contentRowOne->get_gameObject(), "Ignore Commands", initialTts.ignoreCommands, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.ignoreCommands = value;
+            active_->ApplyTtsSettings();
+        }), "Skips messages beginning with ! or / so request commands are not read aloud."));
+    auto* contentRowTwo = makePair(contentSection);
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        contentRowTwo->get_gameObject(), "Speak Links", initialTts.speakUrls, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.speakUrls = value;
+            active_->ApplyTtsSettings();
+        }), "Says the word link for URLs. When off, URL tokens are omitted."));
+    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
+        contentRowTwo->get_gameObject(), "Speak Emotes", initialTts.speakEmoteNames, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.speakEmoteNames = value;
+            active_->ApplyTtsSettings();
+        }), "Reads Twitch emote text. When off, Twitch-tagged emote spans are omitted."));
+
+    auto* voiceSection = makeSection(ttsPage, "Voice and Output");
+    static std::array<std::string_view, 4> ttsVoices{"en-us", "en-gb", "en-sc", "en"};
+    static std::array<std::string_view, 3> ttsRoutes{"Headset", "Broadcast", "Headset + Broadcast"};
+    fitFull(WithHint(BSML::Lite::CreateDropdown(
+        voiceSection, "English Voice", initialTts.voice, ttsVoices, [](StringW value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.voice = static_cast<std::string>(value);
+            active_->ApplyTtsSettings();
+        }), "Selects an embedded eSpeak NG English voice; no network or Android TTS app is required."));
+    const auto routeLabel = initialTts.outputRoute == settings::TtsOutputRoute::BroadcastOnly
+        ? "Broadcast" : initialTts.outputRoute == settings::TtsOutputRoute::HeadsetAndBroadcast
+            ? "Headset + Broadcast" : "Headset";
+    fitFull(WithHint(BSML::Lite::CreateDropdown(
+        voiceSection, "TTS Output", routeLabel, ttsRoutes, [](StringW value) {
+            if (!active_) return;
+            const auto selected = static_cast<std::string>(value);
+            active_->root_.Settings().Edit().tts.outputRoute = selected == "Broadcast"
+                ? settings::TtsOutputRoute::BroadcastOnly
+                : selected == "Headset + Broadcast" ? settings::TtsOutputRoute::HeadsetAndBroadcast
+                                                      : settings::TtsOutputRoute::HeadsetOnly;
+            active_->ApplyTtsSettings();
+        }), "Headset is private monitoring. Broadcast routes speech into local recordings and live streams. Combined sends it to both."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        voiceSection, "TTS Volume", 5.0F, initialTts.volumePercent,
+        0.0F, 150.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.volumePercent = value;
+            active_->ApplyTtsSettings();
+        }), "Speech output level. High values can clip when broadcast over loud game sound."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        voiceSection, "Speech Rate", 0.05F, initialTts.speechRate,
+        0.5F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.speechRate = value;
+            active_->ApplyTtsSettings();
+        }), "Speech-speed multiplier; 1.0 is the normal embedded voice rate."));
+
+    auto* queueSection = makeSection(ttsPage, "Queue Limits");
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        queueSection, "Maximum Characters", 10.0F, static_cast<float>(initialTts.maximumCharacters),
+        40.0F, 500.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.maximumCharacters = static_cast<int>(std::lround(value));
+            active_->ApplyTtsSettings();
+        }), "Clips unusually long chat messages before they enter the speech queue."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        queueSection, "Pending Messages", 1.0F, static_cast<float>(initialTts.queueCapacity),
+        1.0F, 12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.queueCapacity = static_cast<int>(std::lround(value));
+            active_->ApplyTtsSettings();
+        }), "Bounds pending TTS memory and prevents a busy chat from building an unlimited backlog."));
+    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
+        queueSection, "Discard After (seconds)", 1.0F, initialTts.staleAfterSeconds,
+        2.0F, 30.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().tts.staleAfterSeconds = value;
+            active_->ApplyTtsSettings();
+        }), "Skips queued speech that is too old to be useful after a burst of chat."));
 
     active_->ShowCenterDebugTab(0);
     if (active_->centerDebugTabs_) {
@@ -1333,6 +1706,37 @@ void MenuController::TickRuntimePanels() noexcept {
         0.0F, UnityEngine::Time::get_unscaledDeltaTime());
     if (twitchUiRefreshSeconds_ >= 0.5F) {
         twitchUiRefreshSeconds_ = 0.0F;
+        const auto microphone = root_.Recording().MicrophoneState();
+        if (microphone.configured && !microphone.capturing &&
+                microphone.permission == recording::MicrophonePermissionStatus::Granted) {
+            // Android's permission dialog completes asynchronously. This
+            // low-rate reconciliation starts persistent capture after the user
+            // accepts it without polling from the audio callback.
+            root_.Recording().RefreshAudioConfiguration();
+        }
+        if (IsAlive(audioInputStatusText_)) {
+            std::ostringstream status;
+            status << "Microphone: ";
+            if (!microphone.configured) status << "off";
+            else if (microphone.permission == recording::MicrophonePermissionStatus::MissingFromApplication)
+                status << "MBF Microphone Access missing";
+            else if (microphone.permission != recording::MicrophonePermissionStatus::Granted)
+                status << "waiting for Android permission";
+            else if (!microphone.capturing) status << "unavailable; see log";
+            else status << (microphone.gateOpen ? "gate open" : "gate closed")
+                        << "  Level " << std::fixed << std::setprecision(1)
+                        << microphone.levelDb << " dBFS"
+                        << "  Compression " << microphone.compressorReductionDb << " dB";
+            audioInputStatusText_->set_text(status.str());
+        }
+        if (IsAlive(ttsStatusText_)) {
+            const auto tts = root_.Tts().Snapshot();
+            ttsStatusText_->set_text(
+                tts.status + "\nQueued " + std::to_string(tts.queuedMessages) +
+                "  Spoken " + std::to_string(tts.spokenMessages) +
+                "  Filtered " + std::to_string(tts.filteredMessages) +
+                "  Dropped " + std::to_string(tts.droppedMessages));
+        }
         RefreshTwitchControls();
     }
 
@@ -1826,90 +2230,6 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         "Keeps the Quest display, game, encoder, and network stream running when the headset is removed. This prevents off-head sleep from ending Twitch playback with error 2000, but increases battery use and leaves the display active until the stream stops. This setting cannot be changed during a live stream.");
     RememberSelectables(keepHeadsetAwake, active_->livestreamConfigurationControls_);
     ConstrainRightPanelRow(keepHeadsetAwake);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Audio Mix");
-    auto* gameAudio = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage,
-        "Game Sound",
-        active_->root_.Settings().Get().broadcast.gameAudioEnabled,
-        [](bool enabled) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.gameAudioEnabled = enabled;
-            active_->root_.Settings().Save(nullptr);
-            active_->RefreshRecordingStatus();
-        }),
-        "Includes Beat Saber's game and menu audio in the live stream. This affects only the stream mix and never changes what you hear or what a local recording saves. This setting cannot be changed while live.");
-    RememberSelectables(gameAudio, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(gameAudio);
-
-    active_->livestreamGameAudioVolumeSlider_ = ConstrainRightPanelRow(WithHint(
-        BSML::Lite::CreateSliderSetting(
-            livestreamPage,
-            "Game Sound Volume",
-            5.0F,
-            active_->root_.Settings().Get().broadcast.gameAudioVolumePercent,
-            0.0F,
-            200.0F,
-            0.15F,
-            true,
-            {0.0F, 0.0F},
-            [](float value) {
-                if (!active_) return;
-                active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
-                active_->root_.Settings().RequestSave();
-                // Gain is mutable during a stream. RecordingController owns
-                // the synchronized worker-side cache, so the slider never
-                // reaches into the AAC callback or mixer directly.
-                active_->root_.Recording().SetLivestreamGameAudioVolumePercent(value);
-                active_->RefreshRecordingStatus();
-            }),
-        "Balances game sound in the live stream from 0% (silent) to 200%. 100% preserves the captured level. Higher values can clip when combined with a loud microphone. This can be adjusted while live without changing the game volume or local recording."));
-
-    auto* microphone = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage,
-        "Quest Microphone",
-        active_->root_.Settings().Get().broadcast.microphoneEnabled,
-        [](bool enabled) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.microphoneEnabled = enabled;
-            active_->root_.Settings().Save(nullptr);
-            if (enabled) {
-                const auto permission = recording::RecordingController::QueryMicrophonePermission();
-                if (permission == recording::MicrophonePermissionStatus::MissingFromApplication) {
-                    active_->ShowLivestreamActionError(
-                        "Beat Saber was patched without Microphone Access, so Android cannot show a permission prompt. Enable Microphone Access in MBF and repatch Beat Saber before using the Quest microphone.");
-                } else if (permission != recording::MicrophonePermissionStatus::Granted) {
-                    UnityEngine::Android::Permission::RequestUserPermission(
-                        "android.permission.RECORD_AUDIO", nullptr);
-                    active_->ShowLivestreamActionError(
-                        "Android microphone access was requested. Accept the system prompt, then start the stream.");
-                }
-            }
-            active_->RefreshRecordingStatus();
-        }),
-        "Adds the Quest headset microphone to the live-stream audio mix. Android microphone permission is required; MBF installs expose it as Microphone Access. The microphone is never added to local recordings by this switch. This setting cannot be changed while live.");
-    RememberSelectables(microphone, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(microphone);
-
-    active_->livestreamMicrophoneVolumeSlider_ = ConstrainRightPanelRow(WithHint(
-        BSML::Lite::CreateSliderSetting(
-            livestreamPage,
-            "Microphone Volume",
-            5.0F,
-            active_->root_.Settings().Get().broadcast.microphoneVolumePercent,
-            0.0F,
-            200.0F,
-            0.15F,
-            true,
-            {0.0F, 0.0F},
-            [](float value) {
-                if (!active_) return;
-                active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
-                active_->root_.Settings().RequestSave();
-                active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
-                active_->RefreshRecordingStatus();
-            }),
-        "Balances the Quest microphone in the live stream from 0% (silent) to 200%. 100% uses the captured microphone level. Higher values can clip when mixed with loud game sound. This can be adjusted while live; 0% also marks the movable microphone control unavailable."));
 
     CreateRightPanelSubheader(livestreamPage->get_transform(), "Service Setup");
     const auto& stream = active_->root_.Settings().Get().broadcast;

@@ -140,6 +140,8 @@ private:
     void UpdateChatWorldPanelPersistence();
     void TickChatWorldPanel() noexcept;
     void ShowCenterDebugTab(int index);
+    void ApplyAudioSettings(bool requestPermission = false);
+    void ApplyTtsSettings();
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     void ApplyLivestreamReferenceLayout();
@@ -153,6 +155,8 @@ private:
     HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 3> centerDebugTabViewRoots_{};
     std::array<UnityEngine::GameObject*, 3> centerDebugTabContentRoots_{};
+    TMPro::TextMeshProUGUI* audioInputStatusText_ = nullptr;
+    TMPro::TextMeshProUGUI* ttsStatusText_ = nullptr;
     HMUI::TextSegmentedControl* settingsTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 4> tabViewRoots_{};
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};

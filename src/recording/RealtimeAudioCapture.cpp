@@ -164,22 +164,25 @@ private:
                     continue;
                 }
                 const auto count = std::min(available, floats.size());
-                // Sample the local-file mute once per writer batch. Muting must
-                // write timed silence instead of dropping samples, otherwise
-                // the final audio track would become shorter than the video.
-                const bool muteFileBatch = writeWaveFile_ &&
-                    fileMuted_.load(std::memory_order_acquire);
                 for (std::size_t i = 0; i < count; ++i) {
                     floats[i] = ring_[(static_cast<std::size_t>(read) + i) % ring_.size()];
-                    if (writeWaveFile_) {
-                        const auto value = muteFileBatch
-                            ? 0.0F
-                            : std::clamp(floats[i], -1.0F, 1.0F);
+                }
+                // Source gain, microphone DSP and TTS mixing run on this
+                // worker-owned buffer before either sink consumes it. The
+                // Unity audio callback remains a fixed SPSC copy only.
+                if (consumer_) {
+                    consumer_(
+                        floats.data(), count, channels_.load(std::memory_order_relaxed),
+                        sampleRate_.load(std::memory_order_relaxed));
+                }
+                const bool muteFileBatch = writeWaveFile_ &&
+                    fileMuted_.load(std::memory_order_acquire);
+                if (writeWaveFile_) {
+                    for (std::size_t i = 0; i < count; ++i) {
+                        const auto value = muteFileBatch ? 0.0F : std::clamp(floats[i], -1.0F, 1.0F);
                         pcm[i] = static_cast<std::int16_t>(
                             std::lrint(value * static_cast<float>(std::numeric_limits<std::int16_t>::max())));
                     }
-                }
-                if (writeWaveFile_) {
                     output_.write(
                         reinterpret_cast<const char*>(pcm.data()),
                         static_cast<std::streamsize>(count * sizeof(std::int16_t)));
@@ -188,11 +191,6 @@ private:
                         break;
                     }
                     dataBytes_ += static_cast<std::uint32_t>(count * sizeof(std::int16_t));
-                }
-                if (consumer_) {
-                    consumer_(
-                        floats.data(), count, channels_.load(std::memory_order_relaxed),
-                        sampleRate_.load(std::memory_order_relaxed));
                 }
                 readIndex_.store(read + count, std::memory_order_release);
             }

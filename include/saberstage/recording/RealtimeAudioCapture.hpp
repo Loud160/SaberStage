@@ -26,7 +26,7 @@ class RealtimeAudioCaptureImpl;
 // The sample pointer belongs to Unity's audio callback and is valid only for the
 // duration of the call. Consumers must copy into bounded storage before return.
 using PcmConsumer = std::function<void(
-    const float* interleavedSamples,
+    float* interleavedSamples,
     std::size_t sampleCount,
     std::int32_t channels,
     std::int32_t sampleRate)>;
@@ -51,9 +51,8 @@ public:
     // used by stream-only sessions so game audio can reach the network sink
     // without silently creating a local recording.
     void OpenConsumerOnly(saberstage::recording::PcmConsumer consumer);
-    // Controls only the optional local WAV sink. The original samples still
-    // reach the livestream consumer so recording and streaming can be muted
-    // independently when both outputs are active.
+    // Retained for compatibility with the movable local-recording mute. New
+    // source mixing is performed by the worker consumer before WAV encoding.
     void SetFileMuted(bool muted) noexcept;
     // Save stops admission, drains accepted samples, joins the worker, and closes
     // the WAV output. It is safe during normal teardown and error unwinding.

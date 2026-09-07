@@ -1559,7 +1559,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("Hollywood::SetScreenOn(false)", controller)
         self.assertIn("livestreamProximityGuardActive_", header)
 
-    def test_livestream_audio_mix_is_stream_only_bounded_and_permission_aware(self):
+    def test_shared_microphone_and_tts_mix_is_bounded_and_permission_aware(self):
         header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8")
         microphone = (ROOT / "src/recording/MicrophoneCapture.cpp").read_text(encoding="utf-8")
         audio_capture = (ROOT / "src/recording/RealtimeAudioCapture.cpp").read_text(encoding="utf-8")
@@ -1574,8 +1574,15 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("kMicrophoneRingFrames", microphone)
         self.assertNotIn("std::mutex", microphone)
         self.assertIn("livestreamMixScratch_", header)
+        self.assertIn("livestreamMicrophoneScratch_", header)
+        self.assertIn("ttsMixScratch_", header)
         self.assertIn("SubmitLivestreamAudioLocked", controller)
-        self.assertIn("std::clamp(\n                gameSample + microphoneSample", controller)
+        self.assertIn("microphoneDsp_.Process", controller)
+        self.assertIn("tts_.ReadBroadcast", controller)
+        self.assertIn("includeMicrophoneInRecordings", controller)
+        self.assertIn("includeMicrophoneInLivestreams", controller)
+        self.assertIn("streamGame + streamMic + speech", controller)
+        self.assertIn("localGame + localMic + speech", controller)
         self.assertIn("android.permission.RECORD_AUDIO", controller)
         self.assertIn('"Game Sound"', menu)
         self.assertIn('"Game Sound Volume"', menu)
@@ -1583,7 +1590,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn('"Microphone Volume"', menu)
         self.assertIn("without Microphone Access", menu)
         self.assertIn("repatch Beat Saber", menu)
-        self.assertIn("The microphone is never added to local recordings", menu)
+        self.assertIn("Mic in Recordings", menu)
+        self.assertIn("Mic in Streams", menu)
+        self.assertIn('"Twitch TTS"', menu)
         self.assertIn("SetLivestreamGameAudioVolumePercent(value)", menu)
         self.assertIn("SetLivestreamMicrophoneVolumePercent(value)", menu)
         self.assertNotIn(

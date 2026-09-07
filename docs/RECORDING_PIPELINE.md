@@ -57,6 +57,13 @@ The GLES bridge samples Unity's RenderTexture in its native OpenGL orientation. 
 
 The Unity mix tap copies interleaved PCM into a preallocated SPSC ring on the audio callback. It performs no allocation, logging, file I/O, or Unity object work there. The audio worker converts and writes PCM to the temporary WAV and fans it to the live sink, where AAC-LC encoding runs on the network worker. The hardware surface receives explicit monotonic presentation timestamps. Recording pause closes a video segment and disables the audio tap so paused duration is omitted from both temporary tracks; game pause alone does not.
 
+The same audio worker can mix the persistent Quest microphone and local Twitch
+TTS into a requested local recording without creating a second clock or writer.
+Microphone DSP and TTS resampling preserve the worker's frame count; underflow is
+silence. Game-sound mute changes only the game source. Capture formats, bounded
+ownership, routing, and Android permission behavior are documented in
+[Twitch TTS and Quest microphone audio](TWITCH_TTS_AND_MICROPHONE_AUDIO.md).
+
 The MP4 sink starts only after required output formats are known, writes samples in valid order, and finalizes on normal stop. It writes a unique sanitized `.partial.mp4` in the recording directory, then safely renames after successful stop. It never overwrites unrelated files. Low storage, write failure, or codec failure stops only capture, retains diagnostics/partial data when useful, and returns gameplay to `Idle/Failed` safely.
 
 Acceptance requires desktop `ffprobe` validation, decoded frame inspection proving the independent camera, audible game audio, duration/PTS checks, and repeated long Quest 2 sessions. Android contracts: [MediaCodec](https://developer.android.com/reference/android/media/MediaCodec), [MediaMuxer](https://developer.android.com/reference/android/media/MediaMuxer), and [playback capture limitations](https://developer.android.com/media/platform/av-capture).

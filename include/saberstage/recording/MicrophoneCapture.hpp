@@ -22,7 +22,7 @@
 
 namespace saberstage::recording {
 
-// Quest microphone input for the livestream-only audio mixer. AAudio's
+// Quest microphone input for the shared recording/livestream audio mixer. AAudio's
 // real-time callback does nothing except copy mono float samples into a fixed
 // SPSC ring. Mixing, volume control, logging, and network work remain on
 // RealtimeAudioCapture's existing background worker.
@@ -43,7 +43,9 @@ public:
 
     [[nodiscard]] std::uint64_t DroppedFrameCount() const noexcept;
     [[nodiscard]] std::uint64_t UnderflowFrameCount() const noexcept;
+    [[nodiscard]] std::size_t AvailableFrameCount() const noexcept;
     [[nodiscard]] std::int32_t SampleRate() const noexcept;
+    [[nodiscard]] std::int32_t CallbackError() const noexcept;
     [[nodiscard]] bool Failed() const noexcept;
 
 private:
@@ -72,6 +74,7 @@ private:
     std::atomic<std::uint64_t> writeIndex_{0};
     std::atomic<std::uint64_t> droppedFrames_{0};
     std::atomic<std::uint64_t> underflowFrames_{0};
+    // Both consumer paths are serialized by RecordingController's audio lock.
     bool synchronized_ = false;
 };
 

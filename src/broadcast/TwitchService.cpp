@@ -11,6 +11,7 @@
 // - Tokens remain behind the secure-settings boundary and network results are marshalled to callers.
 
 #include "saberstage/broadcast/TwitchService.hpp"
+#include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/broadcast/ChatNetwork.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -450,8 +451,8 @@ void ClearAccountAuthorization(settings::TwitchAccountSettings& account) noexcep
 
 } // namespace
 
-TwitchService::TwitchService(settings::SettingsService& settings)
-    : settings_(settings) {
+TwitchService::TwitchService(settings::SettingsService& settings, TtsService& tts)
+    : settings_(settings), tts_(tts) {
     avformat_network_init();
     requests_ = std::make_unique<SongRequestService>(settings_.Path().parent_path() / "ChatRequests", LookupRequestedMap);
     notices_ = std::make_unique<TwitchNotices>(
@@ -480,6 +481,7 @@ TwitchService::TwitchService(settings::SettingsService& settings)
             return NoticeSubscriptionResult::Connected;
         },
         [this](ChatEvent event) {
+            if (event.mutation == ChatMutation::Append) tts_.Enqueue(event.message);
             std::lock_guard lock(mutex_);
             if (ApplyChatEvent(snapshot_.messages, std::move(event), nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
         });
@@ -1493,6 +1495,7 @@ void TwitchService::ChatWorker(std::string accessToken, std::string login) noexc
                 auto event = ParseTwitchChatLine(line);
                 if (!event) continue;
                 if (event->mutation == ChatMutation::Append && requests_) requests_->Receive(event->message);
+                if (event->mutation == ChatMutation::Append) tts_.Enqueue(event->message);
                 std::lock_guard lock(mutex_);
                 if (ApplyChatEvent(snapshot_.messages, std::move(*event),
                         nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
@@ -1921,6 +1924,9 @@ void TwitchService::DisconnectAccount() {
     refreshStop_.store(true, std::memory_order_release);
     SetChatEnabled(false);
     chatStop_ = true;
+    // Account disconnect is an explicit privacy/lifecycle boundary. Stop both
+    // queued speech and already-buffered headset/broadcast PCM immediately.
+    tts_.ClearQueue();
     requests_->SetChannel({});
     notices_->Configure({}, {}, {}, false, false);
     assets_.Configure({}, {}, {}, false);

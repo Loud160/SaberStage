@@ -36,6 +36,8 @@ class SettingsService;
 
 namespace saberstage::broadcast {
 
+class TtsService;
+
 enum class TwitchAuthorizationState {
     Disconnected,
     RequestingCode,
@@ -98,7 +100,7 @@ struct TwitchSnapshot {
 // Unity objects or SettingsService directly.
 class TwitchService final {
 public:
-    explicit TwitchService(settings::SettingsService& settings);
+    TwitchService(settings::SettingsService& settings, TtsService& tts);
     ~TwitchService();
 
     TwitchService(const TwitchService&) = delete;
@@ -165,6 +167,7 @@ private:
     bool AcquireChatSendSlot();
 
     settings::SettingsService& settings_;
+    TtsService& tts_;
     mutable std::mutex mutex_;
     TwitchSnapshot snapshot_;
     PendingCredentials pendingCredentials_;

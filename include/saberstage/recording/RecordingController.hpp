@@ -14,6 +14,7 @@
 
 #include "saberstage/recording/ControllerShortcut.hpp"
 #include "saberstage/recording/RecordingState.hpp"
+#include "saberstage/recording/MicrophoneDsp.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/broadcast/LivestreamState.hpp"
 
@@ -68,6 +69,7 @@ class MicrophoneCapture;
 
 namespace saberstage::broadcast {
 class DirectLivestreamSink;
+class TtsService;
 }
 
 namespace saberstage::recording {
@@ -107,6 +109,17 @@ struct RecordingSnapshot {
     }
 };
 
+struct MicrophoneSnapshot {
+    MicrophonePermissionStatus permission = MicrophonePermissionStatus::Unknown;
+    bool configured = false;
+    bool capturing = false;
+    bool failed = false;
+    float levelDb = -96.0F;
+    float compressorReductionDb = 0.0F;
+    float limiterReductionDb = 0.0F;
+    bool gateOpen = false;
+};
+
 class RecordingController final {
 public:
     using StatusChangedHandler = std::function<void()>;
@@ -114,6 +127,7 @@ public:
     RecordingController(
         settings::SettingsService& settings,
         camera::CameraManager& camera,
+        broadcast::TtsService& tts,
         std::filesystem::path outputDirectory);
     ~RecordingController();
 
@@ -132,10 +146,15 @@ public:
     bool PauseLivestream(std::string* error = nullptr);
     bool ResumeLivestream(std::string* error = nullptr);
     // Gain changes are deliberately safe while live: the audio worker reads
-    // these cached values only while holding livestreamMutex_. Source-enable
-    // changes still require a new stream because they own capture resources.
+    // these cached values only while holding livestreamMutex_. The shared mic
+    // master is reconciled separately because it owns persistent AAudio input.
     void SetLivestreamGameAudioVolumePercent(float value);
     void SetLivestreamMicrophoneVolumePercent(float value);
+    // Reconciles persistent microphone ownership with saved settings. UI
+    // enable/disable callbacks call this immediately; capture sessions also
+    // call it defensively before starting.
+    void RefreshAudioConfiguration() noexcept;
+    [[nodiscard]] MicrophoneSnapshot MicrophoneState() const noexcept;
     void SetLocalRecordingGameAudioMuted(bool muted) noexcept;
     bool SetLivestreamGameAudioMuted(
         bool muted,
@@ -185,7 +204,7 @@ private:
     bool HandleDirectCaptureHealth() noexcept;
     void CreatePersistentAudioCapture();
     void SubmitLivestreamAudioLocked(
-        const float* samples,
+        float* samples,
         std::size_t count,
         std::int32_t channels,
         std::int32_t sampleRate) noexcept;
@@ -221,6 +240,7 @@ private:
 
     settings::SettingsService& settings_;
     camera::CameraManager& camera_;
+    broadcast::TtsService& tts_;
     std::filesystem::path outputDirectory_;
     std::filesystem::path rawVideoPath_;
     std::filesystem::path rawAudioPath_;
@@ -292,13 +312,20 @@ private:
     mutable std::mutex livestreamMutex_;
     std::unique_ptr<broadcast::DirectLivestreamSink> livestreamSink_;
     std::unique_ptr<AfkMediaSource> afkMedia_;
-    // The Quest microphone and reusable mix buffers are owned by the stream,
-    // never by local recording. Access is serialized by livestreamMutex_ so a
-    // stream can stop while RealtimeAudioCapture's worker remains alive for a
-    // simultaneous local recording.
+    // The Quest microphone is persistent while its master setting is enabled
+    // so local recording and streaming share one processed signal. Access is
+    // serialized by livestreamMutex_ because RealtimeAudioCapture's worker
+    // can mix concurrently with UI-driven settings and stream transitions.
     std::unique_ptr<MicrophoneCapture> livestreamMicrophone_;
     std::vector<float> livestreamMixScratch_;
     std::vector<float> livestreamMicrophoneScratch_;
+    std::vector<float> ttsMixScratch_;
+    MicrophoneDsp microphoneDsp_;
+    // SettingsService is main-thread owned. RefreshAudioConfiguration copies
+    // the values needed by the audio worker under livestreamMutex_; the worker
+    // must never read the mutable settings document directly.
+    settings::AudioProcessingSettings activeAudioSettings_{};
+    std::int32_t activeAudioDspSampleRate_ = 0;
     bool livestreamGameAudioEnabled_ = true;
     float livestreamGameAudioGain_ = 1.0F;
     bool livestreamGameAudioMuted_ = false;
@@ -306,6 +333,8 @@ private:
     float livestreamMicrophoneGain_ = 1.0F;
     bool livestreamMicrophoneMuted_ = false;
     bool livestreamMicrophoneFailureReported_ = false;
+    bool oversizedAudioBlockReported_ = false;
+    bool unsupportedTtsMixRateReported_ = false;
     // Session-only endpoint and key overrides are isolated by provider. Empty
     // means the saved destination record is authoritative for that service.
     std::array<std::string, 4> streamServerUrlOverrides_{};
