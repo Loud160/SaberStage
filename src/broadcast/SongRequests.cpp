@@ -208,7 +208,7 @@ RequestPolicy ValidateRequestPolicy(RequestPolicy p) {
     p.historySize = std::clamp(p.historySize, 1, 500);
     return p;
 }
-std::string RequestRejection(const RequestQueue &q, const RequestPolicy &raw, const TwitchChatMessage &sender,
+std::string RequestRejection(const RequestQueue &q, const RequestPolicy &raw, const ChatMessage &sender,
                              const RequestedMap &map, std::int64_t now) {
     const auto p = ValidateRequestPolicy(raw);
     if (!p.enabled)
@@ -259,7 +259,7 @@ std::optional<RequestCommand> ParseRequestCommand(std::string_view text) {
             return static_cast<RequestCommand>(i);
     return std::nullopt;
 }
-bool HasCommandPermission(CommandPermission permission, const TwitchChatMessage &sender) {
+bool HasCommandPermission(CommandPermission permission, const ChatMessage &sender) {
     // Roles come from authenticated IRC tags. A viewer's name or message can
     // never grant permission, and Disabled includes the broadcaster as well.
     if (permission == CommandPermission::Disabled)

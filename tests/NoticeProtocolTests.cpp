@@ -49,7 +49,7 @@ int main() {
     auto event = ParseNoticeEnvelope(follow, "123");
     Check(event.event && event.event->message.kind == ChatKind::Follow, "follow typed notice");
     Check(!ParseNoticeEnvelope(follow, "789").event, "other-account notice discarded");
-    std::vector<TwitchChatMessage> history;
+    std::vector<ChatMessage> history;
     std::uint64_t sequence = 0;
     Check(ApplyChatEvent(history, *event.event, sequence), "first notice appended");
     Check(!ApplyChatEvent(history, *event.event, sequence) && history.size() == 1, "reconnect duplicate ignored");

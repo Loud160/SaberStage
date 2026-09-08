@@ -151,7 +151,7 @@ std::string HelpFor(std::string_view caption) {
     if (caption == "Platform origin color")
         return "Show Twitch's purple per-message accent. This is independent of the functional scrollbar.";
     if (caption == "Chat text size")
-        return "Change the Twitch message text size on the main movable chat panel. The panel reflows existing "
+        return "Change the message text size on the main movable chat panel. The panel reflows existing "
                "messages immediately; this does not change the size of the settings controls.";
     return std::string(caption);
 }
@@ -363,7 +363,7 @@ struct ChatControls::Impl {
     std::string renderedSelection, renderedMapStatus;
     bool renderedInstalled = false, renderedBusy = false, renderedMenu = false;
     std::string selectedRequest;
-    broadcast::TwitchChatMessage selectedMessage;
+    broadcast::ChatMessage selectedMessage;
     std::string status;
     std::string observedModerationStatus;
     std::string mapStatus, navigateHash;

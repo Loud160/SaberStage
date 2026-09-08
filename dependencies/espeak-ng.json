@@ -1,9 +1,0 @@
-{
-  "name": "eSpeak NG",
-  "version": "1.52.0",
-  "commit": "4870adfa25b1a32b4361592f1be8a40337c58d6c",
-  "archiveUrl": "https://github.com/espeak-ng/espeak-ng/archive/4870adfa25b1a32b4361592f1be8a40337c58d6c.zip",
-  "archiveSha256": "096f0915470c3bba4f9e3ba274485e453f26dedccb5c28a33f871a84f5e064a9",
-  "englishDataSha256": "45d577818dc877ac5f8d62b1290b4efe92308512afa8f135a9b535745f0b2446",
-  "license": "GPL-3.0-or-later"
-}

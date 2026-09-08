@@ -7,8 +7,8 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Validates and extracts the embedded eSpeak NG English data with strict ZIP limits.
-// - Reuses a completed version directory and never exposes a partially extracted dictionary.
+// - Validates and extracts the embedded KittenTTS model with strict ZIP limits.
+// - Reuses a completed version directory and never exposes a partially extracted model.
 
 #include "saberstage/broadcast/TtsData.hpp"
 
@@ -24,13 +24,14 @@
 #include <string_view>
 #include <vector>
 
-extern "C" std::uint8_t _binary_english_data_zip_start[];
-extern "C" std::uint8_t _binary_english_data_zip_end[];
+extern "C" std::uint8_t _binary_kitten_data_zip_start[];
+extern "C" std::uint8_t _binary_kitten_data_zip_end[];
 
 namespace saberstage::broadcast {
 namespace {
 
-constexpr std::string_view kDataIdentity = "espeak-ng-1.52.0-4870adfa";
+constexpr std::string_view kDataIdentity = "kitten-nano-en-v0_2-fp16-e11a97b8";
+constexpr std::string_view kArchivePrefix = "kitten-nano-en-v0_2-fp16/";
 
 std::uint32_t Read(std::string_view data, std::size_t at, std::size_t count) {
     if (at > data.size() || count > data.size() - at) {
@@ -47,7 +48,7 @@ std::uint32_t Read(std::string_view data, std::size_t at, std::size_t count) {
 std::string SafePath(std::string_view raw) {
     if (raw.empty() || raw.size() > 240U || raw.front() == '/' ||
             raw.find_first_of("\\:\0", 0, 3) != raw.npos ||
-            !raw.starts_with("espeak-ng-data/") ||
+            !raw.starts_with(kArchivePrefix) ||
             std::any_of(raw.begin(), raw.end(), [](unsigned char character) {
                 return character < 32U || character == 127U;
             })) {
@@ -77,7 +78,7 @@ struct Entry {
 };
 
 void Extract(std::string_view data, const std::filesystem::path& directory) {
-    if (data.size() < 22U || data.size() > 4U * 1024U * 1024U) {
+    if (data.size() < 22U || data.size() > 28U * 1024U * 1024U) {
         throw std::runtime_error("Embedded TTS ZIP size is invalid");
     }
     std::size_t end = data.size() - 22U;
@@ -134,7 +135,7 @@ void Extract(std::string_view data, const std::filesystem::path& directory) {
             throw std::runtime_error("Duplicate path in embedded TTS ZIP");
         }
         total += entry.unpacked;
-        if (entry.unpacked > 2U * 1024U * 1024U || total > 8U * 1024U * 1024U ||
+        if (entry.unpacked > 24U * 1024U * 1024U || total > 26U * 1024U * 1024U ||
                 entry.offset >= centralStart) {
             throw std::runtime_error("Embedded TTS data exceeds its extraction budget");
         }
@@ -197,20 +198,24 @@ void Extract(std::string_view data, const std::filesystem::path& directory) {
 
 } // namespace
 
-std::filesystem::path EnsureEmbeddedTtsData(const std::filesystem::path& storageRoot) {
+std::filesystem::path EnsureEmbeddedKittenTtsData(const std::filesystem::path& storageRoot) {
     const auto versionRoot = storageRoot / std::string(kDataIdentity);
     const auto marker = versionRoot / ".complete";
+    const auto modelRoot = versionRoot / std::string(kArchivePrefix.substr(0, kArchivePrefix.size() - 1U));
     if (std::filesystem::is_regular_file(marker) &&
-            std::filesystem::is_regular_file(versionRoot / "espeak-ng-data" / "en_dict")) {
-        return versionRoot;
+            std::filesystem::is_regular_file(modelRoot / "model.fp16.onnx") &&
+            std::filesystem::is_regular_file(modelRoot / "voices.bin") &&
+            std::filesystem::is_regular_file(modelRoot / "tokens.txt") &&
+            std::filesystem::is_regular_file(modelRoot / "espeak-ng-data" / "en_dict")) {
+        return modelRoot;
     }
     std::filesystem::create_directories(storageRoot);
     const auto temporary = storageRoot / (std::string(kDataIdentity) + ".new");
     std::error_code ignored;
     std::filesystem::remove_all(temporary, ignored);
     std::filesystem::create_directories(temporary);
-    const auto* begin = _binary_english_data_zip_start;
-    const auto* end = _binary_english_data_zip_end;
+    const auto* begin = _binary_kitten_data_zip_start;
+    const auto* end = _binary_kitten_data_zip_end;
     if (end <= begin) throw std::runtime_error("Embedded TTS data is empty");
     Extract(std::string_view(
         reinterpret_cast<const char*>(begin), static_cast<std::size_t>(end - begin)), temporary);
@@ -223,7 +228,7 @@ std::filesystem::path EnsureEmbeddedTtsData(const std::filesystem::path& storage
     }
     std::filesystem::remove_all(versionRoot, ignored);
     std::filesystem::rename(temporary, versionRoot);
-    return versionRoot;
+    return versionRoot / std::string(kArchivePrefix.substr(0, kArchivePrefix.size() - 1U));
 }
 
 } // namespace saberstage::broadcast

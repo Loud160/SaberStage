@@ -164,44 +164,32 @@ target_link_libraries(${COMPILE_ID} PRIVATE
 native_logger_quest_enable_paper2_abort_bridge(${COMPILE_ID})
 include(extern.cmake)
 
-# eSpeak NG is built into SaberStage so Twitch TTS remains fully local on a
-# standalone Quest. The pinned source and generated English data are prepared
-# outside QPM because neither Android nor Beat Saber guarantees a system TTS
-# service. Async/playback support stays disabled: SaberStage owns the bounded
-# worker and AAudio output paths and uses eSpeak only as a synchronous PCM
-# synthesizer.
-set(SABERSTAGE_ESPEAK_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng/source")
-set(SABERSTAGE_ESPEAK_DATA
-    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng/english-data.zip")
-if(NOT EXISTS "${SABERSTAGE_ESPEAK_DIR}/CMakeLists.txt" OR
-        NOT EXISTS "${SABERSTAGE_ESPEAK_DATA}")
+# Chat TTS uses a pinned KittenTTS Nano v0.2 model through sherpa-onnx. The two
+# inference libraries are private, SONAME-renamed runtime payloads loaded only
+# when speech is requested; they are deliberately not linked into SaberStage's
+# startup dependency graph. This keeps TTS off-cost near zero and prevents an
+# incompatible ONNX Runtime shipped by another mod from satisfying this one.
+set(SABERSTAGE_KITTEN_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/kitten-tts")
+set(SABERSTAGE_KITTEN_DATA "${SABERSTAGE_KITTEN_DIR}/kitten-data.zip")
+set(SABERSTAGE_KITTEN_HEADER
+    "${SABERSTAGE_KITTEN_DIR}/include/sherpa-onnx/c-api/c-api.h")
+set(SABERSTAGE_KITTEN_LIBRARIES
+    "${SABERSTAGE_KITTEN_DIR}/lib/libsabstageort.so"
+    "${SABERSTAGE_KITTEN_DIR}/lib/libss-tts-neural-api.so")
+if(NOT EXISTS "${SABERSTAGE_KITTEN_DATA}" OR
+        NOT EXISTS "${SABERSTAGE_KITTEN_HEADER}")
     message(FATAL_ERROR
-        "Pinned eSpeak NG source/data is missing. Run scripts/prepare-espeak-ng.py first.")
+        "Pinned KittenTTS model/runtime is missing. Run scripts/prepare-kitten-tts.py first.")
 endif()
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(USE_ASYNC OFF CACHE BOOL "" FORCE)
-set(USE_LIBPCAUDIO OFF CACHE BOOL "" FORCE)
-set(USE_LIBSONIC OFF CACHE BOOL "" FORCE)
-set(USE_MBROLA OFF CACHE BOOL "" FORCE)
-set(USE_SPEECHPLAYER OFF CACHE BOOL "" FORCE)
-add_subdirectory(
-    "${SABERSTAGE_ESPEAK_DIR}"
-    "${CMAKE_CURRENT_BINARY_DIR}/espeak-ng"
-    EXCLUDE_FROM_ALL)
-# eSpeak's public CMake interface includes its libc compatibility directory.
-# Exporting that directory into SaberStage would shadow Android's <wctype.h>
-# while compiling unrelated mod sources. Preserve those paths privately for
-# eSpeak itself, clear them from its interface target, and let SaberStage
-# explicitly import only the public speech API.
-target_include_directories(espeak-ng BEFORE PRIVATE
-    "${SABERSTAGE_ESPEAK_DIR}/src/include"
-    "${SABERSTAGE_ESPEAK_DIR}/src/include/compat")
-set_property(TARGET espeak-include PROPERTY INTERFACE_INCLUDE_DIRECTORIES "")
+foreach(SABERSTAGE_KITTEN_LIBRARY IN LISTS SABERSTAGE_KITTEN_LIBRARIES)
+    if(NOT EXISTS "${SABERSTAGE_KITTEN_LIBRARY}")
+        message(FATAL_ERROR
+            "Pinned KittenTTS runtime is incomplete. Run scripts/prepare-kitten-tts.py first.")
+    endif()
+endforeach()
 target_include_directories(${COMPILE_ID} SYSTEM PRIVATE
-    "${SABERSTAGE_ESPEAK_DIR}/src/include")
-target_link_libraries(${COMPILE_ID} PRIVATE espeak-ng)
+    "${SABERSTAGE_KITTEN_DIR}/include")
 
 set(SABERSTAGE_FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/ffmpeg-hardware")
 set(SABERSTAGE_FFMPEG_LIBS
@@ -279,26 +267,26 @@ set_source_files_properties("${SABERSTAGE_AFK_IMAGE_OBJECT}" PROPERTIES
     EXTERNAL_OBJECT TRUE)
 target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_AFK_IMAGE_OBJECT}")
 
-# Bundle the exact generated dictionaries beside the synthesizer code. Runtime
-# extraction is versioned and bounded; users never need to install a separate
-# Android speech service or copy voice files by hand.
-set(SABERSTAGE_ESPEAK_DATA_OBJECT
-    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_espeak_english_data.o")
+# Bundle the exact neural model beside the synthesizer adapter. Runtime
+# extraction is versioned and bounded; users never need to install an Android
+# speech service or copy a model by hand.
+set(SABERSTAGE_KITTEN_DATA_OBJECT
+    "${CMAKE_CURRENT_BINARY_DIR}/saberstage_kitten_tts_data.o")
 add_custom_command(
-    OUTPUT "${SABERSTAGE_ESPEAK_DATA_OBJECT}"
+    OUTPUT "${SABERSTAGE_KITTEN_DATA_OBJECT}"
     COMMAND ${CMAKE_OBJCOPY}
-        english-data.zip
-        "${SABERSTAGE_ESPEAK_DATA_OBJECT}"
+        kitten-data.zip
+        "${SABERSTAGE_KITTEN_DATA_OBJECT}"
         --input-target binary
         --output-target elf64-aarch64
         --set-section-flags binary=alloc,load,readonly,data,contents
-    DEPENDS "${SABERSTAGE_ESPEAK_DATA}"
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.cache/dependencies/espeak-ng"
-    COMMENT "Embedding SaberStage English TTS data")
-set_source_files_properties("${SABERSTAGE_ESPEAK_DATA_OBJECT}" PROPERTIES
+    DEPENDS "${SABERSTAGE_KITTEN_DATA}"
+    WORKING_DIRECTORY "${SABERSTAGE_KITTEN_DIR}"
+    COMMENT "Embedding SaberStage KittenTTS neural model")
+set_source_files_properties("${SABERSTAGE_KITTEN_DATA_OBJECT}" PROPERTIES
     GENERATED TRUE
     EXTERNAL_OBJECT TRUE)
-target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_ESPEAK_DATA_OBJECT}")
+target_sources(${COMPILE_ID} PRIVATE "${SABERSTAGE_KITTEN_DATA_OBJECT}")
 
 # The movable recording panel uses authored PNG glyphs rather than assembling
 # approximate microphones and speakers from UI rectangles. Embed every state

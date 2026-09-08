@@ -67,7 +67,7 @@ void SongRequestService::Configure(RequestPolicy policy) {
         wake_.notify_one();
     }
 }
-bool SongRequestService::Receive(TwitchChatMessage message) {
+bool SongRequestService::Receive(ChatMessage message) {
     const auto command = ParseRequestCommand(message.text);
     if (!command || message.kind != ChatKind::Message)
         return false;

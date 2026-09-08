@@ -16,7 +16,9 @@
   "libraryFiles": [
     "libavformat-saberstage9.so",
     "libavcodec-saberstage9.so",
-    "libavutil-saberstage9.so"
+    "libavutil-saberstage9.so",
+    "libsabstageort.so",
+    "libss-tts-neural-api.so"
   ],
   "fileCopies": [],
   "copyExtensions": []

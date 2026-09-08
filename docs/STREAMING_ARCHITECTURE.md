@@ -10,7 +10,7 @@ Direct livestreaming is now an asynchronous bounded sink with states `Offline`, 
 
 The video and audio queues are bounded. Overflow drops broadcast media and increments visible health counters instead of delaying the Unity thread, audio thread, encoder worker, an independently started local recording, or gameplay. Reconnect uses bounded exponential backoff and waits for the next scheduled H.264 keyframe before reopening output. TLS verification uses the Quest system certificate directory for RTMPS. Start/stop are explicit: stopping a stream-only session releases its capture resources, while stopping a stream attached to an intentional local recording leaves that recording active. Stopping and saving a local session also ends its attached stream.
 
-Game sound, processed Quest microphone, and local Twitch TTS are independent
+Game sound, processed Quest microphone, and local Chat TTS are independent
 sources in one recording/stream audio worker. The microphone has separate local
 recording and livestream routing, one shared 0-200% gain, and open, grip-button
 PTT, or voice-activated modes. Its AAudio input remains open while the master
@@ -23,7 +23,7 @@ The movable stream panel's game/mic mute buttons change only session mute state.
 AFK pause locks/mutes both controls while timed stream silence continues. Local
 game mute affects only game sound and does not suppress selected mic or TTS.
 The complete ownership, formats, defaults, and cancellation rules are in
-[Twitch TTS and Quest microphone audio](TWITCH_TTS_AND_MICROPHONE_AUDIO.md).
+[Chat TTS and Quest microphone audio](CHAT_TTS_AND_MICROPHONE_AUDIO.md).
 
 Quest microphone input requires Android `RECORD_AUDIO`. SaberStage first distinguishes a declared-but-unapproved runtime permission from an APK that was patched without the permission: the former opens Android's normal authorization prompt, while the latter reports that Beat Saber must be repatched instead of waiting for a prompt Android cannot display. A capture failure disables only microphone contribution; local recording or streaming continues with its other selected sources. For MBF installs, Beat Saber must be patched with the `Microphone Access` permission option. The permission is not needed for game sound or TTS.
 
@@ -39,4 +39,15 @@ The current provider presets retain Twitch RTMP, YouTube RTMPS, and Kick RTMPS i
 
 When `Post Map Info to Chat` is enabled, SaberStage snapshots plain song metadata during the level transition and submits one message only after gameplay actually starts and only while a Twitch stream is live. The message includes the locally available song name, artist, difficulty, mapper, map duration in `m:ss`, and notes per second. Chroma, Noodle Extensions, and Vivify are included when they are declared in the selected custom map's requirements or suggestions; star rating is included only when a future/local provider supplies a real value and is otherwise omitted. Beatmap-file inspection and the Twitch Helix request run on the Twitch worker, never on the gameplay-start thread, and a post failure is logged without delaying or failing the map.
 
-Sources: [Twitch broadcast requirements](https://dev.twitch.tv/docs/video-broadcast/), [Twitch ingest](https://dev.twitch.tv/docs/video-broadcast/reference/), [YouTube RTMPS ingestion](https://developers.google.com/youtube/v3/live/guides/rtmps-ingestion), and [YouTube live broadcast flow](https://developers.google.com/youtube/v3/live/guides/implementation/broadcasts-and-streams).
+Configure Stream includes an explicit, user-initiated connection test against
+Cloudflare's public `speed.cloudflare.com` download and upload endpoints. A
+consent dialog describes the destination, data use, and bounded 200 MB transfer
+before any traffic begins. The test streams fixed-size buffers on its own worker,
+publishes progress snapshots to the Unity thread, and does not submit results to
+Cloudflare's optional results endpoint. The slowest completed large transfer is
+used as the conservative sustained value. A successful result, timestamp, and
+supporting measurements are saved in `settings.json`; every livestream start
+reads that durable sustained-upload value and caps only the stream's copied video
+target/peak bitrate. Local recording quality is never changed by this limit.
+
+Sources: [Cloudflare speedtest reference implementation](https://github.com/cloudflare/speedtest), [Cloudflare speed test privacy information](https://speed.cloudflare.com/about), [Twitch broadcast requirements](https://dev.twitch.tv/docs/video-broadcast/), [Twitch ingest](https://dev.twitch.tv/docs/video-broadcast/reference/), [YouTube RTMPS ingestion](https://developers.google.com/youtube/v3/live/guides/rtmps-ingestion), and [YouTube live broadcast flow](https://developers.google.com/youtube/v3/live/guides/implementation/broadcasts-and-streams).

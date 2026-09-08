@@ -6,19 +6,17 @@
 // section 7(b)/(c) and an interoperability permission under section 7;
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
-// File responsibility: provides synchronous local PCM synthesis through the pinned eSpeak NG library.
+// File responsibility: provides lazy, worker-owned KittenTTS neural synthesis through private runtime libraries.
 
 #pragma once
 
 #include "saberstage/broadcast/ITtsBackend.hpp"
 
-#include <espeak-ng/speak_lib.h>
-
 namespace saberstage::broadcast {
 
-class EspeakTtsBackend final : public ITtsBackend {
+class KittenTtsBackend final : public ITtsBackend {
 public:
-    bool Initialize(const std::filesystem::path& dataParent, std::string* error) override;
+    bool Initialize(const std::filesystem::path& modelDirectory, std::string* error) override;
     bool Synthesize(
         std::string_view text,
         std::string_view voice,
@@ -31,13 +29,9 @@ public:
     void Shutdown() noexcept override;
 
 private:
-    static int SynthCallback(short* samples, int count, espeak_EVENT* events) noexcept;
-    std::vector<float>* activeOutput_ = nullptr;
-    const std::atomic<std::uint64_t>* cancellationGeneration_ = nullptr;
-    std::uint64_t expectedGeneration_ = 0;
-    std::size_t activeWritten_ = 0;
-    std::int32_t sampleRate_ = 0;
-    bool initialized_ = false;
+    void* onnxRuntimeLibrary_ = nullptr;
+    void* sherpaApiLibrary_ = nullptr;
+    const void* synthesizer_ = nullptr;
 };
 
 } // namespace saberstage::broadcast

@@ -1,0 +1,14 @@
+{
+  "name": "KittenTTS Nano English v0.2 through sherpa-onnx",
+  "runtimeVersion": "1.13.7",
+  "runtimeArchiveUrl": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.7/sherpa-onnx-v1.13.7-android.tar.bz2",
+  "runtimeArchiveSha256": "7208b26f5109777d1c3c22a45f04665419d6f3ea81f6811a2dfd5ff2d7622e6e",
+  "cApiHeaderUrl": "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v1.13.7/sherpa-onnx/c-api/c-api.h",
+  "cApiHeaderSha256": "426db2c6acfb51e02143aece67c45779fae699d961c7c26ccf6f1388fdeaa2df",
+  "modelArchiveUrl": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kitten-nano-en-v0_2-fp16.tar.bz2",
+  "modelArchiveSha256": "0345a8a2f4a710cb8f7912c9a731ded8b3e1e69b33a871efa95c2e64651518fe",
+  "preparedModelSha256": "e11a97b87d0fa6320739ad9abb83fd61cccbdd9c0793339edc5df30b0d63f810",
+  "preparedOnnxRuntimeSha256": "9ebb9b1fa97ba5300027a51116389a6c821cb2bfde775db66555b4a661821531",
+  "preparedSherpaApiSha256": "7d725aaf857fbd353b3358d7a99b558fc5b69df7913352b22314aff4d822746d",
+  "license": "Apache-2.0"
+}

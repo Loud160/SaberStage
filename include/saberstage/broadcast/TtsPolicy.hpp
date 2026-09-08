@@ -6,7 +6,7 @@
 // section 7(b)/(c) and an interoperability permission under section 7;
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
-// File responsibility: converts untrusted Twitch chat into bounded plain speech without I/O.
+// File responsibility: converts normalized untrusted chat messages into bounded plain speech without I/O.
 
 #pragma once
 
@@ -19,7 +19,7 @@
 namespace saberstage::broadcast {
 
 [[nodiscard]] std::optional<std::string> BuildTtsUtterance(
-    const TwitchChatMessage& message,
+    const ChatMessage& message,
     const settings::TtsSettings& settings);
 
 } // namespace saberstage::broadcast

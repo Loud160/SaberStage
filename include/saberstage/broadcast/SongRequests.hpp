@@ -20,7 +20,7 @@ enum class CommandPermission { Everyone, SubscribersAndVips, Moderators, Broadca
 inline constexpr std::array<std::string_view, 8> kRequestCommandNames{"!bsr",         "!bsrhelp", "!link", "!queue",
                                                                       "!queuestatus", "!wrong",   "!open", "!close"};
 [[nodiscard]] std::optional<RequestCommand> ParseRequestCommand(std::string_view text);
-[[nodiscard]] bool HasCommandPermission(CommandPermission permission, const TwitchChatMessage &sender);
+[[nodiscard]] bool HasCommandPermission(CommandPermission permission, const ChatMessage &sender);
 struct RequestPolicy {
     bool enabled = false;
     int maximumPending = 25;
@@ -73,7 +73,7 @@ struct RequestQueue {
 
 [[nodiscard]] std::string ParseBeatSaverKey(std::string_view input);
 [[nodiscard]] std::string RequestRejection(const RequestQueue &queue, const RequestPolicy &policy,
-                                           const TwitchChatMessage &sender, const RequestedMap &map, std::int64_t now);
+                                           const ChatMessage &sender, const RequestedMap &map, std::int64_t now);
 [[nodiscard]] RequestPolicy ValidateRequestPolicy(RequestPolicy policy);
 [[nodiscard]] std::string_view RequestStateName(RequestState state) noexcept;
 // Owns two alternating, checksummed snapshots per channel. A save is durable

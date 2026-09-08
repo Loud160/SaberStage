@@ -32,6 +32,9 @@ FFMPEG_LIBRARIES = {
     "libavcodec-saberstage9.so",
     "libavutil-saberstage9.so",
 }
+TTS_LIBRARY_DIR = ROOT / ".cache/dependencies/kitten-tts/lib"
+TTS_LIBRARIES = {"libsabstageort.so", "libss-tts-neural-api.so"}
+RUNTIME_LIBRARIES = FFMPEG_LIBRARIES | TTS_LIBRARIES
 
 # The filename contains a hyphen, so load the canonical ELF verifier by path.
 import importlib.util
@@ -55,12 +58,12 @@ def main() -> int:
 
     with zipfile.ZipFile(ARCHIVE) as qmod:
         names = set(qmod.namelist())
-        expected_names = {"mod.json", "libsaberstage.so"} | FFMPEG_LIBRARIES
+        expected_names = {"mod.json", "libsaberstage.so"} | RUNTIME_LIBRARIES
         if names != expected_names:
             fail(f"unexpected QMOD entries: {sorted(names)}")
         manifest = json.loads(qmod.read("mod.json"))
         packaged_library = qmod.read("libsaberstage.so")
-        packaged_ffmpeg = {name: qmod.read(name) for name in FFMPEG_LIBRARIES}
+        packaged_runtimes = {name: qmod.read(name) for name in RUNTIME_LIBRARIES}
 
     expected_identity = {
         "name": "SaberStage",
@@ -76,8 +79,8 @@ def main() -> int:
             fail(f"manifest {key} is {manifest.get(key)!r}; expected {expected!r}")
     if manifest.get("modFiles") != ["libsaberstage.so"]:
         fail("SaberStage must package exactly one early-mod library")
-    if set(manifest.get("libraryFiles", [])) != FFMPEG_LIBRARIES:
-        fail("private FFmpeg runtime library list is missing or unexpected")
+    if set(manifest.get("libraryFiles", [])) != RUNTIME_LIBRARIES:
+        fail("private FFmpeg/KittenTTS runtime library list is missing or unexpected")
     if any(manifest.get(key) for key in ("lateModFiles", "fileCopies", "copyExtensions")):
         fail("QMOD contains an unexpected payload category")
 
@@ -101,8 +104,9 @@ def main() -> int:
     if b"setup\x00" not in packaged_library or b"late_load\x00" not in packaged_library:
         fail("packaged library is missing Scotland2 entry-point names")
     _VERIFY_MODULE.verify(BUILT_LIBRARY)
-    for name, packaged in packaged_ffmpeg.items():
-        built = (FFMPEG_LIBRARY_DIR / name).read_bytes()
+    for name, packaged in packaged_runtimes.items():
+        source = FFMPEG_LIBRARY_DIR if name in FFMPEG_LIBRARIES else TTS_LIBRARY_DIR
+        built = (source / name).read_bytes()
         if packaged != built:
             fail(f"packaged {name} does not byte-match the staged private runtime")
         if packaged[:4] != b"\x7fELF" or packaged[4] != 2 or packaged[5] != 1:

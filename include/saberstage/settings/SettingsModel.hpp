@@ -22,7 +22,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 32;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 35;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.
@@ -242,6 +242,10 @@ struct AudioProcessingSettings {
     // for settings compatibility. These fields describe routing and DSP only.
     MicrophoneMode microphoneMode = MicrophoneMode::Open;
     PushToTalkHand pushToTalkHand = PushToTalkHand::Either;
+    // PTT releases over a short, independent tail so consonants are not cut
+    // off when the player lets go of the controller grip. Voice-activation
+    // hold/release timing must not be reused for this separate interaction.
+    float pushToTalkReleaseMilliseconds = 150.0F;
     bool includeMicrophoneInRecordings = true;
     bool includeMicrophoneInLivestreams = true;
     bool highPassEnabled = true;
@@ -274,8 +278,26 @@ struct TtsSettings {
     float staleAfterSeconds = 12.0F;
     float volumePercent = 80.0F;
     float speechRate = 1.0F;
-    std::string voice = "en-us";
+    // KittenTTS Nano v0.2 speaker IDs are persisted by their upstream names
+    // so settings stay stable even if the display labels are improved later.
+    std::string voice = "expr-voice-2-f";
     TtsOutputRoute outputRoute = TtsOutputRoute::HeadsetOnly;
+};
+
+// A completed, user-initiated connection test is durable because every future
+// stream start must enforce the last measured upload ceiling, including after
+// Beat Saber or the headset has restarted. The remaining values are saved with
+// that ceiling so Configure Stream can explain where the limit came from.
+struct ConnectionTestSettings {
+    bool hasResult = false;
+    float sustainedDownloadMegabitsPerSecond = 0.0F;
+    float sustainedUploadMegabitsPerSecond = 0.0F;
+    float peakDownloadMegabitsPerSecond = 0.0F;
+    float peakUploadMegabitsPerSecond = 0.0F;
+    float latencyMilliseconds = 0.0F;
+    float jitterMilliseconds = 0.0F;
+    float durationSeconds = 0.0F;
+    std::int64_t testedAtUnixSeconds = 0;
 };
 
 struct FeatureSettings {
@@ -341,6 +363,7 @@ struct SettingsDocument {
     LivestreamSettings broadcast;
     AudioProcessingSettings audio;
     TtsSettings tts;
+    ConnectionTestSettings connectionTest;
     ChatSettings chat;
 };
 

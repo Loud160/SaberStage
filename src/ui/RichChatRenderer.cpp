@@ -225,7 +225,7 @@ void RichChatRenderer::BeginPass() {
     for (auto &[id, entry] : impl_->cache)
         entry.pinned = false;
 }
-std::string RichChatRenderer::Format(const broadcast::TwitchChatMessage &message,
+std::string RichChatRenderer::Format(const broadcast::ChatMessage &message,
                                      const settings::ChatSettings &settings, std::string_view channelLogin) {
     auto &p = *impl_;
     std::string text;

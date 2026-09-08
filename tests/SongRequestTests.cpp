@@ -60,7 +60,7 @@ int main() {
     Check(store.Load("123", restored, error) && restored.revision == 1, "partial ignored");
     RequestPolicy policy;
     policy.enabled = true;
-    TwitchChatMessage sender;
+    ChatMessage sender;
     sender.id = "id2";
     sender.userId = "789";
     sender.channelId = "123";

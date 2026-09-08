@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -35,8 +36,6 @@ class SettingsService;
 }
 
 namespace saberstage::broadcast {
-
-class TtsService;
 
 enum class TwitchAuthorizationState {
     Disconnected,
@@ -75,7 +74,9 @@ struct TwitchSnapshot {
     std::string userCode;
     std::string verificationUri;
     std::string login;
-    std::vector<TwitchChatMessage> messages;
+    // This is the normalized history displayed by the chat panel. Twitch IRC
+    // is only the current producer and does not leak into downstream consumers.
+    std::vector<ChatMessage> messages;
     std::uint64_t messagesRevision = 0;
     // Helix reports the live channel's current viewer count. Unknown remains
     // distinct from zero so the UI can show "--" while offline/auth is being
@@ -100,7 +101,11 @@ struct TwitchSnapshot {
 // Unity objects or SettingsService directly.
 class TwitchService final {
 public:
-    TwitchService(settings::SettingsService& settings, TtsService& tts);
+    using ChatMessageCallback = std::function<void(const ChatMessage&)>;
+
+    TwitchService(
+        settings::SettingsService& settings,
+        ChatMessageCallback onChatMessage);
     ~TwitchService();
 
     TwitchService(const TwitchService&) = delete;
@@ -160,6 +165,7 @@ private:
     void StartChatIfReady() noexcept;
     void StopChatWorker() noexcept;
     void JoinCompletedWorkers() noexcept;
+    void PublishChatEvent(ChatEvent event);
     void SetStatus(TwitchAuthorizationState state, std::string status);
     bool RestoreSavedTokens(std::string* error = nullptr) noexcept;
     bool ProtectRuntimeTokens(std::string* error = nullptr) noexcept;
@@ -167,7 +173,9 @@ private:
     bool AcquireChatSendSlot();
 
     settings::SettingsService& settings_;
-    TtsService& tts_;
+    // Provider-neutral delivery point. Twitch owns transport/parsing only;
+    // Chat TTS and future consumers subscribe at the application root.
+    ChatMessageCallback onChatMessage_;
     mutable std::mutex mutex_;
     TwitchSnapshot snapshot_;
     PendingCredentials pendingCredentials_;

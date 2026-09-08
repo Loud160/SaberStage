@@ -272,7 +272,7 @@ std::string ReadableChatColor(std::string_view value) {
     const unsigned r = color >> 16, g = (color >> 8) & 255, b = color & 255;
     return 0.2126 * r + 0.7152 * g + 0.0722 * b < 72 ? "#B9D8FF" : std::string(value);
 }
-std::string FormatChatText(const TwitchChatMessage &message, bool badges) {
+std::string FormatChatText(const ChatMessage &message, bool badges) {
     std::string prefix;
     if (badges) {
         if (message.broadcaster)
@@ -289,7 +289,7 @@ std::string FormatChatText(const TwitchChatMessage &message, bool badges) {
                 EscapeChatMarkup(message.text);
     return message.kind == ChatKind::Action ? "<i>" + text + "</i>" : text;
 }
-bool ApplyChatEvent(std::vector<TwitchChatMessage> &history, ChatEvent event, std::uint64_t &nextSequence,
+bool ApplyChatEvent(std::vector<ChatMessage> &history, ChatEvent event, std::uint64_t &nextSequence,
                     std::size_t limit) {
     if (event.mutation == ChatMutation::Append) {
         if (!event.message.id.empty() && std::any_of(history.begin(), history.end(), [&](const auto &m) {

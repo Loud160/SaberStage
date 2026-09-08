@@ -19,7 +19,7 @@ int main() {
     settings.enabled = true;
     settings.speakUsernames = false;
 
-    broadcast::TwitchChatMessage message;
+    broadcast::ChatMessage message;
     message.author = "Viewer";
     message.login = "viewer";
     message.text = "Hello!!!!!      world???? loooooool";

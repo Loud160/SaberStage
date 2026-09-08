@@ -52,7 +52,7 @@ class SongRequestService final {
     ~SongRequestService();
     void SetChannel(std::string channel);
     void Configure(RequestPolicy policy);
-    bool Receive(TwitchChatMessage message);
+    bool Receive(ChatMessage message);
     bool Act(RequestAction action, std::string id = {});
     void SetCurrentMap(std::string key);
     void GameplayStarted(std::string hash);
@@ -72,7 +72,7 @@ class SongRequestService final {
         bool chat = false;
         RequestAction action = RequestAction::Close;
         std::string id;
-        TwitchChatMessage message;
+        ChatMessage message;
         bool gameplay = false;
     };
     void Run() noexcept;

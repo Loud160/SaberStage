@@ -34,6 +34,10 @@ namespace saberstage::recording {
 class RecordingController;
 }
 
+namespace saberstage::network {
+class CloudflareSpeedTest;
+}
+
 namespace saberstage::broadcast {
 class TwitchService;
 class TtsService;
@@ -61,6 +65,7 @@ public:
     recording::RecordingController& Recording() noexcept;
     broadcast::TwitchService& Twitch() noexcept;
     broadcast::TtsService& Tts() noexcept;
+    network::CloudflareSpeedTest& ConnectionTest() noexcept;
 
 private:
     bool started_ = false;
@@ -72,6 +77,7 @@ private:
     // therefore destroyed after RecordingController during exceptional unwind.
     std::unique_ptr<recording::RecordingController> recording_;
     std::unique_ptr<broadcast::TwitchService> twitch_;
+    std::unique_ptr<network::CloudflareSpeedTest> connectionTest_;
     std::unique_ptr<ui::MenuController> menu_;
 };
 

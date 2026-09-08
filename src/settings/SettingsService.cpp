@@ -487,6 +487,9 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.audio.pushToTalkHand = EnumValue(
                 *audio, "pushToTalkHand", settings.audio.pushToTalkHand,
                 [](std::string_view value, PushToTalkHand& parsed) { return TryParse(value, parsed); }, repaired);
+            settings.audio.pushToTalkReleaseMilliseconds = Float(
+                *audio, "pushToTalkReleaseMilliseconds",
+                settings.audio.pushToTalkReleaseMilliseconds, repaired);
             settings.audio.includeMicrophoneInRecordings = Bool(*audio, "includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, repaired);
             settings.audio.includeMicrophoneInLivestreams = Bool(*audio, "includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, repaired);
             settings.audio.highPassEnabled = Bool(*audio, "highPassEnabled", settings.audio.highPassEnabled, repaired);
@@ -526,6 +529,55 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
             settings.tts.outputRoute = EnumValue(
                 *tts, "outputRoute", settings.tts.outputRoute,
                 [](std::string_view value, TtsOutputRoute& parsed) { return TryParse(value, parsed); }, repaired);
+        }
+    }
+    if (const auto* connectionTest = Member(document, "connectionTest")) {
+        if (!connectionTest->IsObject()) {
+            repaired = true;
+        } else {
+            auto& saved = settings.connectionTest;
+            saved.hasResult = Bool(
+                *connectionTest, "hasResult", saved.hasResult, repaired);
+            saved.sustainedDownloadMegabitsPerSecond = Float(
+                *connectionTest,
+                "sustainedDownloadMegabitsPerSecond",
+                saved.sustainedDownloadMegabitsPerSecond,
+                repaired);
+            saved.sustainedUploadMegabitsPerSecond = Float(
+                *connectionTest,
+                "sustainedUploadMegabitsPerSecond",
+                saved.sustainedUploadMegabitsPerSecond,
+                repaired);
+            saved.peakDownloadMegabitsPerSecond = Float(
+                *connectionTest,
+                "peakDownloadMegabitsPerSecond",
+                saved.peakDownloadMegabitsPerSecond,
+                repaired);
+            saved.peakUploadMegabitsPerSecond = Float(
+                *connectionTest,
+                "peakUploadMegabitsPerSecond",
+                saved.peakUploadMegabitsPerSecond,
+                repaired);
+            saved.latencyMilliseconds = Float(
+                *connectionTest,
+                "latencyMilliseconds",
+                saved.latencyMilliseconds,
+                repaired);
+            saved.jitterMilliseconds = Float(
+                *connectionTest,
+                "jitterMilliseconds",
+                saved.jitterMilliseconds,
+                repaired);
+            saved.durationSeconds = Float(
+                *connectionTest,
+                "durationSeconds",
+                saved.durationSeconds,
+                repaired);
+            saved.testedAtUnixSeconds = Int64(
+                *connectionTest,
+                "testedAtUnixSeconds",
+                saved.testedAtUnixSeconds,
+                repaired);
         }
     }
     if (const auto* chat = Member(document, "chat")) {
@@ -701,6 +753,7 @@ std::string Encode(const SettingsDocument& settings) {
     Value audio(rapidjson::kObjectType);
     audio.AddMember("microphoneMode", Value(ToString(settings.audio.microphoneMode).data(), allocator), allocator);
     audio.AddMember("pushToTalkHand", Value(ToString(settings.audio.pushToTalkHand).data(), allocator), allocator);
+    audio.AddMember("pushToTalkReleaseMilliseconds", settings.audio.pushToTalkReleaseMilliseconds, allocator);
     audio.AddMember("includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, allocator);
     audio.AddMember("includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, allocator);
     audio.AddMember("highPassEnabled", settings.audio.highPassEnabled, allocator);
@@ -736,6 +789,34 @@ std::string Encode(const SettingsDocument& settings) {
     tts.AddMember("voice", Value(settings.tts.voice.c_str(), allocator), allocator);
     tts.AddMember("outputRoute", Value(ToString(settings.tts.outputRoute).data(), allocator), allocator);
     document.AddMember("tts", tts, allocator);
+
+    Value connectionTest(rapidjson::kObjectType);
+    connectionTest.AddMember("hasResult", settings.connectionTest.hasResult, allocator);
+    connectionTest.AddMember(
+        "sustainedDownloadMegabitsPerSecond",
+        settings.connectionTest.sustainedDownloadMegabitsPerSecond,
+        allocator);
+    connectionTest.AddMember(
+        "sustainedUploadMegabitsPerSecond",
+        settings.connectionTest.sustainedUploadMegabitsPerSecond,
+        allocator);
+    connectionTest.AddMember(
+        "peakDownloadMegabitsPerSecond",
+        settings.connectionTest.peakDownloadMegabitsPerSecond,
+        allocator);
+    connectionTest.AddMember(
+        "peakUploadMegabitsPerSecond",
+        settings.connectionTest.peakUploadMegabitsPerSecond,
+        allocator);
+    connectionTest.AddMember(
+        "latencyMilliseconds", settings.connectionTest.latencyMilliseconds, allocator);
+    connectionTest.AddMember(
+        "jitterMilliseconds", settings.connectionTest.jitterMilliseconds, allocator);
+    connectionTest.AddMember(
+        "durationSeconds", settings.connectionTest.durationSeconds, allocator);
+    connectionTest.AddMember(
+        "testedAtUnixSeconds", settings.connectionTest.testedAtUnixSeconds, allocator);
+    document.AddMember("connectionTest", connectionTest, allocator);
 
     Value chat(rapidjson::kObjectType);
     chat.AddMember("enabled", settings.chat.enabled, allocator);

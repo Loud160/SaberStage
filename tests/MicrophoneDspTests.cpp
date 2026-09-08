@@ -53,8 +53,9 @@ int main() {
     settings.microphoneMode = settings::MicrophoneMode::PushToTalk;
     settings.compressorEnabled = false;
     settings.limiterEnabled = false;
+    settings.compressorMakeupDb = 12.0F;
     settings.gateAttackMilliseconds = 1.0F;
-    settings.gateReleaseMilliseconds = 10.0F;
+    settings.pushToTalkReleaseMilliseconds = 150.0F;
     settings.gateHoldMilliseconds = 0.0F;
     dsp.Configure(settings, 48'000);
     dsp.Reset();
@@ -65,6 +66,24 @@ int main() {
     std::fill(blocked.begin(), blocked.end(), 0.5F);
     dsp.Process(blocked.data(), blocked.size());
     assert(blocked.back() > 0.45F);
+    dsp.SetPushToTalk(false);
+    std::vector<float> releaseTail(480, 0.5F);
+    dsp.Process(releaseTail.data(), releaseTail.size());
+    assert(releaseTail.back() > 0.35F);
+    std::vector<float> released(48'000, 0.5F);
+    dsp.Process(released.data(), released.size());
+    assert(released.back() < 0.01F);
+
+    // Compressor bypass must bypass its makeup gain as well. A disabled
+    // processor cannot quietly change level while its UI controls are disabled.
+    settings.microphoneMode = settings::MicrophoneMode::Open;
+    settings.compressorEnabled = false;
+    settings.compressorMakeupDb = 12.0F;
+    dsp.Configure(settings, 48'000);
+    dsp.Reset();
+    std::vector<float> bypass(512, 0.1F);
+    dsp.Process(bypass.data(), bypass.size());
+    assert(std::abs(bypass.back() - 0.1F) < 0.001F);
 
     // Voice pre-roll must not add hidden monitoring/stream latency to open
     // mic or PTT. Only voice-activated detection uses the delayed samples.
@@ -77,8 +96,11 @@ int main() {
     assert(immediate.front() > 0.0F && immediate.back() > 0.45F);
 
     settings.microphoneMode = settings::MicrophoneMode::VoiceActivated;
+    settings.compressorMakeupDb = 0.0F;
     settings.gateOpenThresholdDb = -30.0F;
     settings.gateCloseThresholdDb = -40.0F;
+    settings.gateHoldMilliseconds = 50.0F;
+    settings.gateReleaseMilliseconds = 80.0F;
     dsp.Configure(settings, 48'000);
     dsp.Reset();
     std::vector<float> quiet(1024, 0.001F);
@@ -87,7 +109,7 @@ int main() {
     std::vector<float> voice(1024, 0.1F);
     dsp.Process(voice.data(), voice.size());
     assert(dsp.Snapshot().gateOpen);
-    std::vector<float> silence(8'192, 0.0F);
+    std::vector<float> silence(24'000, 0.0F);
     dsp.Process(silence.data(), silence.size());
     assert(!dsp.Snapshot().gateOpen);
 

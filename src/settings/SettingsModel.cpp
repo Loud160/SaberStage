@@ -395,9 +395,22 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                MicrophoneMode::VoiceActivated, defaults.audio.microphoneMode, result);
     RepairEnum(settings.audio.pushToTalkHand, PushToTalkHand::Left,
                PushToTalkHand::Either, defaults.audio.pushToTalkHand, result);
+    RepairFloat(settings.audio.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
+                defaults.audio.pushToTalkReleaseMilliseconds, result);
+    // The Audio page now exposes one three-state routing selector rather than
+    // two contradictory switches. "Neither" has no selectable representation;
+    // the microphone master switch is the single control for disabling all
+    // capture, so legacy neither-route documents migrate to the safe default.
+    if (!settings.audio.includeMicrophoneInRecordings &&
+            !settings.audio.includeMicrophoneInLivestreams) {
+        settings.audio.includeMicrophoneInRecordings = true;
+        settings.audio.includeMicrophoneInLivestreams = true;
+        result.changed = true;
+        result.repairedFields += 2;
+    }
     RepairFloat(settings.audio.gateOpenThresholdDb, -60.0F, -5.0F,
                 defaults.audio.gateOpenThresholdDb, result);
-    RepairFloat(settings.audio.gateCloseThresholdDb, -70.0F, -5.0F,
+    RepairFloat(settings.audio.gateCloseThresholdDb, -90.0F, -5.0F,
                 defaults.audio.gateCloseThresholdDb, result);
     if (settings.audio.gateCloseThresholdDb > settings.audio.gateOpenThresholdDb) {
         settings.audio.gateCloseThresholdDb = settings.audio.gateOpenThresholdDb - 3.0F;
@@ -438,9 +451,70 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                 defaults.tts.volumePercent, result);
     RepairFloat(settings.tts.speechRate, 0.5F, 2.0F,
                 defaults.tts.speechRate, result);
-    if (settings.tts.voice.empty() || settings.tts.voice.size() > 64 ||
-            settings.tts.voice.find('\0') != std::string::npos) {
+    // The original alpha used eSpeak locale IDs. Any old or malformed value
+    // intentionally selects the new default neural voice rather than silently
+    // retaining the robotic backend the user asked to replace.
+    static constexpr std::array<std::string_view, 8> supportedTtsVoices{
+        "expr-voice-2-m", "expr-voice-2-f", "expr-voice-3-m", "expr-voice-3-f",
+        "expr-voice-4-m", "expr-voice-4-f", "expr-voice-5-m", "expr-voice-5-f"};
+    if (std::find(supportedTtsVoices.begin(), supportedTtsVoices.end(),
+            settings.tts.voice) == supportedTtsVoices.end()) {
         settings.tts.voice = defaults.tts.voice;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    RepairFloat(
+        settings.connectionTest.sustainedDownloadMegabitsPerSecond,
+        0.0F,
+        100'000.0F,
+        defaults.connectionTest.sustainedDownloadMegabitsPerSecond,
+        result);
+    RepairFloat(
+        settings.connectionTest.sustainedUploadMegabitsPerSecond,
+        0.0F,
+        100'000.0F,
+        defaults.connectionTest.sustainedUploadMegabitsPerSecond,
+        result);
+    RepairFloat(
+        settings.connectionTest.peakDownloadMegabitsPerSecond,
+        0.0F,
+        100'000.0F,
+        defaults.connectionTest.peakDownloadMegabitsPerSecond,
+        result);
+    RepairFloat(
+        settings.connectionTest.peakUploadMegabitsPerSecond,
+        0.0F,
+        100'000.0F,
+        defaults.connectionTest.peakUploadMegabitsPerSecond,
+        result);
+    RepairFloat(
+        settings.connectionTest.latencyMilliseconds,
+        0.0F,
+        120'000.0F,
+        defaults.connectionTest.latencyMilliseconds,
+        result);
+    RepairFloat(
+        settings.connectionTest.jitterMilliseconds,
+        0.0F,
+        120'000.0F,
+        defaults.connectionTest.jitterMilliseconds,
+        result);
+    RepairFloat(
+        settings.connectionTest.durationSeconds,
+        0.0F,
+        3'600.0F,
+        defaults.connectionTest.durationSeconds,
+        result);
+    if (settings.connectionTest.testedAtUnixSeconds < 0) {
+        settings.connectionTest.testedAtUnixSeconds = 0;
+        result.changed = true;
+        ++result.repairedFields;
+    }
+    if (settings.connectionTest.hasResult &&
+            settings.connectionTest.sustainedUploadMegabitsPerSecond <= 0.0F) {
+        // A successful test always transfers upload data. Treat a zero ceiling
+        // as incomplete/corrupt instead of silently allowing every bitrate.
+        settings.connectionTest = defaults.connectionTest;
         result.changed = true;
         ++result.repairedFields;
     }

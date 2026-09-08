@@ -31,7 +31,7 @@ class RichChatRenderer final {
     // call, even when both pointers are null or the atlas has not changed.
     void BindSpriteAsset(TMPro::TextMeshProUGUI *row) const;
     void BeginPass();
-    std::string Format(const broadcast::TwitchChatMessage &message, const settings::ChatSettings &settings,
+    std::string Format(const broadcast::ChatMessage &message, const settings::ChatSettings &settings,
                        std::string_view channelLogin);
     void Decorate(TMPro::TextMeshProUGUI *row, float width, float height, bool platformAccent);
 

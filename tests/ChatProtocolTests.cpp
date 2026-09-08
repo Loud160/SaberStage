@@ -37,7 +37,7 @@ int main() {
     auto invalidSpan =
         ParseTwitchChatLine("@emotes=25:999999999999999999999-1000000000000000000000 :x!x@x PRIVMSG #y :Kappa");
     Check(invalidSpan && invalidSpan->message.emotes.empty(), "overflowing span");
-    std::vector<TwitchChatMessage> history;
+    std::vector<ChatMessage> history;
     std::uint64_t sequence = 1;
     Check(ApplyChatEvent(history, *event, sequence), "append");
     Check(!ApplyChatEvent(history, *event, sequence), "duplicate delivery");

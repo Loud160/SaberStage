@@ -7,8 +7,8 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Owns the bounded Twitch TTS queue, offline synthesis worker, and independent output rings.
-// - Keeps synthesis and playback out of Unity, Twitch transport, and realtime game-audio callbacks.
+// - Owns the bounded Chat TTS queue, offline synthesis worker, and independent output rings.
+// - Consumes normalized panel messages so synthesis is independent from Twitch or any future provider transport.
 
 #pragma once
 
@@ -42,7 +42,7 @@ struct TtsSnapshot {
     std::uint64_t spokenMessages = 0;
     std::uint64_t filteredMessages = 0;
     std::uint64_t droppedMessages = 0;
-    std::string status = "Twitch TTS is off";
+    std::string status = "Chat TTS is off";
 };
 
 class TtsService final {
@@ -54,7 +54,7 @@ public:
     TtsService& operator=(const TtsService&) = delete;
 
     void ApplySettings(const settings::TtsSettings& settings);
-    void Enqueue(const TwitchChatMessage& message) noexcept;
+    void Enqueue(const ChatMessage& message) noexcept;
     void ClearQueue() noexcept;
     // The recording worker asks for exactly one mono sample per game-audio
     // frame. Underflow is silence and never changes the stream timeline.
@@ -99,13 +99,17 @@ private:
     // Only the TTS worker opens/stops AAudio during normal operation. UI
     // settings publish this request instead of racing outputStream_ directly.
     std::atomic<bool> headsetStopRequested_{false};
+    // Neural inference is loaded lazily and released again when TTS is turned
+    // off. The request is consumed by the worker that exclusively owns the
+    // backend, avoiding a UI-thread destroy racing active synthesis.
+    std::atomic<bool> backendResetRequested_{false};
     std::atomic<bool> backendReady_{false};
     std::atomic<std::uint64_t> clearGeneration_{0};
     bool speaking_ = false;
     std::uint64_t spokenMessages_ = 0;
     std::uint64_t filteredMessages_ = 0;
     std::uint64_t droppedMessages_ = 0;
-    std::string status_ = "Twitch TTS is off";
+    std::string status_ = "Chat TTS is off";
     // Keep the worker last: member initialization follows declaration order,
     // so every field the worker can observe must exist before its thread starts.
     std::thread worker_;

@@ -24,6 +24,7 @@
 #include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/camera/CameraProfile.hpp"
+#include "saberstage/network/CloudflareSpeedTest.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
 #include "saberstage/preview/PreviewRenderPolicy.hpp"
 #include "saberstage/recording/RecordingController.hpp"
@@ -108,6 +109,7 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <cmath>
 #include <exception>
@@ -165,6 +167,56 @@ static_assert(kRecordingPanelAudioButtonSize.x < 11.0F);
 static_assert(23.0F + kRecordingPanelAudioButtonSize.x * 0.5F < kRecordingPanelWidth * 0.5F - 1.0F);
 static_assert(12.8F - kRecordingPanelAudioButtonSize.y * 0.5F > 8.0F);
 static_assert(12.8F + kRecordingPanelAudioButtonSize.y * 0.5F < kRecordingPanelButtonBandHeight);
+// The microphone meter has a wider useful range than the original -60..0
+// display. Keep these shared with both construction and refresh code so tick,
+// threshold, and live-fill positions can never drift apart.
+constexpr float kAudioMeterWidth = 88.0F;
+constexpr float kAudioMeterCenterX = -10.0F;
+constexpr float kAudioMeterMinimumDb = -65.0F;
+constexpr float kAudioMeterMaximumDb = 5.0F;
+constexpr float kAudioMeterOrangeStartDb = -20.0F;
+constexpr float kAudioMeterRedStartDb = -10.0F;
+constexpr float kAudioMeterClipStartDb = 0.0F;
+// Voice activation keeps the existing open/close thresholds in the settings
+// file, while the UI presents their difference as a positive cutoff offset.
+// Three decibels preserves the DSP's historical minimum hysteresis. Extending
+// the close floor to -90 dBFS lets a 30 dB offset stay constant across the
+// complete -60..-5 dBFS Open range.
+constexpr float kGateCutoffOffsetMinimumDb = 3.0F;
+constexpr float kGateCutoffOffsetMaximumDb = 30.0F;
+constexpr float kGateCloseThresholdMinimumDb = -90.0F;
+
+float GateCutoffOffsetDb(const settings::AudioProcessingSettings& audio) {
+    return std::clamp(
+        audio.gateOpenThresholdDb - audio.gateCloseThresholdDb,
+        kGateCutoffOffsetMinimumDb,
+        kGateCutoffOffsetMaximumDb);
+}
+
+void SetGateOpenPreservingCutoffOffset(
+        settings::AudioProcessingSettings& audio, float openThresholdDb) {
+    const auto cutoffOffsetDb = GateCutoffOffsetDb(audio);
+    audio.gateOpenThresholdDb = openThresholdDb;
+    audio.gateCloseThresholdDb = std::max(
+        kGateCloseThresholdMinimumDb,
+        openThresholdDb - cutoffOffsetDb);
+}
+
+void SetGateCutoffOffset(
+        settings::AudioProcessingSettings& audio, float cutoffOffsetDb) {
+    const auto repairedOffset = std::clamp(
+        cutoffOffsetDb,
+        kGateCutoffOffsetMinimumDb,
+        kGateCutoffOffsetMaximumDb);
+    audio.gateCloseThresholdDb = std::max(
+        kGateCloseThresholdMinimumDb,
+        audio.gateOpenThresholdDb - repairedOffset);
+}
+// One typography scale keeps adjacent native controls visually related even
+// when their BSML prefabs ship with different default font sizes.
+constexpr float kCenterSectionHeaderTextSize = 3.6F;
+constexpr float kCenterControlLabelTextSize = 2.8F;
+constexpr float kCenterDropdownValueTextSize = 2.8F;
 const UnityEngine::Vector2 kChatPanelSize{70.0F, 58.0F};
 constexpr float kChatPanelScale = 0.011F;
 constexpr float kChatPanelHeaderHeight = 10.0F;
@@ -894,6 +946,68 @@ std::string EscapeTmpText(std::string value) {
     return value;
 }
 
+std::string ConnectionTestResultsText(
+    const network::SpeedTestResults& results,
+    bool compact = false) {
+    const auto supportedStreams = network::SupportedSimultaneousStreams(
+        results.uploadMegabitsPerSecond);
+    const auto rating = network::StreamQualityRating(
+        results.uploadMegabitsPerSecond);
+    const auto ratingColor = supportedStreams >= 3 ? "#4CFF72"
+        : supportedStreams >= 2 ? "#7DE8FF"
+        : supportedStreams == 1 ? "#FFD45C" : "#FF665C";
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(1);
+    text << "<color=#59B8FF>Sustained Download</color>  "
+         << results.downloadMegabitsPerSecond << " Mbps\n"
+         << "<color=#59B8FF>Sustained Upload</color>      "
+         << results.uploadMegabitsPerSecond << " Mbps\n"
+         << "<color=#59B8FF>Latency</color>               "
+         << results.latencyMilliseconds << " ms\n"
+         << "<color=#59B8FF>Jitter</color>                "
+         << results.jitterMilliseconds << " ms\n";
+    if (!compact) {
+        text << "<color=#8D99A8>Peak Download</color>       "
+             << results.peakDownloadMegabitsPerSecond << " Mbps\n"
+             << "<color=#8D99A8>Peak Upload</color>         "
+             << results.peakUploadMegabitsPerSecond << " Mbps\n"
+             << "<color=#8D99A8>Test Duration</color>       "
+             << results.durationSeconds << " seconds\n";
+    }
+    text << "\n<b>Stream Quality: <color=" << ratingColor << ">" << rating
+         << "</color></b>\n";
+    if (supportedStreams == 0) {
+        text << "Upload is below the 6 Mbps baseline for one stream.";
+    } else {
+        text << "May support up to " << supportedStreams
+             << " simultaneous stream connection"
+             << (supportedStreams == 1 ? "" : "s") << ".";
+    }
+    text << (compact
+        ? "\nActual capacity also depends on connection stability and device load.\n"
+          "Saved upload is checked before every stream start."
+        : "\nActual capacity also depends on connection stability and device load.\n\n"
+          "The sustained upload result is saved and checked before every stream start.");
+    return text.str();
+}
+
+network::SpeedTestResults SavedConnectionTestResults(
+    const settings::ConnectionTestSettings& saved) {
+    network::SpeedTestResults results;
+    results.downloadMegabitsPerSecond =
+        saved.sustainedDownloadMegabitsPerSecond;
+    results.uploadMegabitsPerSecond =
+        saved.sustainedUploadMegabitsPerSecond;
+    results.peakDownloadMegabitsPerSecond =
+        saved.peakDownloadMegabitsPerSecond;
+    results.peakUploadMegabitsPerSecond =
+        saved.peakUploadMegabitsPerSecond;
+    results.latencyMilliseconds = saved.latencyMilliseconds;
+    results.jitterMilliseconds = saved.jitterMilliseconds;
+    results.durationSeconds = saved.durationSeconds;
+    return results;
+}
+
 } // namespace
 
 MenuController* MenuController::active_ = nullptr;
@@ -1166,7 +1280,288 @@ void MenuController::ApplyAudioSettings(bool requestPermission) {
         }
     }
     root_.Recording().RefreshAudioConfiguration();
+    // A mode or dynamics toggle changes which subordinate controls have an
+    // effect. Refresh immediately so the menu never presents an unused PTT,
+    // gate, compressor, or limiter setting as active.
+    RefreshAudioControlState();
     RefreshRecordingStatus();
+}
+
+void MenuController::RefreshAudioControlState(bool synchronizeValues) {
+    const auto& audio = root_.Settings().Get().audio;
+    const auto& broadcast = root_.Settings().Get().broadcast;
+
+    const auto synchronizeSlider = [](BSML::SliderSetting* setting, float value) {
+        if (!IsAlive(setting) || !IsAlive(setting->slider)) return;
+        if (std::abs(setting->get_Value() - value) < 0.001F) return;
+        // Resets must update the visible control without invoking each slider
+        // callback and repeatedly applying a partially-reset DSP document.
+        auto callback = std::move(setting->onChange);
+        setting->onChange = nullptr;
+        setting->set_Value(value);
+        setting->onChange = std::move(callback);
+    };
+    const auto synchronizeToggle = [](BSML::ToggleSetting* setting, bool value) {
+        if (!IsAlive(setting) || !IsAlive(setting->toggle)) return;
+        setting->currentValue = value;
+        setting->toggle->SetIsOnWithoutNotify(value);
+    };
+
+    if (synchronizeValues) {
+        synchronizeSlider(audioVolumeSliders_[0], broadcast.gameAudioVolumePercent);
+        synchronizeSlider(audioVolumeSliders_[1], broadcast.microphoneVolumePercent);
+        synchronizeSlider(pushToTalkReleaseSlider_, audio.pushToTalkReleaseMilliseconds);
+        const std::array gateValues{
+            audio.gateOpenThresholdDb,
+            GateCutoffOffsetDb(audio),
+            audio.gateAttackMilliseconds,
+            audio.gateHoldMilliseconds,
+            audio.gateReleaseMilliseconds,
+            audio.gatePreRollMilliseconds};
+        for (std::size_t index = 0; index < voiceActivationSliders_.size(); ++index) {
+            synchronizeSlider(voiceActivationSliders_[index], gateValues[index]);
+        }
+        synchronizeToggle(compressorToggle_, audio.compressorEnabled);
+        const std::array compressorValues{
+            audio.compressorThresholdDb,
+            audio.compressorRatio,
+            audio.compressorAttackMilliseconds,
+            audio.compressorReleaseMilliseconds,
+            audio.compressorMakeupDb};
+        for (std::size_t index = 0; index < compressorSliders_.size(); ++index) {
+            synchronizeSlider(compressorSliders_[index], compressorValues[index]);
+        }
+        synchronizeToggle(limiterToggle_, audio.limiterEnabled);
+        synchronizeSlider(limiterSliders_[0], audio.limiterCeilingDb);
+        synchronizeSlider(limiterSliders_[1], audio.limiterReleaseMilliseconds);
+    }
+    // The meter handle and the full Voice Activated slider edit the same
+    // setting. Keep the compact meter control synchronized without firing its
+    // callback, including changes made by reset or by the full slider row.
+    synchronizeSlider(audioLevelThresholdSlider_, audio.gateOpenThresholdDb);
+
+    const bool pushToTalkControlsActive =
+        audio.microphoneMode == settings::MicrophoneMode::PushToTalk;
+    const bool gateControlsActive =
+        audio.microphoneMode == settings::MicrophoneMode::VoiceActivated;
+    if (IsAlive(pushToTalkControlsRoot_)) {
+        pushToTalkControlsRoot_->SetActive(pushToTalkControlsActive);
+    }
+    if (IsAlive(voiceActivationControlsRoot_)) {
+        voiceActivationControlsRoot_->SetActive(gateControlsActive);
+    }
+    if (IsAlive(pushToTalkControlDropdown_)) {
+        pushToTalkControlDropdown_->set_interactable(pushToTalkControlsActive);
+    }
+    if (IsAlive(pushToTalkReleaseSlider_)) {
+        pushToTalkReleaseSlider_->set_interactable(pushToTalkControlsActive);
+    }
+    for (auto* slider : voiceActivationSliders_) {
+        if (IsAlive(slider)) slider->set_interactable(gateControlsActive);
+    }
+    if (IsAlive(audioLevelThresholdSlider_)) {
+        audioLevelThresholdSlider_->get_gameObject()->SetActive(gateControlsActive);
+        audioLevelThresholdSlider_->set_interactable(gateControlsActive);
+    }
+    if (IsAlive(compressorToggle_)) compressorToggle_->set_interactable(true);
+    if (IsAlive(compressorControlsRoot_)) {
+        compressorControlsRoot_->SetActive(audio.compressorEnabled);
+    }
+    for (auto* slider : compressorSliders_) {
+        if (IsAlive(slider)) slider->set_interactable(audio.compressorEnabled);
+    }
+    if (IsAlive(limiterToggle_)) limiterToggle_->set_interactable(true);
+    if (IsAlive(limiterControlsRoot_)) {
+        limiterControlsRoot_->SetActive(audio.limiterEnabled);
+    }
+    for (auto* slider : limiterSliders_) {
+        if (IsAlive(slider)) slider->set_interactable(audio.limiterEnabled);
+    }
+}
+
+void MenuController::RefreshAudioMeter() {
+    if (!IsAlive(audioLevelMeterFill_) || !IsAlive(audioLevelMeterText_) ||
+            !IsAlive(audioLevelMeterValueText_)) {
+        return;
+    }
+    const auto microphone = root_.Recording().MicrophoneState();
+    const auto& audio = root_.Settings().Get().audio;
+    const auto rawDb = std::isfinite(microphone.levelDb)
+        ? microphone.levelDb
+        : -96.0F;
+    const auto shownDb = std::clamp(
+        rawDb, kAudioMeterMinimumDb, kAudioMeterMaximumDb);
+    const auto meterLeft = kAudioMeterCenterX - kAudioMeterWidth * 0.5F;
+    const auto positionForDb = [](float db) {
+        return kAudioMeterWidth *
+            (std::clamp(db, kAudioMeterMinimumDb, kAudioMeterMaximumDb) -
+             kAudioMeterMinimumDb) /
+            (kAudioMeterMaximumDb - kAudioMeterMinimumDb);
+    };
+    const auto updateSegment = [&](HMUI::ImageView* image,
+                                   float startDb,
+                                   float endDb,
+                                   UnityEngine::Color color) {
+        if (!IsAlive(image)) return;
+        const auto visibleEnd = std::clamp(shownDb, startDb, endDb);
+        const auto width = std::max(
+            0.0F, positionForDb(visibleEnd) - positionForDb(startDb));
+        image->get_gameObject()->SetActive(width > 0.001F && rawDb < kAudioMeterClipStartDb);
+        image->set_color(color);
+        if (auto* rect = image->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()) {
+            rect->set_sizeDelta({width, 3.8F});
+            rect->set_anchoredPosition(
+                {meterLeft + positionForDb(startDb) + width * 0.5F, 0.5F});
+        }
+    };
+
+    // Each active range keeps its own color rather than recoloring the entire
+    // partial bar. This makes the -20 and -10 dBFS boundaries meaningful at a
+    // glance while the signal moves. Crossing 0 dBFS replaces every segment
+    // with a full-width red warning, as clipping is then already occurring.
+    updateSegment(
+        audioLevelMeterFill_, kAudioMeterMinimumDb, kAudioMeterOrangeStartDb,
+        {0.20F, 0.80F, 0.38F, 1.0F});
+    updateSegment(
+        audioLevelMeterOrangeFill_, kAudioMeterOrangeStartDb, kAudioMeterRedStartDb,
+        {1.0F, 0.55F, 0.06F, 1.0F});
+    updateSegment(
+        audioLevelMeterRedFill_, kAudioMeterRedStartDb, kAudioMeterClipStartDb,
+        {1.0F, 0.16F, 0.10F, 1.0F});
+    if (IsAlive(audioLevelMeterClipFill_)) {
+        const bool clipping = rawDb >= kAudioMeterClipStartDb;
+        audioLevelMeterClipFill_->get_gameObject()->SetActive(clipping);
+        if (clipping) {
+            audioLevelMeterClipFill_->set_color({1.0F, 0.05F, 0.03F, 1.0F});
+            if (auto* clipRect = audioLevelMeterClipFill_->get_gameObject()
+                    ->GetComponent<UnityEngine::RectTransform*>()) {
+                clipRect->set_sizeDelta({kAudioMeterWidth, 3.8F});
+                clipRect->set_anchoredPosition({kAudioMeterCenterX, 0.5F});
+            }
+        }
+    }
+
+    const bool showThreshold =
+        audio.microphoneMode == settings::MicrophoneMode::VoiceActivated;
+    if (IsAlive(audioLevelThresholdSlider_)) {
+        audioLevelThresholdSlider_->get_gameObject()->SetActive(showThreshold);
+    }
+    if (IsAlive(audioLevelMeterThresholdText_)) {
+        if (showThreshold) {
+            std::ostringstream thresholdText;
+            thresholdText << "Drag yellow bar: opens at " << std::fixed
+                          << std::setprecision(0) << audio.gateOpenThresholdDb
+                          << " dBFS, closes below "
+                          << audio.gateCloseThresholdDb << " dBFS";
+            audioLevelMeterThresholdText_->set_text(thresholdText.str());
+        } else {
+            audioLevelMeterThresholdText_->set_text("");
+        }
+    }
+
+    std::string state;
+    bool open = false;
+    if (!microphone.configured) state = "OFF";
+    else if (!microphone.capturing) state = "UNAVAILABLE";
+    else if (audio.microphoneMode == settings::MicrophoneMode::Open) {
+        state = "OPEN";
+        open = true;
+    } else if (audio.microphoneMode == settings::MicrophoneMode::PushToTalk) {
+        open = microphone.gateOpen;
+        state = open ? "PTT OPEN" : "PTT CLOSED";
+    } else {
+        open = microphone.gateOpen;
+        state = open ? "GATE OPEN" : "GATE CLOSED";
+    }
+    audioLevelMeterText_->set_text(state);
+    audioLevelMeterText_->set_color(open
+        ? UnityEngine::Color{0.20F, 1.0F, 0.35F, 1.0F}
+        : UnityEngine::Color{1.0F, 0.16F, 0.10F, 1.0F});
+    std::ostringstream value;
+    value << std::fixed << std::setprecision(1) << rawDb << " dBFS";
+    audioLevelMeterValueText_->set_text(value.str());
+    audioLevelMeterValueText_->set_color(rawDb >= kAudioMeterClipStartDb
+        ? UnityEngine::Color{1.0F, 0.16F, 0.10F, 1.0F}
+        : UnityEngine::Color{0.84F, 0.89F, 0.96F, 1.0F});
+}
+
+void MenuController::ShowAudioResetConfirmation(int resetKind) {
+    if (resetKind < 1 || resetKind > 3 || !IsAlive(settingsView_)) return;
+    pendingAudioResetKind_ = resetKind;
+    if (!IsAlive(audioResetConfirmationModal_)) {
+        audioResetConfirmationModal_ = BSML::Lite::CreateModal(
+            settingsView_, {70.0F, 38.0F}, nullptr, true);
+        if (!audioResetConfirmationModal_) {
+            Logging::Logger.error("Could not create the Audio reset confirmation dialog");
+            pendingAudioResetKind_ = 0;
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            audioResetConfirmationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        audioResetConfirmationText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "", 3.4F, {0.0F, 0.0F}, {62.0F, 22.0F});
+        audioResetConfirmationText_->set_enableWordWrapping(true);
+        audioResetConfirmationText_->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        audioResetConfirmationText_->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(audioResetConfirmationText_, 62.0F, 22.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 50.0F, 8.0F, 1.0F);
+        BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveAudioResetConfirmation(false);
+        });
+        BSML::Lite::CreateUIButton(actions, "Reset", [] {
+            if (active_) active_->ResolveAudioResetConfirmation(true);
+        });
+    }
+    if (!IsAlive(audioResetConfirmationText_)) return;
+    audioResetConfirmationText_->set_text(resetKind == 1
+        ? "Reset all six Voice Activated threshold and timing settings to their defaults?"
+        : resetKind == 2
+            ? "Reset the compressor switch and all compressor settings to their defaults?"
+            : "Reset the limiter switch and all limiter settings to their defaults?");
+    audioResetConfirmationModal_->Show();
+}
+
+void MenuController::ResolveAudioResetConfirmation(bool confirmed) {
+    const auto resetKind = pendingAudioResetKind_;
+    pendingAudioResetKind_ = 0;
+    if (IsAlive(audioResetConfirmationModal_)) audioResetConfirmationModal_->Hide();
+    if (!confirmed || resetKind < 1 || resetKind > 3) return;
+
+    auto& audio = root_.Settings().Edit().audio;
+    const auto defaults = settings::AudioProcessingSettings{};
+    if (resetKind == 1) {
+        audio.gateOpenThresholdDb = defaults.gateOpenThresholdDb;
+        audio.gateCloseThresholdDb = defaults.gateCloseThresholdDb;
+        audio.gateAttackMilliseconds = defaults.gateAttackMilliseconds;
+        audio.gateHoldMilliseconds = defaults.gateHoldMilliseconds;
+        audio.gateReleaseMilliseconds = defaults.gateReleaseMilliseconds;
+        audio.gatePreRollMilliseconds = defaults.gatePreRollMilliseconds;
+        Logging::Logger.info("Voice Activated microphone settings reset to defaults");
+    } else if (resetKind == 2) {
+        audio.compressorEnabled = defaults.compressorEnabled;
+        audio.compressorThresholdDb = defaults.compressorThresholdDb;
+        audio.compressorRatio = defaults.compressorRatio;
+        audio.compressorAttackMilliseconds = defaults.compressorAttackMilliseconds;
+        audio.compressorReleaseMilliseconds = defaults.compressorReleaseMilliseconds;
+        audio.compressorMakeupDb = defaults.compressorMakeupDb;
+        Logging::Logger.info("Microphone compressor settings reset to defaults");
+    } else {
+        audio.limiterEnabled = defaults.limiterEnabled;
+        audio.limiterCeilingDb = defaults.limiterCeilingDb;
+        audio.limiterReleaseMilliseconds = defaults.limiterReleaseMilliseconds;
+        Logging::Logger.info("Microphone limiter settings reset to defaults");
+    }
+    ApplyAudioSettings();
+    RefreshAudioControlState(true);
 }
 
 void MenuController::ApplyTtsSettings() {
@@ -1176,16 +1571,366 @@ void MenuController::ApplyTtsSettings() {
     root_.Tts().ApplySettings(document.tts);
 }
 
+void MenuController::ShowTtsClearQueueConfirmation() {
+    if (!IsAlive(settingsView_)) return;
+    if (!IsAlive(ttsClearQueueConfirmationModal_)) {
+        ttsClearQueueConfirmationModal_ = BSML::Lite::CreateModal(
+            settingsView_, {66.0F, 34.0F}, nullptr, true);
+        if (!IsAlive(ttsClearQueueConfirmationModal_)) {
+            Logging::Logger.error(
+                "Could not create the Chat TTS clear-queue confirmation dialog");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            ttsClearQueueConfirmationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* message = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "Clear all pending and buffered Chat TTS speech? The current spoken message will also stop.",
+            3.4F, {0.0F, 0.0F}, {58.0F, 18.0F});
+        message->set_enableWordWrapping(true);
+        message->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        message->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(message, 58.0F, 18.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(
+            layout->get_transform());
+        actions->set_spacing(2.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 48.0F, 8.0F, 1.0F);
+        BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveTtsClearQueueConfirmation(false);
+        });
+        BSML::Lite::CreateUIButton(actions, "Clear Queue", [] {
+            if (active_) active_->ResolveTtsClearQueueConfirmation(true);
+        });
+    }
+    ttsClearQueueConfirmationModal_->Show();
+}
+
+void MenuController::ResolveTtsClearQueueConfirmation(bool confirmed) {
+    if (IsAlive(ttsClearQueueConfirmationModal_)) {
+        ttsClearQueueConfirmationModal_->Hide();
+    }
+    if (!confirmed) return;
+    root_.Tts().ClearQueue();
+    Logging::Logger.info("Chat TTS queue cleared after user confirmation");
+}
+
+void MenuController::ShowConnectionTestConsent() {
+    if (!IsAlive(settingsView_)) return;
+    if (!IsAlive(connectionTestConsentModal_)) {
+        connectionTestConsentModal_ = BSML::Lite::CreateModal(
+            settingsView_, {94.0F, 60.0F}, nullptr, true);
+        if (!IsAlive(connectionTestConsentModal_)) {
+            Logging::Logger.error(
+                "Could not create the Cloudflare connection-test consent dialog");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            connectionTestConsentModal_->get_transform());
+        layout->set_spacing(1.5F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* title = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "Run a Cloudflare connection test?", 3.8F,
+            {0.0F, 0.0F}, {86.0F, 6.0F});
+        title->set_enableWordWrapping(false);
+        title->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(title, 86.0F, 6.0F, 1.0F);
+        auto* message = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "SaberStage will send generated download and upload test data to Cloudflare. "
+            "The test may transfer up to 200 MB and briefly use most of your connection.\n\n"
+            "Cloudflare receives your public IP and connection measurements. SaberStage does not send your Twitch account, stream key, chat, microphone audio, recordings, gameplay, or a persistent device identifier.\n\n"
+            "SaberStage does not publish your result. Cloudflare states that it does not sell personal data; measurements may be anonymized and used for aggregate network-quality insights.\n\n"
+            "The test runs only after you accept. A successful sustained upload result is saved in SaberStage settings and checked before every stream start.",
+            2.65F, {0.0F, 0.0F}, {86.0F, 36.0F});
+        message->set_enableWordWrapping(true);
+        message->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        message->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+        ConfigureLayout(message, 86.0F, 36.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(
+            layout->get_transform());
+        actions->set_spacing(3.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 62.0F, 8.0F, 1.0F);
+        BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveConnectionTestConsent(false);
+        });
+        BSML::Lite::CreateUIButton(actions, "Accept", [] {
+            if (active_) active_->ResolveConnectionTestConsent(true);
+        });
+    }
+    connectionTestConsentModal_->Show();
+}
+
+void MenuController::ResolveConnectionTestConsent(bool accepted) {
+    if (IsAlive(connectionTestConsentModal_)) connectionTestConsentModal_->Hide();
+    if (!accepted || !IsAlive(settingsView_)) return;
+    if (broadcast::CanStop(root_.Recording().LivestreamSnapshot().state)) {
+        const std::string message =
+            "Stop the active stream before running the connection test. The upload stage intentionally saturates the connection and would disrupt the broadcast.";
+        Logging::Logger.warn("Cloudflare connection test refused while a livestream is active");
+        if (IsAlive(connectionTestTabSummaryText_)) {
+            connectionTestTabSummaryText_->set_text(message);
+        }
+        return;
+    }
+
+    if (!IsAlive(connectionTestProgressModal_)) {
+        connectionTestProgressModal_ = BSML::Lite::CreateModal(
+            settingsView_, {86.0F, 38.0F}, nullptr, false);
+        if (!IsAlive(connectionTestProgressModal_)) {
+            Logging::Logger.error(
+                "Could not create the Cloudflare connection-test progress dialog");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            connectionTestProgressModal_->get_transform());
+        layout->set_spacing(3.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* title = BSML::Lite::CreateText(
+            layout->get_transform(), "Cloudflare Connection Test", 4.2F,
+            {0.0F, 0.0F}, {78.0F, 7.0F});
+        title->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(title, 78.0F, 7.0F, 1.0F);
+
+        constexpr float kProgressBarWidth = 72.0F;
+        constexpr float kProgressBarHeight = 5.5F;
+        auto* bar = BSML::Lite::CreateImage(
+            layout->get_transform(), BSML::Utilities::FindSpriteCached("RoundRect10"));
+        bar->set_color({0.22F, 0.24F, 0.28F, 0.95F});
+        bar->set_type(UnityEngine::UI::Image::Type::Sliced);
+        bar->set_raycastTarget(false);
+        ConfigureLayout(bar, kProgressBarWidth, kProgressBarHeight, 0.0F, 0.0F);
+        active_->connectionTestProgressFill_ = BSML::Lite::CreateImage(
+            bar->get_transform(), BSML::Utilities::FindSpriteCached("RoundRect10"));
+        active_->connectionTestProgressFill_->set_color({0.0F, 0.64F, 1.0F, 1.0F});
+        active_->connectionTestProgressFill_->set_type(
+            UnityEngine::UI::Image::Type::Sliced);
+        active_->connectionTestProgressFill_->set_raycastTarget(false);
+        if (auto* fillLayout = active_->connectionTestProgressFill_->get_gameObject()
+                ->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+            fillLayout->set_ignoreLayout(true);
+        }
+        auto fillRect = active_->connectionTestProgressFill_->get_rectTransform();
+        fillRect->set_anchorMin({0.0F, 0.0F});
+        fillRect->set_anchorMax({0.0F, 1.0F});
+        fillRect->set_pivot({0.0F, 0.5F});
+        fillRect->set_anchoredPosition({0.0F, 0.0F});
+        fillRect->set_sizeDelta({0.0F, 0.0F});
+
+        active_->connectionTestProgressText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "Preparing test...", 3.3F,
+            {0.0F, 0.0F}, {78.0F, 11.0F});
+        active_->connectionTestProgressText_->set_enableWordWrapping(true);
+        active_->connectionTestProgressText_->set_alignment(
+            TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(active_->connectionTestProgressText_, 78.0F, 11.0F, 1.0F);
+    }
+
+    std::string error;
+    connectionTestCompletionShown_ = false;
+    connectionTestDisplayedRevision_ = 0;
+    if (!root_.ConnectionTest().Start(&error)) {
+        Logging::Logger.error("Cloudflare connection test did not start: {}", error);
+        if (IsAlive(connectionTestProgressModal_)) connectionTestProgressModal_->Hide();
+        if (IsAlive(connectionTestTabSummaryText_)) {
+            connectionTestTabSummaryText_->set_text("Connection test could not start:\n" + error);
+        }
+        return;
+    }
+    connectionTestProgressModal_->Show();
+    RefreshConnectionTestUi();
+}
+
+void MenuController::ShowConnectionTestResults() {
+    if (!IsAlive(settingsView_)) return;
+    const auto snapshot = root_.ConnectionTest().Snapshot();
+    if (!IsAlive(connectionTestResultsModal_)) {
+        connectionTestResultsModal_ = BSML::Lite::CreateModal(
+            settingsView_, {84.0F, 61.0F}, nullptr, true);
+        if (!IsAlive(connectionTestResultsModal_)) {
+            Logging::Logger.error(
+                "Could not create the Cloudflare connection-test results dialog");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            connectionTestResultsModal_->get_transform());
+        layout->set_spacing(1.5F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* title = BSML::Lite::CreateText(
+            layout->get_transform(), "Cloudflare Connection Test Results", 3.8F,
+            {0.0F, 0.0F}, {76.0F, 6.0F});
+        title->set_enableWordWrapping(false);
+        title->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(title, 76.0F, 6.0F, 1.0F);
+        connectionTestResultsText_ = BSML::Lite::CreateText(
+            layout->get_transform(), "", 2.8F,
+            {0.0F, 0.0F}, {76.0F, 39.0F});
+        connectionTestResultsText_->set_enableWordWrapping(true);
+        connectionTestResultsText_->set_overflowMode(
+            TMPro::TextOverflowModes::Overflow);
+        connectionTestResultsText_->set_alignment(
+            TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(connectionTestResultsText_, 76.0F, 39.0F, 1.0F);
+        auto* close = BSML::Lite::CreateUIButton(layout->get_transform(), "OK", [] {
+            if (active_ && IsAlive(active_->connectionTestResultsModal_)) {
+                active_->connectionTestResultsModal_->Hide();
+            }
+        });
+        ConfigureLayout(close, 28.0F, 7.0F, 0.0F, 0.0F);
+    }
+    if (!IsAlive(connectionTestResultsText_)) return;
+    if (snapshot.stage == network::SpeedTestStage::Complete) {
+        connectionTestResultsText_->set_text(
+            ConnectionTestResultsText(snapshot.results));
+    } else {
+        connectionTestResultsText_->set_text(
+            "<b>Connection Test Failed</b>\n\n" +
+            (snapshot.error.empty() ? snapshot.status : snapshot.error) +
+            "\n\nNo bandwidth limit was changed.");
+    }
+    connectionTestResultsModal_->Show();
+}
+
+void MenuController::RefreshConnectionTestUi() {
+    const auto snapshot = root_.ConnectionTest().Snapshot();
+    if (snapshot.revision == connectionTestDisplayedRevision_) return;
+    connectionTestDisplayedRevision_ = snapshot.revision;
+
+    if (IsAlive(connectionTestProgressFill_)) {
+        constexpr float kProgressBarWidth = 72.0F;
+        auto rect = connectionTestProgressFill_->get_rectTransform();
+        auto size = rect->get_sizeDelta();
+        size.x = kProgressBarWidth * std::clamp(snapshot.progress, 0.0F, 1.0F);
+        rect->set_sizeDelta(size);
+    }
+    if (IsAlive(connectionTestProgressText_)) {
+        connectionTestProgressText_->set_text(
+            snapshot.status + "\n" +
+            std::to_string(static_cast<int>(std::lround(
+                std::clamp(snapshot.progress, 0.0F, 1.0F) * 100.0F))) + "% complete");
+    }
+
+    if (snapshot.stage == network::SpeedTestStage::Complete) {
+        auto& saved = root_.Settings().Edit().connectionTest;
+        saved.hasResult = true;
+        saved.sustainedDownloadMegabitsPerSecond = static_cast<float>(
+            snapshot.results.downloadMegabitsPerSecond);
+        saved.sustainedUploadMegabitsPerSecond = static_cast<float>(
+            snapshot.results.uploadMegabitsPerSecond);
+        saved.peakDownloadMegabitsPerSecond = static_cast<float>(
+            snapshot.results.peakDownloadMegabitsPerSecond);
+        saved.peakUploadMegabitsPerSecond = static_cast<float>(
+            snapshot.results.peakUploadMegabitsPerSecond);
+        saved.latencyMilliseconds = static_cast<float>(
+            snapshot.results.latencyMilliseconds);
+        saved.jitterMilliseconds = static_cast<float>(
+            snapshot.results.jitterMilliseconds);
+        saved.durationSeconds = static_cast<float>(snapshot.results.durationSeconds);
+        saved.testedAtUnixSeconds = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        settings::ValidateAndRepair(root_.Settings().Edit());
+        std::string saveError;
+        if (!root_.Settings().Save(&saveError)) {
+            Logging::Logger.error(
+                "Connection test completed but its persistent settings save failed: {}",
+                saveError);
+            ErrorManager::Instance().ReportUserVisible(
+                "CONNECTION TEST RESULT COULD NOT BE SAVED",
+                "The speed test completed, but SaberStage could not save its upload limit. "
+                "The limit will be lost when Beat Saber closes.\n\n" + saveError);
+        } else {
+            Logging::Logger.info(
+                "Saved Cloudflare connection test; sustained upload {:.2f} Mbps will be checked before every livestream",
+                snapshot.results.uploadMegabitsPerSecond);
+        }
+        if (IsAlive(connectionTestTabSummaryText_)) {
+            connectionTestTabSummaryText_->set_text(
+                ConnectionTestResultsText(snapshot.results, true));
+        }
+        if (IsAlive(connectionTestProgressModal_)) connectionTestProgressModal_->Hide();
+        if (!connectionTestCompletionShown_) {
+            connectionTestCompletionShown_ = true;
+            ShowConnectionTestResults();
+        }
+    } else if (snapshot.stage == network::SpeedTestStage::Failed ||
+               snapshot.stage == network::SpeedTestStage::Cancelled) {
+        if (IsAlive(connectionTestTabSummaryText_)) {
+            connectionTestTabSummaryText_->set_text(
+                snapshot.error.empty() ? snapshot.status : snapshot.error);
+        }
+        if (IsAlive(connectionTestProgressModal_)) connectionTestProgressModal_->Hide();
+        if (!connectionTestCompletionShown_) {
+            connectionTestCompletionShown_ = true;
+            ShowConnectionTestResults();
+        }
+    } else if (IsAlive(connectionTestTabSummaryText_)) {
+        connectionTestTabSummaryText_->set_text(snapshot.status);
+    }
+}
+
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
+    active_->settingsView_ = view;
 
-    static std::array<std::string_view, 3> tabNames{
-        "Overview", "Audio", "Twitch TTS"};
+    static std::array<std::string_view, 4> tabNames{
+        "Overview", "Audio", "Chat TTS", "Configure Stream"};
     active_->centerDebugTabViewRoots_.fill(nullptr);
     active_->centerDebugTabContentRoots_.fill(nullptr);
     active_->selectedCenterDebugTab_ = 0;
     active_->audioInputStatusText_ = nullptr;
+    active_->audioLevelMeterText_ = nullptr;
+    active_->audioLevelMeterValueText_ = nullptr;
+    active_->audioLevelMeterThresholdText_ = nullptr;
+    active_->audioLevelMeterFill_ = nullptr;
+    active_->audioLevelMeterOrangeFill_ = nullptr;
+    active_->audioLevelMeterRedFill_ = nullptr;
+    active_->audioLevelMeterClipFill_ = nullptr;
+    active_->audioLevelMeterThreshold_ = nullptr;
+    active_->audioLevelThresholdSlider_ = nullptr;
+    active_->pushToTalkControlsRoot_ = nullptr;
+    active_->voiceActivationControlsRoot_ = nullptr;
+    active_->compressorControlsRoot_ = nullptr;
+    active_->limiterControlsRoot_ = nullptr;
+    active_->audioResetConfirmationModal_ = nullptr;
+    active_->audioResetConfirmationText_ = nullptr;
+    active_->pendingAudioResetKind_ = 0;
     active_->ttsStatusText_ = nullptr;
+    active_->ttsClearQueueConfirmationModal_ = nullptr;
+    active_->connectionTestConsentModal_ = nullptr;
+    active_->connectionTestProgressModal_ = nullptr;
+    active_->connectionTestResultsModal_ = nullptr;
+    active_->connectionTestTabSummaryText_ = nullptr;
+    active_->connectionTestProgressText_ = nullptr;
+    active_->connectionTestResultsText_ = nullptr;
+    active_->connectionTestProgressFill_ = nullptr;
+    active_->connectionTestDisplayedRevision_ = 0;
+    active_->connectionTestCompletionShown_ = false;
+    active_->audioVolumeSliders_.fill(nullptr);
+    active_->pushToTalkControlDropdown_ = nullptr;
+    active_->pushToTalkReleaseSlider_ = nullptr;
+    active_->voiceActivationSliders_.fill(nullptr);
+    active_->compressorToggle_ = nullptr;
+    active_->compressorSliders_.fill(nullptr);
+    active_->limiterToggle_ = nullptr;
+    active_->limiterSliders_.fill(nullptr);
 
     // These are the exact page/viewport dimensions verified in-headset before
     // feature controls were introduced. Do not "correct" the three-unit side
@@ -1193,8 +1938,14 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     constexpr float kPageInset = 5.0F;
     constexpr float kScrollHorizontalInset = 3.0F;
     constexpr float kScrollVerticalInset = 0.0F;
-    constexpr float kTabStripHeight = 10.0F;
-    constexpr float kContentWidth = 60.0F;
+    constexpr float kTabStripHeight = 9.0F;
+    // The visible center screen is substantially wider than a stock 90-unit
+    // BSML settings row. The pre-avatar-removal center menu established 116
+    // units as the safe span between the outer tab captions on Quest. Keep
+    // every section and row on that same width so the scroll content, not a
+    // narrower nested group, owns the available horizontal space.
+    constexpr float kContentWidth = 116.0F;
+    constexpr float kControlHeight = 12.5F;
 
     const auto fitInsideParent = [](
         UnityEngine::RectTransform* rect,
@@ -1236,8 +1987,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         auto* pageRect = page->AddComponent<UnityEngine::RectTransform*>();
         page->get_transform()->SetParent(view->get_transform(), false);
         // Five units of exposed parent surround prove that the page itself
-        // remains inside the center panel. The larger top inset reserves the
-        // native tab strip while retaining the same five-unit gap below it.
+        // remains inside the center panel. The top inset ends just beneath the
+        // native tab strip; the scroll layout supplies no second top margin.
         fitInsideParent(
             pageRect,
             kPageInset,
@@ -1276,10 +2027,12 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             rows->set_childControlHeight(true);
             rows->set_childForceExpandHeight(false);
             rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
-            rows->set_spacing(1.0F);
-            // Five-unit content padding was also verified with the scroll
-            // viewport. Controls below use the remaining width explicitly.
-            rows->set_padding(UnityEngine::RectOffset::New_ctor(5, 5, 5, 5));
+            rows->set_spacing(3.0F);
+            // The scroll mask already supplies the verified three-unit outer
+            // margin. The one-unit horizontal inset keeps controls off the mask
+            // edge; vertical padding stays zero so the first row begins directly
+            // beneath the tab strip and the last row does not reserve dead space.
+            rows->set_padding(UnityEngine::RectOffset::New_ctor(1, 1, 0, 0));
         }
     }
 
@@ -1289,13 +2042,13 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         [](auto* page) { return page == nullptr; });
     if (missingPage) {
         Logging::Logger.error(
-            "Could not create all three center-panel tab pages");
+            "Could not create all four center-panel tab pages");
         return;
     }
 
     const auto makeSection = [](UnityEngine::GameObject* parent, std::string_view title) {
         auto* section = BSML::Lite::CreateVerticalLayoutGroup(parent->get_transform());
-        section->set_spacing(0.35F);
+        section->set_spacing(2.25F);
         section->set_childControlWidth(true);
         section->set_childControlHeight(true);
         section->set_childForceExpandWidth(false);
@@ -1303,64 +2056,568 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         section->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
         ConfigureLayout(section, kContentWidth, -1.0F, 0.0F, 0.0F);
         auto* heading = BSML::Lite::CreateText(
-            section->get_transform(), StringW(title), TMPro::FontStyles::Bold, 3.6F);
+            section->get_transform(), StringW(title), TMPro::FontStyles::Bold,
+            kCenterSectionHeaderTextSize);
         heading->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
         heading->set_color({0.35F, 0.72F, 1.0F, 1.0F});
-        ConfigureLayout(heading, kContentWidth, 5.0F, 0.0F, 0.0F);
+        ConfigureLayout(heading, kContentWidth, 7.0F, 0.0F, 0.0F);
         return section->get_gameObject().ptr();
     };
-    const auto makePair = [](UnityEngine::GameObject* section) {
+    const auto makeCollapsibleGroup = [](UnityEngine::GameObject* parent) {
+        auto* group = BSML::Lite::CreateVerticalLayoutGroup(parent->get_transform());
+        group->set_spacing(2.25F);
+        group->set_childControlWidth(true);
+        group->set_childControlHeight(true);
+        group->set_childForceExpandWidth(false);
+        group->set_childForceExpandHeight(false);
+        group->set_childAlignment(UnityEngine::TextAnchor::UpperCenter);
+        ConfigureLayout(group, kContentWidth, -1.0F, 0.0F, 0.0F);
+        return group->get_gameObject().ptr();
+    };
+    const auto makePaddedRow = [](UnityEngine::GameObject* section,
+                                  int columns,
+                                  float height,
+                                  int horizontalPadding = 5) {
         auto* row = BSML::Lite::CreateHorizontalLayoutGroup(section->get_transform());
-        row->set_spacing(1.0F);
+        row->set_spacing(2.0F);
+        row->set_padding(UnityEngine::RectOffset::New_ctor(
+            horizontalPadding, horizontalPadding, 0, 0));
         row->set_childControlWidth(true);
         row->set_childControlHeight(true);
         row->set_childForceExpandWidth(false);
         row->set_childForceExpandHeight(false);
         row->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
-        ConfigureLayout(row, kContentWidth, 8.0F, 0.0F, 0.0F);
-        return row;
+        ConfigureLayout(row, kContentWidth, height, 0.0F, 0.0F);
+        const auto usable = kContentWidth - static_cast<float>(horizontalPadding * 2) -
+            (columns > 1 ? static_cast<float>(columns - 1) * 2.0F : 0.0F);
+        return std::pair{row, usable / static_cast<float>(std::max(columns, 1))};
     };
-    const auto fitFull = [](auto* control) {
+    const auto makeCenteredControlSlot = [](UnityEngine::GameObject* row,
+                                            float width,
+                                            float height = kControlHeight) {
+        auto* slot = BSML::Lite::CreateHorizontalLayoutGroup(row->get_transform());
+        slot->set_spacing(0.0F);
+        slot->set_padding(UnityEngine::RectOffset::New_ctor(0, 0, 0, 0));
+        slot->set_childControlWidth(true);
+        slot->set_childControlHeight(true);
+        slot->set_childForceExpandWidth(false);
+        slot->set_childForceExpandHeight(false);
+        slot->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+        ConfigureLayout(slot, width, height, 0.0F, 0.0F);
+        return slot;
+    };
+    const auto resolveControlRow = [](UnityEngine::Component* control) {
+        if (!control) return static_cast<UnityEngine::RectTransform*>(nullptr);
+        // DropdownListSetting is attached to its selector child while sliders
+        // and toggles live on their outer row. Resolve the first transform
+        // whose parent owns the page layout so every prefab is sized by the
+        // same visible row rather than by an implementation-detail child.
+        auto row = control->get_transform();
+        while (row && row->get_parent()) {
+            auto parent = row->get_parent();
+            if (parent->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>() ||
+                    parent->GetComponent<UnityEngine::UI::HorizontalLayoutGroup*>()) {
+                break;
+            }
+            row = parent;
+        }
+        return row
+            ? row->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
+            : nullptr;
+    };
+    const auto fitControlRow = [&](UnityEngine::Component* control, float width, float height) {
+        if (!control) return;
+        auto* rowRect = resolveControlRow(control);
+        if (!rowRect) return;
+        NeutralizeContentSizeFitter(rowRect);
+        ConfigureLayout(rowRect, width, height, 0.0F, 0.0F);
+        if (auto* layout = rowRect->get_gameObject()->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+            layout->set_minWidth(width);
+        }
+        FlattenFlatPanelDepth(rowRect->get_transform().ptr());
+    };
+    const auto fitCenterSetting = [&](UnityEngine::Component* control, float width) {
+        if (!control) return;
+        fitControlRow(control, width, kControlHeight);
+        auto* object = control->get_gameObject().ptr();
+        if (!object) return;
+        if (auto* slider = object->GetComponent<BSML::SliderSetting*>()) {
+            auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+            if (auto titleTransform = root->Find("Title")) {
+                FitRectToParentRegion(
+                    titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+                    0.0F, 0.43F, 0.4F, 0.5F);
+                if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+                    title->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+                    title->set_enableWordWrapping(false);
+                    title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+                    title->set_fontSize(kCenterControlLabelTextSize);
+                }
+            }
+            if (slider->slider) {
+                FitRectToParentRegion(
+                    slider->slider->get_transform().cast<UnityEngine::RectTransform>(),
+                    0.43F, 1.0F, 0.5F, 0.35F);
+            }
+        } else if (object->GetComponent<BSML::DropdownListSetting*>()) {
+            // DropdownListSetting lives on the selector rather than on the
+            // complete setting row. Explicitly divide the resolved row so a
+            // compact three-column dropdown cannot retain the stock 90-unit
+            // center-menu geometry and overlap its neighbors.
+            if (auto* rowRect = resolveControlRow(control)) {
+                if (auto titleTransform = rowRect->get_transform()->Find("Title")) {
+                    FitRectToParentRegion(
+                        titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+                        0.0F, 0.42F, 0.25F, 0.25F);
+                    if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+                        title->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+                        title->set_enableWordWrapping(false);
+                        title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+                        title->set_fontSize(kCenterControlLabelTextSize);
+                    }
+                }
+                FitRectToParentRegion(
+                    control->get_transform().cast<UnityEngine::RectTransform>(),
+                    0.42F, 1.0F, 0.25F, 0.25F);
+                if (auto* dropdown = object->GetComponent<BSML::DropdownListSetting*>()) {
+                    if (IsAlive(dropdown->dropdown) &&
+                            IsAlive(dropdown->dropdown->__cordl_internal_get__text().ptr())) {
+                        dropdown->dropdown->__cordl_internal_get__text()->set_fontSize(
+                            kCenterDropdownValueTextSize);
+                    }
+                }
+            }
+        } else if (auto* toggle = object->GetComponent<BSML::ToggleSetting*>()) {
+            auto root = object->get_transform().cast<UnityEngine::RectTransform>();
+            auto switchTransform = root->Find("SwitchView");
+            auto* switchRect = switchTransform
+                ? switchTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>()
+                : nullptr;
+            constexpr float switchWidth = 10.0F;
+            if (auto nameTransform = root->Find("NameText")) {
+                auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
+                nameRect->set_anchorMin({0.0F, 0.0F});
+                nameRect->set_anchorMax({1.0F, 1.0F});
+                nameRect->set_pivot({0.5F, 0.5F});
+                nameRect->set_offsetMin({0.5F, 0.0F});
+                nameRect->set_offsetMax({-(switchWidth + 1.0F), 0.0F});
+            }
+            if (toggle->text) {
+                toggle->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+                toggle->text->set_enableWordWrapping(false);
+                toggle->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+                toggle->text->set_fontSize(kCenterControlLabelTextSize);
+            }
+            if (switchRect) {
+                switchRect->set_anchorMin({1.0F, 0.5F});
+                switchRect->set_anchorMax({1.0F, 0.5F});
+                switchRect->set_pivot({1.0F, 0.5F});
+                switchRect->set_anchoredPosition({-0.5F, 0.0F});
+                const auto currentSize = switchRect->get_sizeDelta();
+                switchRect->set_sizeDelta({switchWidth, currentSize.y});
+            }
+        }
+    };
+    const auto fitInlineDropdownSetting = [&](BSML::DropdownListSetting* control,
+                                              float width,
+                                              float labelWidth) {
+        if (!control || width <= 0.0F) return control;
+        fitCenterSetting(control, width);
+        auto* rowRect = resolveControlRow(control);
+        if (!rowRect) return control;
+
+        // A dropdown's label and selector are one visual unit. Size that unit
+        // from the actual caption and longest option instead of dividing every
+        // dropdown by the same percentage; otherwise a short selector such as
+        // Voice inherits the space required by TTS Output and looks detached
+        // from its label. The one-unit boundary inset is the intentional gap
+        // between the caption and its selector.
+        const auto split = std::clamp(labelWidth / width, 0.15F, 0.75F);
+        if (auto titleTransform = rowRect->get_transform()->Find("Title")) {
+            FitRectToParentRegion(
+                titleTransform->get_gameObject()->GetComponent<UnityEngine::RectTransform*>(),
+                0.0F, split, 0.25F, 0.5F);
+            if (auto* title = titleTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+                title->set_enableWordWrapping(false);
+                title->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+            }
+        }
+        FitRectToParentRegion(
+            control->get_transform().cast<UnityEngine::RectTransform>(),
+            split, 1.0F, 0.5F, 0.25F);
+        return control;
+    };
+    const auto fitInlineToggleSetting = [&](BSML::ToggleSetting* control, float width) {
         if (!control) return control;
-        ConstrainRightPanelRow(control);
-        ConfigureLayout(control, kContentWidth, 8.0F, 0.0F, 0.0F);
-        if (auto* layout = control->get_gameObject()->template GetComponent<UnityEngine::UI::LayoutElement*>()) {
-            layout->set_minWidth(kContentWidth);
+        fitCenterSetting(control, width);
+        auto root = control->get_transform().cast<UnityEngine::RectTransform>();
+        if (auto nameTransform = root->Find("NameText")) {
+            auto nameRect = nameTransform.cast<UnityEngine::RectTransform>();
+            // TMP's italic glyphs extend slightly past their measured text
+            // bounds. Reserve a visible 1.5-unit gap before the ten-unit switch
+            // so the caption and switch remain close without touching.
+            nameRect->set_offsetMax({-12.0F, 0.0F});
+            if (auto* label = nameTransform->GetComponent<TMPro::TextMeshProUGUI*>()) {
+                label->set_enableWordWrapping(false);
+                label->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+            }
         }
         return control;
     };
-    const auto fitHalfToggle = [](BSML::ToggleSetting* control) {
+    const auto fitActionButton = [](UnityEngine::UI::Button* control, float width) {
         if (!control) return control;
-        constexpr float width = (kContentWidth - 1.0F) * 0.5F;
-        ConfigureLayout(control, width, 8.0F, 0.0F, 0.0F);
-        FlattenFlatPanelDepth(control->get_transform());
-        FitLivestreamToggle(control, 0.25F, 0.25F);
-        if (control->text) control->text->set_fontSize(2.65F);
-        return control;
-    };
-    const auto fitHalfButton = [](UnityEngine::UI::Button* control) {
-        if (!control) return control;
-        constexpr float width = (kContentWidth - 1.0F) * 0.5F;
         NeutralizeContentSizeFitter(control);
-        ConfigureLayout(control, width, 7.0F, 0.0F, 0.0F);
-        BSML::Lite::SetButtonTextSize(control, 2.8F);
+        ConfigureLayout(control, width, 9.5F, 0.0F, 0.0F);
+        BSML::Lite::SetButtonTextSize(control, kCenterControlLabelTextSize);
         return control;
     };
-    const auto makeStatus = [](UnityEngine::GameObject* parent, std::string_view text) {
+    const auto showWholeNumber = [](BSML::SliderSetting* setting, float initial, bool percent) {
+        if (!setting) return setting;
+        setting->isInt = true;
+        setting->digits = 0;
+        setting->formatter = [percent](float value) -> StringW {
+            auto text = std::to_string(static_cast<int>(std::lround(value)));
+            if (percent) text += "%";
+            return StringW(text);
+        };
+        if (IsAlive(setting->slider)) {
+            auto valueText = setting->slider->__cordl_internal_get__valueText();
+            if (IsAlive(valueText.ptr())) valueText->set_text(setting->TextForValue(initial));
+        }
+        return setting;
+    };
+    struct SettingTileParts {
+        UnityEngine::GameObject* root = nullptr;
+        TMPro::TextMeshProUGUI* label = nullptr;
+        UnityEngine::UI::HorizontalLayoutGroup* controls = nullptr;
+    };
+    const auto makeSettingTile = [](UnityEngine::GameObject* parent,
+                                    float width,
+                                    std::string_view title) {
+        SettingTileParts parts;
+        auto* tile = BSML::Lite::CreateVerticalLayoutGroup(parent->get_transform());
+        tile->set_spacing(0.25F);
+        tile->set_childControlWidth(true);
+        tile->set_childControlHeight(true);
+        tile->set_childForceExpandWidth(false);
+        tile->set_childForceExpandHeight(false);
+        tile->set_childAlignment(UnityEngine::TextAnchor::UpperLeft);
+        ConfigureLayout(tile, width, 14.0F, 0.0F, 0.0F);
+        auto* label = BSML::Lite::CreateText(
+            tile->get_transform(), StringW(std::string(title)),
+            kCenterControlLabelTextSize);
+        label->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+        label->set_enableWordWrapping(false);
+        label->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
+        ConfigureLayout(label, width, 4.5F, 0.0F, 0.0F);
+
+        auto* controls = BSML::Lite::CreateHorizontalLayoutGroup(tile->get_transform());
+        controls->set_spacing(0.75F);
+        controls->set_childControlWidth(true);
+        controls->set_childControlHeight(true);
+        controls->set_childForceExpandWidth(false);
+        controls->set_childForceExpandHeight(false);
+        controls->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
+        ConfigureLayout(controls, width, 8.5F, 0.0F, 0.0F);
+        parts.root = tile->get_gameObject();
+        parts.label = label;
+        parts.controls = controls;
+        return parts;
+    };
+    const auto fitBareSlider = [&](BSML::SliderSetting* setting, float width) {
+        if (!setting) return setting;
+        fitControlRow(setting, width, 8.5F);
+        if (auto* row = resolveControlRow(setting)) {
+            if (auto title = row->get_transform()->Find("Title")) {
+                title->get_gameObject()->SetActive(false);
+            }
+        }
+        if (IsAlive(setting->slider)) {
+            FitRectToParentRegion(
+                setting->slider->get_transform().cast<UnityEngine::RectTransform>(),
+                0.0F, 1.0F, 0.25F, 0.25F);
+        }
+        return setting;
+    };
+    const auto fitBareDropdown = [&](BSML::DropdownListSetting* setting, float width) {
+        if (!setting) return setting;
+        fitControlRow(setting, width, 8.5F);
+        if (auto* row = resolveControlRow(setting)) {
+            if (auto title = row->get_transform()->Find("Title")) {
+                title->get_gameObject()->SetActive(false);
+            }
+        }
+        FitRectToParentRegion(
+            setting->get_transform().cast<UnityEngine::RectTransform>(),
+            0.0F, 1.0F, 0.25F, 0.25F);
+        return setting;
+    };
+    const auto fitBareToggle = [&](BSML::ToggleSetting* setting,
+                                   float width,
+                                   float horizontalAnchor) {
+        if (!setting) return setting;
+        fitControlRow(setting, width, 8.5F);
+        auto root = setting->get_transform().cast<UnityEngine::RectTransform>();
+        if (auto name = root->Find("NameText")) name->get_gameObject()->SetActive(false);
+        if (auto switchTransform = root->Find("SwitchView")) {
+            if (auto* switchRect = switchTransform->get_gameObject()
+                    ->GetComponent<UnityEngine::RectTransform*>()) {
+                switchRect->set_anchorMin({horizontalAnchor, 0.5F});
+                switchRect->set_anchorMax({horizontalAnchor, 0.5F});
+                switchRect->set_pivot({horizontalAnchor, 0.5F});
+                switchRect->set_anchoredPosition({0.0F, 0.0F});
+            }
+        }
+        return setting;
+    };
+    const auto makeResetGlyphButton = [](UnityEngine::GameObject* parent,
+                                         std::function<void()> callback,
+                                         std::string_view hint) {
+        auto* button = WithHint(BSML::Lite::CreateUIButton(
+            parent, "↻", std::move(callback)), hint);
+        if (!button) return button;
+        NeutralizeContentSizeFitter(button);
+        ConfigureLayout(button, 7.0F, 7.0F, 0.0F, 0.0F);
+        if (auto* layout = button->get_gameObject()
+                ->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+            layout->set_minWidth(7.0F);
+            layout->set_preferredWidth(7.0F);
+            layout->set_preferredHeight(7.0F);
+            layout->set_flexibleWidth(0.0F);
+        }
+        // Match Big Screen's proven reset control: the compact button remains
+        // seven units square while the reset symbol itself is enlarged.
+        BSML::Lite::SetButtonTextSize(button, 6.0F);
+        return button;
+    };
+    const auto makeStatus = [](UnityEngine::GameObject* parent,
+                               std::string_view text,
+                               float height = 10.0F) {
         auto* status = BSML::Lite::CreateText(
             parent->get_transform(), StringW(text), 2.8F);
         status->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
         status->set_enableWordWrapping(true);
         status->set_color({0.76F, 0.84F, 0.92F, 1.0F});
-        ConfigureLayout(status, kContentWidth, 9.0F, 0.0F, 0.0F);
+        ConfigureLayout(status, kContentWidth, height, 0.0F, 0.0F);
         return status;
+    };
+    const auto makeAudioMeter = [&](UnityEngine::GameObject* parent) {
+        auto* meterRoot = UnityEngine::GameObject::New_ctor("SaberStage Microphone Level Meter");
+        if (!meterRoot) return;
+        auto* meterRect = meterRoot->AddComponent<UnityEngine::RectTransform*>();
+        meterRoot->get_transform()->SetParent(parent->get_transform(), false);
+        ConfigureLayout(meterRect, kContentWidth, 18.0F, 0.0F, 0.0F);
+
+        const auto place = [](UnityEngine::Component* component,
+                              UnityEngine::Vector2 position,
+                              UnityEngine::Vector2 size) {
+            if (!component) return;
+            auto* rect = component->get_gameObject()->GetComponent<UnityEngine::RectTransform*>();
+            if (!rect) return;
+            rect->set_anchorMin({0.5F, 0.5F});
+            rect->set_anchorMax({0.5F, 0.5F});
+            rect->set_pivot({0.5F, 0.5F});
+            rect->set_anchoredPosition(position);
+            rect->set_sizeDelta(size);
+        };
+        auto* caption = BSML::Lite::CreateText(
+            meterRoot->get_transform(), "Input level", TMPro::FontStyles::Bold, 2.8F);
+        caption->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+        caption->set_enableWordWrapping(false);
+        caption->set_raycastTarget(false);
+        place(caption, {-45.0F, 6.0F}, {18.0F, 4.0F});
+        active_->audioLevelMeterValueText_ = BSML::Lite::CreateText(
+            meterRoot->get_transform(), "-96.0 dBFS", 2.8F);
+        active_->audioLevelMeterValueText_->set_alignment(
+            TMPro::TextAlignmentOptions::MidlineLeft);
+        active_->audioLevelMeterValueText_->set_enableWordWrapping(false);
+        active_->audioLevelMeterValueText_->set_raycastTarget(false);
+        place(active_->audioLevelMeterValueText_, {-18.0F, 6.0F}, {32.0F, 4.0F});
+        auto* stateCaption = BSML::Lite::CreateText(
+            meterRoot->get_transform(), "Mic State", TMPro::FontStyles::Bold, 2.8F);
+        stateCaption->set_alignment(TMPro::TextAlignmentOptions::Midline);
+        stateCaption->set_enableWordWrapping(false);
+        stateCaption->set_raycastTarget(false);
+        place(stateCaption, {45.0F, 6.0F}, {20.0F, 4.0F});
+        active_->audioLevelMeterText_ = BSML::Lite::CreateText(
+            meterRoot->get_transform(), "OFF", TMPro::FontStyles::Bold, 2.8F);
+        active_->audioLevelMeterText_->set_alignment(TMPro::TextAlignmentOptions::Midline);
+        active_->audioLevelMeterText_->set_enableWordWrapping(false);
+        active_->audioLevelMeterText_->set_raycastTarget(false);
+        active_->audioLevelMeterText_->set_color({1.0F, 0.16F, 0.10F, 1.0F});
+        place(active_->audioLevelMeterText_, {45.0F, 0.5F}, {20.0F, 4.0F});
+
+        const auto whitePixel = BSML::Utilities::ImageResources::GetWhitePixel();
+        auto* track = BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+        track->set_color({0.20F, 0.23F, 0.28F, 1.0F});
+        track->set_raycastTarget(false);
+        place(track, {kAudioMeterCenterX, 0.5F}, {kAudioMeterWidth, 3.8F});
+        const auto meterLeft = kAudioMeterCenterX - kAudioMeterWidth * 0.5F;
+        const auto positionForDb = [](float db) {
+            return kAudioMeterWidth * (db - kAudioMeterMinimumDb) /
+                (kAudioMeterMaximumDb - kAudioMeterMinimumDb);
+        };
+        const auto createRangeBackground = [&](float startDb,
+                                               float endDb,
+                                               UnityEngine::Color color) {
+            auto* range = BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+            range->set_color(color);
+            range->set_raycastTarget(false);
+            const auto start = positionForDb(startDb);
+            const auto width = positionForDb(endDb) - start;
+            place(range, {meterLeft + start + width * 0.5F, 0.5F}, {width, 3.8F});
+        };
+        // Muted range colors remain visible with no input, so the safe,
+        // caution, hot, and clipping areas are readable before the meter moves.
+        createRangeBackground(
+            kAudioMeterMinimumDb, kAudioMeterOrangeStartDb,
+            {0.08F, 0.27F, 0.14F, 1.0F});
+        createRangeBackground(
+            kAudioMeterOrangeStartDb, kAudioMeterRedStartDb,
+            {0.34F, 0.19F, 0.04F, 1.0F});
+        createRangeBackground(
+            kAudioMeterRedStartDb, kAudioMeterClipStartDb,
+            {0.35F, 0.07F, 0.05F, 1.0F});
+        createRangeBackground(
+            kAudioMeterClipStartDb, kAudioMeterMaximumDb,
+            {0.46F, 0.03F, 0.02F, 1.0F});
+        active_->audioLevelMeterFill_ =
+            BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+        active_->audioLevelMeterFill_->set_color({0.20F, 0.80F, 0.38F, 1.0F});
+        active_->audioLevelMeterFill_->set_raycastTarget(false);
+        place(active_->audioLevelMeterFill_, {meterLeft, 0.5F}, {0.0F, 3.8F});
+        active_->audioLevelMeterOrangeFill_ =
+            BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+        active_->audioLevelMeterOrangeFill_->set_raycastTarget(false);
+        place(active_->audioLevelMeterOrangeFill_, {meterLeft, 0.5F}, {0.0F, 3.8F});
+        active_->audioLevelMeterRedFill_ =
+            BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+        active_->audioLevelMeterRedFill_->set_raycastTarget(false);
+        place(active_->audioLevelMeterRedFill_, {meterLeft, 0.5F}, {0.0F, 3.8F});
+        active_->audioLevelMeterClipFill_ =
+            BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+        active_->audioLevelMeterClipFill_->set_color({1.0F, 0.05F, 0.03F, 1.0F});
+        active_->audioLevelMeterClipFill_->set_raycastTarget(false);
+        place(active_->audioLevelMeterClipFill_, {kAudioMeterCenterX, 0.5F},
+              {kAudioMeterWidth, 3.8F});
+        active_->audioLevelMeterClipFill_->get_gameObject()->SetActive(false);
+
+        for (int db = -65; db <= 5; db += 5) {
+            auto* tick = BSML::Lite::CreateImage(meterRoot->get_transform(), whitePixel);
+            tick->set_color({0.78F, 0.82F, 0.88F, 0.9F});
+            tick->set_raycastTarget(false);
+            place(tick, {meterLeft + positionForDb(static_cast<float>(db)), 0.5F},
+                  {0.22F, 5.2F});
+        }
+
+        // Reuse HMUI's native draggable slider rather than interpreting VR
+        // pointer coordinates ourselves. Its normal visuals are transparent;
+        // a narrow yellow child on the native handle is the only rendered part.
+        // The interactive span matches the gate's valid -60..-5 dBFS range
+        // while remaining aligned to the full -65..+5 dBFS meter scale.
+        active_->audioLevelThresholdSlider_ = WithHint(
+            BSML::Lite::CreateSliderSetting(
+                meterRoot->get_transform(), "", 1.0F,
+                active_->root_.Settings().Get().audio.gateOpenThresholdDb,
+                -60.0F, -5.0F, 0.05F, false, {0.0F, 0.0F}, [](float value) {
+                    if (!active_) return;
+                    SetGateOpenPreservingCutoffOffset(
+                        active_->root_.Settings().Edit().audio, value);
+                    active_->ApplyAudioSettings();
+                    // Keep the detailed Open/offset controls synchronized
+                    // without recursively invoking their callbacks.
+                    active_->RefreshAudioControlState(true);
+                }),
+            "Drag the yellow bar left for quieter voices or right to ignore more background noise.");
+        if (IsAlive(active_->audioLevelThresholdSlider_)) {
+            auto* sliderRoot = active_->audioLevelThresholdSlider_->get_gameObject()
+                ->GetComponent<UnityEngine::RectTransform*>();
+            const auto allowedLeft = meterLeft + positionForDb(-60.0F);
+            const auto allowedRight = meterLeft + positionForDb(-5.0F);
+            const auto allowedWidth = allowedRight - allowedLeft;
+            if (sliderRoot) {
+                NeutralizeContentSizeFitter(sliderRoot);
+                if (auto* layout = sliderRoot->get_gameObject()
+                        ->GetComponent<UnityEngine::UI::LayoutElement*>()) {
+                    layout->set_ignoreLayout(true);
+                }
+                sliderRoot->set_anchorMin({0.5F, 0.5F});
+                sliderRoot->set_anchorMax({0.5F, 0.5F});
+                sliderRoot->set_pivot({0.5F, 0.5F});
+                sliderRoot->set_anchoredPosition(
+                    {(allowedLeft + allowedRight) * 0.5F, 0.5F});
+                sliderRoot->set_sizeDelta({allowedWidth, 7.0F});
+            }
+            for (auto* text : active_->audioLevelThresholdSlider_->get_gameObject()
+                    ->GetComponentsInChildren<TMPro::TextMeshProUGUI*>(true)) {
+                if (IsAlive(text)) text->get_gameObject()->SetActive(false);
+            }
+            if (IsAlive(active_->audioLevelThresholdSlider_->incButton)) {
+                active_->audioLevelThresholdSlider_->incButton->get_gameObject()->SetActive(false);
+            }
+            if (IsAlive(active_->audioLevelThresholdSlider_->decButton)) {
+                active_->audioLevelThresholdSlider_->decButton->get_gameObject()->SetActive(false);
+            }
+            if (IsAlive(active_->audioLevelThresholdSlider_->slider)) {
+                auto* nativeSlider = active_->audioLevelThresholdSlider_->slider;
+                nativeSlider->__cordl_internal_set__enableDragging(true);
+                nativeSlider->set_handleSize(0.02F);
+                for (auto* graphic : nativeSlider->get_gameObject()
+                        ->GetComponentsInChildren<UnityEngine::UI::Graphic*>(true)) {
+                    if (!IsAlive(graphic)) continue;
+                    auto color = graphic->get_color();
+                    color.a = 0.0F;
+                    graphic->set_color(color);
+                }
+                auto handleRect = nativeSlider->get_handleRect();
+                if (IsAlive(handleRect.ptr())) {
+                    active_->audioLevelMeterThreshold_ = BSML::Lite::CreateImage(
+                        handleRect->get_transform(), whitePixel);
+                    active_->audioLevelMeterThreshold_->set_color(
+                        {1.0F, 0.72F, 0.08F, 1.0F});
+                    active_->audioLevelMeterThreshold_->set_raycastTarget(false);
+                    place(active_->audioLevelMeterThreshold_, {0.0F, 0.0F}, {0.7F, 5.8F});
+                }
+            }
+        }
+
+        constexpr std::array<int, 11> labeledDb{
+            -65, -55, -45, -35, -25, -20, -15, -10, -5, 0, 5};
+        for (const auto db : labeledDb) {
+            auto labelText = db > 0 ? "+" + std::to_string(db) : std::to_string(db);
+            auto* label = BSML::Lite::CreateText(
+                meterRoot->get_transform(), StringW(labelText), 1.55F);
+            label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+            label->set_enableWordWrapping(false);
+            label->set_raycastTarget(false);
+            label->set_color(db >= -10
+                ? UnityEngine::Color{1.0F, 0.25F, 0.16F, 1.0F}
+                : db >= -20
+                    ? UnityEngine::Color{1.0F, 0.62F, 0.10F, 1.0F}
+                    : UnityEngine::Color{0.70F, 0.75F, 0.82F, 1.0F});
+            place(label,
+                  {meterLeft + positionForDb(static_cast<float>(db)), -3.3F},
+                  {6.0F, 2.6F});
+        }
+        active_->audioLevelMeterThresholdText_ = BSML::Lite::CreateText(
+            meterRoot->get_transform(), "", 1.9F);
+        active_->audioLevelMeterThresholdText_->set_alignment(
+            TMPro::TextAlignmentOptions::MidlineLeft);
+        active_->audioLevelMeterThresholdText_->set_enableWordWrapping(false);
+        active_->audioLevelMeterThresholdText_->set_overflowMode(
+            TMPro::TextOverflowModes::Ellipsis);
+        active_->audioLevelMeterThresholdText_->set_raycastTarget(false);
+        active_->audioLevelMeterThresholdText_->set_color(
+            {1.0F, 0.72F, 0.08F, 1.0F});
+        place(active_->audioLevelMeterThresholdText_,
+              {kAudioMeterCenterX, -6.5F}, {kAudioMeterWidth, 3.0F});
     };
 
     auto* overview = active_->centerDebugTabContentRoots_[0];
     auto* overviewSection = makeSection(overview, "Broadcast Sound");
     makeStatus(
         overviewSection,
-        "Audio contains the Quest microphone, gate, compressor, limiter, and recording/stream routing. Twitch TTS contains fully local chat speech and output routing.");
+        "Audio contains the Quest microphone, gate, compressor, limiter, and recording/stream routing. Chat TTS contains fully local chat speech and output routing.");
     auto* safetySection = makeSection(overview, "Quest Performance and Privacy");
     makeStatus(
         safetySection,
@@ -1371,49 +2628,100 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     const auto& initialAudio = active_->root_.Settings().Get().audio;
 
     auto* mixSection = makeSection(audioPage, "Sources and Routing");
-    auto* sourceRow = makePair(mixSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        sourceRow->get_gameObject(), "Game Sound", initialBroadcast.gameAudioEnabled, [](bool value) {
+    auto [sourceRow, sourceColumnWidth] = makePaddedRow(
+        mixSection, 3, 14.0F);
+    auto gameAudioTile = makeSettingTile(
+        sourceRow->get_gameObject(), sourceColumnWidth, "Game Audio");
+    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        gameAudioTile.controls->get_gameObject(), "", initialBroadcast.gameAudioEnabled, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().broadcast.gameAudioEnabled = value;
             active_->ApplyAudioSettings();
-        }), "Includes Beat Saber's sound in the live-stream mix. This does not change the volume heard in the headset."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        sourceRow->get_gameObject(), "Quest Microphone", initialBroadcast.microphoneEnabled, [](bool value) {
+        }), "Includes Beat Saber's sound in recordings and live streams. This does not change the volume heard in the headset."),
+        sourceColumnWidth, 0.0F);
+    auto questMicrophoneTile = makeSettingTile(
+        sourceRow->get_gameObject(), sourceColumnWidth, "Enable Quest Microphone");
+    questMicrophoneTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    questMicrophoneTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        questMicrophoneTile.controls->get_gameObject(), "",
+        initialBroadcast.microphoneEnabled, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().broadcast.microphoneEnabled = value;
             active_->ApplyAudioSettings(value);
-        }), "Keeps the Quest microphone capture open while enabled. Requires Microphone Access in MBF and Android permission."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        mixSection, "Game Sound Volume", 5.0F, initialBroadcast.gameAudioVolumePercent,
+        }), "Master microphone control. It opens persistent Quest capture for the meter and DSP; Mic Output selects where the processed signal is used."),
+        sourceColumnWidth, 0.5F);
+    static std::array<std::string_view, 3> microphoneRoutes{
+        "Local Only", "Stream Only", "Both"};
+    const auto microphoneRouteLabel =
+        initialAudio.includeMicrophoneInRecordings &&
+                !initialAudio.includeMicrophoneInLivestreams
+            ? "Local Only"
+            : !initialAudio.includeMicrophoneInRecordings &&
+                    initialAudio.includeMicrophoneInLivestreams
+                ? "Stream Only"
+                : "Both";
+    auto microphoneRouteTile = makeSettingTile(
+        sourceRow->get_gameObject(), sourceColumnWidth, "Mic Output");
+    microphoneRouteTile.label->set_alignment(TMPro::TextAlignmentOptions::MidlineRight);
+    microphoneRouteTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleRight);
+    fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        microphoneRouteTile.controls->get_gameObject(), "", microphoneRouteLabel,
+        microphoneRoutes, [](StringW value) {
+            if (!active_) return;
+            const auto selected = static_cast<std::string>(value);
+            auto& audio = active_->root_.Settings().Edit().audio;
+            audio.includeMicrophoneInRecordings = selected != "Stream Only";
+            audio.includeMicrophoneInLivestreams = selected != "Local Only";
+            active_->ApplyAudioSettings();
+        }), "Selects whether processed Quest microphone audio is added to local recordings, live streams, or both."),
+        sourceColumnWidth);
+
+    auto [volumeRow, volumeColumnWidth] = makePaddedRow(mixSection, 2, 14.0F);
+    auto gameVolumeTile = makeSettingTile(
+        volumeRow->get_gameObject(), volumeColumnWidth, "Game Volume");
+    active_->audioVolumeSliders_[0] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+            gameVolumeTile.controls->get_gameObject(), "", 1.0F,
+            initialBroadcast.gameAudioVolumePercent,
         0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
             active_->root_.Recording().SetLivestreamGameAudioVolumePercent(value);
             active_->ApplyAudioSettings();
-        }), "Live-stream game sound level. It remains adjustable while a stream is active."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        mixSection, "Microphone Volume", 5.0F, initialBroadcast.microphoneVolumePercent,
+        }), "Game-sound mix level for local recordings and live streams. It remains adjustable while active."),
+        volumeColumnWidth - 7.75F), initialBroadcast.gameAudioVolumePercent, true);
+    makeResetGlyphButton(gameVolumeTile.controls->get_gameObject(), [] {
+        if (!active_) return;
+        active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = 100.0F;
+        active_->root_.Recording().SetLivestreamGameAudioVolumePercent(100.0F);
+        active_->ApplyAudioSettings();
+        active_->RefreshAudioControlState(true);
+    }, "Resets game volume to 100%.");
+
+    auto microphoneVolumeTile = makeSettingTile(
+        volumeRow->get_gameObject(), volumeColumnWidth, "Mic Volume");
+    active_->audioVolumeSliders_[1] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+            microphoneVolumeTile.controls->get_gameObject(), "", 1.0F,
+            initialBroadcast.microphoneVolumePercent,
         0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
             active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
             active_->ApplyAudioSettings();
-        }), "Microphone level after gate, compression, and limiting. It remains adjustable while live."));
-    auto* routeRow = makePair(mixSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        routeRow->get_gameObject(), "Mic in Recordings", initialAudio.includeMicrophoneInRecordings, [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().audio.includeMicrophoneInRecordings = value;
-            active_->ApplyAudioSettings();
-        }), "Routes the processed Quest microphone into local SaberStage recordings."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        routeRow->get_gameObject(), "Mic in Streams", initialAudio.includeMicrophoneInLivestreams, [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().audio.includeMicrophoneInLivestreams = value;
-            active_->ApplyAudioSettings();
-        }), "Routes the processed Quest microphone into live streams."));
-    active_->audioInputStatusText_ = makeStatus(mixSection, "Microphone status: checking...");
+        }), "Microphone level after gate, compression, and limiting. It remains adjustable while active."),
+        volumeColumnWidth - 7.75F), initialBroadcast.microphoneVolumePercent, true);
+    makeResetGlyphButton(microphoneVolumeTile.controls->get_gameObject(), [] {
+        if (!active_) return;
+        active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = 100.0F;
+        active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(100.0F);
+        active_->ApplyAudioSettings();
+        active_->RefreshAudioControlState(true);
+    }, "Resets microphone volume to 100%.");
+    makeAudioMeter(mixSection);
+    active_->audioInputStatusText_ = makeStatus(
+        mixSection, "Microphone status: checking...", 4.5F);
 
     auto* modeSection = makeSection(audioPage, "Microphone Mode and Gate");
     static std::array<std::string_view, 3> microphoneModes{
@@ -1422,8 +2730,17 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     const auto modeLabel = initialAudio.microphoneMode == settings::MicrophoneMode::PushToTalk
         ? "Push to Talk" : initialAudio.microphoneMode == settings::MicrophoneMode::VoiceActivated
             ? "Voice Activated" : "Open";
-    fitFull(WithHint(BSML::Lite::CreateDropdown(
-        modeSection, "Microphone Mode", modeLabel, microphoneModes, [](StringW value) {
+    // The mode selector needs only enough room for "Voice Activated". Keeping
+    // it compact leaves a balanced peer position for the high-pass switch and
+    // prevents the selector from looking detached from its label.
+    auto [microphoneModeRow, ignoredMicrophoneModeWidth] = makePaddedRow(
+        modeSection, 2, 12.5F);
+    (void)ignoredMicrophoneModeWidth;
+    constexpr float kMicrophoneModeWidth = 62.0F;
+    constexpr float kHighPassWidth = 42.0F;
+    fitCenterSetting(WithHint(BSML::Lite::CreateDropdown(
+        microphoneModeRow->get_gameObject(), "Microphone Mode", modeLabel,
+        microphoneModes, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
             active_->root_.Settings().Edit().audio.microphoneMode = selected == "Push to Talk"
@@ -1431,12 +2748,32 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
                 : selected == "Voice Activated" ? settings::MicrophoneMode::VoiceActivated
                                                   : settings::MicrophoneMode::Open;
             active_->ApplyAudioSettings();
-        }), "Open passes the microphone continuously. Push to Talk uses a controller grip. Voice Activated uses the thresholds below."));
+        }), "Open keeps the mic on. Push to Talk opens it while a controller grip is held. Voice Activated opens it when your voice is loud enough."),
+        kMicrophoneModeWidth);
+    fitCenterSetting(WithHint(BSML::Lite::CreateToggle(
+        microphoneModeRow->get_gameObject(), "High-pass Filter",
+        initialAudio.highPassEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.highPassEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Reduces deep headset rumble and breath noise before the microphone decides whether speech is present."),
+        kHighPassWidth);
     const auto handLabel = initialAudio.pushToTalkHand == settings::PushToTalkHand::Left
         ? "Left Grip" : initialAudio.pushToTalkHand == settings::PushToTalkHand::Right
             ? "Right Grip" : "Either Grip";
-    fitFull(WithHint(BSML::Lite::CreateDropdown(
-        modeSection, "Push to Talk Control", handLabel, pttHands, [](StringW value) {
+    active_->pushToTalkControlsRoot_ = makeCollapsibleGroup(modeSection);
+    auto [pushToTalkRow, ignoredPushToTalkWidth] = makePaddedRow(
+        active_->pushToTalkControlsRoot_, 2, 14.0F);
+    (void)ignoredPushToTalkWidth;
+    constexpr float kPushToTalkControlWidth = 38.0F;
+    constexpr float kPushToTalkReleaseWidth = 66.0F;
+    auto pushToTalkControlTile = makeSettingTile(
+        pushToTalkRow->get_gameObject(), kPushToTalkControlWidth,
+        "Push to Talk Control");
+    active_->pushToTalkControlDropdown_ = fitBareDropdown(WithHint(
+        BSML::Lite::CreateDropdown(
+        pushToTalkControlTile.controls->get_gameObject(), "", handLabel,
+        pttHands, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
             active_->root_.Settings().Edit().audio.pushToTalkHand = selected == "Left Grip"
@@ -1444,186 +2781,415 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
                 : selected == "Right Grip" ? settings::PushToTalkHand::Right
                                              : settings::PushToTalkHand::Either;
             active_->ApplyAudioSettings();
-        }), "Selects which controller grip opens Push to Talk. Either Grip accepts either hand."));
-    fitFull(WithHint(BSML::Lite::CreateToggle(
-        modeSection, "High-pass Filter", initialAudio.highPassEnabled, [](bool value) {
+        }), "Chooses which controller grip turns on the microphone while Push to Talk is selected."),
+        kPushToTalkControlWidth);
+    auto pushToTalkReleaseTile = makeSettingTile(
+        pushToTalkRow->get_gameObject(), kPushToTalkReleaseWidth,
+        "PTT Release Tail (ms)");
+    active_->pushToTalkReleaseSlider_ = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        pushToTalkReleaseTile.controls->get_gameObject(), "", 10.0F,
+        initialAudio.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
+        0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.highPassEnabled = value;
+            active_->root_.Settings().Edit().audio.pushToTalkReleaseMilliseconds = value;
             active_->ApplyAudioSettings();
-        }), "Reduces headset rumble and low-frequency breath noise before gate detection."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        modeSection, "Gate Open (dBFS)", 1.0F, initialAudio.gateOpenThresholdDb,
-        -60.0F, -10.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+        }), "Keeps the mic open briefly after you release the grip so the last part of a word is not cut off."),
+        kPushToTalkReleaseWidth - 7.75F),
+        initialAudio.pushToTalkReleaseMilliseconds, false);
+    makeResetGlyphButton(pushToTalkReleaseTile.controls->get_gameObject(), [] {
+        if (!active_) return;
+        active_->root_.Settings().Edit().audio.pushToTalkReleaseMilliseconds =
+            settings::AudioProcessingSettings{}.pushToTalkReleaseMilliseconds;
+        active_->ApplyAudioSettings();
+        active_->RefreshAudioControlState(true);
+    }, "Resets the Push to Talk release tail to 150 ms.");
+    active_->voiceActivationControlsRoot_ = makeCollapsibleGroup(modeSection);
+    auto [gateThresholdRow, gateThresholdColumnWidth] = makePaddedRow(
+        active_->voiceActivationControlsRoot_, 3, 14.0F, 0);
+    auto gateOpenTile = makeSettingTile(
+        gateThresholdRow->get_gameObject(), gateThresholdColumnWidth,
+        "Open (dBFS)");
+    gateOpenTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gateOpenTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[0] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gateOpenTile.controls->get_gameObject(), "", 1.0F,
+        initialAudio.gateOpenThresholdDb,
+        -60.0F, -5.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateOpenThresholdDb = value;
+            SetGateOpenPreservingCutoffOffset(
+                active_->root_.Settings().Edit().audio, value);
             active_->ApplyAudioSettings();
-        }), "Voice Activated opens when the measured microphone level reaches this value."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        modeSection, "Gate Close (dBFS)", 1.0F, initialAudio.gateCloseThresholdDb,
-        -70.0F, -12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            active_->RefreshAudioControlState(true);
+        }), "How loud your voice must be before Voice Activated turns the microphone on. The yellow meter bar and this slider move together."),
+        gateThresholdColumnWidth), initialAudio.gateOpenThresholdDb, false);
+    auto gateCloseTile = makeSettingTile(
+        gateThresholdRow->get_gameObject(), gateThresholdColumnWidth,
+        "Mic Cutoff Offset (dB)");
+    gateCloseTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gateCloseTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[1] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gateCloseTile.controls->get_gameObject(), "", 1.0F,
+        GateCutoffOffsetDb(initialAudio),
+        kGateCutoffOffsetMinimumDb, kGateCutoffOffsetMaximumDb,
+        0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateCloseThresholdDb = value;
+            SetGateCutoffOffset(active_->root_.Settings().Edit().audio, value);
             active_->ApplyAudioSettings();
-        }), "The gate closes below this lower value, preventing rapid chatter around one threshold."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        modeSection, "Gate Attack (ms)", 1.0F, initialAudio.gateAttackMilliseconds,
-        1.0F, 100.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateAttackMilliseconds = value;
-            active_->ApplyAudioSettings();
-        }), "How quickly the voice gate fades open."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        modeSection, "Hold / Release (ms)", 10.0F, initialAudio.gateHoldMilliseconds,
-        0.0F, 1000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateHoldMilliseconds = value;
-            active_->root_.Settings().Edit().audio.gateReleaseMilliseconds = std::max(10.0F, value * 0.75F);
-            active_->ApplyAudioSettings();
-        }), "Keeps the gate open between words; release follows at 75% of this value."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        modeSection, "Voice Pre-roll (ms)", 5.0F, initialAudio.gatePreRollMilliseconds,
+            active_->RefreshAudioControlState(true);
+        }), "Sets how far below Open the volume must fall before the microphone closes. Open -38 with a 5 dB offset closes below -43 dBFS."),
+        gateThresholdColumnWidth), GateCutoffOffsetDb(initialAudio), false);
+    auto gatePreRollTile = makeSettingTile(
+        gateThresholdRow->get_gameObject(), gateThresholdColumnWidth,
+        "Pre-roll (ms)");
+    gatePreRollTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gatePreRollTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[5] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gatePreRollTile.controls->get_gameObject(), "", 5.0F,
+        initialAudio.gatePreRollMilliseconds,
         0.0F, 80.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.gatePreRollMilliseconds = value;
             active_->ApplyAudioSettings();
-        }), "Delays output by a small fixed amount so the start of a word is retained when the voice gate opens."));
+        }), "Keeps a tiny amount of sound from just before the mic opened. Increase it if the beginning of words is being cut off."),
+        gateThresholdColumnWidth), initialAudio.gatePreRollMilliseconds, false);
 
-    auto* dynamicsSection = makeSection(audioPage, "Dynamics and Safety");
-    auto* dynamicsRow = makePair(dynamicsSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        dynamicsRow->get_gameObject(), "Limiter", initialAudio.limiterEnabled, [](bool value) {
+    auto [gateTimingRow, gateTimingColumnWidth] = makePaddedRow(
+        active_->voiceActivationControlsRoot_, 3, 14.0F, 0);
+    auto gateAttackTile = makeSettingTile(
+        gateTimingRow->get_gameObject(), gateTimingColumnWidth,
+        "Attack (ms)");
+    gateAttackTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gateAttackTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[2] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gateAttackTile.controls->get_gameObject(), "", 1.0F,
+        initialAudio.gateAttackMilliseconds,
+        1.0F, 100.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.limiterEnabled = value;
+            active_->root_.Settings().Edit().audio.gateAttackMilliseconds = value;
             active_->ApplyAudioSettings();
-        }), "Prevents the processed microphone from exceeding the selected ceiling."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        dynamicsRow->get_gameObject(), "Compressor", initialAudio.compressorEnabled, [](bool value) {
+        }), "How quickly the mic reaches full volume after it opens. Lower values start speech faster; higher values fade it in more gently."),
+        gateTimingColumnWidth), initialAudio.gateAttackMilliseconds, false);
+    auto gateHoldTile = makeSettingTile(
+        gateTimingRow->get_gameObject(), gateTimingColumnWidth,
+        "Hold (ms)");
+    gateHoldTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gateHoldTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[3] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gateHoldTile.controls->get_gameObject(), "", 10.0F,
+        initialAudio.gateHoldMilliseconds,
+        0.0F, 1000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateHoldMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How long the mic stays fully open during a short pause in your speech. Increase it if the mic closes between words."),
+        gateTimingColumnWidth), initialAudio.gateHoldMilliseconds, false);
+    auto gateReleaseTile = makeSettingTile(
+        gateTimingRow->get_gameObject(), gateTimingColumnWidth,
+        "Release (ms)");
+    gateReleaseTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    gateReleaseTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    active_->voiceActivationSliders_[4] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        gateReleaseTile.controls->get_gameObject(), "", 10.0F,
+        initialAudio.gateReleaseMilliseconds,
+        10.0F, 2000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.gateReleaseMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How quickly the mic fades out after the hold time ends. Increase it if the ends of words sound abruptly cut off."),
+        gateTimingColumnWidth), initialAudio.gateReleaseMilliseconds, false);
+    auto [voiceResetRow, ignoredVoiceResetWidth] = makePaddedRow(
+        active_->voiceActivationControlsRoot_, 1, 10.0F);
+    (void)ignoredVoiceResetWidth;
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        voiceResetRow->get_gameObject(), "Reset Voice Activation", [] {
+            if (active_) active_->ShowAudioResetConfirmation(1);
+        }), "Asks for confirmation before restoring the six Voice Activated settings."),
+        43.0F);
+
+    // Compressor and limiter settings deliberately live in separate sections. Although they
+    // execute consecutively in the microphone pipeline, combining them under one heading made
+    // it unclear whether makeup gain and release values belonged to compression or limiting.
+    auto* compressorSection = makeSection(audioPage, "Compressor");
+    auto [compressorEnabledRow, ignoredCompressorEnabledWidth] = makePaddedRow(
+        compressorSection, 1, 10.0F);
+    (void)ignoredCompressorEnabledWidth;
+    compressorEnabledRow->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
+    active_->compressorToggle_ = WithHint(BSML::Lite::CreateToggle(
+        compressorEnabledRow->get_gameObject(), "Enable Compressor",
+        initialAudio.compressorEnabled, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.compressorEnabled = value;
             active_->ApplyAudioSettings();
-        }), "Reduces loud microphone peaks before output makeup and limiting."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        dynamicsSection, "Compressor Threshold", 1.0F, initialAudio.compressorThresholdDb,
-        -40.0F, -6.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+        }), "Turns on compression, which lowers loud speech before makeup gain and limiting.");
+    fitCenterSetting(active_->compressorToggle_, 44.0F);
+    active_->compressorControlsRoot_ = makeCollapsibleGroup(compressorSection);
+    auto [compressorMainRow, compressorMainColumnWidth] = makePaddedRow(
+        active_->compressorControlsRoot_, 2, 14.0F);
+    auto compressorThresholdTile = makeSettingTile(
+        compressorMainRow->get_gameObject(), compressorMainColumnWidth,
+        "Threshold (dBFS)");
+    active_->compressorSliders_[0] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        compressorThresholdTile.controls->get_gameObject(), "", 1.0F,
+        initialAudio.compressorThresholdDb,
+        -60.0F, 0.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.compressorThresholdDb = value;
             active_->ApplyAudioSettings();
-        }), "Compression begins above this dBFS level."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        dynamicsSection, "Compressor Ratio", 0.5F, initialAudio.compressorRatio,
-        1.0F, 10.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+        }), "Compression begins above this dBFS level."),
+        compressorMainColumnWidth), initialAudio.compressorThresholdDb, false);
+    auto compressorRatioTile = makeSettingTile(
+        compressorMainRow->get_gameObject(), compressorMainColumnWidth,
+        "Ratio");
+    active_->compressorSliders_[1] = fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        compressorRatioTile.controls->get_gameObject(), "", 0.5F,
+        initialAudio.compressorRatio,
+        1.0F, 20.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.compressorRatio = value;
             active_->ApplyAudioSettings();
-        }), "Controls how strongly loud speech is reduced above the threshold."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        dynamicsSection, "Makeup Gain (dB)", 0.5F, initialAudio.compressorMakeupDb,
-        0.0F, 12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+        }), "Controls how strongly loud speech is reduced above the threshold."),
+        compressorMainColumnWidth);
+    auto [compressorTimingRow, compressorTimingColumnWidth] = makePaddedRow(
+        active_->compressorControlsRoot_, 2, 14.0F);
+    auto compressorAttackTile = makeSettingTile(
+        compressorTimingRow->get_gameObject(), compressorTimingColumnWidth,
+        "Attack (ms)");
+    active_->compressorSliders_[2] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        compressorAttackTile.controls->get_gameObject(), "", 1.0F,
+        initialAudio.compressorAttackMilliseconds, 1.0F, 200.0F,
+        0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorAttackMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How quickly the compressor reacts to a louder microphone signal."),
+        compressorTimingColumnWidth), initialAudio.compressorAttackMilliseconds, false);
+    auto compressorReleaseTile = makeSettingTile(
+        compressorTimingRow->get_gameObject(), compressorTimingColumnWidth,
+        "Release (ms)");
+    active_->compressorSliders_[3] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        compressorReleaseTile.controls->get_gameObject(), "", 10.0F,
+        initialAudio.compressorReleaseMilliseconds, 10.0F, 2000.0F,
+        0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.compressorReleaseMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How quickly compression recovers after speech falls below the threshold."),
+        compressorTimingColumnWidth), initialAudio.compressorReleaseMilliseconds, false);
+    auto [makeupGainRow, makeupGainColumnWidth] = makePaddedRow(
+        active_->compressorControlsRoot_, 1, 14.0F);
+    auto makeupGainTile = makeSettingTile(
+        makeupGainRow->get_gameObject(), makeupGainColumnWidth,
+        "Makeup Gain (dB)");
+    active_->compressorSliders_[4] = fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        makeupGainTile.controls->get_gameObject(), "", 0.5F,
+        initialAudio.compressorMakeupDb,
+        -12.0F, 24.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.compressorMakeupDb = value;
             active_->ApplyAudioSettings();
-        }), "Raises the compressed microphone before the limiter."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        dynamicsSection, "Limiter Ceiling (dBFS)", 0.5F, initialAudio.limiterCeilingDb,
-        -12.0F, -0.5F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
+        }), "Raises the compressed microphone before the limiter."),
+        makeupGainColumnWidth);
+    auto [compressorResetRow, ignoredCompressorResetWidth] = makePaddedRow(
+        active_->compressorControlsRoot_, 1, 10.0F);
+    (void)ignoredCompressorResetWidth;
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        compressorResetRow->get_gameObject(), "Reset Compressor", [] {
+            if (active_) active_->ShowAudioResetConfirmation(2);
+        }), "Asks for confirmation before restoring the compressor defaults."),
+        34.0F);
+
+    auto* limiterSection = makeSection(audioPage, "Limiter");
+    auto [limiterEnabledRow, ignoredLimiterEnabledWidth] = makePaddedRow(
+        limiterSection, 1, 10.0F);
+    (void)ignoredLimiterEnabledWidth;
+    limiterEnabledRow->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
+    active_->limiterToggle_ = WithHint(BSML::Lite::CreateToggle(
+        limiterEnabledRow->get_gameObject(), "Enable Limiter",
+        initialAudio.limiterEnabled, [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.limiterEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Turns on the final safety limiter so microphone peaks cannot pass the selected ceiling.");
+    fitCenterSetting(active_->limiterToggle_, 38.0F);
+    active_->limiterControlsRoot_ = makeCollapsibleGroup(limiterSection);
+    auto [limiterSettingsRow, limiterSettingsColumnWidth] = makePaddedRow(
+        active_->limiterControlsRoot_, 2, 14.0F);
+    auto limiterCeilingTile = makeSettingTile(
+        limiterSettingsRow->get_gameObject(), limiterSettingsColumnWidth,
+        "Ceiling (dBFS)");
+    active_->limiterSliders_[0] = fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        limiterCeilingTile.controls->get_gameObject(), "", 0.5F,
+        initialAudio.limiterCeilingDb,
+        -12.0F, 0.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().audio.limiterCeilingDb = value;
             active_->ApplyAudioSettings();
-        }), "Maximum microphone peak before it is mixed with game sound."));
-    auto* presetRow = makePair(dynamicsSection);
-    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(presetRow, "Normal Voice", [] {
-        if (!active_) return;
-        auto& audio = active_->root_.Settings().Edit().audio;
-        const auto defaults = settings::AudioProcessingSettings{};
-        const auto mode = audio.microphoneMode;
-        const auto hand = audio.pushToTalkHand;
-        const auto local = audio.includeMicrophoneInRecordings;
-        const auto stream = audio.includeMicrophoneInLivestreams;
-        audio = defaults;
-        audio.microphoneMode = mode;
-        audio.pushToTalkHand = hand;
-        audio.includeMicrophoneInRecordings = local;
-        audio.includeMicrophoneInLivestreams = stream;
-        active_->ApplyAudioSettings();
-    }), "Restores the documented normal-voice gate, compressor, and limiter values without changing routing."));
-    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(presetRow, "Open Mic", [] {
-        if (!active_) return;
-        active_->root_.Settings().Edit().audio.microphoneMode = settings::MicrophoneMode::Open;
-        active_->ApplyAudioSettings();
-    }), "Uses continuous microphone input while retaining compression and limiting."));
+        }), "Maximum microphone peak before it is mixed with game sound."),
+        limiterSettingsColumnWidth);
+    auto limiterReleaseTile = makeSettingTile(
+        limiterSettingsRow->get_gameObject(), limiterSettingsColumnWidth,
+        "Release (ms)");
+    active_->limiterSliders_[1] = showWholeNumber(fitBareSlider(WithHint(
+        BSML::Lite::CreateSliderSetting(
+        limiterReleaseTile.controls->get_gameObject(), "", 10.0F,
+        initialAudio.limiterReleaseMilliseconds, 10.0F, 2000.0F,
+        0.15F, true, {0.0F, 0.0F}, [](float value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().audio.limiterReleaseMilliseconds = value;
+            active_->ApplyAudioSettings();
+        }), "How quickly the limiter returns to unity after suppressing a peak."),
+        limiterSettingsColumnWidth), initialAudio.limiterReleaseMilliseconds, false);
+    auto [limiterResetRow, ignoredLimiterResetWidth] = makePaddedRow(
+        active_->limiterControlsRoot_, 1, 10.0F);
+    (void)ignoredLimiterResetWidth;
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        limiterResetRow->get_gameObject(), "Reset Limiter", [] {
+            if (active_) active_->ShowAudioResetConfirmation(3);
+        }), "Asks for confirmation before restoring the limiter defaults."),
+        30.0F);
 
     auto* ttsPage = active_->centerDebugTabContentRoots_[2];
     const auto& initialTts = active_->root_.Settings().Get().tts;
-    auto* ttsMainSection = makeSection(ttsPage, "Local Twitch Speech");
-    auto* ttsMainRow = makePair(ttsMainSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        ttsMainRow->get_gameObject(), "Enable TTS", initialTts.enabled, [](bool value) {
+    auto* ttsMainSection = makeSection(ttsPage, "Local Chat Speech");
+    auto [ttsMainRow, ttsMainColumnWidth] = makePaddedRow(
+        ttsMainSection, 2, kControlHeight);
+    auto* enableTtsSlot = makeCenteredControlSlot(
+        ttsMainRow->get_gameObject(), ttsMainColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        enableTtsSlot->get_gameObject(), "Enable TTS", initialTts.enabled, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.enabled = value;
             active_->ApplyTtsSettings();
-        }), "Speaks new Twitch chat locally using the embedded offline voice. Off has no per-frame speech work."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        ttsMainRow->get_gameObject(), "Speak Usernames", initialTts.speakUsernames, [](bool value) {
+        }), "Speaks normalized messages from SaberStage's chat panel using the embedded KittenTTS neural model. Off unloads the model and has no per-frame speech work."),
+        29.0F);
+    auto* speakUsernamesSlot = makeCenteredControlSlot(
+        ttsMainRow->get_gameObject(), ttsMainColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        speakUsernamesSlot->get_gameObject(), "Speak Usernames", initialTts.speakUsernames, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.speakUsernames = value;
             active_->ApplyTtsSettings();
-        }), "Prefixes each spoken message with its Twitch display name."));
-    active_->ttsStatusText_ = makeStatus(ttsMainSection, "TTS status: checking...");
-    auto* ttsActions = makePair(ttsMainSection);
-    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(ttsActions, "Test Voice", [] {
+        }), "Prefixes each spoken message with its chat display name."),
+        39.0F);
+    active_->ttsStatusText_ = makeStatus(
+        ttsMainSection, "TTS status: checking...", 7.0F);
+    auto [ttsActions, ttsActionColumnWidth] = makePaddedRow(
+        ttsMainSection, 2, 9.5F);
+    auto* testVoiceSlot = makeCenteredControlSlot(
+        ttsActions->get_gameObject(), ttsActionColumnWidth, 9.5F);
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(testVoiceSlot, "Test Voice", [] {
         if (!active_) return;
-        broadcast::TwitchChatMessage test;
+        broadcast::ChatMessage test;
         test.author = "SaberStage";
         test.login = "saberstage";
-        test.text = "Twitch text to speech is ready.";
+        test.text = "Chat text to speech is ready.";
         active_->root_.Tts().Enqueue(test);
-    }), "Queues one local test phrase through the same bounded worker used by Twitch chat."));
-    fitHalfButton(WithHint(BSML::Lite::CreateUIButton(ttsActions, "Clear Queue", [] {
-        if (active_) active_->root_.Tts().ClearQueue();
-    }), "Drops queued and buffered speech without disconnecting Twitch chat."));
+    }), "Queues one local test phrase through the same bounded worker used by chat messages."),
+        26.0F);
+    auto* clearQueueSlot = makeCenteredControlSlot(
+        ttsActions->get_gameObject(), ttsActionColumnWidth, 9.5F);
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(clearQueueSlot, "Clear Queue", [] {
+        if (active_) active_->ShowTtsClearQueueConfirmation();
+    }), "Asks for confirmation before dropping queued and buffered speech."),
+        26.0F);
 
     auto* contentSection = makeSection(ttsPage, "Message Content");
-    auto* contentRowOne = makePair(contentSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        contentRowOne->get_gameObject(), "Ignore Bots", initialTts.ignoreKnownBots, [](bool value) {
+    if (auto* contentLayout = contentSection
+            ->GetComponent<UnityEngine::UI::VerticalLayoutGroup*>()) {
+        // These two compact toggle rows form one logical block. Keep their
+        // heading and rows closer than separate settings sections without
+        // changing the standard position or styling of the heading itself.
+        contentLayout->set_spacing(0.75F);
+    }
+    auto [contentRowOne, contentColumnWidth] = makePaddedRow(
+        contentSection, 2, kControlHeight);
+    auto* ignoreBotsSlot = makeCenteredControlSlot(
+        contentRowOne->get_gameObject(), contentColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        ignoreBotsSlot->get_gameObject(), "Ignore Bots", initialTts.ignoreKnownBots, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.ignoreKnownBots = value;
             active_->ApplyTtsSettings();
-        }), "Skips common automated Twitch bot accounts."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        contentRowOne->get_gameObject(), "Ignore Commands", initialTts.ignoreCommands, [](bool value) {
+        }), "Skips common automated chat bot accounts."), 30.0F);
+    auto* ignoreCommandsSlot = makeCenteredControlSlot(
+        contentRowOne->get_gameObject(), contentColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        ignoreCommandsSlot->get_gameObject(), "Ignore Commands", initialTts.ignoreCommands, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.ignoreCommands = value;
             active_->ApplyTtsSettings();
-        }), "Skips messages beginning with ! or / so request commands are not read aloud."));
-    auto* contentRowTwo = makePair(contentSection);
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        contentRowTwo->get_gameObject(), "Speak Links", initialTts.speakUrls, [](bool value) {
+        }), "Skips messages beginning with ! or / so request commands are not read aloud."), 39.0F);
+    auto [contentRowTwo, ignoredContentColumnWidth] = makePaddedRow(
+        contentSection, 2, kControlHeight);
+    (void)ignoredContentColumnWidth;
+    auto* speakLinksSlot = makeCenteredControlSlot(
+        contentRowTwo->get_gameObject(), contentColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        speakLinksSlot->get_gameObject(), "Speak Links", initialTts.speakUrls, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.speakUrls = value;
             active_->ApplyTtsSettings();
-        }), "Says the word link for URLs. When off, URL tokens are omitted."));
-    fitHalfToggle(WithHint(BSML::Lite::CreateToggle(
-        contentRowTwo->get_gameObject(), "Speak Emotes", initialTts.speakEmoteNames, [](bool value) {
+        }), "Says the word link for URLs. When off, URL tokens are omitted."), 31.0F);
+    auto* speakEmotesSlot = makeCenteredControlSlot(
+        contentRowTwo->get_gameObject(), contentColumnWidth);
+    fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+        speakEmotesSlot->get_gameObject(), "Speak Emotes", initialTts.speakEmoteNames, [](bool value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.speakEmoteNames = value;
             active_->ApplyTtsSettings();
-        }), "Reads Twitch emote text. When off, Twitch-tagged emote spans are omitted."));
+        }), "Reads emote text. When off, provider-tagged emote spans are omitted."), 34.0F);
 
     auto* voiceSection = makeSection(ttsPage, "Voice and Output");
-    static std::array<std::string_view, 4> ttsVoices{"en-us", "en-gb", "en-sc", "en"};
+    static std::array<std::string_view, 8> ttsVoices{
+        "Adam", "Mary", "Noah", "Emma", "Liam", "Ava", "Ethan", "Sofia"};
     static std::array<std::string_view, 3> ttsRoutes{"Headset", "Broadcast", "Headset + Broadcast"};
-    fitFull(WithHint(BSML::Lite::CreateDropdown(
-        voiceSection, "English Voice", initialTts.voice, ttsVoices, [](StringW value) {
+    const auto voiceLabel = initialTts.voice == "expr-voice-2-m" ? "Adam"
+        : initialTts.voice == "expr-voice-3-m" ? "Noah"
+        : initialTts.voice == "expr-voice-3-f" ? "Emma"
+        : initialTts.voice == "expr-voice-4-m" ? "Liam"
+        : initialTts.voice == "expr-voice-4-f" ? "Ava"
+        : initialTts.voice == "expr-voice-5-m" ? "Ethan"
+        : initialTts.voice == "expr-voice-5-f" ? "Sofia"
+        : "Mary";
+    auto [voiceOutputRow, voiceOutputColumnWidth] = makePaddedRow(
+        voiceSection, 2, kControlHeight);
+    auto* voiceSlot = makeCenteredControlSlot(
+        voiceOutputRow->get_gameObject(), voiceOutputColumnWidth);
+    fitInlineDropdownSetting(WithHint(BSML::Lite::CreateDropdown(
+        voiceSlot->get_gameObject(), "Voice", voiceLabel, ttsVoices, [](StringW value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().tts.voice = static_cast<std::string>(value);
+            const auto selected = static_cast<std::string>(value);
+            active_->root_.Settings().Edit().tts.voice = selected == "Adam"
+                ? "expr-voice-2-m" : selected == "Noah"
+                    ? "expr-voice-3-m" : selected == "Emma"
+                        ? "expr-voice-3-f" : selected == "Liam"
+                            ? "expr-voice-4-m" : selected == "Ava"
+                                ? "expr-voice-4-f" : selected == "Ethan"
+                                    ? "expr-voice-5-m" : selected == "Sofia"
+                                        ? "expr-voice-5-f" : "expr-voice-2-f";
             active_->ApplyTtsSettings();
-        }), "Selects an embedded eSpeak NG English voice; no network or Android TTS app is required."));
+        }), "Selects one of the eight KittenTTS Nano v0.2 English voices. The friendly names identify the otherwise numbered model voices."),
+        31.0F, 12.5F);
     const auto routeLabel = initialTts.outputRoute == settings::TtsOutputRoute::BroadcastOnly
         ? "Broadcast" : initialTts.outputRoute == settings::TtsOutputRoute::HeadsetAndBroadcast
             ? "Headset + Broadcast" : "Headset";
-    fitFull(WithHint(BSML::Lite::CreateDropdown(
-        voiceSection, "TTS Output", routeLabel, ttsRoutes, [](StringW value) {
+    auto* outputSlot = makeCenteredControlSlot(
+        voiceOutputRow->get_gameObject(), voiceOutputColumnWidth);
+    fitInlineDropdownSetting(WithHint(BSML::Lite::CreateDropdown(
+        outputSlot->get_gameObject(), "TTS Output", routeLabel, ttsRoutes, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
             active_->root_.Settings().Edit().tts.outputRoute = selected == "Broadcast"
@@ -1631,46 +3197,113 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
                 : selected == "Headset + Broadcast" ? settings::TtsOutputRoute::HeadsetAndBroadcast
                                                       : settings::TtsOutputRoute::HeadsetOnly;
             active_->ApplyTtsSettings();
-        }), "Headset is private monitoring. Broadcast routes speech into local recordings and live streams. Combined sends it to both."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        voiceSection, "TTS Volume", 5.0F, initialTts.volumePercent,
+        }), "Headset is private monitoring. Broadcast routes speech into local recordings and live streams. Combined sends it to both."),
+        52.0F, 21.5F);
+
+    auto [voiceTuningRow, voiceTuningColumnWidth] = makePaddedRow(
+        voiceSection, 2, 14.0F);
+    auto ttsVolumeTile = makeSettingTile(
+        voiceTuningRow->get_gameObject(), voiceTuningColumnWidth, "TTS Volume");
+    ttsVolumeTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    ttsVolumeTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    showWholeNumber(fitBareSlider(WithHint(BSML::Lite::CreateSliderSetting(
+        ttsVolumeTile.controls->get_gameObject(), "", 1.0F, initialTts.volumePercent,
         0.0F, 150.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.volumePercent = value;
             active_->ApplyTtsSettings();
-        }), "Speech output level. High values can clip when broadcast over loud game sound."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        voiceSection, "Speech Rate", 0.05F, initialTts.speechRate,
+        }), "Speech output level. High values can clip when broadcast over loud game sound."),
+        voiceTuningColumnWidth),
+        initialTts.volumePercent, true);
+    auto speechRateTile = makeSettingTile(
+        voiceTuningRow->get_gameObject(), voiceTuningColumnWidth, "Speech Rate");
+    speechRateTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    speechRateTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    fitBareSlider(WithHint(BSML::Lite::CreateSliderSetting(
+        speechRateTile.controls->get_gameObject(), "", 0.05F, initialTts.speechRate,
         0.5F, 2.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.speechRate = value;
             active_->ApplyTtsSettings();
-        }), "Speech-speed multiplier; 1.0 is the normal embedded voice rate."));
+        }), "Speech-speed multiplier; 1.0 is the neural model's normal voice rate."),
+        voiceTuningColumnWidth);
 
     auto* queueSection = makeSection(ttsPage, "Queue Limits");
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        queueSection, "Maximum Characters", 10.0F, static_cast<float>(initialTts.maximumCharacters),
+    auto [queueLimitsRow, queueLimitColumnWidth] = makePaddedRow(
+        queueSection, 3, 14.0F);
+    auto maximumCharactersTile = makeSettingTile(
+        queueLimitsRow->get_gameObject(), queueLimitColumnWidth,
+        "Maximum Characters");
+    maximumCharactersTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    maximumCharactersTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    showWholeNumber(fitBareSlider(WithHint(BSML::Lite::CreateSliderSetting(
+        maximumCharactersTile.controls->get_gameObject(), "", 10.0F,
+        static_cast<float>(initialTts.maximumCharacters),
         40.0F, 500.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.maximumCharacters = static_cast<int>(std::lround(value));
             active_->ApplyTtsSettings();
-        }), "Clips unusually long chat messages before they enter the speech queue."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        queueSection, "Pending Messages", 1.0F, static_cast<float>(initialTts.queueCapacity),
+        }), "Clips unusually long chat messages before they enter the speech queue."),
+        queueLimitColumnWidth),
+        static_cast<float>(initialTts.maximumCharacters), false);
+    auto pendingMessagesTile = makeSettingTile(
+        queueLimitsRow->get_gameObject(), queueLimitColumnWidth,
+        "Pending Messages");
+    pendingMessagesTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    pendingMessagesTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    showWholeNumber(fitBareSlider(WithHint(BSML::Lite::CreateSliderSetting(
+        pendingMessagesTile.controls->get_gameObject(), "", 1.0F,
+        static_cast<float>(initialTts.queueCapacity),
         1.0F, 12.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.queueCapacity = static_cast<int>(std::lround(value));
             active_->ApplyTtsSettings();
-        }), "Bounds pending TTS memory and prevents a busy chat from building an unlimited backlog."));
-    fitFull(WithHint(BSML::Lite::CreateSliderSetting(
-        queueSection, "Discard After (seconds)", 1.0F, initialTts.staleAfterSeconds,
+        }), "Bounds pending TTS memory and prevents a busy chat from building an unlimited backlog."),
+        queueLimitColumnWidth),
+        static_cast<float>(initialTts.queueCapacity), false);
+    auto discardAfterTile = makeSettingTile(
+        queueLimitsRow->get_gameObject(), queueLimitColumnWidth,
+        "Discard After (seconds)");
+    discardAfterTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
+    discardAfterTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+    showWholeNumber(fitBareSlider(WithHint(BSML::Lite::CreateSliderSetting(
+        discardAfterTile.controls->get_gameObject(), "", 1.0F, initialTts.staleAfterSeconds,
         2.0F, 30.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             active_->root_.Settings().Edit().tts.staleAfterSeconds = value;
             active_->ApplyTtsSettings();
-        }), "Skips queued speech that is too old to be useful after a burst of chat."));
+        }), "Skips queued speech that is too old to be useful after a burst of chat."),
+        queueLimitColumnWidth), initialTts.staleAfterSeconds, false);
+
+    auto* configureStreamPage = active_->centerDebugTabContentRoots_[3];
+    auto* connectionSection = makeSection(
+        configureStreamPage, "Internet Connection Quality");
+    makeStatus(
+        connectionSection,
+        "Run an explicit Cloudflare edge test before streaming. The test measures sustained download and upload speed using transfers much larger than a burst test, plus latency and jitter. It may use up to 200 MB of data.",
+        13.0F);
+    auto [connectionActionRow, connectionActionWidth] = makePaddedRow(
+        connectionSection, 1, 9.5F);
+    auto* connectionActionSlot = makeCenteredControlSlot(
+        connectionActionRow->get_gameObject(), connectionActionWidth, 9.5F);
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        connectionActionSlot, "Run Cloudflare Test", [] {
+            if (active_) active_->ShowConnectionTestConsent();
+        }),
+        "Shows a privacy and data-use notice before sending any test traffic. The test never starts automatically."),
+        40.0F);
+    auto* resultSection = makeSection(configureStreamPage, "Latest Saved Result");
+    const auto& savedConnectionTest = active_->root_.Settings().Get().connectionTest;
+    active_->connectionTestTabSummaryText_ = makeStatus(
+        resultSection,
+        savedConnectionTest.hasResult
+            ? ConnectionTestResultsText(
+                  SavedConnectionTestResults(savedConnectionTest), true)
+            : "No saved connection test result. No measured upload bitrate limit is active.",
+        27.0F);
 
     active_->ShowCenterDebugTab(0);
+    active_->RefreshAudioControlState();
     if (active_->centerDebugTabs_) {
         active_->centerDebugTabs_->SelectCellWithNumber(0);
     }
@@ -1693,6 +3326,7 @@ void MenuController::TickRuntimePanels() noexcept {
     }
 
     root_.Twitch().Tick();
+    RefreshConnectionTestUi();
     const auto twitch = root_.Twitch().Snapshot();
     if (pendingLiveTwitchTitleUpdate_ && twitch.titleUpdateComplete) {
         pendingLiveTwitchTitleUpdate_ = false;
@@ -1700,6 +3334,21 @@ void MenuController::TickRuntimePanels() noexcept {
             ShowLivestreamActionError(twitch.titleUpdateStatus, true);
         }
         RefreshTwitchControls();
+    }
+
+    // Metering is visual-only and intentionally capped at 10 Hz. The audio
+    // callback publishes atomics; it never touches Unity UI or emits logs.
+    if (selectedCenterDebugTab_ == 1 &&
+            IsAlive(centerDebugTabViewRoots_[1]) &&
+            centerDebugTabViewRoots_[1]->get_activeInHierarchy()) {
+        audioMeterRefreshSeconds_ += std::max(
+            0.0F, UnityEngine::Time::get_unscaledDeltaTime());
+        if (audioMeterRefreshSeconds_ >= 0.1F) {
+            audioMeterRefreshSeconds_ = 0.0F;
+            RefreshAudioMeter();
+        }
+    } else {
+        audioMeterRefreshSeconds_ = 0.0F;
     }
 
     twitchUiRefreshSeconds_ += std::max(
@@ -1723,10 +3372,9 @@ void MenuController::TickRuntimePanels() noexcept {
             else if (microphone.permission != recording::MicrophonePermissionStatus::Granted)
                 status << "waiting for Android permission";
             else if (!microphone.capturing) status << "unavailable; see log";
-            else status << (microphone.gateOpen ? "gate open" : "gate closed")
-                        << "  Level " << std::fixed << std::setprecision(1)
-                        << microphone.levelDb << " dBFS"
-                        << "  Compression " << microphone.compressorReductionDb << " dB";
+            else status << "active  Compression " << std::fixed << std::setprecision(1)
+                        << microphone.compressorReductionDb << " dB"
+                        << "  Limiter " << microphone.limiterReductionDb << " dB";
             audioInputStatusText_->set_text(status.str());
         }
         if (IsAlive(ttsStatusText_)) {
@@ -2839,7 +4487,7 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
 }
 
 void MenuController::ShowCenterDebugTab(int index) {
-    index = std::clamp(index, 0, 2);
+    index = std::clamp(index, 0, 3);
     selectedCenterDebugTab_ = index;
     for (int page = 0;
          page < static_cast<int>(centerDebugTabViewRoots_.size());
@@ -2859,6 +4507,7 @@ void MenuController::ShowCenterDebugTab(int index) {
         UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(rect);
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
+    if (selectedCenterDebugTab_ == 1) RefreshAudioMeter();
 }
 
 void MenuController::ShowSettingsTab(int index) {

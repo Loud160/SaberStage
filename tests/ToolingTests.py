@@ -165,6 +165,17 @@ class ReceiptSafetyTests(unittest.TestCase):
 
 
 class RepositoryInvariantTests(unittest.TestCase):
+    def test_neural_tts_loads_the_modloader_executable_library_mirror(self):
+        backend = (ROOT / "src/broadcast/KittenTtsBackend.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            '"/data/user/0/com.beatgames.beatsaber/files/libs"',
+            backend,
+        )
+        self.assertNotIn(
+            '"/sdcard/ModData/com.beatgames.beatsaber/Modloader/libs"',
+            backend,
+        )
+
     def test_owned_slider_cleanup_precedes_ui_destruction_and_rebuild(self):
         lifetime = (ROOT / "src/ui/SliderLifetime.cpp").read_text(encoding="utf-8")
         policy = (ROOT / "include/saberstage/ui/SliderRegistration.hpp").read_text(encoding="utf-8")
@@ -812,7 +823,13 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertEqual(template["packageVersion"], "1.40.8_7379")
         self.assertEqual(
             set(template["libraryFiles"]),
-            {"libavformat-saberstage9.so", "libavcodec-saberstage9.so", "libavutil-saberstage9.so"},
+            {
+                "libavformat-saberstage9.so",
+                "libavcodec-saberstage9.so",
+                "libavutil-saberstage9.so",
+                "libsabstageort.so",
+                "libss-tts-neural-api.so",
+            },
         )
         dependencies = {item["id"] for item in qpm["dependencies"]}
         self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types", "hollywood"} <= dependencies)
@@ -1584,15 +1601,71 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("streamGame + streamMic + speech", controller)
         self.assertIn("localGame + localMic + speech", controller)
         self.assertIn("android.permission.RECORD_AUDIO", controller)
-        self.assertIn('"Game Sound"', menu)
-        self.assertIn('"Game Sound Volume"', menu)
-        self.assertIn('"Quest Microphone"', menu)
-        self.assertIn('"Microphone Volume"', menu)
+        self.assertIn('"Game Audio"', menu)
+        self.assertIn('"Game Volume"', menu)
+        self.assertIn('"Enable Quest Microphone"', menu)
+        self.assertIn('"Mic Volume"', menu)
         self.assertIn("without Microphone Access", menu)
         self.assertIn("repatch Beat Saber", menu)
-        self.assertIn("Mic in Recordings", menu)
-        self.assertIn("Mic in Streams", menu)
-        self.assertIn('"Twitch TTS"', menu)
+        self.assertIn('"Local Only", "Stream Only", "Both"', menu)
+        self.assertIn('"Mic Output"', menu)
+        self.assertNotIn('"Recording Mic"', menu)
+        self.assertNotIn('"Streaming Mic"', menu)
+        self.assertIn('"Chat TTS"', menu)
+        self.assertIn("Reset Voice Activation", menu)
+        self.assertIn('makeSection(audioPage, "Compressor")', menu)
+        self.assertIn('makeSection(audioPage, "Limiter")', menu)
+        self.assertIn("Reset Compressor", menu)
+        self.assertIn("Reset Limiter", menu)
+        self.assertNotIn('"Dynamics and Safety"', menu)
+        self.assertNotIn("Reset Compressor / Limiter", menu)
+        self.assertNotIn('"Open Mic"', menu)
+        self.assertNotIn('"Normal Voice"', menu)
+        self.assertIn("pushToTalkControlDropdown_->set_interactable", menu)
+        self.assertIn("pushToTalkReleaseSlider_->set_interactable", menu)
+        self.assertIn("gateControlsActive", menu)
+        self.assertIn("pushToTalkControlsRoot_->SetActive", menu)
+        self.assertIn("voiceActivationControlsRoot_->SetActive", menu)
+        self.assertIn("compressorControlsRoot_->SetActive", menu)
+        self.assertIn("limiterControlsRoot_->SetActive", menu)
+        self.assertIn("slider->set_interactable(audio.compressorEnabled)", menu)
+        self.assertIn("slider->set_interactable(audio.limiterEnabled)", menu)
+        self.assertIn("RefreshAudioMeter", menu)
+        self.assertIn("audioLevelMeterThreshold_", menu)
+        self.assertIn("audioLevelThresholdSlider_", menu)
+        self.assertIn("nativeSlider->__cordl_internal_set__enableDragging(true)", menu)
+        self.assertIn("kAudioMeterMinimumDb = -65.0F", menu)
+        self.assertIn("kAudioMeterMaximumDb = 5.0F", menu)
+        self.assertIn("kAudioMeterOrangeStartDb = -20.0F", menu)
+        self.assertIn("kAudioMeterRedStartDb = -10.0F", menu)
+        self.assertIn("rawDb >= kAudioMeterClipStartDb", menu)
+        self.assertIn('"Mic State"', menu)
+        self.assertIn('state = open ? "PTT OPEN" : "PTT CLOSED"', menu)
+        self.assertIn("ShowAudioResetConfirmation(1)", menu)
+        self.assertIn("ShowAudioResetConfirmation(2)", menu)
+        self.assertIn("ShowAudioResetConfirmation(3)", menu)
+        self.assertIn("ResolveAudioResetConfirmation", menu)
+        self.assertIn("kCenterControlLabelTextSize", menu)
+        self.assertIn("kCenterDropdownValueTextSize", menu)
+        self.assertIn("Drag yellow bar: opens at", menu)
+        self.assertIn("GateCutoffOffsetDb", menu)
+        self.assertIn("SetGateOpenPreservingCutoffOffset", menu)
+        self.assertIn('"Mic Cutoff Offset (dB)"', menu)
+        self.assertIn("ShowTtsClearQueueConfirmation", menu)
+        self.assertIn("ResolveTtsClearQueueConfirmation", menu)
+        self.assertIn('"Adam", "Mary", "Noah", "Emma"', menu)
+        self.assertIn("makeCenteredControlSlot", menu)
+        self.assertIn("fitInlineDropdownSetting", menu)
+        self.assertIn("fitInlineToggleSetting", menu)
+        self.assertIn("contentLayout->set_spacing(0.75F)", menu)
+        self.assertIn('voiceSlot->get_gameObject(), "Voice"', menu)
+        self.assertIn('outputSlot->get_gameObject(), "TTS Output"', menu)
+        self.assertIn("queueLimitsRow", menu)
+        self.assertIn("makeResetGlyphButton", menu)
+        self.assertIn("constexpr float kContentWidth = 116.0F", menu)
+        self.assertNotIn("constexpr float kContentWidth = 72.0F", menu)
+        self.assertIn('"PTT Release Tail (ms)"', menu)
+        self.assertIn('"Release (ms)"', menu)
         self.assertIn("SetLivestreamGameAudioVolumePercent(value)", menu)
         self.assertIn("SetLivestreamMicrophoneVolumePercent(value)", menu)
         self.assertNotIn(

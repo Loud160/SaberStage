@@ -41,6 +41,10 @@ REMOTE_FFMPEG_LIBRARIES = (
     f"{MOD_DATA}/Modloader/libs/libavcodec-saberstage9.so",
     f"{MOD_DATA}/Modloader/libs/libavutil-saberstage9.so",
 )
+REMOTE_TTS_LIBRARIES = (
+    f"{MOD_DATA}/Modloader/libs/libsabstageort.so",
+    f"{MOD_DATA}/Modloader/libs/libss-tts-neural-api.so",
+)
 RECEIPT_DIR = f"{MOD_DATA}/SaberStage/SourceInstall"
 RECEIPT = f"{RECEIPT_DIR}/receipt.json"
 REMOTE_RECORDINGS = "/sdcard/Oculus/VideoShots"
@@ -136,11 +140,14 @@ def local_hash(path: pathlib.Path) -> str:
 
 def deployment_payloads() -> tuple[tuple[pathlib.Path, str], ...]:
     ffmpeg = ROOT / ".cache" / "dependencies" / "ffmpeg-hardware" / "lib"
+    tts = ROOT / ".cache" / "dependencies" / "kitten-tts" / "lib"
     return (
         (ROOT / "build" / "libsaberstage.so", REMOTE_LIBRARY),
         (ffmpeg / "libavformat-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[0]),
         (ffmpeg / "libavcodec-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[1]),
         (ffmpeg / "libavutil-saberstage9.so", REMOTE_FFMPEG_LIBRARIES[2]),
+        (tts / "libsabstageort.so", REMOTE_TTS_LIBRARIES[0]),
+        (tts / "libss-tts-neural-api.so", REMOTE_TTS_LIBRARIES[1]),
     )
 
 
@@ -235,7 +242,7 @@ def remove(adb: Adb) -> None:
     quoted = " ".join(f"'{remote}'" for remote in (*owned, RECEIPT))
     adb.shell(f"rm -f {quoted}")
     adb.shell(f"rmdir '{RECEIPT_DIR}' 2>/dev/null || true", check=False)
-    print(f"Removed only receipt-owned source file: {REMOTE_LIBRARY}")
+    print("Removed only receipt-owned SaberStage source files.")
 
 
 def redact_settings_credentials(raw: str) -> str:

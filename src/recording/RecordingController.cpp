@@ -388,6 +388,10 @@ bool RecordingController::StartCapture(
 }
 
 bool RecordingController::Pause(std::string* error) {
+    // Scene/recording lifecycle boundaries always fail PTT closed. The
+    // configured release tail still produces a natural end without allowing
+    // a stale controller state to leave the microphone logically open.
+    microphoneDsp_.SetPushToTalk(false);
     {
         const auto livestream = LivestreamSnapshot();
         if (broadcast::CanStop(livestream.state)) {
@@ -633,6 +637,7 @@ void RecordingController::StopVideoSegment(bool recordCaptureFailure) noexcept {
 }
 
 bool RecordingController::Stop(std::string_view reason) {
+    microphoneDsp_.SetPushToTalk(false);
     try {
         // A stream-only session has no local media to finalize. Route every
         // stop source (UI, shutdown, camera loss, or encoder failure) through
@@ -672,6 +677,7 @@ bool RecordingController::Stop(std::string_view reason) {
 void RecordingController::Shutdown() noexcept {
     if (shuttingDown_) return;
     shuttingDown_ = true;
+    microphoneDsp_.SetPushToTalk(false);
     try {
         camera_.SetRuntimeCameraInvalidatedHandler({});
         camera_.SetRuntimeCameraReadyHandler({});
@@ -778,16 +784,27 @@ void RecordingController::Tick() noexcept {
     // the resulting atomic state through MicrophoneDsp, never OVRInput itself.
     try {
         const auto& audio = settings_.Get().audio;
-        const auto left = GlobalNamespace::OVRInput::Get(
-            GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
-            GlobalNamespace::OVRInput::Controller::LTouch);
-        const auto right = GlobalNamespace::OVRInput::Get(
-            GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
-            GlobalNamespace::OVRInput::Controller::RTouch);
-        const bool pressed = audio.pushToTalkHand == settings::PushToTalkHand::Left
-            ? left
-            : audio.pushToTalkHand == settings::PushToTalkHand::Right ? right : left || right;
-        microphoneDsp_.SetPushToTalk(pressed);
+        if (audio.microphoneMode != settings::MicrophoneMode::PushToTalk) {
+            microphoneDsp_.SetPushToTalk(false);
+        } else {
+            const auto connected = static_cast<std::int32_t>(
+                GlobalNamespace::OVRInput::GetConnectedControllers());
+            const bool leftConnected = (connected & static_cast<std::int32_t>(
+                GlobalNamespace::OVRInput::Controller::LTouch)) != 0;
+            const bool rightConnected = (connected & static_cast<std::int32_t>(
+                GlobalNamespace::OVRInput::Controller::RTouch)) != 0;
+            const auto left = leftConnected && GlobalNamespace::OVRInput::Get(
+                GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
+                GlobalNamespace::OVRInput::Controller::LTouch);
+            const auto right = rightConnected && GlobalNamespace::OVRInput::Get(
+                GlobalNamespace::OVRInput::Button::PrimaryHandTrigger,
+                GlobalNamespace::OVRInput::Controller::RTouch);
+            const bool pressed = audio.pushToTalkHand == settings::PushToTalkHand::Left
+                ? left
+                : audio.pushToTalkHand == settings::PushToTalkHand::Right
+                    ? right : left || right;
+            microphoneDsp_.SetPushToTalk(pressed);
+        }
     } catch (...) {
         microphoneDsp_.SetPushToTalk(false);
     }
@@ -1077,6 +1094,35 @@ bool RecordingController::StartLivestream(std::string* error) {
     // capture without rewriting that preference or creating recording files.
     auto recording = settings_.Get().recording;
     recording.backend = settings::RecordingBackend::DirectFfmpegHardware;
+    // The last successful user-run test is persisted. Read it for every stream
+    // start rather than caching a session value so restarting Beat Saber cannot
+    // bypass the measured upload ceiling.
+    const auto& connectionTest = settings_.Get().connectionTest;
+    const auto measuredUpload = connectionTest.hasResult
+        ? static_cast<std::int64_t>(std::floor(
+              connectionTest.sustainedUploadMegabitsPerSecond * 1'000'000.0F))
+        : 0;
+    if (measuredUpload > 0 &&
+            (recording.bitrateBitsPerSecond > measuredUpload ||
+             recording.peakBitrateBitsPerSecond > measuredUpload)) {
+        const auto configuredBitrate = recording.bitrateBitsPerSecond;
+        const auto configuredPeak = recording.peakBitrateBitsPerSecond;
+        recording.bitrateBitsPerSecond = static_cast<std::int32_t>(std::min<std::int64_t>(
+            recording.bitrateBitsPerSecond, measuredUpload));
+        recording.peakBitrateBitsPerSecond = static_cast<std::int32_t>(std::min<std::int64_t>(
+            recording.peakBitrateBitsPerSecond, measuredUpload));
+        // VBR's peak cannot fall below its target. Both values use the same
+        // measured ceiling until future multi-stream headroom policy is added.
+        recording.peakBitrateBitsPerSecond = std::max(
+            recording.peakBitrateBitsPerSecond, recording.bitrateBitsPerSecond);
+        Logging::Logger.warn(
+            "Cloudflare test capped this livestream video bitrate: configured={}/{} bps effective={}/{} bps measuredUpload={} bps",
+            configuredBitrate,
+            configuredPeak,
+            recording.bitrateBitsPerSecond,
+            recording.peakBitrateBitsPerSecond,
+            measuredUpload);
+    }
     if (state_.load() == RecordingState::Recording &&
         activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware) {
         if (error) *error = "This recording was started with Hollywood. Stop it before switching to Direct FFmpeg for live streaming.";
@@ -1396,6 +1442,7 @@ bool SameAudioProcessingSettings(
     const settings::AudioProcessingSettings& right) noexcept {
     return left.microphoneMode == right.microphoneMode &&
         left.pushToTalkHand == right.pushToTalkHand &&
+        left.pushToTalkReleaseMilliseconds == right.pushToTalkReleaseMilliseconds &&
         left.includeMicrophoneInRecordings == right.includeMicrophoneInRecordings &&
         left.includeMicrophoneInLivestreams == right.includeMicrophoneInLivestreams &&
         left.highPassEnabled == right.highPassEnabled &&
@@ -1570,6 +1617,7 @@ void RecordingController::StopLivestream() noexcept {
     // explicitly started local recording owns its capture independently and
     // therefore continues when only the network stream is stopped.
     livestreamAfk_.store(false, std::memory_order_release);
+    microphoneDsp_.SetPushToTalk(false);
     DisableLivestreamWakeGuard();
     if (IsUnityObjectAlive(directVideoCapture_)) {
         directVideoCapture_->SetOverrideTexture(nullptr);
@@ -1652,6 +1700,7 @@ broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
 
 void RecordingController::HandleRuntimeCameraInvalidated() noexcept {
     activeRuntimeCamera_ = nullptr;
+    microphoneDsp_.SetPushToTalk(false);
     if (recording::CanStop(state_.load())) {
         try {
             Stop("The spectator camera became unavailable.");
@@ -1778,7 +1827,7 @@ void RecordingController::SubmitLivestreamAudioLocked(
         if (!unsupportedTtsMixRateReported_) {
             unsupportedTtsMixRateReported_ = true;
             Logging::Logger.error(
-                "Twitch TTS broadcast routing requires the 48 kHz Quest mixer but received {} Hz; microphone/game audio continue and TTS broadcast output is muted",
+                "Chat TTS broadcast routing requires the 48 kHz Quest mixer but received {} Hz; microphone/game audio continue and TTS broadcast output is muted",
                 sampleRate);
         }
     }

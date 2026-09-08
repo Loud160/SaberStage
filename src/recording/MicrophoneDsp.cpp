@@ -55,8 +55,11 @@ void MicrophoneDsp::Configure(
     const settings::AudioProcessingSettings defaults;
     settings_.gateOpenThresholdDb = SafeSetting(
         settings_.gateOpenThresholdDb, -60.0F, -5.0F, defaults.gateOpenThresholdDb);
+    settings_.pushToTalkReleaseMilliseconds = SafeSetting(
+        settings_.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
+        defaults.pushToTalkReleaseMilliseconds);
     settings_.gateCloseThresholdDb = std::min(
-        SafeSetting(settings_.gateCloseThresholdDb, -70.0F, -5.0F,
+        SafeSetting(settings_.gateCloseThresholdDb, -90.0F, -5.0F,
             defaults.gateCloseThresholdDb),
         settings_.gateOpenThresholdDb - 3.0F);
     settings_.gateAttackMilliseconds = SafeSetting(
@@ -146,10 +149,14 @@ void MicrophoneDsp::Process(float* monoSamples, std::size_t frameCount) noexcept
             break;
     }
 
-    if (requestedOpen) {
+    // Hold belongs to voice activation only. PTT instead has its own short
+    // release envelope, while Open mode has neither gate timing behavior.
+    if (requestedOpen &&
+            settings_.microphoneMode == settings::MicrophoneMode::VoiceActivated) {
         gateHoldSamplesRemaining_ = static_cast<std::size_t>(std::lround(
             settings_.gateHoldMilliseconds * 0.001F * static_cast<float>(sampleRate_)));
-    } else if (gateHoldSamplesRemaining_ > frameCount) {
+    } else if (settings_.microphoneMode == settings::MicrophoneMode::VoiceActivated &&
+            gateHoldSamplesRemaining_ > frameCount) {
         gateHoldSamplesRemaining_ -= frameCount;
         requestedOpen = true;
     } else {
@@ -157,11 +164,18 @@ void MicrophoneDsp::Process(float* monoSamples, std::size_t frameCount) noexcept
     }
 
     const auto gateAttack = TimeCoefficient(settings_.gateAttackMilliseconds);
-    const auto gateRelease = TimeCoefficient(settings_.gateReleaseMilliseconds);
+    const auto gateRelease = TimeCoefficient(
+        settings_.microphoneMode == settings::MicrophoneMode::PushToTalk
+            ? settings_.pushToTalkReleaseMilliseconds
+            : settings_.gateReleaseMilliseconds);
     const auto compressorAttack = TimeCoefficient(settings_.compressorAttackMilliseconds);
     const auto compressorRelease = TimeCoefficient(settings_.compressorReleaseMilliseconds);
     const auto limiterRelease = TimeCoefficient(settings_.limiterReleaseMilliseconds);
-    const auto makeup = DbToLinear(settings_.compressorMakeupDb);
+    // Makeup is part of the compressor. Bypassing compression must be a true
+    // bypass, especially because the UI disables its subordinate controls.
+    const auto makeup = settings_.compressorEnabled
+        ? DbToLinear(settings_.compressorMakeupDb)
+        : 1.0F;
     const auto limiterCeiling = DbToLinear(settings_.limiterCeilingDb);
     float maximumCompressorReduction = 0.0F;
     float maximumLimiterReduction = 0.0F;

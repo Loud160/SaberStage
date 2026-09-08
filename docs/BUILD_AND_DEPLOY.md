@@ -20,7 +20,7 @@ This restores dependencies, builds the platform-neutral settings code in WSL, ru
 & 'C:\Users\Owner\AppData\Local\Programs\QPM\qpm.exe' scripts qmod
 ```
 
-The build uses QPM's Ninja, the installed QPM NDK at `C:\Users\Owner\AppData\Roaming\QPM-RS\ndk\android-ndk-r27d`, and a user-local CMake at `C:\Users\Owner\AppData\Local\SaberStage\tools\cmake\cmake\data\bin\cmake.exe`. That CMake was installed as a user-local tool and is not part of the repository. On the first build, the script also invokes WSL to create the SHA-pinned private FFmpeg/Mbed TLS ARM64 runtime documented in `docs/DIRECT_FFMPEG_AND_LIVESTREAM.md`; later builds reuse the staged runtime.
+The build uses QPM's Ninja, the installed QPM NDK at `C:\Users\Owner\AppData\Roaming\QPM-RS\ndk\android-ndk-r27d`, and a user-local CMake at `C:\Users\Owner\AppData\Local\SaberStage\tools\cmake\cmake\data\bin\cmake.exe`. That CMake was installed as a user-local tool and is not part of the repository. On the first build, the script also invokes WSL to create the SHA-pinned private FFmpeg/Mbed TLS ARM64 runtime documented in `docs/DIRECT_FFMPEG_AND_LIVESTREAM.md`; later builds reuse the staged runtime. It also prepares the pinned KittenTTS Nano v0.2 model and private sherpa-onnx/ONNX Runtime ARM64 libraries documented in `docs/CHAT_TTS_AND_MICROPHONE_AUDIO.md`.
 
 Before CMake runs, `scripts/prepare-native-logger.py` resolves the immutable
 Native Logger Quest revision recorded in `dependencies/native-logger.json`.
@@ -32,7 +32,8 @@ bring Paper2 for their own use.
 
 Output is `SaberStage.qmod`. Packaging automatically verifies manifest
 identity, payload boundaries, dependency IDs, byte-for-byte inclusion of
-SaberStage and all three private FFmpeg libraries, ELF64/AArch64 identity, and
+SaberStage, all three private FFmpeg libraries, and both private neural-TTS
+runtime libraries, ELF64/AArch64 identity, and
 Scotland2 entry-point names. The native build additionally rejects a direct
 Paper2 `DT_NEEDED` entry or leaked private Paper bridge symbols. Build outputs,
 downloaded dependency sources, generated manifests, binaries, and QMODs are

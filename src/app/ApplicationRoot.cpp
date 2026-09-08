@@ -17,6 +17,7 @@
 #include "saberstage/camera/CameraManager.hpp"
 #include "saberstage/broadcast/TwitchService.hpp"
 #include "saberstage/broadcast/TtsService.hpp"
+#include "saberstage/network/CloudflareSpeedTest.hpp"
 #include "saberstage/preview/PreviewManager.hpp"
 #include "saberstage/recording/RecordingController.hpp"
 #include "saberstage/ui/MenuController.hpp"
@@ -71,7 +72,15 @@ bool ApplicationRoot::Start() {
     tts_->ApplySettings(settings_.Get().tts);
     recording_ = std::make_unique<recording::RecordingController>(
         settings_, *camera_, *tts_, kQuestVideoShotsDirectory);
-    twitch_ = std::make_unique<broadcast::TwitchService>(settings_, *tts_);
+    twitch_ = std::make_unique<broadcast::TwitchService>(
+        settings_,
+        [this](const broadcast::ChatMessage& message) {
+            // Chat providers publish the same normalized message shape used by
+            // the panel. TTS remains provider-agnostic and can consume future
+            // YouTube/Kick adapters without acquiring transport dependencies.
+            if (tts_) tts_->Enqueue(message);
+        });
+    connectionTest_ = std::make_unique<network::CloudflareSpeedTest>();
 
     menu_ = std::make_unique<ui::MenuController>(*this);
     menu_->Register();
@@ -105,7 +114,11 @@ void ApplicationRoot::Stop() noexcept {
         if (twitch_) twitch_->Shutdown();
         twitch_.reset();
     });
-    errors.Guard("stopping Twitch text-to-speech", [this] {
+    errors.Guard("stopping the Cloudflare connection test", [this] {
+        if (connectionTest_) connectionTest_->Shutdown();
+        connectionTest_.reset();
+    });
+    errors.Guard("stopping Chat TTS", [this] {
         if (tts_) tts_->Shutdown();
         tts_.reset();
     });
@@ -123,5 +136,8 @@ preview::PreviewManager& ApplicationRoot::Preview() noexcept { return *preview_;
 recording::RecordingController& ApplicationRoot::Recording() noexcept { return *recording_; }
 broadcast::TwitchService& ApplicationRoot::Twitch() noexcept { return *twitch_; }
 broadcast::TtsService& ApplicationRoot::Tts() noexcept { return *tts_; }
+network::CloudflareSpeedTest& ApplicationRoot::ConnectionTest() noexcept {
+    return *connectionTest_;
+}
 
 } // namespace saberstage::app

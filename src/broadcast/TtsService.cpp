@@ -13,7 +13,7 @@
 #include "saberstage/broadcast/TtsService.hpp"
 
 #include "saberstage/Logging.hpp"
-#include "saberstage/broadcast/EspeakTtsBackend.hpp"
+#include "saberstage/broadcast/KittenTtsBackend.hpp"
 #include "saberstage/broadcast/TtsData.hpp"
 #include "saberstage/broadcast/TtsPolicy.hpp"
 
@@ -195,9 +195,9 @@ void TtsService::ApplySettings(const settings::TtsSettings& settings) {
         if (!settings.enabled) {
             queue_.clear();
             speaking_ = false;
-            status_ = "Twitch TTS is off";
+            status_ = "Chat TTS is off";
         } else if (!wasEnabled) {
-            status_ = "Twitch TTS is ready for chat";
+            status_ = "Chat TTS is ready";
         }
     }
     const auto routeChanged = previousRoute != settings.outputRoute;
@@ -211,10 +211,11 @@ void TtsService::ApplySettings(const settings::TtsSettings& settings) {
         headsetRing_->Clear();
         broadcastRing_->Clear();
         headsetStopRequested_.store(true, std::memory_order_release);
-        if (wasEnabled) Logging::Logger.info("Twitch TTS disabled; queued and buffered speech cleared");
+        backendResetRequested_.store(true, std::memory_order_release);
+        if (wasEnabled) Logging::Logger.info("Chat TTS disabled; queued and buffered speech cleared");
     } else if (!wasEnabled) {
         Logging::Logger.info(
-            "Twitch TTS enabled (route={}, queueCapacity={}, maximumCharacters={})",
+            "Chat TTS enabled (route={}, queueCapacity={}, maximumCharacters={})",
             settings::ToString(settings.outputRoute), settings.queueCapacity,
             settings.maximumCharacters);
     }
@@ -228,7 +229,7 @@ void TtsService::ApplySettings(const settings::TtsSettings& settings) {
     condition_.notify_one();
 }
 
-void TtsService::Enqueue(const TwitchChatMessage& message) noexcept {
+void TtsService::Enqueue(const ChatMessage& message) noexcept {
     if (!enabled_.load(std::memory_order_acquire)) return;
     try {
         std::lock_guard lock(mutex_);
@@ -245,9 +246,9 @@ void TtsService::Enqueue(const TwitchChatMessage& message) noexcept {
         queue_.push_back({*utterance, std::chrono::steady_clock::now()});
         condition_.notify_one();
     } catch (const std::exception& error) {
-        Logging::Logger.error("Twitch TTS queue rejected a message: {}", error.what());
+        Logging::Logger.error("Chat TTS queue rejected a message: {}", error.what());
     } catch (...) {
-        Logging::Logger.error("Twitch TTS queue rejected a message with an unknown error");
+        Logging::Logger.error("Chat TTS queue rejected a message with an unknown error");
     }
 }
 
@@ -257,13 +258,13 @@ void TtsService::ClearQueue() noexcept {
             std::lock_guard lock(mutex_);
             queue_.clear();
             status_ = enabled_.load(std::memory_order_acquire)
-                ? "TTS queue cleared" : "Twitch TTS is off";
+                ? "TTS queue cleared" : "Chat TTS is off";
         }
         clearGeneration_.fetch_add(1, std::memory_order_acq_rel);
         headsetRing_->Clear();
         broadcastRing_->Clear();
     } catch (...) {
-        Logging::Logger.error("Twitch TTS queue could not be cleared safely");
+        Logging::Logger.error("Chat TTS queue could not be cleared safely");
     }
 }
 
@@ -283,8 +284,9 @@ TtsSnapshot TtsService::Snapshot() const {
 
 void TtsService::Shutdown() noexcept {
     if (stop_.exchange(true, std::memory_order_acq_rel)) return;
-    // Wake/cancel eSpeak through its callback generation before joining so a
-    // long utterance cannot hold shutdown until its full text has completed.
+    // Wake/cancel the neural backend through its progress callback generation
+    // before joining so a long utterance cannot hold shutdown until its full
+    // text has completed.
     clearGeneration_.fetch_add(1, std::memory_order_acq_rel);
     headsetRing_->Clear();
     broadcastRing_->Clear();
@@ -292,7 +294,7 @@ void TtsService::Shutdown() noexcept {
     try {
         if (worker_.joinable()) worker_.join();
     } catch (...) {
-        Logging::Logger.error("Twitch TTS worker could not be joined during shutdown");
+        Logging::Logger.error("Chat TTS worker could not be joined during shutdown");
     }
     StopHeadsetOutput();
     if (backend_) backend_->Shutdown();
@@ -301,12 +303,17 @@ void TtsService::Shutdown() noexcept {
 
 bool TtsService::EnsureBackend(std::string* error) {
     if (backendReady_.load(std::memory_order_acquire) && backend_) return true;
-    auto backend = std::make_unique<EspeakTtsBackend>();
-    const auto data = EnsureEmbeddedTtsData(storageRoot_);
+    {
+        std::lock_guard lock(mutex_);
+        status_ = "Loading KittenTTS neural voice...";
+    }
+    auto backend = std::make_unique<KittenTtsBackend>();
+    const auto data = EnsureEmbeddedKittenTtsData(storageRoot_);
     if (!backend->Initialize(data, error)) return false;
     backend_ = std::move(backend);
     backendReady_.store(true, std::memory_order_release);
-    Logging::Logger.info("Twitch TTS initialized the embedded eSpeak NG English backend");
+    Logging::Logger.info(
+        "Chat TTS initialized KittenTTS Nano English v0.2 through private sherpa-onnx 1.13.7");
     return true;
 }
 
@@ -320,6 +327,7 @@ void TtsService::Worker() noexcept {
                 condition_.wait(lock, [this] {
                     return stop_.load(std::memory_order_acquire) ||
                         headsetStopRequested_.load(std::memory_order_acquire) ||
+                        backendResetRequested_.load(std::memory_order_acquire) ||
                         !queue_.empty();
                 });
                 if (stop_.load(std::memory_order_acquire)) break;
@@ -327,8 +335,15 @@ void TtsService::Worker() noexcept {
                     lock.unlock();
                     StopHeadsetOutput();
                     lock.lock();
-                    if (queue_.empty()) continue;
                 }
+                if (backendResetRequested_.exchange(false, std::memory_order_acq_rel)) {
+                    lock.unlock();
+                    if (backend_) backend_->Shutdown();
+                    backend_.reset();
+                    backendReady_.store(false, std::memory_order_release);
+                    lock.lock();
+                }
+                if (queue_.empty()) continue;
                 item = std::move(queue_.front());
                 queue_.pop_front();
                 current = settings_;
@@ -339,7 +354,7 @@ void TtsService::Worker() noexcept {
                     continue;
                 }
                 speaking_ = true;
-                status_ = "Speaking Twitch chat";
+                status_ = "Speaking chat message";
             }
             std::string error;
             std::vector<float> source;
@@ -353,7 +368,7 @@ void TtsService::Worker() noexcept {
                 speaking_ = false;
                 status_ = "TTS failed; see SaberStage log";
                 ++droppedMessages_;
-                Logging::Logger.error("Twitch TTS synthesis failed: {}", error);
+                Logging::Logger.error("Chat TTS synthesis failed: {}", error);
                 continue;
             }
             auto output = ResampleTo48Khz(source, sourceRate,
@@ -377,14 +392,14 @@ void TtsService::Worker() noexcept {
                 speaking_ = false;
                 if (accepted) {
                     ++spokenMessages_;
-                    status_ = "Twitch TTS is ready for chat";
+                    status_ = "Chat TTS is ready";
                 } else {
                     ++droppedMessages_;
                     status_ = "TTS output queue was full; a message was skipped";
                 }
             }
             if (!accepted) {
-                Logging::Logger.warn("Twitch TTS output skipped: {}",
+                Logging::Logger.warn("Chat TTS output skipped: {}",
                     error.empty() ? "bounded PCM queue was full" : error);
             }
         }
@@ -393,13 +408,13 @@ void TtsService::Worker() noexcept {
         backendReady_.store(false, std::memory_order_release);
         speaking_ = false;
         status_ = "TTS worker stopped; see SaberStage log";
-        Logging::Logger.error("Twitch TTS worker stopped: {}", error.what());
+        Logging::Logger.error("Chat TTS worker stopped: {}", error.what());
     } catch (...) {
         std::lock_guard lock(mutex_);
         backendReady_.store(false, std::memory_order_release);
         speaking_ = false;
         status_ = "TTS worker stopped; see SaberStage log";
-        Logging::Logger.error("Twitch TTS worker stopped with an unknown error");
+        Logging::Logger.error("Chat TTS worker stopped with an unknown error");
     }
 }
 

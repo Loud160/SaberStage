@@ -34,7 +34,10 @@ struct ChatEmote {
     std::size_t begin = 0;
     std::size_t end = 0;
 };
-struct TwitchChatMessage {
+// Provider-neutral message consumed by the chat panel, moderation/request
+// features, and Chat TTS. Transport adapters populate this normalized shape;
+// downstream features must not depend on Twitch IRC payloads.
+struct ChatMessage {
     std::uint64_t sequence = 0;
     std::string author;
     std::string text;
@@ -54,7 +57,7 @@ struct TwitchChatMessage {
 enum class ChatMutation { Append, DeleteMessage, ClearUser, ClearChannel };
 struct ChatEvent {
     ChatMutation mutation = ChatMutation::Append;
-    TwitchChatMessage message;
+    ChatMessage message;
     std::string targetId;
 };
 
@@ -62,10 +65,10 @@ struct ChatEvent {
 [[nodiscard]] std::string EscapeChatMarkup(std::string_view text);
 [[nodiscard]] bool IsChatColor(std::string_view text) noexcept;
 [[nodiscard]] std::string ReadableChatColor(std::string_view text);
-[[nodiscard]] std::string FormatChatText(const TwitchChatMessage &message, bool badges = true);
+[[nodiscard]] std::string FormatChatText(const ChatMessage &message, bool badges = true);
 // Deletions/clears increment the caller's revision even when the newest
 // sequence is unchanged. This is essential for already-visible virtual rows.
-bool ApplyChatEvent(std::vector<TwitchChatMessage> &history, ChatEvent event, std::uint64_t &nextSequence,
+bool ApplyChatEvent(std::vector<ChatMessage> &history, ChatEvent event, std::uint64_t &nextSequence,
                     std::size_t limit = 128);
 
 } // namespace saberstage::broadcast

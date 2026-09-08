@@ -119,7 +119,10 @@ int main() {
               defaults.tts.ignoreCommands && !defaults.tts.speakUrls &&
               !defaults.tts.speakEmoteNames && defaults.tts.queueCapacity == 4 &&
               defaults.tts.outputRoute == TtsOutputRoute::HeadsetOnly,
-          "local Twitch TTS defaults off with conservative filtering and queue bounds");
+          "local Chat TTS defaults off with conservative filtering and queue bounds");
+    Check(!defaults.connectionTest.hasResult &&
+              defaults.connectionTest.sustainedUploadMegabitsPerSecond == 0.0F,
+          "connection test defaults do not impose an unmeasured stream ceiling");
     Check(defaults.broadcast.provider == LivestreamProvider::Twitch &&
               defaults.broadcast.twitch.serverUrl.rfind("rtmp://", 0) == 0 &&
               defaults.broadcast.youtube.serverUrl.rfind("rtmps://", 0) == 0 &&
@@ -171,15 +174,23 @@ int main() {
     invalid.broadcast.reconnectAttempts = 1000;
     invalid.broadcast.gameAudioVolumePercent = -20.0F;
     invalid.broadcast.microphoneVolumePercent = 500.0F;
+    invalid.audio.includeMicrophoneInRecordings = false;
+    invalid.audio.includeMicrophoneInLivestreams = false;
     invalid.broadcast.youtube.serverUrl = "https://not-an-rtmp-endpoint";
     invalid.broadcast.kick.streamKey = "invalid key with spaces";
     invalid.audio.gateOpenThresholdDb = std::numeric_limits<float>::quiet_NaN();
     invalid.audio.gateCloseThresholdDb = 4.0F;
+    invalid.audio.pushToTalkReleaseMilliseconds = 5000.0F;
     invalid.audio.compressorRatio = -2.0F;
     invalid.audio.limiterCeilingDb = 6.0F;
     invalid.tts.maximumCharacters = 50'000;
     invalid.tts.queueCapacity = 0;
     invalid.tts.speechRate = std::numeric_limits<float>::infinity();
+    invalid.tts.voice = "unsupported-voice";
+    invalid.connectionTest.hasResult = true;
+    invalid.connectionTest.sustainedUploadMegabitsPerSecond =
+        std::numeric_limits<float>::quiet_NaN();
+    invalid.connectionTest.testedAtUnixSeconds = -1;
     const auto validation = ValidateAndRepair(invalid);
     Check(validation.changed && validation.repairedFields >= 7, "invalid fields are repaired individually");
     Check(invalid.camera.Primary().fovDegrees == defaults.camera.Primary().fovDegrees, "invalid FOV repairs to default");
@@ -194,18 +205,39 @@ int main() {
     Check(invalid.broadcast.gameAudioVolumePercent == 100.0F &&
               invalid.broadcast.microphoneVolumePercent == 100.0F,
           "livestream audio mix volumes repair to safe defaults");
+    Check(invalid.audio.includeMicrophoneInRecordings &&
+              invalid.audio.includeMicrophoneInLivestreams,
+          "legacy microphone routing with no destination repairs to Both");
     Check(invalid.broadcast.youtube.serverUrl == defaults.broadcast.youtube.serverUrl &&
               invalid.broadcast.kick.streamKey.empty(),
           "invalid service-specific livestream destinations repair without exposing credentials");
     Check(invalid.audio.gateOpenThresholdDb == defaults.audio.gateOpenThresholdDb &&
               invalid.audio.gateCloseThresholdDb <= invalid.audio.gateOpenThresholdDb &&
+              invalid.audio.pushToTalkReleaseMilliseconds ==
+                  defaults.audio.pushToTalkReleaseMilliseconds &&
               invalid.audio.compressorRatio == defaults.audio.compressorRatio &&
               invalid.audio.limiterCeilingDb == defaults.audio.limiterCeilingDb,
           "invalid microphone DSP values repair to safe finite settings");
+    auto wideGateOffset = defaults;
+    wideGateOffset.audio.gateOpenThresholdDb = -60.0F;
+    wideGateOffset.audio.gateCloseThresholdDb = -90.0F;
+    ValidateAndRepair(wideGateOffset);
+    Check(wideGateOffset.audio.gateCloseThresholdDb == -90.0F,
+          "voice gate preserves a 30 dB cutoff offset at the quietest open threshold");
     Check(invalid.tts.maximumCharacters == defaults.tts.maximumCharacters &&
               invalid.tts.queueCapacity == defaults.tts.queueCapacity &&
-              invalid.tts.speechRate == defaults.tts.speechRate,
-          "invalid Twitch TTS bounds repair to disabled-safe defaults");
+              invalid.tts.speechRate == defaults.tts.speechRate &&
+              invalid.tts.voice == defaults.tts.voice,
+          "invalid Chat TTS bounds repair to disabled-safe defaults");
+    Check(!invalid.connectionTest.hasResult &&
+              invalid.connectionTest.sustainedUploadMegabitsPerSecond == 0.0F &&
+              invalid.connectionTest.testedAtUnixSeconds == 0,
+          "invalid persisted bandwidth measurements cannot disable or bypass stream limits");
+    auto legacyTtsVoice = defaults;
+    legacyTtsVoice.tts.voice = "en-gb-scotland";
+    ValidateAndRepair(legacyTtsVoice);
+    Check(legacyTtsVoice.tts.voice == defaults.tts.voice,
+          "legacy eSpeak voice migrates to the default KittenTTS neural voice");
     auto excessProfiles = defaults;
     auto futureProfile = saberstage::camera::DefaultCameraProfile();
     futureProfile.profileId = "future-secondary";
@@ -305,15 +337,23 @@ int main() {
     first.Edit().broadcast.postMapInfoToChat = true;
     first.Edit().audio.microphoneMode = MicrophoneMode::VoiceActivated;
     first.Edit().audio.pushToTalkHand = PushToTalkHand::Right;
+    first.Edit().audio.pushToTalkReleaseMilliseconds = 230.0F;
     first.Edit().audio.includeMicrophoneInRecordings = false;
     first.Edit().audio.includeMicrophoneInLivestreams = true;
     first.Edit().audio.highPassEnabled = false;
     first.Edit().audio.gateOpenThresholdDb = -33.0F;
     first.Edit().audio.gateCloseThresholdDb = -44.0F;
+    first.Edit().audio.gateAttackMilliseconds = 17.0F;
+    first.Edit().audio.gateHoldMilliseconds = 260.0F;
+    first.Edit().audio.gateReleaseMilliseconds = 310.0F;
     first.Edit().audio.gatePreRollMilliseconds = 50.0F;
+    first.Edit().audio.compressorThresholdDb = -21.0F;
     first.Edit().audio.compressorRatio = 4.0F;
+    first.Edit().audio.compressorAttackMilliseconds = 13.0F;
+    first.Edit().audio.compressorReleaseMilliseconds = 180.0F;
     first.Edit().audio.compressorMakeupDb = 4.0F;
     first.Edit().audio.limiterCeilingDb = -2.0F;
+    first.Edit().audio.limiterReleaseMilliseconds = 90.0F;
     first.Edit().tts.enabled = true;
     first.Edit().tts.speakUsernames = false;
     first.Edit().tts.ignoreKnownBots = false;
@@ -325,8 +365,17 @@ int main() {
     first.Edit().tts.staleAfterSeconds = 20.0F;
     first.Edit().tts.volumePercent = 90.0F;
     first.Edit().tts.speechRate = 1.25F;
-    first.Edit().tts.voice = "en-gb";
+    first.Edit().tts.voice = "expr-voice-4-f";
     first.Edit().tts.outputRoute = TtsOutputRoute::HeadsetAndBroadcast;
+    first.Edit().connectionTest.hasResult = true;
+    first.Edit().connectionTest.sustainedDownloadMegabitsPerSecond = 312.5F;
+    first.Edit().connectionTest.sustainedUploadMegabitsPerSecond = 18.75F;
+    first.Edit().connectionTest.peakDownloadMegabitsPerSecond = 401.0F;
+    first.Edit().connectionTest.peakUploadMegabitsPerSecond = 22.5F;
+    first.Edit().connectionTest.latencyMilliseconds = 17.0F;
+    first.Edit().connectionTest.jitterMilliseconds = 2.5F;
+    first.Edit().connectionTest.durationSeconds = 28.0F;
+    first.Edit().connectionTest.testedAtUnixSeconds = 1'800'000'123;
     // Saving migrates any alpha-era per-user Client ID to SaberStage's
     // registered public application identifier.
     first.Edit().broadcast.twitchAccount.clientId = "legacy-client-id";
@@ -426,15 +475,23 @@ int main() {
           "livestream destinations, AFK media, and protected Twitch account state survive restart");
     Check(second.Get().audio.microphoneMode == MicrophoneMode::VoiceActivated &&
               second.Get().audio.pushToTalkHand == PushToTalkHand::Right &&
+              second.Get().audio.pushToTalkReleaseMilliseconds == 230.0F &&
               !second.Get().audio.includeMicrophoneInRecordings &&
               second.Get().audio.includeMicrophoneInLivestreams &&
               !second.Get().audio.highPassEnabled &&
               second.Get().audio.gateOpenThresholdDb == -33.0F &&
               second.Get().audio.gateCloseThresholdDb == -44.0F &&
+              second.Get().audio.gateAttackMilliseconds == 17.0F &&
+              second.Get().audio.gateHoldMilliseconds == 260.0F &&
+              second.Get().audio.gateReleaseMilliseconds == 310.0F &&
               second.Get().audio.gatePreRollMilliseconds == 50.0F &&
+              second.Get().audio.compressorThresholdDb == -21.0F &&
               second.Get().audio.compressorRatio == 4.0F &&
+              second.Get().audio.compressorAttackMilliseconds == 13.0F &&
+              second.Get().audio.compressorReleaseMilliseconds == 180.0F &&
               second.Get().audio.compressorMakeupDb == 4.0F &&
-              second.Get().audio.limiterCeilingDb == -2.0F,
+              second.Get().audio.limiterCeilingDb == -2.0F &&
+              second.Get().audio.limiterReleaseMilliseconds == 90.0F,
           "microphone modes, routing, and DSP values survive restart");
     Check(second.Get().tts.enabled && !second.Get().tts.speakUsernames &&
               !second.Get().tts.ignoreKnownBots && !second.Get().tts.ignoreCommands &&
@@ -444,9 +501,19 @@ int main() {
               second.Get().tts.staleAfterSeconds == 20.0F &&
               second.Get().tts.volumePercent == 90.0F &&
               second.Get().tts.speechRate == 1.25F &&
-              second.Get().tts.voice == "en-gb" &&
+              second.Get().tts.voice == "expr-voice-4-f" &&
               second.Get().tts.outputRoute == TtsOutputRoute::HeadsetAndBroadcast,
-          "Twitch TTS filtering, voice, queue, and routing survive restart");
+          "Chat TTS filtering, voice, queue, and routing survive restart");
+    Check(second.Get().connectionTest.hasResult &&
+              second.Get().connectionTest.sustainedDownloadMegabitsPerSecond == 312.5F &&
+              second.Get().connectionTest.sustainedUploadMegabitsPerSecond == 18.75F &&
+              second.Get().connectionTest.peakDownloadMegabitsPerSecond == 401.0F &&
+              second.Get().connectionTest.peakUploadMegabitsPerSecond == 22.5F &&
+              second.Get().connectionTest.latencyMilliseconds == 17.0F &&
+              second.Get().connectionTest.jitterMilliseconds == 2.5F &&
+              second.Get().connectionTest.durationSeconds == 28.0F &&
+              second.Get().connectionTest.testedAtUnixSeconds == 1'800'000'123,
+          "connection quality results and the stream upload ceiling survive restart");
     Check(second.Get().chat.enabled && second.Get().chat.position.x == -0.32F &&
               second.Get().chat.rotationDegrees.y == 170.0F &&
               second.Get().chat.width == 240.0F && second.Get().chat.height == 200.0F,

@@ -1,22 +1,21 @@
 # Third-party notices
 
-## eSpeak NG
+## KittenTTS Nano and sherpa-onnx
 
-SaberStage statically builds [eSpeak NG](https://github.com/espeak-ng/espeak-ng)
-version `1.52.0` from immutable revision
-`4870adfa25b1a32b4361592f1be8a40337c58d6c`. The expected official source
-archive SHA-256 is
-`096f0915470c3bba4f9e3ba274485e453f26dedccb5c28a33f871a84f5e064a9`
-and the deterministic English data SHA-256 is
-`45d577818dc877ac5f8d62b1290b4efe92308512afa8f135a9b535745f0b2446`.
-Both are recorded in `dependencies/espeak-ng.json`. SaberStage uses its
-synchronous in-memory PCM API and a generated English-only voice-data set; it
-does not install a system speech service or invoke cloud TTS.
+SaberStage uses [KittenTTS Nano English v0.2](https://github.com/KittenML/KittenTTS)
+through [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 1.13.7. The exact
+model archive, C API header, Android runtime archive, prepared English-only
+model ZIP, and private-name runtime-library hashes are recorded in
+`dependencies/kitten-tts.json`. The model ZIP is embedded in
+`libsaberstage.so`; the ARM64 sherpa-onnx and ONNX Runtime libraries are shipped
+as private runtime payloads and loaded only while Chat TTS is enabled.
 
-eSpeak NG is distributed under GPL-3.0-or-later. Its copyright notices and
-complete license are preserved in the pinned upstream source prepared during a
-build. SaberStage distributes the combined work under GPL version 3 and the
-additional project terms in the repository root.
+KittenTTS model files and sherpa-onnx are distributed under Apache License 2.0.
+The ONNX Runtime binary included in sherpa-onnx's pinned Android distribution is
+distributed under the MIT License. Their upstream licenses and notices are
+preserved in the pinned source/model archives. SaberStage does not install an
+Android speech service, invoke cloud speech, or share these private libraries
+with other mods.
 
 ## Native Logger Quest
 

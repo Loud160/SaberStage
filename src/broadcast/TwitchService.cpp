@@ -11,7 +11,6 @@
 // - Tokens remain behind the secure-settings boundary and network results are marshalled to callers.
 
 #include "saberstage/broadcast/TwitchService.hpp"
-#include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/broadcast/ChatNetwork.hpp"
 
 #include "saberstage/Logging.hpp"
@@ -451,8 +450,34 @@ void ClearAccountAuthorization(settings::TwitchAccountSettings& account) noexcep
 
 } // namespace
 
-TwitchService::TwitchService(settings::SettingsService& settings, TtsService& tts)
-    : settings_(settings), tts_(tts) {
+void TwitchService::PublishChatEvent(ChatEvent event) {
+    const bool appending = event.mutation == ChatMutation::Append;
+    std::optional<ChatMessage> acceptedMessage;
+    {
+        std::lock_guard lock(mutex_);
+        if (!ApplyChatEvent(
+                snapshot_.messages,
+                std::move(event),
+                nextMessageSequence_,
+                kMaximumChatMessages)) {
+            return;
+        }
+        ++snapshot_.messagesRevision;
+        if (appending && !snapshot_.messages.empty()) {
+            // Chat TTS receives the exact normalized, de-duplicated message
+            // accepted into the panel history—not provider protocol text.
+            acceptedMessage = snapshot_.messages.back();
+        }
+    }
+    // Synthesis queue work remains outside the snapshot lock so a busy chat
+    // cannot delay panel readers or Twitch state transitions.
+    if (acceptedMessage && onChatMessage_) onChatMessage_(*acceptedMessage);
+}
+
+TwitchService::TwitchService(
+    settings::SettingsService& settings,
+    ChatMessageCallback onChatMessage)
+    : settings_(settings), onChatMessage_(std::move(onChatMessage)) {
     avformat_network_init();
     requests_ = std::make_unique<SongRequestService>(settings_.Path().parent_path() / "ChatRequests", LookupRequestedMap);
     notices_ = std::make_unique<TwitchNotices>(
@@ -481,9 +506,7 @@ TwitchService::TwitchService(settings::SettingsService& settings, TtsService& tt
             return NoticeSubscriptionResult::Connected;
         },
         [this](ChatEvent event) {
-            if (event.mutation == ChatMutation::Append) tts_.Enqueue(event.message);
-            std::lock_guard lock(mutex_);
-            if (ApplyChatEvent(snapshot_.messages, std::move(event), nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
+            PublishChatEvent(std::move(event));
         });
     auto& account = settings_.Edit().broadcast.twitchAccount;
     std::string secureStorageError;
@@ -1495,10 +1518,7 @@ void TwitchService::ChatWorker(std::string accessToken, std::string login) noexc
                 auto event = ParseTwitchChatLine(line);
                 if (!event) continue;
                 if (event->mutation == ChatMutation::Append && requests_) requests_->Receive(event->message);
-                if (event->mutation == ChatMutation::Append) tts_.Enqueue(event->message);
-                std::lock_guard lock(mutex_);
-                if (ApplyChatEvent(snapshot_.messages, std::move(*event),
-                        nextMessageSequence_, kMaximumChatMessages)) ++snapshot_.messagesRevision;
+                PublishChatEvent(std::move(*event));
             }
             if (!disconnectReason.empty()) break;
             if (pending.size() > 16U * 1024U) pending.clear();
@@ -1924,9 +1944,9 @@ void TwitchService::DisconnectAccount() {
     refreshStop_.store(true, std::memory_order_release);
     SetChatEnabled(false);
     chatStop_ = true;
-    // Account disconnect is an explicit privacy/lifecycle boundary. Stop both
-    // queued speech and already-buffered headset/broadcast PCM immediately.
-    tts_.ClearQueue();
+    // Provider disconnect stops future messages at the transport boundary.
+    // Already-normalized panel messages and Chat TTS lifecycle remain owned by
+    // their provider-neutral consumers rather than by the Twitch adapter.
     requests_->SetChannel({});
     notices_->Configure({}, {}, {}, false, false);
     assets_.Configure({}, {}, {}, false);

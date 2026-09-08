@@ -6,7 +6,7 @@
 // section 7(b)/(c) and an interoperability permission under section 7;
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
-// File responsibility: materializes SaberStage's embedded, versioned English TTS data safely.
+// File responsibility: materializes SaberStage's embedded, versioned KittenTTS model safely.
 
 #pragma once
 
@@ -14,7 +14,8 @@
 
 namespace saberstage::broadcast {
 
-// Returns the parent directory that contains espeak-ng-data.
-std::filesystem::path EnsureEmbeddedTtsData(const std::filesystem::path& storageRoot);
+// Returns the directory containing model.fp16.onnx, voices.bin, tokens.txt,
+// and the English phonemizer data used by the pinned neural model.
+std::filesystem::path EnsureEmbeddedKittenTtsData(const std::filesystem::path& storageRoot);
 
 } // namespace saberstage::broadcast

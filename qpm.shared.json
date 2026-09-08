@@ -31,7 +31,8 @@
       "qmodIncludeDirs": [
         "./build",
         "./extern/libs",
-        "./.cache/dependencies/ffmpeg-hardware/lib"
+        "./.cache/dependencies/ffmpeg-hardware/lib",
+        "./.cache/dependencies/kitten-tts/lib"
       ],
       "qmodIncludeFiles": [],
       "qmodOutput": "SaberStage.qmod"

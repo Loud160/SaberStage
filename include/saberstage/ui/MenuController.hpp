@@ -141,7 +141,17 @@ private:
     void TickChatWorldPanel() noexcept;
     void ShowCenterDebugTab(int index);
     void ApplyAudioSettings(bool requestPermission = false);
+    void RefreshAudioControlState(bool synchronizeValues = false);
+    void RefreshAudioMeter();
+    void ShowAudioResetConfirmation(int resetKind);
+    void ResolveAudioResetConfirmation(bool confirmed);
     void ApplyTtsSettings();
+    void ShowTtsClearQueueConfirmation();
+    void ResolveTtsClearQueueConfirmation(bool confirmed);
+    void ShowConnectionTestConsent();
+    void ResolveConnectionTestConsent(bool accepted);
+    void RefreshConnectionTestUi();
+    void ShowConnectionTestResults();
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     void ApplyLivestreamReferenceLayout();
@@ -153,10 +163,45 @@ private:
     // roots let the debug colors expose both bounds while tab visibility and
     // native scroll layout remain independently controlled.
     HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 3> centerDebugTabViewRoots_{};
-    std::array<UnityEngine::GameObject*, 3> centerDebugTabContentRoots_{};
+    std::array<UnityEngine::GameObject*, 4> centerDebugTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 4> centerDebugTabContentRoots_{};
     TMPro::TextMeshProUGUI* audioInputStatusText_ = nullptr;
+    TMPro::TextMeshProUGUI* audioLevelMeterText_ = nullptr;
+    TMPro::TextMeshProUGUI* audioLevelMeterValueText_ = nullptr;
+    TMPro::TextMeshProUGUI* audioLevelMeterThresholdText_ = nullptr;
+    HMUI::ImageView* audioLevelMeterFill_ = nullptr;
+    HMUI::ImageView* audioLevelMeterOrangeFill_ = nullptr;
+    HMUI::ImageView* audioLevelMeterRedFill_ = nullptr;
+    HMUI::ImageView* audioLevelMeterClipFill_ = nullptr;
+    HMUI::ImageView* audioLevelMeterThreshold_ = nullptr;
+    BSML::SliderSetting* audioLevelThresholdSlider_ = nullptr;
+    UnityEngine::GameObject* pushToTalkControlsRoot_ = nullptr;
+    UnityEngine::GameObject* voiceActivationControlsRoot_ = nullptr;
+    UnityEngine::GameObject* compressorControlsRoot_ = nullptr;
+    UnityEngine::GameObject* limiterControlsRoot_ = nullptr;
+    HMUI::ViewController* settingsView_ = nullptr;
+    BSML::ModalView* audioResetConfirmationModal_ = nullptr;
+    TMPro::TextMeshProUGUI* audioResetConfirmationText_ = nullptr;
+    int pendingAudioResetKind_ = 0;
     TMPro::TextMeshProUGUI* ttsStatusText_ = nullptr;
+    BSML::ModalView* ttsClearQueueConfirmationModal_ = nullptr;
+    BSML::ModalView* connectionTestConsentModal_ = nullptr;
+    BSML::ModalView* connectionTestProgressModal_ = nullptr;
+    BSML::ModalView* connectionTestResultsModal_ = nullptr;
+    TMPro::TextMeshProUGUI* connectionTestTabSummaryText_ = nullptr;
+    TMPro::TextMeshProUGUI* connectionTestProgressText_ = nullptr;
+    TMPro::TextMeshProUGUI* connectionTestResultsText_ = nullptr;
+    HMUI::ImageView* connectionTestProgressFill_ = nullptr;
+    std::uint64_t connectionTestDisplayedRevision_ = 0;
+    bool connectionTestCompletionShown_ = false;
+    std::array<BSML::SliderSetting*, 2> audioVolumeSliders_{};
+    BSML::DropdownListSetting* pushToTalkControlDropdown_ = nullptr;
+    BSML::SliderSetting* pushToTalkReleaseSlider_ = nullptr;
+    std::array<BSML::SliderSetting*, 6> voiceActivationSliders_{};
+    BSML::ToggleSetting* compressorToggle_ = nullptr;
+    std::array<BSML::SliderSetting*, 5> compressorSliders_{};
+    BSML::ToggleSetting* limiterToggle_ = nullptr;
+    std::array<BSML::SliderSetting*, 2> limiterSliders_{};
     HMUI::TextSegmentedControl* settingsTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 4> tabViewRoots_{};
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
@@ -312,6 +357,7 @@ private:
     // finish before a new Twitch stream is allowed to start.
     bool pendingLiveTwitchTitleUpdate_ = false;
     float twitchUiRefreshSeconds_ = 0.0F;
+    float audioMeterRefreshSeconds_ = 0.0F;
     // Used to suppress one identical deferred-save error per frame while the
     // settings service performs its bounded one-second retry cadence.
     std::string lastDeferredSettingsSaveError_;

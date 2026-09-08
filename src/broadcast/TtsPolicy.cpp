@@ -160,7 +160,7 @@ std::string ReplaceUrls(std::string_view text, bool speakUrls) {
     return output;
 }
 
-std::string RemoveEmotes(const TwitchChatMessage& message) {
+std::string RemoveEmotes(const ChatMessage& message) {
     if (message.emotes.empty()) return message.text;
     std::string output;
     std::size_t cursor = 0;
@@ -177,7 +177,7 @@ std::string RemoveEmotes(const TwitchChatMessage& message) {
 } // namespace
 
 std::optional<std::string> BuildTtsUtterance(
-    const TwitchChatMessage& message,
+    const ChatMessage& message,
     const settings::TtsSettings& settings) {
     if (!settings.enabled || message.kind == ChatKind::Notice) return std::nullopt;
     const auto login = Lower(message.login.empty() ? message.author : message.login);
