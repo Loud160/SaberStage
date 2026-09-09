@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "saberstage/broadcast/DiscordScreenSink.hpp"
 #include "saberstage/camera/Math.hpp"
 #include "saberstage/ui/ChatPanelDiagnostics.hpp"
 #include "saberstage/ui/ChatPanelScrollGeometry.hpp"
@@ -152,6 +153,11 @@ private:
     void ResolveConnectionTestConsent(bool accepted);
     void RefreshConnectionTestUi();
     void ShowConnectionTestResults();
+    void RefreshDiscordScreenControls();
+    void HandleDiscordLiveStreamAction();
+    void ShowDiscordHelperInstallPrompt();
+    void BeginDiscordHelperDownload();
+    void ShowDiscordHelperInstallInstructions();
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
     void ApplyLivestreamReferenceLayout();
@@ -163,8 +169,8 @@ private:
     // roots let the debug colors expose both bounds while tab visibility and
     // native scroll layout remain independently controlled.
     HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 4> centerDebugTabViewRoots_{};
-    std::array<UnityEngine::GameObject*, 4> centerDebugTabContentRoots_{};
+    std::array<UnityEngine::GameObject*, 5> centerDebugTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 5> centerDebugTabContentRoots_{};
     TMPro::TextMeshProUGUI* audioInputStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* audioLevelMeterText_ = nullptr;
     TMPro::TextMeshProUGUI* audioLevelMeterValueText_ = nullptr;
@@ -191,6 +197,11 @@ private:
     TMPro::TextMeshProUGUI* connectionTestTabSummaryText_ = nullptr;
     TMPro::TextMeshProUGUI* connectionTestProgressText_ = nullptr;
     TMPro::TextMeshProUGUI* connectionTestResultsText_ = nullptr;
+    TMPro::TextMeshProUGUI* discordScreenStatusText_ = nullptr;
+    BSML::ModalView* discordHelperInstallModal_ = nullptr;
+    BSML::ModalView* discordHelperInstructionsModal_ = nullptr;
+    broadcast::DiscordHelperAvailability discordHelperAvailability_ =
+        broadcast::DiscordHelperAvailability::Unknown;
     HMUI::ImageView* connectionTestProgressFill_ = nullptr;
     std::uint64_t connectionTestDisplayedRevision_ = 0;
     bool connectionTestCompletionShown_ = false;
@@ -255,6 +266,8 @@ private:
     UnityEngine::UI::Button* startLivestreamButton_ = nullptr;
     UnityEngine::UI::Button* stopLivestreamButton_ = nullptr;
     UnityEngine::UI::Button* connectTwitchButton_ = nullptr;
+    UnityEngine::UI::Button* startDiscordScreenButton_ = nullptr;
+    UnityEngine::UI::Button* stopDiscordScreenButton_ = nullptr;
     UnityEngine::UI::Button* setLivestreamServerButton_ = nullptr;
     UnityEngine::UI::Button* setLivestreamKeyButton_ = nullptr;
     UnityEngine::UI::Button* clearLivestreamKeyButton_ = nullptr;

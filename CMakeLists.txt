@@ -297,7 +297,8 @@ set(SABERSTAGE_CONTROL_ICON_ASSETS
     saberstage_mic_muted
     saberstage_mic_unavailable
     saberstage_game_audio_active
-    saberstage_game_audio_muted)
+    saberstage_game_audio_muted
+    saberstage_discord)
 foreach(SABERSTAGE_CONTROL_ICON IN LISTS SABERSTAGE_CONTROL_ICON_ASSETS)
     set(SABERSTAGE_CONTROL_ICON_ASSET
         "${CMAKE_CURRENT_SOURCE_DIR}/assets/${SABERSTAGE_CONTROL_ICON}.png")

@@ -135,6 +135,8 @@ extern "C" std::uint8_t _binary_saberstage_game_audio_active_png_start[];
 extern "C" std::uint8_t _binary_saberstage_game_audio_active_png_end[];
 extern "C" std::uint8_t _binary_saberstage_game_audio_muted_png_start[];
 extern "C" std::uint8_t _binary_saberstage_game_audio_muted_png_end[];
+extern "C" std::uint8_t _binary_saberstage_discord_png_start[];
+extern "C" std::uint8_t _binary_saberstage_discord_png_end[];
 
 namespace saberstage::ui {
 namespace {
@@ -185,6 +187,9 @@ constexpr float kAudioMeterClipStartDb = 0.0F;
 constexpr float kGateCutoffOffsetMinimumDb = 3.0F;
 constexpr float kGateCutoffOffsetMaximumDb = 30.0F;
 constexpr float kGateCloseThresholdMinimumDb = -90.0F;
+constexpr std::string_view kDiscordHelperApkName = "SaberStage-Helper.apk";
+constexpr std::string_view kDiscordHelperLatestReleaseUrl =
+    "https://github.com/Loud160/SaberStage-Helper/releases/latest/download/SaberStage-Helper.apk";
 
 float GateCutoffOffsetDb(const settings::AudioProcessingSettings& audio) {
     return std::clamp(
@@ -440,6 +445,7 @@ struct RecordingPanelIconTextures {
     UnityEngine::Texture2D* microphoneUnavailable = nullptr;
     UnityEngine::Texture2D* gameAudioActive = nullptr;
     UnityEngine::Texture2D* gameAudioMuted = nullptr;
+    UnityEngine::Texture2D* discord = nullptr;
 };
 
 UnityEngine::Texture2D* DecodeEmbeddedControlIcon(
@@ -502,9 +508,9 @@ struct CachedRecordingPanelIcon {
 
 RecordingPanelIconTextures EmbeddedRecordingPanelIcons() {
     // Process-lifetime strong managed references plus DontUnloadUnusedAsset
-    // retain all five variants, not only the two currently assigned to images.
+    // retain all variants, not only the textures currently assigned to images.
     // Callers borrow a snapshot for this refresh, never cache its raw pointers.
-    static std::array<CachedRecordingPanelIcon, 5> cache;
+    static std::array<CachedRecordingPanelIcon, 6> cache;
     return {
         cache[0].Get(
             _binary_saberstage_mic_active_png_start,
@@ -525,7 +531,11 @@ RecordingPanelIconTextures EmbeddedRecordingPanelIcons() {
         cache[4].Get(
             _binary_saberstage_game_audio_muted_png_start,
             _binary_saberstage_game_audio_muted_png_end,
-            "SaberStage Game Audio Muted")};
+            "SaberStage Game Audio Muted"),
+        cache[5].Get(
+            _binary_saberstage_discord_png_start,
+            _binary_saberstage_discord_png_end,
+            "Discord")};
 }
 
 void SetRecordingPanelButtonIcon(UnityEngine::UI::RawImage* image,
@@ -1886,12 +1896,215 @@ void MenuController::RefreshConnectionTestUi() {
     }
 }
 
+void MenuController::HandleDiscordLiveStreamAction() {
+    try {
+        const auto snapshot = root_.Recording().DiscordScreenSnapshot();
+        if (broadcast::CanStop(snapshot.state)) {
+            RefreshDiscordScreenControls();
+            return;
+        }
+
+        // Query only when the user opens the page or requests the action. A
+        // package-manager JNI call every half-second would add pointless work
+        // to the persistent runtime-panel update loop.
+        discordHelperAvailability_ = broadcast::QueryDiscordHelperAvailability();
+        if (discordHelperAvailability_ ==
+                broadcast::DiscordHelperAvailability::NotInstalled) {
+            Logging::Logger.info(
+                "Discord live stream requested without SaberStage Helper installed");
+            ShowDiscordHelperInstallPrompt();
+            RefreshDiscordScreenControls();
+            return;
+        }
+
+        std::string error;
+        if (!root_.Recording().StartDiscordScreen(&error)) {
+            Logging::Logger.error("Discord screen source start failed: {}", error);
+            ShowLivestreamActionError(error);
+        }
+        RefreshDiscordScreenControls();
+        RefreshRecordingStatus();
+    } catch (const std::exception& exception) {
+        Logging::Logger.error(
+            "Discord live-stream action failed safely: {}", exception.what());
+        ShowLivestreamActionError(
+            std::string("Discord live streaming could not start: ") + exception.what());
+    } catch (...) {
+        Logging::Logger.error(
+            "Discord live-stream action failed safely because of an unknown error");
+        ShowLivestreamActionError(
+            "Discord live streaming could not start because of an unknown error. Details were written to the SaberStage log.");
+    }
+}
+
+void MenuController::ShowDiscordHelperInstallPrompt() {
+    if (!IsAlive(settingsView_)) return;
+    if (!IsAlive(discordHelperInstallModal_)) {
+        discordHelperInstallModal_ = BSML::Lite::CreateModal(
+            settingsView_, {86.0F, 46.0F}, nullptr, true);
+        if (!IsAlive(discordHelperInstallModal_)) {
+            Logging::Logger.error(
+                "Could not create the SaberStage Helper installation dialog");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            discordHelperInstallModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* title = BSML::Lite::CreateText(
+            layout->get_transform(), "SaberStage Helper Required", 3.9F,
+            {0.0F, 0.0F}, {78.0F, 7.0F});
+        title->set_enableWordWrapping(false);
+        title->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(title, 78.0F, 7.0F, 1.0F);
+        auto* message = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "Discord streaming requires the separate SaberStage Helper APK, and it is not installed. Download the newest SaberStage-Helper.apk from the current GitHub release?",
+            3.15F, {0.0F, 0.0F}, {76.0F, 23.0F});
+        message->set_enableWordWrapping(true);
+        message->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        message->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(message, 76.0F, 23.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(
+            layout->get_transform());
+        actions->set_spacing(3.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 58.0F, 8.0F, 1.0F);
+        BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_ && IsAlive(active_->discordHelperInstallModal_)) {
+                active_->discordHelperInstallModal_->Hide();
+            }
+        });
+        BSML::Lite::CreateUIButton(actions, "Download", [] {
+            if (active_) active_->BeginDiscordHelperDownload();
+        });
+    }
+    discordHelperInstallModal_->Show();
+}
+
+void MenuController::BeginDiscordHelperDownload() {
+    if (IsAlive(discordHelperInstallModal_)) discordHelperInstallModal_->Hide();
+    // Construct and display the return instructions before Android switches to
+    // the browser. The modal is then waiting in Beat Saber when the user comes
+    // back from installing the APK.
+    ShowDiscordHelperInstallInstructions();
+    try {
+        Logging::Logger.info(
+            "Opening current SaberStage Helper release asset '{}' from '{}'",
+            kDiscordHelperApkName,
+            kDiscordHelperLatestReleaseUrl);
+        UnityEngine::Application::OpenURL(std::string(kDiscordHelperLatestReleaseUrl));
+    } catch (const std::exception& exception) {
+        Logging::Logger.error(
+            "Could not open the SaberStage Helper download in the Quest browser: {}",
+            exception.what());
+        ShowLivestreamActionError(
+            std::string("The Quest browser could not be opened: ") + exception.what());
+    } catch (...) {
+        Logging::Logger.error(
+            "Could not open the SaberStage Helper download because of an unknown error");
+        ShowLivestreamActionError(
+            "The Quest browser could not be opened. Details were written to the SaberStage log.");
+    }
+}
+
+void MenuController::ShowDiscordHelperInstallInstructions() {
+    if (!IsAlive(settingsView_)) return;
+    if (!IsAlive(discordHelperInstructionsModal_)) {
+        discordHelperInstructionsModal_ = BSML::Lite::CreateModal(
+            settingsView_, {94.0F, 60.0F}, nullptr, true);
+        if (!IsAlive(discordHelperInstructionsModal_)) {
+            Logging::Logger.error(
+                "Could not create the SaberStage Helper installation instructions");
+            return;
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            discordHelperInstructionsModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* title = BSML::Lite::CreateText(
+            layout->get_transform(), "Install SaberStage Helper", 3.9F,
+            {0.0F, 0.0F}, {86.0F, 7.0F});
+        title->set_enableWordWrapping(false);
+        title->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(title, 86.0F, 7.0F, 1.0F);
+        auto* message = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "The Quest browser is downloading SaberStage-Helper.apk from the newest GitHub release.\n\n"
+            "In the browser's Downloads list, select SaberStage-Helper.apk, open it with Quest Package Manager, and follow the package manager instructions.\n\n"
+            "Installing a sideloaded APK requires Unknown Sources to be enabled. When installation finishes, return to Beat Saber and press Discord Live Steam again.",
+            3.0F, {0.0F, 0.0F}, {84.0F, 39.0F});
+        message->set_enableWordWrapping(true);
+        message->set_overflowMode(TMPro::TextOverflowModes::Overflow);
+        message->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
+        ConfigureLayout(message, 84.0F, 39.0F, 1.0F);
+        auto* ok = BSML::Lite::CreateUIButton(
+            layout->get_transform(), "OK", [] {
+                if (active_ && IsAlive(active_->discordHelperInstructionsModal_)) {
+                    active_->discordHelperInstructionsModal_->Hide();
+                }
+            });
+        ConfigureLayout(ok, 28.0F, 7.0F, 0.0F, 0.0F);
+    }
+    discordHelperInstructionsModal_->Show();
+}
+
+void MenuController::RefreshDiscordScreenControls() {
+    try {
+        const auto snapshot = root_.Recording().DiscordScreenSnapshot();
+        if (IsAlive(discordScreenStatusText_)) {
+            std::ostringstream text;
+            if (broadcast::CanStart(snapshot.state) &&
+                    discordHelperAvailability_ ==
+                        broadcast::DiscordHelperAvailability::NotInstalled) {
+                text << "SaberStage Helper is not installed. Press Discord Live Steam to download it.";
+            } else if (broadcast::CanStart(snapshot.state) &&
+                    discordHelperAvailability_ ==
+                        broadcast::DiscordHelperAvailability::Installed) {
+                text << "SaberStage Helper is installed and ready.";
+            } else {
+                text << snapshot.status;
+            }
+            if (snapshot.state == broadcast::DiscordScreenState::Live ||
+                    snapshot.videoPacketsSent > 0 || snapshot.videoPacketsDropped > 0 ||
+                    snapshot.audioPacketsSent > 0 || snapshot.audioPacketsDropped > 0) {
+                text << "\nVideo packets sent " << snapshot.videoPacketsSent
+                     << "  Dropped " << snapshot.videoPacketsDropped
+                     << "\nAudio packets sent " << snapshot.audioPacketsSent
+                     << "  Dropped " << snapshot.audioPacketsDropped;
+            }
+            discordScreenStatusText_->set_text(text.str());
+        }
+        if (IsAlive(startDiscordScreenButton_)) {
+            startDiscordScreenButton_->set_interactable(
+                broadcast::CanStart(snapshot.state));
+        }
+        if (IsAlive(stopDiscordScreenButton_)) {
+            stopDiscordScreenButton_->set_interactable(
+                broadcast::CanStop(snapshot.state));
+        }
+    } catch (const std::exception& exception) {
+        Logging::Logger.error(
+            "Discord screen-source controls could not refresh: {}", exception.what());
+    } catch (...) {
+        Logging::Logger.error(
+            "Discord screen-source controls could not refresh because of an unknown error");
+    }
+}
+
 void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
     active_->settingsView_ = view;
 
-    static std::array<std::string_view, 4> tabNames{
-        "Overview", "Audio", "Chat TTS", "Configure Stream"};
+    static std::array<std::string_view, 5> tabNames{
+        "Overview", "Audio", "Chat TTS", "Configure Stream", "Live Stream"};
     active_->centerDebugTabViewRoots_.fill(nullptr);
     active_->centerDebugTabContentRoots_.fill(nullptr);
     active_->selectedCenterDebugTab_ = 0;
@@ -1920,6 +2133,13 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->connectionTestTabSummaryText_ = nullptr;
     active_->connectionTestProgressText_ = nullptr;
     active_->connectionTestResultsText_ = nullptr;
+    active_->discordScreenStatusText_ = nullptr;
+    active_->discordHelperInstallModal_ = nullptr;
+    active_->discordHelperInstructionsModal_ = nullptr;
+    active_->discordHelperAvailability_ =
+        broadcast::DiscordHelperAvailability::Unknown;
+    active_->startDiscordScreenButton_ = nullptr;
+    active_->stopDiscordScreenButton_ = nullptr;
     active_->connectionTestProgressFill_ = nullptr;
     active_->connectionTestDisplayedRevision_ = 0;
     active_->connectionTestCompletionShown_ = false;
@@ -1965,7 +2185,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->centerDebugTabs_ = BSML::Lite::CreateTextSegmentedControl(
         view,
         {0.0F, 0.0F},
-        {86.0F, 7.0F},
+        {112.0F, 7.0F},
         tabNames,
         [](int index) {
             if (active_) active_->ShowCenterDebugTab(index);
@@ -2042,7 +2262,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         [](auto* page) { return page == nullptr; });
     if (missingPage) {
         Logging::Logger.error(
-            "Could not create all four center-panel tab pages");
+            "Could not create all five center-panel tab pages");
         return;
     }
 
@@ -3276,6 +3496,47 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         queueLimitColumnWidth), initialTts.staleAfterSeconds, false);
 
     auto* configureStreamPage = active_->centerDebugTabContentRoots_[3];
+    auto* liveStreamPage = active_->centerDebugTabContentRoots_[4];
+    auto* discordSection = makeSection(
+        liveStreamPage, "Discord Live Stream");
+    makeStatus(
+        discordSection,
+        "Uses the separate SaberStage Helper app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. Start the source, select SaberStage Camera in Discord's app-sharing picker, enable application audio, then return to Beat Saber.",
+        16.0F);
+    auto [discordActionRow, discordActionWidth] = makePaddedRow(
+        discordSection, 2, 9.5F);
+    auto* discordStartSlot = makeCenteredControlSlot(
+        discordActionRow->get_gameObject(), discordActionWidth, 9.5F);
+    active_->startDiscordScreenButton_ = WithHint(BSML::Lite::CreateUIButton(
+        discordStartSlot, "Discord Live Steam", [] {
+            if (active_) active_->HandleDiscordLiveStreamAction();
+        }),
+        "Checks for SaberStage Helper, starts its session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
+    fitActionButton(active_->startDiscordScreenButton_, 45.0F);
+    if (auto* icon = CreateRecordingPanelButtonIcon(
+            active_->startDiscordScreenButton_,
+            EmbeddedRecordingPanelIcons().discord,
+            "Discord Live Stream Icon")) {
+        auto rect = icon->get_rectTransform();
+        rect->set_anchoredPosition({-18.0F, 0.0F});
+        rect->set_sizeDelta({4.3F, 4.3F});
+    }
+    auto* discordStopSlot = makeCenteredControlSlot(
+        discordActionRow->get_gameObject(), discordActionWidth, 9.5F);
+    active_->stopDiscordScreenButton_ = WithHint(BSML::Lite::CreateUIButton(
+        discordStopSlot, "Stop Discord Source", [] {
+            if (!active_) return;
+            active_->root_.Recording().StopDiscordScreen();
+            active_->RefreshDiscordScreenControls();
+            active_->RefreshRecordingStatus();
+        }),
+        "Stops the helper feed and releases its camera demand when no recording or Twitch stream still needs it.");
+    fitActionButton(active_->stopDiscordScreenButton_, 36.0F);
+    active_->discordScreenStatusText_ = makeStatus(
+        discordSection,
+        "Stopped. Press Discord Live Steam to check or start SaberStage Helper.",
+        10.0F);
+
     auto* connectionSection = makeSection(
         configureStreamPage, "Internet Connection Quality");
     makeStatus(
@@ -3304,6 +3565,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
 
     active_->ShowCenterDebugTab(0);
     active_->RefreshAudioControlState();
+    active_->RefreshDiscordScreenControls();
     if (active_->centerDebugTabs_) {
         active_->centerDebugTabs_->SelectCellWithNumber(0);
     }
@@ -3386,6 +3648,10 @@ void MenuController::TickRuntimePanels() noexcept {
                 "  Dropped " + std::to_string(tts.droppedMessages));
         }
         RefreshTwitchControls();
+        // The helper connects on a private worker after Android changes tasks.
+        // Refresh at the existing bounded UI cadence so its connection state
+        // and packet counters become visible without touching Unity off-thread.
+        RefreshDiscordScreenControls();
     }
 
     TickRecordingWorldPanel();
@@ -4487,7 +4753,7 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
 }
 
 void MenuController::ShowCenterDebugTab(int index) {
-    index = std::clamp(index, 0, 3);
+    index = std::clamp(index, 0, 4);
     selectedCenterDebugTab_ = index;
     for (int page = 0;
          page < static_cast<int>(centerDebugTabViewRoots_.size());
@@ -4508,6 +4774,11 @@ void MenuController::ShowCenterDebugTab(int index) {
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
     if (selectedCenterDebugTab_ == 1) RefreshAudioMeter();
+    if (selectedCenterDebugTab_ == 4) {
+        discordHelperAvailability_ =
+            broadcast::QueryDiscordHelperAvailability();
+        RefreshDiscordScreenControls();
+    }
 }
 
 void MenuController::ShowSettingsTab(int index) {
@@ -5464,12 +5735,20 @@ void MenuController::RefreshRecordingWorldPanel() {
     if (!IsAlive(recordingWorldPanelScreen_)) return;
     const auto snapshot = root_.Recording().Snapshot();
     const auto livestream = root_.Recording().LivestreamSnapshot();
+    const auto discord = root_.Recording().DiscordScreenSnapshot();
+    const bool liveOutputActive = broadcast::CanStop(livestream.state) ||
+        broadcast::CanStop(discord.state);
     const auto streamMode = root_.Settings().Get().recording.worldControlsStreamMode;
-    const auto elapsed = streamMode ? livestream.elapsedSeconds : snapshot.elapsedSeconds;
+    const auto elapsed = streamMode
+        ? (broadcast::CanStop(livestream.state)
+            ? livestream.elapsedSeconds
+            : snapshot.elapsedSeconds)
+        : snapshot.elapsedSeconds;
     const auto elapsedSecond = std::max(0, static_cast<int>(elapsed));
     recordingWorldPanelDisplayedSecond_ = elapsedSecond;
     recordingWorldPanelDisplayedState_ = streamMode
-        ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
+        ? 100 + static_cast<int>(livestream.state) +
+            static_cast<int>(discord.state) * 1000 + (livestream.afk ? 20 : 0) +
             (livestream.microphoneAvailable ? 40 : 0) +
             (livestream.microphoneMuted ? 80 : 0) +
             (livestream.gameAudioAvailable ? 160 : 0) +
@@ -5481,7 +5760,7 @@ void MenuController::RefreshRecordingWorldPanel() {
             : std::string(recording::RecordingOutputTypeName(snapshot.outputType)));
         // Color communicates state at a glance: red while the encoder is
         // rolling, amber while paused, neutral gray otherwise.
-        if (streamMode && broadcast::CanStop(livestream.state) && !livestream.afk) {
+        if (streamMode && liveOutputActive && !livestream.afk) {
             recordingWorldPanelTypeText_->set_color({0.75F, 0.25F, 1.0F, 1.0F});
         } else if (streamMode && livestream.afk) {
             recordingWorldPanelTypeText_->set_color({1.0F, 0.72F, 0.20F, 1.0F});
@@ -5551,17 +5830,18 @@ void MenuController::RefreshRecordingWorldPanel() {
             !streamMode && snapshot.CanResume() ? "RESUME" : "START");
         recordingWorldPanelPrimaryButton_->set_interactable(streamMode
             ? (livestream.afk ||
-               (broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured))
+               (!liveOutputActive && broadcast::CanStart(livestream.state) &&
+                livestream.streamKeyConfigured))
             : (snapshot.CanStart() || snapshot.CanResume()));
     }
     if (IsAlive(recordingWorldPanelPauseButton_)) {
         recordingWorldPanelPauseButton_->set_interactable(streamMode
-            ? (broadcast::CanStop(livestream.state) && !livestream.afk)
+            ? (liveOutputActive && !livestream.afk)
             : snapshot.CanPause());
     }
     if (IsAlive(recordingWorldPanelStopButton_)) {
         recordingWorldPanelStopButton_->set_interactable(streamMode
-            ? broadcast::CanStop(livestream.state)
+            ? liveOutputActive
             : snapshot.CanStop());
     }
 }
@@ -5571,11 +5851,14 @@ void MenuController::RecordingWorldPanelPrimaryAction() {
     if (streamMode) {
         std::string error;
         const auto livestream = root_.Recording().LivestreamSnapshot();
+        const auto discord = root_.Recording().DiscordScreenSnapshot();
+        const bool liveOutputActive = broadcast::CanStop(livestream.state) ||
+            broadcast::CanStop(discord.state);
         if (livestream.afk) {
             if (!root_.Recording().ResumeLivestream(&error)) {
                 ShowLivestreamActionError(error);
             }
-        } else if (broadcast::CanStart(livestream.state)) {
+        } else if (!liveOutputActive && broadcast::CanStart(livestream.state)) {
             TryStartLivestreamWithTitle();
         }
         RefreshRecordingStatus();
@@ -5608,6 +5891,7 @@ void MenuController::RecordingWorldPanelPauseAction() {
 void MenuController::RecordingWorldPanelStopAction() {
     if (root_.Settings().Get().recording.worldControlsStreamMode) {
         root_.Recording().StopLivestream();
+        root_.Recording().StopDiscordScreen();
     } else {
         root_.Recording().Stop("Stopped from movable recording controls.");
     }
@@ -5616,8 +5900,10 @@ void MenuController::RecordingWorldPanelStopAction() {
 
 void MenuController::RecordingWorldPanelMicrophoneAction() {
     const auto livestream = root_.Recording().LivestreamSnapshot();
+    const auto discord = root_.Recording().DiscordScreenSnapshot();
     if (!root_.Settings().Get().recording.worldControlsStreamMode ||
-            !broadcast::CanStop(livestream.state) || livestream.afk ||
+            (!broadcast::CanStop(livestream.state) &&
+             !broadcast::CanStop(discord.state)) || livestream.afk ||
             !livestream.microphoneAvailable) {
         RefreshRecordingWorldPanel();
         return;
@@ -5665,9 +5951,13 @@ void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode) {
     recordingWorldPanelDropSamples_.clear();
     const auto snapshot = root_.Recording().Snapshot();
     const auto livestream = root_.Recording().LivestreamSnapshot();
+    const auto discord = root_.Recording().DiscordScreenSnapshot();
     recordingWorldPanelSessionStartDrops_ = snapshot.encoderDroppedFrameCount +
         (streamMode && broadcast::CanStop(livestream.state)
             ? livestream.videoPacketsDropped
+            : 0) +
+        (streamMode && broadcast::CanStop(discord.state)
+            ? discord.videoPacketsDropped
             : 0);
     RefreshRecordingWorldPanel();
 }
@@ -5730,12 +6020,17 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         UpdateRecordingWorldPanelPersistence();
         const auto snapshot = root_.Recording().Snapshot();
         const auto livestream = root_.Recording().LivestreamSnapshot();
+        const auto discord = root_.Recording().DiscordScreenSnapshot();
         const auto streamMode = recordingSettings.worldControlsStreamMode;
         const auto selectedElapsed = streamMode
-            ? livestream.elapsedSeconds : snapshot.elapsedSeconds;
+            ? (broadcast::CanStop(livestream.state)
+                ? livestream.elapsedSeconds
+                : snapshot.elapsedSeconds)
+            : snapshot.elapsedSeconds;
         const auto elapsedSecond = std::max(0, static_cast<int>(selectedElapsed));
         const auto selectedState = streamMode
-            ? 100 + static_cast<int>(livestream.state) + (livestream.afk ? 20 : 0) +
+            ? 100 + static_cast<int>(livestream.state) +
+                static_cast<int>(discord.state) * 1000 + (livestream.afk ? 20 : 0) +
                 (livestream.microphoneAvailable ? 40 : 0) +
                 (livestream.microphoneMuted ? 80 : 0) +
                 (livestream.gameAudioAvailable ? 160 : 0) +
@@ -5757,9 +6052,15 @@ void MenuController::TickRecordingWorldPanel() noexcept {
         // The first second remains a warm-up period so normal encoder/connection
         // startup pressure is not presented as sustained output loss.
         const auto dropped = snapshot.encoderDroppedFrameCount +
-            (streamMode && broadcast::CanStop(livestream.state) ? livestream.videoPacketsDropped : 0);
+            (streamMode && broadcast::CanStop(livestream.state)
+                ? livestream.videoPacketsDropped
+                : 0) +
+            (streamMode && broadcast::CanStop(discord.state)
+                ? discord.videoPacketsDropped
+                : 0);
         const bool outputActive = recording::HasRecordingTimeline(snapshot.state) ||
-            broadcast::CanStop(livestream.state);
+            broadcast::CanStop(livestream.state) ||
+            broadcast::CanStop(discord.state);
         if (!outputActive || selectedElapsed <= 0.0) {
             recordingWorldPanelDropSamples_.clear();
             recordingWorldPanelSessionStartDrops_ = dropped;

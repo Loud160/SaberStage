@@ -17,6 +17,7 @@
 #include "saberstage/recording/MicrophoneDsp.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/broadcast/LivestreamState.hpp"
+#include "saberstage/broadcast/DiscordScreenSink.hpp"
 
 #include <atomic>
 #include <array>
@@ -69,6 +70,7 @@ class MicrophoneCapture;
 
 namespace saberstage::broadcast {
 class DirectLivestreamSink;
+class DiscordScreenSink;
 class TtsService;
 }
 
@@ -99,13 +101,13 @@ struct RecordingSnapshot {
         return recording::CanStart(state);
     }
     [[nodiscard]] bool CanPause() const noexcept {
-        return outputType != RecordingOutputType::LiveStream && recording::CanPause(state);
+        return IncludesLocalRecording(outputType) && recording::CanPause(state);
     }
     [[nodiscard]] bool CanResume() const noexcept {
-        return outputType != RecordingOutputType::LiveStream && recording::CanResume(state);
+        return IncludesLocalRecording(outputType) && recording::CanResume(state);
     }
     [[nodiscard]] bool CanStop() const noexcept {
-        return outputType != RecordingOutputType::LiveStream && recording::CanStop(state);
+        return IncludesLocalRecording(outputType) && recording::CanStop(state);
     }
 };
 
@@ -139,6 +141,7 @@ public:
     bool Resume(std::string* error = nullptr);
     bool Stop(std::string_view reason = "Stopped by user");
     bool StartLivestream(std::string* error = nullptr);
+    bool StartDiscordScreen(std::string* error = nullptr);
     // Android can display a runtime microphone prompt only when RECORD_AUDIO
     // was included while Beat Saber was patched. Exposing that distinction
     // lets the menu explain an MBF patch-permission omission accurately.
@@ -163,6 +166,7 @@ public:
         bool muted,
         std::string* error = nullptr);
     void StopLivestream() noexcept;
+    void StopDiscordScreen() noexcept;
     bool PrepareAfkMedia(
         const std::filesystem::path& path,
         std::string* error = nullptr);
@@ -183,6 +187,7 @@ public:
         settings::LivestreamProvider provider) const;
     [[nodiscard]] std::string StreamKey(settings::LivestreamProvider provider) const;
     [[nodiscard]] broadcast::LivestreamSnapshot LivestreamSnapshot() const;
+    [[nodiscard]] broadcast::DiscordScreenSnapshot DiscordScreenSnapshot() const;
     void Shutdown() noexcept;
     void Tick() noexcept;
     void SetStatusChangedHandler(StatusChangedHandler handler);
@@ -197,12 +202,14 @@ private:
         std::string* error,
         bool forceContinuous = false,
         bool forceDirectHardware = false,
-        bool writeLocalOutput = true);
+        bool writeLocalOutput = true,
+        bool captureAudio = true);
     void StartVideoSegment();
     void StopVideoSegment(bool recordCaptureFailure = true) noexcept;
     void LogCapturePerformance(std::string_view reason) const noexcept;
     bool HandleDirectCaptureHealth() noexcept;
     void CreatePersistentAudioCapture();
+    void StopPersistentAudioCapture(bool recordFailure = true) noexcept;
     void SubmitLivestreamAudioLocked(
         float* samples,
         std::size_t count,
@@ -311,6 +318,8 @@ private:
     std::uint32_t audioListenerRefreshFrame_ = 0;
     mutable std::mutex livestreamMutex_;
     std::unique_ptr<broadcast::DirectLivestreamSink> livestreamSink_;
+    mutable std::mutex discordScreenMutex_;
+    std::unique_ptr<broadcast::DiscordScreenSink> discordScreenSink_;
     std::unique_ptr<AfkMediaSource> afkMedia_;
     // The Quest microphone is persistent while its master setting is enabled
     // so local recording and streaming share one processed signal. Access is

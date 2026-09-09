@@ -1,5 +1,14 @@
 # Third-party notices
 
+## Discord interface symbol
+
+The Discord glyph shown beside the **Discord Live Steam** action is provided by
+[Icons8](https://icons8.com/icon/25627/discord) and is used only to identify the
+Discord destination. Discord and the Discord logo are trademarks of Discord
+Inc.; SaberStage is not endorsed by or affiliated with Discord. The glyph is
+kept white, undistorted, and adjacent to the visible Discord name in accordance
+with [Discord's brand guidance](https://discord.com/branding).
+
 ## KittenTTS Nano and sherpa-onnx
 
 SaberStage uses [KittenTTS Nano English v0.2](https://github.com/KittenML/KittenTTS)

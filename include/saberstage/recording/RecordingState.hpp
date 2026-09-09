@@ -19,7 +19,11 @@ namespace saberstage::recording {
 enum class RecordingOutputType : std::uint8_t {
     Local,
     LiveStream,
+    DiscordScreen,
     LocalAndLive,
+    LocalAndDiscord,
+    LiveAndDiscord,
+    LocalLiveAndDiscord,
 };
 
 [[nodiscard]] constexpr const char* RecordingOutputTypeName(
@@ -27,9 +31,21 @@ enum class RecordingOutputType : std::uint8_t {
     switch (type) {
         case RecordingOutputType::Local: return "LOCAL";
         case RecordingOutputType::LiveStream: return "LIVE STREAM";
+        case RecordingOutputType::DiscordScreen: return "DISCORD SCREEN";
         case RecordingOutputType::LocalAndLive: return "LOCAL + LIVE";
+        case RecordingOutputType::LocalAndDiscord: return "LOCAL + DISCORD";
+        case RecordingOutputType::LiveAndDiscord: return "LIVE + DISCORD";
+        case RecordingOutputType::LocalLiveAndDiscord: return "LOCAL + LIVE + DISCORD";
     }
     return "LOCAL";
+}
+
+[[nodiscard]] constexpr bool IncludesLocalRecording(
+    RecordingOutputType type) noexcept {
+    return type == RecordingOutputType::Local ||
+           type == RecordingOutputType::LocalAndLive ||
+           type == RecordingOutputType::LocalAndDiscord ||
+           type == RecordingOutputType::LocalLiveAndDiscord;
 }
 
 enum class RecordingState : std::uint8_t {

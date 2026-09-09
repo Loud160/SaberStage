@@ -1116,7 +1116,7 @@ class RepositoryInvariantTests(unittest.TestCase):
                      menu.index("void ConfigureLayout(")]
         self.assertIn("SafePtrUnity<UnityEngine::Texture2D> texture", icons)
         self.assertIn("set_hideFlags(UnityEngine::HideFlags::DontUnloadUnusedAsset)", icons)
-        self.assertIn("static std::array<CachedRecordingPanelIcon, 5> cache", icons)
+        self.assertIn("static std::array<CachedRecordingPanelIcon, 6> cache", icons)
         self.assertIn("if (texture) return texture.ptr();", icons)
         self.assertIn("if (failed) return nullptr;", icons)
         self.assertIn("lost its Unity texture; rebuilding from embedded PNG", icons)
@@ -1558,6 +1558,34 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("Going live does not start or save a local recording", menu)
         self.assertNotIn("starts a local safety recording", menu)
 
+    def test_discord_screen_source_reuses_one_bounded_hardware_encode(self):
+        controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
+        sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("StartCapture(error, true, true, false, true)", controller)
+        self.assertIn("discordScreenSink_->SubmitVideo(packet)", controller)
+        self.assertIn("discordScreenSink_->SubmitAudio(", controller)
+        self.assertIn("CreatePersistentAudioCapture();", controller)
+        self.assertIn("kMaximumQueuedBytes", sink)
+        self.assertIn("kProtocolVersion = 2", sink)
+        self.assertIn("kAudioMessage = 7", sink)
+        self.assertIn("kSignedPcm16Format", sink)
+        self.assertIn("std::deque<QueuedPacket>", sink)
+        self.assertIn("TYPE_STOP", sink)
+        self.assertIn("Let the worker send TYPE_STOP", sink)
+        self.assertIn('"Live Stream"', menu)
+        self.assertIn('"Discord Live Steam"', menu)
+        self.assertIn('"Stop Discord Source"', menu)
+        self.assertIn("RefreshDiscordScreenControls();", menu)
+        self.assertIn("QueryDiscordHelperAvailability", sink)
+        self.assertIn("getLaunchIntentForPackage", sink)
+        self.assertIn("releases/latest/download/SaberStage-Helper.apk", menu)
+        self.assertIn("Quest Package Manager", menu)
+        self.assertIn("Unknown Sources", menu)
+        self.assertIn("broadcast::CanStop(discord.state)", controller)
+        self.assertIn("if (afk)", controller)
+
     def test_livestream_wake_guard_is_scoped_and_restores_previous_timeout(self):
         header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8")
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
@@ -1695,6 +1723,7 @@ class RepositoryInvariantTests(unittest.TestCase):
             "saberstage_mic_unavailable.png",
             "saberstage_game_audio_active.png",
             "saberstage_game_audio_muted.png",
+            "saberstage_discord.png",
         ):
             self.assertTrue((ROOT / "assets" / icon).is_file())
             self.assertIn(icon.removesuffix(".png"), cmake)

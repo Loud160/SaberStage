@@ -14,11 +14,22 @@ Twitch should prefer supported EventSub/API paths over legacy IRC where feasible
 | Discord voice | Social SDK supports game-integrated voice subject to platform and production requirements; it is separate from livestream video |
 | Launch Discord | Android intent/deep link may be offered when a compatible local client exists |
 | Consume Discord data | Only via public SDK/API, OAuth scopes, and user consent |
-| Feed SaberStage video into the local Discord client's stream/screen share | **Unsupported:** no public Android Discord/Social SDK API was found for registering an arbitrary external/synthetic video source with the Discord client |
+| Feed SaberStage video and selected stream audio into the local Discord client's stream/screen share | Implemented through the separate `SaberStage Camera` Android activity and Android 14's user-selected single-app sharing flow; this is app-window sharing with capturable app audio, not a Discord SDK video-source API |
 | Control the local Discord client's livestream | **Unsupported:** no public supported automation contract was found |
 
-Android `MediaProjection` captures a consenting app/display; it does not register SaberStage's third-person render as a camera source for another app. A virtual display likewise does not make Discord accept that stream as its share source. Therefore modifying/hooking Discord, private APIs, self-bots/user tokens, root, synthetic camera hacks, and automated client control are rejected.
+Android `MediaProjection` still does not register a synthetic camera device or
+give SaberStage control of Discord. Instead, the separately installed helper
+provides an ordinary resizable app window that the user explicitly chooses in
+Discord's Android 14 app-sharing picker. SaberStage sends its already encoded
+third-person video and existing game/microphone/TTS stream mix to that window
+over authenticated loopback. The helper hardware-decodes video and publishes
+the PCM mix through a capture-enabled Android `AudioTrack`. Discord continues
+to own user consent, app selection, capture, transport, and stream controls.
 
-Supported alternatives are: stream directly to Twitch/YouTube/custom RTMPS; send to the companion and use desktop OBS/Discord screen sharing; or expose a local authenticated receiver the user can deliberately share from a supported desktop client. The media architecture has no Discord-specific sink until Discord publishes an applicable API.
+The implementation does not modify or hook Discord, use private Discord APIs,
+automate the client, require root, or impersonate an Android camera. Direct
+Twitch/custom RTMP streaming remains independent from this optional path. See
+[Discord screen source](DISCORD_SCREEN_SOURCE.md) for the lifecycle and test
+boundary.
 
 Sources: [Discord Social SDK](https://discord.com/developers/docs/social-sdk/index.html), [communication feature requirements](https://docs.discord.com/developers/discord-social-sdk/core-concepts/communication-features), [mobile account linking](https://docs.discord.com/developers/discord-social-sdk/development-guides/account-linking-on-mobile), and [OAuth2 policy](https://discord.com/developers/docs/topics/oauth2).

@@ -30,6 +30,7 @@ using saberstage::recording::ControllerShortcut;
 using saberstage::recording::ControllerShortcutAction;
 using saberstage::recording::DecideCaptureTimelineFrame;
 using saberstage::recording::HasRecordingTimeline;
+using saberstage::recording::IncludesLocalRecording;
 using saberstage::recording::NormalizeCapturePresentationFrame;
 using saberstage::recording::RecordingOutputType;
 using saberstage::recording::RecordingOutputTypeName;
@@ -48,8 +49,21 @@ int main() {
             "local recording output has the compact world-panel label");
     Require(RecordingOutputTypeName(RecordingOutputType::LiveStream) == std::string_view("LIVE STREAM"),
             "stream-only output has the compact world-panel label");
+    Require(RecordingOutputTypeName(RecordingOutputType::DiscordScreen) == std::string_view("DISCORD SCREEN"),
+            "Discord-only output has a distinct compact world-panel label");
     Require(RecordingOutputTypeName(RecordingOutputType::LocalAndLive) == std::string_view("LOCAL + LIVE"),
             "an intentional local recording with an attached broadcast has a clear compact label");
+    Require(RecordingOutputTypeName(RecordingOutputType::LocalAndDiscord) == std::string_view("LOCAL + DISCORD"),
+            "a local recording with Discord sharing has a clear compact label");
+    Require(RecordingOutputTypeName(RecordingOutputType::LiveAndDiscord) == std::string_view("LIVE + DISCORD"),
+            "two network outputs without a local file have a clear compact label");
+    Require(RecordingOutputTypeName(RecordingOutputType::LocalLiveAndDiscord) ==
+                std::string_view("LOCAL + LIVE + DISCORD"),
+            "all three outputs have a clear compact label");
+    Require(IncludesLocalRecording(RecordingOutputType::LocalAndDiscord),
+            "local plus Discord retains local recording controls");
+    Require(!IncludesLocalRecording(RecordingOutputType::LiveAndDiscord),
+            "network-only output never exposes local recording controls");
 
     Require(CanStart(RecordingState::Idle), "idle can start");
     Require(CanStart(RecordingState::Failed), "failed session can retry");

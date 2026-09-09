@@ -6,6 +6,16 @@ Protocol layers are discovery/pairing, authenticated control, stream negotiation
 
 The companion first proves live view and synchronized desktop recording, then exposes a stable OBS handoff. It may remux encoded H.264/AAC without transcoding when compatible. Network loss drops/reconnects that sink independently.
 
+The Quest Discord screen-source helper is a narrower local companion path. It
+reuses the Direct MediaCodec H.264 packets and the already-mixed game,
+microphone, and TTS PCM, sending both over authenticated TCP loopback to an
+ordinary Android activity named `SaberStage Camera`. Android 14 and Discord
+perform user-consented single-app sharing of that activity. The helper
+hardware-decodes video to a surface and writes PCM through a capture-enabled
+`AudioTrack` associated with the helper app; it never starts at boot and stops
+on protocol stop, heartbeat loss, or disconnect timeout. This path is
+documented separately in [Discord screen source](DISCORD_SCREEN_SOURCE.md).
+
 Direct livestreaming is now an asynchronous bounded sink with states `Offline`, `Connecting`, `Live`, `Reconnecting`, `Stopping`, and `Failed`. It accepts Direct FFmpeg MediaCodec H.264 packets, encodes game audio as AAC on its network worker, muxes FLV, and writes to provider RTMP/RTMPS ingest. Starting a stream from idle creates a stream-only encoder/audio session with consumer-only audio draining; it never opens local H.264/WAV/MP4 outputs. If the user explicitly started a Direct FFmpeg local recording first, the network sink shares that existing hardware encode rather than starting a second encoder. Twitch and custom endpoints can start streams. YouTube and Kick remain selectable only so their separate future settings are visible; both are labeled unsupported and blocked at start. Each provider owns an independent server-address/key/title record and independent session-only endpoint/key overrides. The fields are staged until `Set` is pressed; `Use Once` applies only to the current session, while `Save in Settings` explicitly persists the selected provider's value. Keys and Twitch OAuth tokens are password-masked where entered, never logged, and recursively redacted before `settings.json` enters a support archive.
 
 The video and audio queues are bounded. Overflow drops broadcast media and increments visible health counters instead of delaying the Unity thread, audio thread, encoder worker, an independently started local recording, or gameplay. Reconnect uses bounded exponential backoff and waits for the next scheduled H.264 keyframe before reopening output. TLS verification uses the Quest system certificate directory for RTMPS. Start/stop are explicit: stopping a stream-only session releases its capture resources, while stopping a stream attached to an intentional local recording leaves that recording active. Stopping and saving a local session also ends its attached stream.

@@ -18,6 +18,7 @@
 #include "saberstage/camera/CameraProfile.hpp"
 #include "saberstage/camera/FrameDemand.hpp"
 #include "saberstage/broadcast/DirectLivestreamSink.hpp"
+#include "saberstage/broadcast/DiscordScreenSink.hpp"
 #include "saberstage/broadcast/TtsService.hpp"
 #include "saberstage/recording/RecordingRuntimeDriver.hpp"
 #include "saberstage/recording/AsyncVideoWriter.hpp"
@@ -244,7 +245,8 @@ bool RecordingController::StartCapture(
     std::string* error,
     bool forceContinuous,
     bool forceDirectHardware,
-    bool writeLocalOutput) {
+    bool writeLocalOutput,
+    bool captureAudio) {
     if (!TryTransition(
         {RecordingState::Idle, RecordingState::Failed, RecordingState::Armed},
         RecordingState::Starting,
@@ -344,7 +346,11 @@ bool RecordingController::StartCapture(
         }
         StartVideoSegment();
 
-        CreatePersistentAudioCapture();
+        // Network outputs consume the same bounded PCM worker used for local
+        // recording. The worker mixes game audio, Quest microphone, and Chat
+        // TTS once, then fans that result out without touching Unity's realtime
+        // audio callback with socket work.
+        if (captureAudio) CreatePersistentAudioCapture();
 
         recordingStarted_ = std::chrono::steady_clock::now();
         pauseStarted_ = {};
@@ -553,8 +559,14 @@ void RecordingController::StartVideoSegment() {
                     videoSegmentLastPresentationFrame_, segmentFrame);
                 videoPresentationFrames_.push_back(videoSegmentFrameBase_ + segmentFrame);
             }
-            std::lock_guard lock(livestreamMutex_);
-            if (livestreamSink_) livestreamSink_->SubmitVideo(packet);
+            {
+                std::lock_guard lock(livestreamMutex_);
+                if (livestreamSink_) livestreamSink_->SubmitVideo(packet);
+            }
+            {
+                std::lock_guard lock(discordScreenMutex_);
+                if (discordScreenSink_) discordScreenSink_->SubmitVideo(packet);
+            }
         });
     if (!IsUnityObjectAlive(directVideoCapture_->texture)) {
         throw std::runtime_error("Direct FFmpeg did not create an encoder texture");
@@ -644,6 +656,7 @@ bool RecordingController::Stop(std::string_view reason) {
         // the live teardown path instead of manufacturing a failed MP4.
         if (streamOnlySession_) {
             StopLivestream();
+            StopDiscordScreen();
             return true;
         }
         const auto current = state_.load();
@@ -661,6 +674,7 @@ bool RecordingController::Stop(std::string_view reason) {
             return false;
         }
         StopLivestream();
+        StopDiscordScreen();
         CleanupCaptureObjects();
         camera_.RemoveRenderDemand(kRecordingDemandId);
         FinalizeAsync();
@@ -689,6 +703,7 @@ void RecordingController::Shutdown() noexcept {
             Stop("SaberStage is shutting down.");
         }
         StopLivestream();
+        StopDiscordScreen();
         {
             std::lock_guard lock(livestreamMutex_);
             livestreamSink_.reset();
@@ -698,6 +713,10 @@ void RecordingController::Shutdown() noexcept {
                 key.clear();
             }
             streamServerUrlOverrides_.fill({});
+        }
+        {
+            std::lock_guard lock(discordScreenMutex_);
+            discordScreenSink_.reset();
         }
         if (finalizer_.joinable()) finalizer_.join();
         CleanupCaptureObjects();
@@ -844,15 +863,34 @@ void RecordingController::Tick() noexcept {
     // so the user can correct the endpoint or key and retry.
     if (streamOnlySession_) {
         const auto livestream = LivestreamSnapshot();
+        const auto discord = DiscordScreenSnapshot();
+        const bool livestreamActive = broadcast::CanStop(livestream.state);
+        const bool discordActive = broadcast::CanStop(discord.state);
         if (livestream.state == broadcast::LivestreamState::Failed) {
             const auto failure = livestream.status;
             StopLivestream();
-            SetState(
-                RecordingState::Failed,
-                failure.empty()
-                    ? "Live stream failed. No local recording was created."
-                    : failure + " No local recording was created.");
-            return;
+            if (!discordActive) {
+                StopDiscordScreen();
+                SetState(
+                    RecordingState::Failed,
+                    failure.empty()
+                        ? "Live stream failed. No local recording was created."
+                        : failure + " No local recording was created.");
+                return;
+            }
+        }
+        if (discord.state == broadcast::DiscordScreenState::Failed) {
+            const auto failure = discord.status;
+            StopDiscordScreen();
+            if (!livestreamActive) {
+                StopLivestream();
+                SetState(
+                    RecordingState::Failed,
+                    failure.empty()
+                        ? "Discord screen source failed. No local recording was created."
+                        : failure + " No local recording was created.");
+                return;
+            }
         }
     }
     const auto current = state_.load();
@@ -994,9 +1032,20 @@ RecordingSnapshot RecordingController::Snapshot() const {
     }
     snapshot.droppedFrameCount = snapshot.skippedCaptureFrameCount + snapshot.encoderDroppedFrameCount;
     const auto live = LivestreamSnapshot();
-    if (streamOnlySession_) {
+    const auto discord = DiscordScreenSnapshot();
+    const bool livestreamActive = broadcast::CanStop(live.state);
+    const bool discordActive = broadcast::CanStop(discord.state);
+    if (streamOnlySession_ && livestreamActive && discordActive) {
+        snapshot.outputType = RecordingOutputType::LiveAndDiscord;
+    } else if (streamOnlySession_ && discordActive) {
+        snapshot.outputType = RecordingOutputType::DiscordScreen;
+    } else if (streamOnlySession_) {
         snapshot.outputType = RecordingOutputType::LiveStream;
-    } else if (broadcast::CanStop(live.state)) {
+    } else if (livestreamActive && discordActive) {
+        snapshot.outputType = RecordingOutputType::LocalLiveAndDiscord;
+    } else if (discordActive) {
+        snapshot.outputType = RecordingOutputType::LocalAndDiscord;
+    } else if (livestreamActive) {
         snapshot.outputType = RecordingOutputType::LocalAndLive;
     }
     return snapshot;
@@ -1199,10 +1248,126 @@ bool RecordingController::StartLivestream(std::string* error) {
         StopLivestream();
         if (error) *error = "Wait for local recording to finish starting, pausing, or saving before going live.";
         return false;
+    } else if (!IsUnityObjectAlive(audioCapture_)) {
+        // Another network output can already own the hardware encoder. Attach
+        // the shared PCM worker without restarting video or disturbing the
+        // companion decoder.
+        try {
+            CreatePersistentAudioCapture();
+        } catch (const std::exception& exception) {
+            if (error) *error = std::string("Live stream audio could not start: ") + exception.what();
+            StopLivestream();
+            return false;
+        } catch (...) {
+            if (error) *error = "Live stream audio could not start because of an unknown capture failure.";
+            StopLivestream();
+            return false;
+        }
     }
     EnableLivestreamWakeGuard();
     statusVersion_.fetch_add(1);
     return true;
+}
+
+bool RecordingController::StartDiscordScreen(std::string* error) {
+    try {
+        if (state_.load() == RecordingState::Recording &&
+                activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware) {
+            if (error) {
+                *error = "This recording uses Hollywood. Stop it before starting the Discord screen source, which requires the shared Direct FFmpeg encoder.";
+            }
+            return false;
+        }
+
+        const auto requestedBroadcastSettings = settings_.Get().broadcast;
+        if (requestedBroadcastSettings.microphoneEnabled) {
+            const auto permissionStatus = QueryMicrophonePermission();
+            if (permissionStatus != MicrophonePermissionStatus::Granted) {
+                if (permissionStatus != MicrophonePermissionStatus::MissingFromApplication) {
+                    UnityEngine::Android::Permission::RequestUserPermission(
+                        kMicrophonePermission, nullptr);
+                }
+                Logging::Logger.warn(
+                    "Discord screen audio will continue without Quest microphone input: {}",
+                    permissionStatus == MicrophonePermissionStatus::MissingFromApplication
+                        ? "Beat Saber was patched without RECORD_AUDIO"
+                        : "Android microphone permission has not been granted");
+            }
+        }
+        RefreshAudioConfiguration();
+
+        const auto& recording = settings_.Get().recording;
+        std::int32_t width = 0;
+        std::int32_t height = 0;
+        settings::ResolutionDimensions(recording.resolution, width, height);
+        {
+            std::lock_guard lock(discordScreenMutex_);
+            if (discordScreenSink_ &&
+                    broadcast::CanStop(discordScreenSink_->Snapshot().state)) {
+                if (error) *error = "The Discord screen source is already active.";
+                return false;
+            }
+            discordScreenSink_.reset();
+            discordScreenSink_ = std::make_unique<broadcast::DiscordScreenSink>(
+                width,
+                height,
+                recording.framesPerSecond,
+                [this] { statusVersion_.fetch_add(1); });
+            if (!discordScreenSink_->Start(error)) {
+                discordScreenSink_.reset();
+                return false;
+            }
+        }
+
+        const auto current = state_.load();
+        if (recording::CanStart(current)) {
+            if (!StartCapture(error, true, true, false, true)) {
+                StopDiscordScreen();
+                return false;
+            }
+        } else if (current != RecordingState::Recording) {
+            StopDiscordScreen();
+            if (error) {
+                *error = "Wait for recording to finish starting, pausing, or saving before opening the Discord screen source.";
+            }
+            return false;
+        } else if (!IsUnityObjectAlive(audioCapture_)) {
+            try {
+                CreatePersistentAudioCapture();
+            } catch (const std::exception& exception) {
+                if (error) {
+                    *error = std::string("Discord screen audio could not start: ") +
+                        exception.what();
+                }
+                StopDiscordScreen();
+                return false;
+            } catch (...) {
+                if (error) {
+                    *error = "Discord screen audio could not start because of an unknown capture failure.";
+                }
+                StopDiscordScreen();
+                return false;
+            }
+        }
+        EnableLivestreamWakeGuard();
+        statusVersion_.fetch_add(1);
+        Logging::Logger.info(
+            "Discord screen source started at {}x{}@{} using shared hardware video and mixed PCM audio",
+            width,
+            height,
+            recording.framesPerSecond);
+        return true;
+    } catch (const std::exception& exception) {
+        StopDiscordScreen();
+        if (error) *error = std::string("Discord screen source could not start: ") + exception.what();
+        Logging::Logger.error("Discord screen source start failed: {}", exception.what());
+        return false;
+    } catch (...) {
+        StopDiscordScreen();
+        if (error) *error = "Discord screen source could not start because of an unknown error.";
+        Logging::Logger.error("Discord screen source start failed because of an unknown error");
+        return false;
+    }
 }
 
 void RecordingController::EnableLivestreamWakeGuard() noexcept {
@@ -1343,10 +1508,13 @@ bool RecordingController::PrepareAfkMedia(
 
 bool RecordingController::PauseLivestream(std::string* error) {
     const auto live = LivestreamSnapshot();
-    if (!broadcast::CanStop(live.state) || live.afk) {
+    const auto discord = DiscordScreenSnapshot();
+    const bool liveOutputActive = broadcast::CanStop(live.state) ||
+        broadcast::CanStop(discord.state);
+    if (!liveOutputActive || live.afk) {
         if (error) *error = live.afk
-            ? "The live stream is already showing the AFK screen."
-            : "Start the Twitch stream before pausing it.";
+            ? "The live output is already showing the AFK screen."
+            : "Start a Twitch or Discord live output before pausing it.";
         return false;
     }
     if (!streamOnlySession_) {
@@ -1394,7 +1562,7 @@ bool RecordingController::PauseLivestream(std::string* error) {
     livestreamAfk_.store(true, std::memory_order_release);
     statusVersion_.fetch_add(1);
     Logging::Logger.info(
-        "Livestream entered AFK mode using '{}' while RTMP remained connected",
+        "Live output entered AFK mode using '{}' while active transports remained connected",
         afkMedia_->Description());
     return true;
 }
@@ -1421,7 +1589,7 @@ bool RecordingController::ResumeLivestream(std::string* error) {
     }
     livestreamAfk_.store(false, std::memory_order_release);
     statusVersion_.fetch_add(1);
-    Logging::Logger.info("Livestream left AFK mode and restored the spectator camera/audio");
+    Logging::Logger.info("Live output left AFK mode and restored the spectator camera/audio");
     return true;
 }
 
@@ -1559,8 +1727,9 @@ bool RecordingController::SetLivestreamGameAudioMuted(
     bool muted,
     std::string* error) {
     std::lock_guard lock(livestreamMutex_);
-    const bool streamActive = livestreamSink_ &&
-        broadcast::CanStop(livestreamSink_->Snapshot().state);
+    const bool streamActive =
+        (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) ||
+        broadcast::CanStop(DiscordScreenSnapshot().state);
     if (streamActive && livestreamAfk_.load(std::memory_order_acquire)) {
         if (error) *error = "Game sound is locked while the AFK screen is active.";
         return false;
@@ -1587,8 +1756,12 @@ bool RecordingController::SetLivestreamMicrophoneMuted(
     bool muted,
     std::string* error) {
     std::lock_guard lock(livestreamMutex_);
-    if (!livestreamSink_ || !broadcast::CanStop(livestreamSink_->Snapshot().state)) {
-        if (error) *error = "Start the live stream before changing microphone mute.";
+    const bool streamActive =
+        (livestreamSink_ && broadcast::CanStop(livestreamSink_->Snapshot().state)) ||
+        broadcast::CanStop(DiscordScreenSnapshot().state);
+    if (!streamActive) {
+        if (error) *error =
+            "Start a Twitch or Discord live output before changing microphone mute.";
         return false;
     }
     if (livestreamAfk_.load(std::memory_order_acquire)) {
@@ -1606,7 +1779,7 @@ bool RecordingController::SetLivestreamMicrophoneMuted(
     livestreamMicrophoneMuted_ = muted;
     statusVersion_.fetch_add(1);
     Logging::Logger.info(
-        "Livestream microphone {} from movable controls",
+        "Live-output microphone {} from movable controls",
         muted ? "muted" : "unmuted");
     return true;
 }
@@ -1618,13 +1791,15 @@ void RecordingController::StopLivestream() noexcept {
     // therefore continues when only the network stream is stopped.
     livestreamAfk_.store(false, std::memory_order_release);
     microphoneDsp_.SetPushToTalk(false);
-    DisableLivestreamWakeGuard();
     if (IsUnityObjectAlive(directVideoCapture_)) {
         directVideoCapture_->SetOverrideTexture(nullptr);
     }
     if (afkMedia_) afkMedia_->Deactivate();
-    const bool stopStreamOnlyCapture =
-        streamOnlySession_ && recording::CanStop(state_.load());
+    const auto discord = DiscordScreenSnapshot();
+    const bool discordActive = broadcast::CanStop(discord.state);
+    if (!discordActive) DisableLivestreamWakeGuard();
+    const bool stopStreamOnlyCapture = streamOnlySession_ && !discordActive &&
+        recording::CanStop(state_.load());
     bool captureTransitioned = false;
     if (stopStreamOnlyCapture) {
         captureTransitioned = TryTransition(
@@ -1655,6 +1830,61 @@ void RecordingController::StopLivestream() noexcept {
         streamOnlySession_ = false;
         SetState(RecordingState::Idle, "Live stream stopped. No local recording was created.");
         Logging::Logger.info("Stream-only capture stopped without creating local media files");
+    }
+    statusVersion_.fetch_add(1);
+}
+
+void RecordingController::StopDiscordScreen() noexcept {
+    const auto livestream = LivestreamSnapshot();
+    const bool livestreamActive = broadcast::CanStop(livestream.state);
+    // Discord-only AFK uses the same camera override and privacy mute as RTMP.
+    // Removing the final network destination must release both immediately;
+    // otherwise the next live session would inherit a stale AFK state.
+    if (!livestreamActive) {
+        livestreamAfk_.store(false, std::memory_order_release);
+        microphoneDsp_.SetPushToTalk(false);
+        if (IsUnityObjectAlive(directVideoCapture_)) {
+            directVideoCapture_->SetOverrideTexture(nullptr);
+        }
+        if (afkMedia_) afkMedia_->Deactivate();
+        std::lock_guard lock(livestreamMutex_);
+        livestreamMicrophoneMuted_ = false;
+    }
+    if (!livestreamActive) DisableLivestreamWakeGuard();
+    const bool stopExternalOnlyCapture = streamOnlySession_ && !livestreamActive &&
+        recording::CanStop(state_.load());
+    bool captureTransitioned = false;
+    if (stopExternalOnlyCapture) {
+        captureTransitioned = TryTransition(
+            {RecordingState::Starting, RecordingState::Recording, RecordingState::Pausing,
+             RecordingState::Paused, RecordingState::Resuming},
+            RecordingState::Stopping,
+            "Stopping Discord screen-source capture...");
+        if (captureTransitioned) {
+            CleanupCaptureObjects();
+            camera_.RemoveRenderDemand(kRecordingDemandId);
+        }
+    }
+    {
+        std::lock_guard lock(discordScreenMutex_);
+        if (discordScreenSink_) discordScreenSink_->Stop();
+    }
+    if (captureTransitioned) {
+        rawVideoPath_.clear();
+        rawAudioPath_.clear();
+        partialOutputPath_.clear();
+        finalOutputPath_.clear();
+        recordingStarted_ = {};
+        pauseStarted_ = {};
+        accumulatedPaused_ = {};
+        captureWriteFailed_.store(false);
+        captureFailureDetail_.clear();
+        streamOnlySession_ = false;
+        SetState(
+            RecordingState::Idle,
+            "Discord screen source stopped. No local recording was created.");
+        Logging::Logger.info(
+            "Discord-only camera capture stopped without creating local media files");
     }
     statusVersion_.fetch_add(1);
 }
@@ -1690,12 +1920,19 @@ broadcast::LivestreamSnapshot RecordingController::LivestreamSnapshot() const {
     snapshot.afk = livestreamAfk_.load(std::memory_order_acquire);
     snapshot.gameAudioAvailable = broadcastSettings.gameAudioEnabled &&
         broadcastSettings.gameAudioVolumePercent > 0.0001F;
-    snapshot.gameAudioMuted = !snapshot.gameAudioAvailable ||
+    snapshot.gameAudioMuted = snapshot.afk || !snapshot.gameAudioAvailable ||
         livestreamGameAudioMuted_;
     snapshot.microphoneAvailable = broadcastSettings.microphoneEnabled &&
         broadcastSettings.microphoneVolumePercent > 0.0001F;
-    snapshot.microphoneMuted = !snapshot.microphoneAvailable;
+    snapshot.microphoneMuted = snapshot.afk || !snapshot.microphoneAvailable ||
+        livestreamMicrophoneMuted_;
     return snapshot;
+}
+
+broadcast::DiscordScreenSnapshot RecordingController::DiscordScreenSnapshot() const {
+    std::lock_guard lock(discordScreenMutex_);
+    if (discordScreenSink_) return discordScreenSink_->Snapshot();
+    return {};
 }
 
 void RecordingController::HandleRuntimeCameraInvalidated() noexcept {
@@ -1755,6 +1992,13 @@ void RecordingController::HandleSpectatorRendered() noexcept {
 }
 
 void RecordingController::CreatePersistentAudioCapture() {
+    if (IsUnityObjectAlive(audioCapture_) && IsUnityObjectAlive(audioObject_)) return;
+    // A prior partial construction must never be layered under another audio
+    // listener. This path records no failure because the new capture has not
+    // started and therefore has no media continuity to preserve.
+    if (audioCapture_ || audioObject_ || captureAudioListener_) {
+        StopPersistentAudioCapture(false);
+    }
     audioObject_ = UnityEngine::GameObject::New_ctor("SaberStage Persistent Game Audio Capture");
     if (!IsUnityObjectAlive(audioObject_)) throw std::runtime_error("cannot create persistent game-audio capture object");
     audioObject_->SetActive(false);
@@ -1832,7 +2076,13 @@ void RecordingController::SubmitLivestreamAudioLocked(
         }
     }
     const auto localOutput = !streamOnlySession_;
-    const auto streamOutput = livestreamSink_ != nullptr;
+    bool discordOutput = false;
+    {
+        std::lock_guard lock(discordScreenMutex_);
+        discordOutput = discordScreenSink_ != nullptr;
+    }
+    const auto streamOutput = livestreamSink_ != nullptr || discordOutput;
+    const auto afk = livestreamAfk_.load(std::memory_order_acquire);
     const auto localGameMuted = localRecordingGameAudioMuted_.load(std::memory_order_acquire);
 
     for (std::size_t frame = 0; frame < frameCount; ++frame) {
@@ -1842,12 +2092,19 @@ void RecordingController::SubmitLivestreamAudioLocked(
             const auto index = frame * channelCount + channel;
             const auto game = samples[index];
             if (streamOutput) {
-                const auto streamGame = livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_
-                    ? game * livestreamGameAudioGain_ : 0.0F;
-                const auto streamMic = microphone && audioSettings.includeMicrophoneInLivestreams &&
-                        !livestreamMicrophoneMuted_
-                    ? mic * livestreamMicrophoneGain_ : 0.0F;
-                livestreamMixScratch_[index] = std::clamp(streamGame + streamMic + speech, -1.0F, 1.0F);
+                if (afk) {
+                    // AFK is a privacy state for every network destination,
+                    // including the raw PCM sent to the Discord helper.
+                    livestreamMixScratch_[index] = 0.0F;
+                } else {
+                    const auto streamGame = livestreamGameAudioEnabled_ && !livestreamGameAudioMuted_
+                        ? game * livestreamGameAudioGain_ : 0.0F;
+                    const auto streamMic = microphone && audioSettings.includeMicrophoneInLivestreams &&
+                            !livestreamMicrophoneMuted_
+                        ? mic * livestreamMicrophoneGain_ : 0.0F;
+                    livestreamMixScratch_[index] = std::clamp(
+                        streamGame + streamMic + speech, -1.0F, 1.0F);
+                }
             }
             if (localOutput) {
                 const auto localGame = localGameMuted ? 0.0F : game;
@@ -1859,9 +2116,62 @@ void RecordingController::SubmitLivestreamAudioLocked(
         }
     }
     if (streamOutput) {
-        livestreamSink_->SubmitAudio(
-            livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+        if (livestreamSink_) {
+            livestreamSink_->SubmitAudio(
+                livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+        }
+        if (discordOutput) {
+            std::lock_guard lock(discordScreenMutex_);
+            if (discordScreenSink_) {
+                discordScreenSink_->SubmitAudio(
+                    livestreamMixScratch_.data(), usableSampleCount, channels, sampleRate);
+            }
+        }
     }
+}
+
+void RecordingController::StopPersistentAudioCapture(bool recordFailure) noexcept {
+    try {
+        if (IsUnityObjectAlive(audioObject_)) audioObject_->SetActive(false);
+    } catch (...) {
+        Logging::Logger.error("Game-audio capture deactivation failed");
+    }
+    try {
+        if (IsUnityObjectAlive(audioCapture_)) {
+            audioCapture_->Save();
+            const auto firstSample = audioCapture_->FirstSampleMonotonicNanos();
+            if (firstAudioSampleMonotonicNanos_ == 0 && firstSample > 0) {
+                firstAudioSampleMonotonicNanos_ = firstSample;
+            }
+            if (recordFailure &&
+                    (audioCapture_->Failed() || audioCapture_->DroppedSampleCount() > 0)) {
+                captureWriteFailed_.store(true);
+                if (captureFailureDetail_.empty()) {
+                    captureFailureDetail_ = audioCapture_->Failed()
+                        ? "The game-audio capture worker failed."
+                        : "Game-audio capture overflowed and dropped " +
+                            std::to_string(audioCapture_->DroppedSampleCount()) + " sample(s).";
+                }
+                Logging::Logger.error(
+                    "Audio capture was incomplete: failed={}, droppedSamples={}",
+                    audioCapture_->Failed(), audioCapture_->DroppedSampleCount());
+            }
+        }
+    } catch (...) {
+        Logging::Logger.error("Game-audio capture save failed");
+    }
+    // Restore only listeners that still exist in the current scene. This must
+    // happen before clearing/destroying the capture listener so it can be
+    // excluded from the live enumeration without retaining a stale wrapper.
+    RestoreAudioListenerOwnership();
+    try {
+        if (IsUnityObjectAlive(audioObject_)) UnityEngine::Object::DestroyImmediate(audioObject_);
+    } catch (...) {
+        Logging::Logger.error("Game-audio capture object destruction failed");
+    }
+    audioCapture_ = nullptr;
+    captureAudioListener_ = nullptr;
+    audioObject_ = nullptr;
 }
 
 void RecordingController::StopLivestreamMicrophoneLocked() noexcept {
@@ -2109,46 +2419,7 @@ void RecordingController::FinalizeWorker(
 
 void RecordingController::CleanupCaptureObjects() noexcept {
     camera_.EndExternalRenderOutput();
-    try {
-        if (IsUnityObjectAlive(audioObject_)) audioObject_->SetActive(false);
-    } catch (...) {
-        Logging::Logger.error("Game-audio capture deactivation failed");
-    }
-    try {
-        if (IsUnityObjectAlive(audioCapture_)) {
-            audioCapture_->Save();
-            const auto firstSample = audioCapture_->FirstSampleMonotonicNanos();
-            if (firstAudioSampleMonotonicNanos_ == 0 && firstSample > 0) {
-                firstAudioSampleMonotonicNanos_ = firstSample;
-            }
-            if (audioCapture_->Failed() || audioCapture_->DroppedSampleCount() > 0) {
-                captureWriteFailed_.store(true);
-                if (captureFailureDetail_.empty()) {
-                    captureFailureDetail_ = audioCapture_->Failed()
-                        ? "The game-audio capture worker failed."
-                        : "Game-audio capture overflowed and dropped " +
-                            std::to_string(audioCapture_->DroppedSampleCount()) + " sample(s).";
-                }
-                Logging::Logger.error(
-                    "Audio capture was incomplete: failed={}, droppedSamples={}",
-                    audioCapture_->Failed(), audioCapture_->DroppedSampleCount());
-            }
-        }
-    } catch (...) {
-        Logging::Logger.error("Game-audio capture save failed");
-    }
-    // Restore only listeners that still exist in the current scene. This must
-    // happen before clearing/destroying the capture listener so it can be
-    // excluded from the live enumeration without retaining any stale wrapper.
-    RestoreAudioListenerOwnership();
-    try {
-        if (IsUnityObjectAlive(audioObject_)) UnityEngine::Object::DestroyImmediate(audioObject_);
-    } catch (...) {
-        Logging::Logger.error("Game-audio capture object destruction failed");
-    }
-    audioCapture_ = nullptr;
-    captureAudioListener_ = nullptr;
-    audioObject_ = nullptr;
+    StopPersistentAudioCapture(true);
 
     StopVideoSegment();
     activeRuntimeCamera_ = nullptr;
