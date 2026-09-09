@@ -141,7 +141,9 @@ public:
     bool Resume(std::string* error = nullptr);
     bool Stop(std::string_view reason = "Stopped by user");
     bool StartLivestream(std::string* error = nullptr);
-    bool StartDiscordScreen(std::string* error = nullptr);
+    bool StartDiscordScreen(
+        std::string* error = nullptr,
+        broadcast::DiscordHelperAvailability* helperAvailability = nullptr);
     // Android can display a runtime microphone prompt only when RECORD_AUDIO
     // was included while Beat Saber was patched. Exposing that distinction
     // lets the menu explain an MBF patch-permission omission accurately.

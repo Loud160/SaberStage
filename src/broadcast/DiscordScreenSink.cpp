@@ -7,7 +7,10 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Launches the Discord-selectable SaberStage Camera Android activity.
+// - Opens Discord before launching the selectable SaberStage Camera activity.
+//   Meta's 2D window manager removes an existing sideloaded panel when Discord
+//   is launched from the Quest library; opening the source last keeps both
+//   tasks alive so Discord's single-app picker can enumerate the helper.
 // - Transfers bounded H.264 Annex-B access units and mixed signed 16-bit PCM over
 //   authenticated TCP loopback for Android app-window video/audio capture.
 
@@ -87,6 +90,37 @@ bool ClearJniException() noexcept {
     Jni::ExceptionClear();
     Jni::DeleteLocalRef(exception);
     return true;
+}
+
+enum class PendingJniException : std::uint8_t {
+    None,
+    ActivityNotFound,
+    Other,
+};
+
+// PackageManager visibility and activity launching are separate Android
+// operations. An explicit exported component may be launched even when the
+// caller cannot enumerate its package, so only ActivityNotFoundException is
+// treated as proof that the install workflow is required.
+PendingJniException ConsumePendingJniException() noexcept {
+    const auto exception = Jni::ExceptionOccurred();
+    if (IsNull(exception)) return PendingJniException::None;
+
+    Jni::ExceptionClear();
+    bool activityNotFound = false;
+    const auto activityNotFoundClass =
+        Jni::FindClass("android/content/ActivityNotFoundException");
+    if (!IsNull(activityNotFoundClass) && !ClearJniException()) {
+        activityNotFound = Jni::IsInstanceOf(exception, activityNotFoundClass);
+        ClearJniException();
+        Jni::DeleteLocalRef(activityNotFoundClass);
+    } else {
+        ClearJniException();
+    }
+    Jni::DeleteLocalRef(exception);
+    return activityNotFound
+        ? PendingJniException::ActivityNotFound
+        : PendingJniException::Other;
 }
 
 class LocalFrame final {
@@ -176,9 +210,16 @@ DiscordHelperAvailability QueryDiscordHelperAvailabilityImpl() noexcept {
                 "Android rejected the Discord helper package query");
             return DiscordHelperAvailability::Unknown;
         }
-        return IsNull(launchIntent)
-            ? DiscordHelperAvailability::NotInstalled
-            : DiscordHelperAvailability::Installed;
+        if (IsNull(launchIntent)) {
+            // Android 11+ returns null when Beat Saber has no <queries> entry,
+            // even for the installed, exported SaberStage Helper. Do not send
+            // the user back through installation on this ambiguous result.
+            Logging::Logger.warn(
+                "Android PackageManager did not expose SaberStage Helper; "
+                "the explicit helper launch will verify availability");
+            return DiscordHelperAvailability::Unknown;
+        }
+        return DiscordHelperAvailability::Installed;
     } catch (const std::exception& exception) {
         ClearJniException();
         Logging::Logger.error(
@@ -197,8 +238,12 @@ bool LaunchHelperActivity(
     std::int32_t width,
     std::int32_t height,
     std::int32_t framesPerSecond,
-    std::string* error) noexcept {
+    std::string* error,
+    DiscordHelperAvailability* helperAvailability) noexcept {
     try {
+        if (helperAvailability) {
+            *helperAvailability = DiscordHelperAvailability::Unknown;
+        }
         const auto fail = [error](std::string message) {
             ClearJniException();
             if (error) *error = std::move(message);
@@ -226,6 +271,61 @@ bool LaunchHelperActivity(
         const auto constructor = Jni::GetMethodID(intentClass, "<init>", "()V");
         if (IsNull(constructor) || ClearJniException())
             return fail("Android could not resolve the helper launch request constructor.");
+
+        const auto setClassName = Jni::GetMethodID(
+            intentClass,
+            "setClassName",
+            "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;");
+        const auto setAction = Jni::GetMethodID(
+            intentClass, "setAction", "(Ljava/lang/String;)Landroid/content/Intent;");
+        const auto addCategory = Jni::GetMethodID(
+            intentClass, "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;");
+        const auto addFlags = Jni::GetMethodID(
+            intentClass, "addFlags", "(I)Landroid/content/Intent;");
+        const auto activityClass = Jni::GetObjectClass(activity);
+        const auto startActivity = IsNull(activityClass)
+            ? JHandle{}
+            : Jni::GetMethodID(
+                  activityClass, "startActivity", "(Landroid/content/Intent;)V");
+        if (IsNull(setClassName) || IsNull(setAction) || IsNull(addCategory) ||
+                IsNull(addFlags) || IsNull(activityClass) || IsNull(startActivity) ||
+                ClearJniException()) {
+            return fail("Android could not resolve the Discord application launcher.");
+        }
+
+        const auto discordIntent = Jni::NewObject(intentClass, constructor, nullptr);
+        const auto discordPackage = Jni::NewStringUTF("com.discord");
+        const auto discordActivity = Jni::NewStringUTF("com.discord.main.MainDefault");
+        const auto mainAction = Jni::NewStringUTF("android.intent.action.MAIN");
+        const auto launcherCategory =
+            Jni::NewStringUTF("android.intent.category.LAUNCHER");
+        if (IsNull(discordIntent) || IsNull(discordPackage) ||
+                IsNull(discordActivity) || IsNull(mainAction) ||
+                IsNull(launcherCategory) || ClearJniException()) {
+            return fail("Android could not prepare the Discord application launch.");
+        }
+        Jni::CallObjectMethod(
+            discordIntent,
+            setClassName,
+            {ObjectArgument(discordPackage), ObjectArgument(discordActivity)});
+        Jni::CallObjectMethod(discordIntent, setAction, {ObjectArgument(mainAction)});
+        Jni::CallObjectMethod(
+            discordIntent, addCategory, {ObjectArgument(launcherCategory)});
+        Jni::CallObjectMethod(discordIntent, addFlags, {IntArgument(0x10000000)});
+        if (ClearJniException())
+            return fail("Android could not configure the Discord application launch.");
+        Jni::CallVoidMethod(activity, startActivity, {ObjectArgument(discordIntent)});
+        const auto discordLaunchException = ConsumePendingJniException();
+        if (discordLaunchException == PendingJniException::ActivityNotFound) {
+            return fail("The Quest Discord app is not installed or its main activity is unavailable.");
+        }
+        if (discordLaunchException != PendingJniException::None) {
+            return fail("Android rejected the Discord application launch. Details were written to the SaberStage log.");
+        }
+
+        // Launch the source second. This ordering is required on Horizon OS:
+        // opening Discord from the library after the helper is visible removes
+        // the helper's root task before Discord builds its share-source list.
         const auto intent = Jni::NewObject(intentClass, constructor, nullptr);
         if (IsNull(intent) || ClearJniException())
             return fail("Android could not create the helper launch request.");
@@ -243,20 +343,12 @@ bool LaunchHelperActivity(
                 IsNull(heightKey) || IsNull(fpsKey) || ClearJniException())
             return fail("Android could not prepare the helper session.");
 
-        const auto setClassName = Jni::GetMethodID(
-            intentClass,
-            "setClassName",
-            "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;");
-        const auto setAction = Jni::GetMethodID(
-            intentClass, "setAction", "(Ljava/lang/String;)Landroid/content/Intent;");
         const auto putString = Jni::GetMethodID(
             intentClass,
             "putExtra",
             "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;");
         const auto putInteger = Jni::GetMethodID(
             intentClass, "putExtra", "(Ljava/lang/String;I)Landroid/content/Intent;");
-        const auto addFlags = Jni::GetMethodID(
-            intentClass, "addFlags", "(I)Landroid/content/Intent;");
         if (IsNull(setClassName) || IsNull(setAction) || IsNull(putString) ||
                 IsNull(putInteger) || IsNull(addFlags) || ClearJniException())
             return fail("Android could not resolve the helper launch methods.");
@@ -277,17 +369,19 @@ bool LaunchHelperActivity(
         if (ClearJniException())
             return fail("Android could not configure the helper launch request.");
 
-        const auto activityClass = Jni::GetObjectClass(activity);
-        if (IsNull(activityClass) || ClearJniException())
-            return fail("Beat Saber's Android activity type is unavailable.");
-        const auto startActivity = Jni::GetMethodID(
-            activityClass, "startActivity", "(Landroid/content/Intent;)V");
-        if (IsNull(startActivity) || ClearJniException())
-            return fail("Android could not resolve the helper activity launcher.");
         Jni::CallVoidMethod(activity, startActivity, {ObjectArgument(intent)});
-        if (ClearJniException()) {
-            return fail(
-                "SaberStage Camera could not be opened. Install the SaberStage Helper APK first.");
+        const auto launchException = ConsumePendingJniException();
+        if (launchException == PendingJniException::ActivityNotFound) {
+            if (helperAvailability) {
+                *helperAvailability = DiscordHelperAvailability::NotInstalled;
+            }
+            return fail("SaberStage Helper is not installed or its camera activity is unavailable.");
+        }
+        if (launchException != PendingJniException::None) {
+            return fail("Android rejected the SaberStage Camera activity launch. Details were written to the SaberStage log.");
+        }
+        if (helperAvailability) {
+            *helperAvailability = DiscordHelperAvailability::Installed;
         }
         return true;
     } catch (...) {
@@ -471,7 +565,9 @@ public:
 
     ~Impl() { Stop(); }
 
-    bool Start(std::string* error) {
+    bool Start(
+        std::string* error,
+        DiscordHelperAvailability* helperAvailability) {
         auto expected = DiscordScreenState::Stopped;
         if (!state_.compare_exchange_strong(expected, DiscordScreenState::Launching)) {
             expected = DiscordScreenState::Failed;
@@ -508,9 +604,19 @@ public:
         videoPacketsDropped_.store(0, std::memory_order_relaxed);
         audioPacketsSent_.store(0, std::memory_order_relaxed);
         audioPacketsDropped_.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(statusMutex_);
+            decoderStatus_.clear();
+        }
         token_ = CreateSessionToken();
         SetStatus(DiscordScreenState::Launching, "Opening SaberStage Camera on Android...");
-        if (!LaunchHelperActivity(token_, width_, height_, framesPerSecond_, error)) {
+        if (!LaunchHelperActivity(
+                token_,
+                width_,
+                height_,
+                framesPerSecond_,
+                error,
+                helperAvailability)) {
             SetStatus(
                 DiscordScreenState::Failed,
                 error && !error->empty()
@@ -673,6 +779,7 @@ public:
         {
             std::lock_guard lock(statusMutex_);
             result.status = status_;
+            result.decoderStatus = decoderStatus_;
         }
         {
             std::lock_guard lock(queueMutex_);
@@ -851,6 +958,29 @@ private:
             CloseSocket();
             return false;
         }
+        // Protocol v2 helpers historically returned only "ready". Newer
+        // helpers append one human-readable decoder line after a newline, so
+        // accepting the old payload preserves compatibility while allowing
+        // SaberStage to display the exact MediaCodec chosen by Android.
+        const std::string acknowledgement(payload.begin(), payload.end());
+        constexpr const char* kReadyPrefix = "ready\n";
+        std::string decoderStatus;
+        if (acknowledgement.rfind(kReadyPrefix, 0) == 0) {
+            decoderStatus = acknowledgement.substr(std::strlen(kReadyPrefix));
+            decoderStatus.erase(
+                std::remove(decoderStatus.begin(), decoderStatus.end(), '\r'),
+                decoderStatus.end());
+            decoderStatus.erase(
+                std::remove(decoderStatus.begin(), decoderStatus.end(), '\0'),
+                decoderStatus.end());
+        }
+        if (!decoderStatus.empty()) {
+            Logging::Logger.info("SaberStage Helper reported {}", decoderStatus);
+        }
+        {
+            std::lock_guard lock(statusMutex_);
+            decoderStatus_ = std::move(decoderStatus);
+        }
         return true;
     }
 
@@ -913,6 +1043,7 @@ private:
     std::thread worker_;
     mutable std::mutex statusMutex_;
     std::string status_ = "Stopped";
+    std::string decoderStatus_;
     mutable std::mutex queueMutex_;
     std::condition_variable ready_;
     std::deque<QueuedPacket> packetQueue_;
@@ -936,7 +1067,11 @@ DiscordScreenSink::DiscordScreenSink(
 
 DiscordScreenSink::~DiscordScreenSink() = default;
 
-bool DiscordScreenSink::Start(std::string* error) { return impl_->Start(error); }
+bool DiscordScreenSink::Start(
+    std::string* error,
+    DiscordHelperAvailability* helperAvailability) {
+    return impl_->Start(error, helperAvailability);
+}
 
 void DiscordScreenSink::Stop() noexcept { impl_->Stop(); }
 

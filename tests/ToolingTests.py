@@ -1571,6 +1571,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("kProtocolVersion = 2", sink)
         self.assertIn("kAudioMessage = 7", sink)
         self.assertIn("kSignedPcm16Format", sink)
+        self.assertIn("decoderStatus", sink)
+        self.assertIn('constexpr const char* kReadyPrefix = "ready\\n"', sink)
         self.assertIn("std::deque<QueuedPacket>", sink)
         self.assertIn("TYPE_STOP", sink)
         self.assertIn("Let the worker send TYPE_STOP", sink)
@@ -1580,6 +1582,17 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("RefreshDiscordScreenControls();", menu)
         self.assertIn("QueryDiscordHelperAvailability", sink)
         self.assertIn("getLaunchIntentForPackage", sink)
+        self.assertIn('Jni::NewStringUTF("com.discord")', sink)
+        self.assertIn('Jni::NewStringUTF("com.discord.main.MainDefault")', sink)
+        self.assertLess(
+            sink.index('Jni::NewStringUTF("com.discord.main.MainDefault")'),
+            sink.index('Jni::NewStringUTF("com.saberstage.helper.MainActivity")'),
+        )
+        self.assertIn("Android PackageManager did not expose SaberStage Helper", sink)
+        self.assertIn("android/content/ActivityNotFoundException", sink)
+        self.assertIn("ConsumePendingJniException", sink)
+        self.assertIn("StartDiscordScreen(&error, &launchAvailability)", menu)
+        self.assertIn('text << "\\n" << snapshot.decoderStatus', menu)
         self.assertIn("releases/latest/download/SaberStage-Helper.apk", menu)
         self.assertIn("Quest Package Manager", menu)
         self.assertIn("Unknown Sources", menu)

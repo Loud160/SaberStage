@@ -30,10 +30,11 @@ the helper publishes that mix as Android app audio associated with the selected
 3. Open the downloaded APK with Quest Package Manager and follow its install
    prompts. Sideloaded APK installation requires Unknown Sources to be enabled.
 4. Return to Beat Saber and press **Discord Live Steam** again. SaberStage
-   launches **SaberStage Camera** and begins one authenticated local
-   session.
-5. Open Discord, start screen sharing, select **SaberStage Camera**, and enable
-   application audio in Discord's share controls.
+   opens Discord first, then launches **SaberStage Camera** and begins one
+   authenticated local session.
+5. Select the Discord panel that SaberStage already opened; do not relaunch it
+   from the application library. Start screen sharing, select **SaberStage
+   Camera**, and enable application audio in Discord's share controls.
 6. Return to Beat Saber. Press **Stop Discord Source** when finished.
 
 The download action targets
@@ -43,7 +44,17 @@ asset name. The mod never silently downloads or installs an APK.
 
 The helper launch is intentionally visible because Android and Discord require
 the user to select an actual app window. SaberStage does not automate that
-consent or selection.
+consent or selection. Discord is opened first because launching it from the
+Quest library after the source is visible can remove the helper's root task
+before Discord creates its source list. Launching the source second leaves both
+panels available without requiring a fragile manual startup order.
+
+Android 11+ package visibility can hide a sideloaded helper from Beat Saber's
+`PackageManager` query. A null query result is therefore treated as unknown,
+not proof that the APK is missing. SaberStage attempts the explicit exported
+activity launch and shows the installation workflow only when Android returns
+`ActivityNotFoundException`. Other launch failures produce a normal diagnostic
+error instead of incorrectly asking the user to reinstall the helper.
 
 ## Media and performance design
 
@@ -64,6 +75,19 @@ a separate bounded worker to an Android `AudioTrack` using `USAGE_GAME` and
 No AAC encoder is added for Discord. A random 256-bit session token is delivered
 by the explicit activity launch and must match the first loopback `HELLO`
 message before media is accepted.
+
+The helper binds specifically to IPv4 `127.0.0.1:39781`. Using Android's
+generic loopback resolver could select IPv6 `::1` while SaberStage's native
+client connects to IPv4, producing a connection failure even though both sides
+are on the same headset.
+
+The protocol-v2 success acknowledgement remains backward compatible with the
+original `ready` payload and may append one line describing the decoder. The
+current helper selects an AVC decoder from Android's `MediaCodec` registry,
+creates that exact decoder when the first usable keyframe arrives, and reports
+its codec name, Android acceleration classification, resolution, and frame
+rate. SaberStage displays this line in the Live Stream status area rather than
+overlaying it on the Discord-captured helper surface.
 
 ## Lifecycle and failure behavior
 
@@ -94,7 +118,11 @@ They do not prove that a particular Quest/Discord release lists, captures, or
 keeps the helper activity alive. On-device acceptance must separately verify:
 
 - the helper appears as **SaberStage Camera** in Discord's source picker;
+- the automatic Discord-first, helper-second launch leaves both panels
+  available without requiring the user to discover a strict startup order;
 - video continues after returning to Beat Saber;
+- the decoder line shown by SaberStage matches the codec Android actually
+  creates and classifies it as hardware accelerated on supported devices;
 - Discord receives the helper application's audio when application audio is
   enabled, with game sound, microphone, and TTS following SaberStage's existing
   stream-audio settings;
@@ -108,3 +136,8 @@ keeps the helper activity alive. On-device acceptance must separately verify:
 
 The loopback wire format is documented in the companion repository's
 `docs/PROTOCOL.md`.
+
+Meta's experimental Horizon OS Virtual Camera Publisher may eventually provide
+a direct system camera path, but it is not used here. Its current requirements,
+Discord compatibility questions, and proof-of-concept gates are recorded in
+[`planning/24_FUTURE_HORIZON_OS_VIRTUAL_CAMERA_PUBLISHER.md`](planning/24_FUTURE_HORIZON_OS_VIRTUAL_CAMERA_PUBLISHER.md).

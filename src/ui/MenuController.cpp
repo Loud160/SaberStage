@@ -1918,9 +1918,22 @@ void MenuController::HandleDiscordLiveStreamAction() {
         }
 
         std::string error;
-        if (!root_.Recording().StartDiscordScreen(&error)) {
+        broadcast::DiscordHelperAvailability launchAvailability =
+            broadcast::DiscordHelperAvailability::Unknown;
+        if (!root_.Recording().StartDiscordScreen(&error, &launchAvailability)) {
             Logging::Logger.error("Discord screen source start failed: {}", error);
-            ShowLivestreamActionError(error);
+            discordHelperAvailability_ = launchAvailability;
+            if (launchAvailability ==
+                    broadcast::DiscordHelperAvailability::NotInstalled) {
+                ShowDiscordHelperInstallPrompt();
+            } else {
+                ShowLivestreamActionError(error);
+            }
+        } else {
+            // A successful explicit launch is authoritative even when Android
+            // package visibility hid the helper from PackageManager.
+            discordHelperAvailability_ =
+                broadcast::DiscordHelperAvailability::Installed;
         }
         RefreshDiscordScreenControls();
         RefreshRecordingStatus();
@@ -2071,6 +2084,9 @@ void MenuController::RefreshDiscordScreenControls() {
                 text << "SaberStage Helper is installed and ready.";
             } else {
                 text << snapshot.status;
+            }
+            if (!snapshot.decoderStatus.empty()) {
+                text << "\n" << snapshot.decoderStatus;
             }
             if (snapshot.state == broadcast::DiscordScreenState::Live ||
                     snapshot.videoPacketsSent > 0 || snapshot.videoPacketsDropped > 0 ||
@@ -3501,7 +3517,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         liveStreamPage, "Discord Live Stream");
     makeStatus(
         discordSection,
-        "Uses the separate SaberStage Helper app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. Start the source, select SaberStage Camera in Discord's app-sharing picker, enable application audio, then return to Beat Saber.",
+        "Uses the separate SaberStage Helper app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. The button opens Discord first and SaberStage Camera second so both remain available. Select the existing Discord panel, choose SaberStage Camera in its app-sharing picker, enable application audio, then return to Beat Saber.",
         16.0F);
     auto [discordActionRow, discordActionWidth] = makePaddedRow(
         discordSection, 2, 9.5F);
@@ -3511,7 +3527,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         discordStartSlot, "Discord Live Steam", [] {
             if (active_) active_->HandleDiscordLiveStreamAction();
         }),
-        "Checks for SaberStage Helper, starts its session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
+        "Checks for SaberStage Helper, opens Discord before the source window, starts the session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
     fitActionButton(active_->startDiscordScreenButton_, 45.0F);
     if (auto* icon = CreateRecordingPanelButtonIcon(
             active_->startDiscordScreenButton_,
@@ -3535,7 +3551,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->discordScreenStatusText_ = makeStatus(
         discordSection,
         "Stopped. Press Discord Live Steam to check or start SaberStage Helper.",
-        10.0F);
+        16.0F);
 
     auto* connectionSection = makeSection(
         configureStreamPage, "Internet Connection Quality");

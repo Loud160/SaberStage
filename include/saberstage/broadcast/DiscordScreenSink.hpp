@@ -33,10 +33,10 @@ enum class DiscordScreenState : std::uint8_t {
     Failed,
 };
 
-// Android package visibility can distinguish an absent helper from a
-// transient JNI/platform failure. The menu only offers installation when the
-// package is definitively absent; Unknown falls back to the normal guarded
-// launch so a visibility problem is logged instead of misreported.
+// Android 11+ package visibility can hide an installed sideloaded helper from
+// PackageManager. Unknown therefore means "not queryable" as well as a
+// transient JNI/platform failure; the explicit activity launch remains the
+// authoritative availability check.
 enum class DiscordHelperAvailability : std::uint8_t {
     Unknown,
     NotInstalled,
@@ -57,6 +57,10 @@ enum class DiscordHelperAvailability : std::uint8_t {
 struct DiscordScreenSnapshot {
     DiscordScreenState state = DiscordScreenState::Stopped;
     std::string status = "Stopped";
+    // Populated from the helper's authenticated ACK. Keeping this separate
+    // from the lifecycle status lets the UI update packet counters without
+    // losing the decoder identity selected by Android.
+    std::string decoderStatus;
     std::uint64_t videoPacketsSent = 0;
     std::uint64_t videoPacketsDropped = 0;
     std::uint64_t audioPacketsSent = 0;
@@ -85,7 +89,9 @@ public:
     // Must be called from Unity's main thread because Android launches the
     // helper activity here. Network connection and packet writes remain on a
     // private worker after the activity has been requested.
-    bool Start(std::string* error = nullptr);
+    bool Start(
+        std::string* error = nullptr,
+        DiscordHelperAvailability* helperAvailability = nullptr);
     void Stop() noexcept;
     bool SubmitVideo(const recording::EncodedVideoPacketView& packet) noexcept;
     bool SubmitAudio(

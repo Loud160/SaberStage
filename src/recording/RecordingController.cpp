@@ -1269,8 +1269,13 @@ bool RecordingController::StartLivestream(std::string* error) {
     return true;
 }
 
-bool RecordingController::StartDiscordScreen(std::string* error) {
+bool RecordingController::StartDiscordScreen(
+    std::string* error,
+    broadcast::DiscordHelperAvailability* helperAvailability) {
     try {
+        if (helperAvailability) {
+            *helperAvailability = broadcast::DiscordHelperAvailability::Unknown;
+        }
         if (state_.load() == RecordingState::Recording &&
                 activeBackend_ != settings::RecordingBackend::DirectFfmpegHardware) {
             if (error) {
@@ -1313,7 +1318,7 @@ bool RecordingController::StartDiscordScreen(std::string* error) {
                 height,
                 recording.framesPerSecond,
                 [this] { statusVersion_.fetch_add(1); });
-            if (!discordScreenSink_->Start(error)) {
+            if (!discordScreenSink_->Start(error, helperAvailability)) {
                 discordScreenSink_.reset();
                 return false;
             }
