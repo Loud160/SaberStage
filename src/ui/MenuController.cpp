@@ -55,6 +55,7 @@
 #include "UnityEngine/Component.hpp"
 #include "UnityEngine/FilterMode.hpp"
 #include "UnityEngine/GameObject.hpp"
+#include "UnityEngine/GUIUtility.hpp"
 #include "UnityEngine/HideFlags.hpp"
 #include "UnityEngine/ImageConversion.hpp"
 #include "UnityEngine/LineRenderer.hpp"
@@ -144,8 +145,8 @@ namespace {
 // Floating recording-controls geometry. Every value below is in FloatingScreen
 // canvas units; the world size is canvas units multiplied by
 // kRecordingPanelScale (48 x 24 units -> 60 x 30 cm at 0.0125). The panel has
-// two fixed bands: an information band on top (status + elapsed, plus an
-// optional FPS row) and a button band at the bottom. The invisible grab handle
+// two fixed bands: an information band on top (status, elapsed, and FPS) and a
+// button band at the bottom. The invisible grab handle
 // must cover ONLY the information band — a physics handle hit always wins over
 // Unity's UI raycast, so any handle overlap with the button band turns button
 // clicks into panel grabs.
@@ -188,6 +189,19 @@ constexpr float kGateCutoffOffsetMinimumDb = 3.0F;
 constexpr float kGateCutoffOffsetMaximumDb = 30.0F;
 constexpr float kGateCloseThresholdMinimumDb = -90.0F;
 constexpr std::string_view kDiscordHelperApkName = "SaberStage-Helper.apk";
+// Fixed page slots keep feature code and persistent Unity objects stable while
+// the visible tab strip changes with Record/Stream mode and microphone state.
+// Slot 5 was the removed Overview page and intentionally remains unused so the
+// mature Audio, TTS, speed-test, and Discord pages do not need risky reindexing.
+constexpr int kCenterGeneralPage = 0;
+constexpr int kCenterTwitchPage = 1;
+constexpr int kCenterKickPage = 2;
+constexpr int kCenterYouTubePage = 3;
+constexpr int kCenterCustomPage = 4;
+constexpr int kCenterAudioPage = 6;
+constexpr int kCenterTtsPage = 7;
+constexpr int kCenterConfigureStreamPage = 8;
+constexpr int kCenterLiveStreamPage = 9;
 constexpr std::string_view kDiscordHelperLatestReleaseUrl =
     "https://github.com/Loud160/SaberStage-Helper/releases/latest/download/SaberStage-Helper.apk";
 
@@ -217,6 +231,28 @@ void SetGateCutoffOffset(
         kGateCloseThresholdMinimumDb,
         audio.gateOpenThresholdDb - repairedOffset);
 }
+
+settings::RecordingProfileSettings& SelectedOutputProfile(
+        settings::SettingsDocument& document) {
+    return settings::RecordingProfileForMode(
+        document.recording, document.recording.worldControlsStreamMode);
+}
+
+const settings::RecordingProfileSettings& SelectedOutputProfile(
+        const settings::SettingsDocument& document) {
+    return settings::RecordingProfileForMode(
+        document.recording, document.recording.worldControlsStreamMode);
+}
+
+settings::AudioProcessingSettings& SelectedAudioProcessing(
+        settings::SettingsDocument& document) {
+    return SelectedOutputProfile(document).audio;
+}
+
+const settings::AudioProcessingSettings& SelectedAudioProcessing(
+        const settings::SettingsDocument& document) {
+    return SelectedOutputProfile(document).audio;
+}
 // One typography scale keeps adjacent native controls visually related even
 // when their BSML prefabs ship with different default font sizes.
 constexpr float kCenterSectionHeaderTextSize = 3.6F;
@@ -241,31 +277,31 @@ constexpr float kChatDataRefreshIntervalSeconds = 0.10F;
 const camera::Vec3 kDefaultRecordingPanelPosition{0.42F, 1.25F, 1.45F};
 const camera::Vec3 kDefaultChatPanelPosition{-0.48F, 1.25F, 1.45F};
 
-settings::LivestreamProvider LivestreamProviderFromLabel(std::string_view value) noexcept {
-    if (value == "YouTube (Not Supported)") return settings::LivestreamProvider::YouTube;
-    if (value == "Kick (Not Supported)") return settings::LivestreamProvider::Kick;
-    if (value == "Custom") return settings::LivestreamProvider::Custom;
-    return settings::LivestreamProvider::Twitch;
+std::size_t LivestreamProviderIndex(settings::LivestreamProvider provider) noexcept {
+    switch (provider) {
+        case settings::LivestreamProvider::Twitch: return 0;
+        case settings::LivestreamProvider::YouTube: return 1;
+        case settings::LivestreamProvider::Kick: return 2;
+        case settings::LivestreamProvider::Custom: return 3;
+    }
+    return 0;
 }
 
 std::string_view LivestreamProviderLabel(settings::LivestreamProvider provider) noexcept {
     switch (provider) {
         case settings::LivestreamProvider::Twitch: return "Twitch";
-        case settings::LivestreamProvider::YouTube: return "YouTube (Not Supported)";
-        case settings::LivestreamProvider::Kick: return "Kick (Not Supported)";
+        case settings::LivestreamProvider::YouTube: return "YouTube";
+        case settings::LivestreamProvider::Kick: return "Kick";
         case settings::LivestreamProvider::Custom: return "Custom";
     }
     return "Twitch";
 }
 
-// The panel height depends on whether the FPS row is enabled. Toggling the
-// row rebuilds the panel at the matching size rather than leaving dead space.
-UnityEngine::Vector2 RecordingPanelSize(bool showFps) {
+UnityEngine::Vector2 RecordingPanelSize() {
     return {
         kRecordingPanelWidth,
         kRecordingPanelModeRowHeight + kRecordingPanelHeaderHeight +
-            kRecordingPanelDropRowHeight +
-            (showFps ? kRecordingPanelFpsRowHeight : 0.0F) +
+            kRecordingPanelDropRowHeight + kRecordingPanelFpsRowHeight +
             kRecordingPanelButtonBandHeight + 2.0F};
 }
 
@@ -834,98 +870,6 @@ void ConfigureRightPanelInlineButton(UnityEngine::UI::Button* button) {
     BSML::Lite::SetButtonTextSize(button, 3.0F);
 }
 
-// Live Stream deliberately uses the existing Service row as its ruler. BSML
-// returns an inner selector for dropdowns but an outer row for sliders/toggles;
-// applying one width to those returned components does NOT align their rows.
-// These helpers run only on Live Stream's other rows, after the reference has
-// real canvas geometry. They never traverse into the Service widget or change
-// shared Camera/Record layout rules.
-void SetLivestreamRowWidth(UnityEngine::GameObject* object, float width) {
-    auto* layout = object->GetComponent<UnityEngine::UI::LayoutElement*>();
-    if (!layout) layout = object->AddComponent<UnityEngine::UI::LayoutElement*>();
-    // Override native text/group minimum widths too: otherwise a long caption
-    // can expand a nested row beyond the correctly sized outer group.
-    layout->set_minWidth(0.0F);
-    layout->set_preferredWidth(width);
-    layout->set_flexibleWidth(0.0F);
-    if (auto* fitter = object->GetComponent<UnityEngine::UI::ContentSizeFitter*>()) {
-        fitter->set_horizontalFit(UnityEngine::UI::ContentSizeFitter::FitMode::Unconstrained);
-    }
-}
-
-void FitLivestreamHorizontalSpan(UnityEngine::RectTransform* rect, float leftInset, float rightInset) {
-    if (!rect) return;
-    // Align X only. In particular, a dropdown's native height and vertical
-    // anchors must not change just because its caption is being aligned.
-    auto anchorMin = rect->get_anchorMin();
-    auto anchorMax = rect->get_anchorMax();
-    anchorMin.x = 0.0F;
-    anchorMax.x = 1.0F;
-    rect->set_anchorMin(anchorMin);
-    rect->set_anchorMax(anchorMax);
-    auto offsetMin = rect->get_offsetMin();
-    auto offsetMax = rect->get_offsetMax();
-    offsetMin.x = leftInset;
-    offsetMax.x = -rightInset;
-    rect->set_offsetMin(offsetMin);
-    rect->set_offsetMax(offsetMax);
-}
-
-void FitLivestreamToggle(BSML::ToggleSetting* toggle, float leftInset, float rightInset) {
-    auto root = toggle->get_transform();
-    auto switchTransform = root->Find("SwitchView");
-    if (!switchTransform) return;
-    auto* switchRect = switchTransform->GetComponent<UnityEngine::RectTransform*>();
-    if (!switchRect) return;
-    const float switchWidth = switchRect->get_sizeDelta().x;
-    switchRect->set_anchorMin({1.0F, 0.5F});
-    switchRect->set_anchorMax({1.0F, 0.5F});
-    switchRect->set_pivot({1.0F, 0.5F});
-    switchRect->set_anchoredPosition({-rightInset, 0.0F});
-    if (IsAlive(toggle->text)) {
-        FitLivestreamHorizontalSpan(toggle->text->get_rectTransform(),
-            leftInset, rightInset + switchWidth + 1.25F);
-        toggle->text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-        toggle->text->set_enableWordWrapping(false);
-        toggle->text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-        toggle->text->set_fontSize(3.0F);
-    }
-}
-
-void FitLivestreamActionRow(
-    UnityEngine::UI::HorizontalLayoutGroup* group,
-    float rowWidth,
-    float leftInset,
-    float rightInset) {
-    // This is the same outer row width as Service, NOT a smaller group shifted
-    // toward the viewport edge. Native layout padding restricts its children
-    // to Service's visible label-to-selector span. RectOffset uses whole units.
-    const int leftPadding = static_cast<int>(std::lround(leftInset));
-    const int rightPadding = static_cast<int>(std::lround(rightInset));
-    group->set_padding(UnityEngine::RectOffset::New_ctor(leftPadding, rightPadding, 0, 0));
-    group->set_childAlignment(UnityEngine::TextAnchor::MiddleLeft);
-    group->set_childControlWidth(true);
-    group->set_childForceExpandWidth(false);
-    const float gap = group->get_spacing();
-    auto transform = group->get_transform();
-    const int count = transform->get_childCount();
-    if (count == 0) return;
-    const float available = rowWidth - leftPadding - rightPadding - gap * (count - 1);
-    // Input/Set and Chat/Reset retain a compact action at the right edge.
-    // Start/Stop and Connect/Disconnect split the same available span evenly.
-    auto* first = transform->GetChild(0)->get_gameObject().ptr();
-    const bool inlineAction = count == 2 &&
-        (first->GetComponent<HMUI::InputFieldView*>() || first->GetComponent<BSML::ToggleSetting*>());
-    for (int child = 0; child < count; ++child) {
-        auto* object = transform->GetChild(child)->get_gameObject().ptr();
-        const float width = inlineAction ? (child == 0 ? available - 9.0F : 9.0F) : available / count;
-        SetLivestreamRowWidth(object, width);
-        if (auto* toggle = object->GetComponent<BSML::ToggleSetting*>()) {
-            FitLivestreamToggle(toggle, 0.0F, 0.0F);
-        }
-    }
-}
-
 std::string Lower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
         return static_cast<char>(std::tolower(character));
@@ -1277,7 +1221,7 @@ void MenuController::ApplyAudioSettings(bool requestPermission) {
     auto& document = root_.Settings().Edit();
     settings::ValidateAndRepair(document);
     root_.Settings().RequestSave();
-    if (requestPermission && document.broadcast.microphoneEnabled) {
+    if (requestPermission && SelectedOutputProfile(document).microphoneEnabled) {
         const auto permission = recording::RecordingController::QueryMicrophonePermission();
         if (permission == recording::MicrophonePermissionStatus::MissingFromApplication) {
             ShowLivestreamActionError(
@@ -1298,8 +1242,8 @@ void MenuController::ApplyAudioSettings(bool requestPermission) {
 }
 
 void MenuController::RefreshAudioControlState(bool synchronizeValues) {
-    const auto& audio = root_.Settings().Get().audio;
-    const auto& broadcast = root_.Settings().Get().broadcast;
+    const auto& profile = SelectedOutputProfile(root_.Settings().Get());
+    const auto& audio = profile.audio;
 
     const auto synchronizeSlider = [](BSML::SliderSetting* setting, float value) {
         if (!IsAlive(setting) || !IsAlive(setting->slider)) return;
@@ -1316,10 +1260,37 @@ void MenuController::RefreshAudioControlState(bool synchronizeValues) {
         setting->currentValue = value;
         setting->toggle->SetIsOnWithoutNotify(value);
     };
+    const auto synchronizeDropdown = [](BSML::DropdownListSetting* setting,
+                                        std::string_view value) {
+        if (!IsAlive(setting)) return;
+        auto callback = std::move(setting->onChange);
+        setting->onChange = nullptr;
+        const auto managedValue = StringW(value);
+        setting->set_Value(
+            reinterpret_cast<System::Object*>(managedValue.convert()));
+        setting->onChange = std::move(callback);
+    };
 
     if (synchronizeValues) {
-        synchronizeSlider(audioVolumeSliders_[0], broadcast.gameAudioVolumePercent);
-        synchronizeSlider(audioVolumeSliders_[1], broadcast.microphoneVolumePercent);
+        synchronizeToggle(gameAudioToggle_, profile.gameAudioEnabled);
+        synchronizeToggle(microphoneEnabledToggle_, profile.microphoneEnabled);
+        synchronizeSlider(audioVolumeSliders_[0], profile.gameAudioVolumePercent);
+        synchronizeSlider(audioVolumeSliders_[1], profile.microphoneVolumePercent);
+        synchronizeDropdown(
+            microphoneModeDropdown_,
+            audio.microphoneMode == settings::MicrophoneMode::PushToTalk
+                ? "Push to Talk"
+                : audio.microphoneMode == settings::MicrophoneMode::VoiceActivated
+                    ? "Voice Activated"
+                    : "Open");
+        synchronizeToggle(highPassToggle_, audio.highPassEnabled);
+        synchronizeDropdown(
+            pushToTalkControlDropdown_,
+            audio.pushToTalkHand == settings::PushToTalkHand::Left
+                ? "Left Grip"
+                : audio.pushToTalkHand == settings::PushToTalkHand::Right
+                    ? "Right Grip"
+                    : "Either Grip");
         synchronizeSlider(pushToTalkReleaseSlider_, audio.pushToTalkReleaseMilliseconds);
         const std::array gateValues{
             audio.gateOpenThresholdDb,
@@ -1349,6 +1320,13 @@ void MenuController::RefreshAudioControlState(bool synchronizeValues) {
     // setting. Keep the compact meter control synchronized without firing its
     // callback, including changes made by reset or by the full slider row.
     synchronizeSlider(audioLevelThresholdSlider_, audio.gateOpenThresholdDb);
+
+    if (IsAlive(audioVolumeSliders_[0])) {
+        audioVolumeSliders_[0]->set_interactable(profile.gameAudioEnabled);
+    }
+    if (IsAlive(audioVolumeSliders_[1])) {
+        audioVolumeSliders_[1]->set_interactable(profile.microphoneEnabled);
+    }
 
     const bool pushToTalkControlsActive =
         audio.microphoneMode == settings::MicrophoneMode::PushToTalk;
@@ -1389,13 +1367,79 @@ void MenuController::RefreshAudioControlState(bool synchronizeValues) {
     }
 }
 
+std::string FormatMegabitsPerSecond(std::int32_t bitsPerSecond) {
+    const auto whole = bitsPerSecond / 1'000'000;
+    const auto remainder = bitsPerSecond % 1'000'000;
+    if (remainder == 0) return std::to_string(whole) + " Mbps";
+    std::ostringstream stream;
+    stream << std::fixed << std::setprecision(1)
+           << static_cast<double>(bitsPerSecond) / 1'000'000.0
+           << " Mbps";
+    return stream.str();
+}
+
+std::int32_t ParseMegabitsPerSecond(std::string_view value) {
+    return static_cast<std::int32_t>(std::lround(
+        std::stod(std::string(value.substr(0, value.find(' ')))) * 1'000'000.0));
+}
+
+bool IsGameplaySceneActive() {
+    auto scene = UnityEngine::SceneManagement::SceneManager::GetActiveScene();
+    if (!scene.IsValid()) return false;
+    const auto name = static_cast<std::string>(scene.get_name());
+    return name == "GameCore" || name.find("GameCore") != std::string::npos;
+}
+
+void MenuController::RefreshOutputProfileControls(bool synchronizeValues) {
+    const auto& document = root_.Settings().Get();
+    const auto& profile = SelectedOutputProfile(document);
+
+    if (synchronizeValues) {
+        const auto synchronizeDropdown = [](BSML::DropdownListSetting* setting,
+                                            std::string value) {
+            if (!IsAlive(setting)) return;
+            auto callback = std::move(setting->onChange);
+            setting->onChange = nullptr;
+            const auto managedValue = StringW(value);
+            setting->set_Value(
+                reinterpret_cast<System::Object*>(managedValue.convert()));
+            setting->onChange = std::move(callback);
+        };
+        const std::array<std::string, 10> values{
+            std::string(settings::ToString(profile.resolution)),
+            profile.framesPerSecond == 60 ? "60 FPS" : "30 FPS",
+            FormatMegabitsPerSecond(profile.bitrateBitsPerSecond),
+            FormatMegabitsPerSecond(profile.peakBitrateBitsPerSecond),
+            profile.rateControl == settings::RateControlMode::ConstantBitrate
+                ? "CBR" : "VBR",
+            profile.encoderPriority == settings::EncoderPriority::Performance
+                ? "Performance"
+                : profile.encoderPriority == settings::EncoderPriority::Quality
+                    ? "Quality" : "Balanced",
+            profile.h264Profile == settings::H264Profile::Baseline ? "Baseline"
+                : profile.h264Profile == settings::H264Profile::Main ? "Main"
+                : profile.h264Profile == settings::H264Profile::High ? "High"
+                                                                     : "Auto",
+            settings::ToString(profile.h264Level) == "auto"
+                ? "Auto" : std::string(settings::ToString(profile.h264Level)),
+            std::to_string(profile.keyframeIntervalSeconds) +
+                (profile.keyframeIntervalSeconds == 1 ? " second" : " seconds"),
+            std::to_string(profile.audioBitrateBitsPerSecond / 1000) + " kbps"};
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            synchronizeDropdown(generalEncodingDropdowns_[index], values[index]);
+        }
+    }
+
+    RefreshAudioControlState(synchronizeValues);
+}
+
 void MenuController::RefreshAudioMeter() {
     if (!IsAlive(audioLevelMeterFill_) || !IsAlive(audioLevelMeterText_) ||
             !IsAlive(audioLevelMeterValueText_)) {
         return;
     }
     const auto microphone = root_.Recording().MicrophoneState();
-    const auto& audio = root_.Settings().Get().audio;
+    const auto& audio = SelectedAudioProcessing(root_.Settings().Get());
     const auto rawDb = std::isfinite(microphone.levelDb)
         ? microphone.levelDb
         : -96.0F;
@@ -1546,7 +1590,7 @@ void MenuController::ResolveAudioResetConfirmation(bool confirmed) {
     if (IsAlive(audioResetConfirmationModal_)) audioResetConfirmationModal_->Hide();
     if (!confirmed || resetKind < 1 || resetKind > 3) return;
 
-    auto& audio = root_.Settings().Edit().audio;
+    auto& audio = SelectedAudioProcessing(root_.Settings().Edit());
     const auto defaults = settings::AudioProcessingSettings{};
     if (resetKind == 1) {
         audio.gateOpenThresholdDb = defaults.gateOpenThresholdDb;
@@ -2119,11 +2163,28 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     if (active_ == nullptr) return;
     active_->settingsView_ = view;
 
-    static std::array<std::string_view, 5> tabNames{
-        "Overview", "Audio", "Chat TTS", "Configure Stream", "Live Stream"};
+    active_->centerDebugTabs_ = nullptr;
     active_->centerDebugTabViewRoots_.fill(nullptr);
     active_->centerDebugTabContentRoots_.fill(nullptr);
     active_->selectedCenterDebugTab_ = 0;
+    active_->centerTabStripSignature_ = -1;
+    active_->visibleCenterTabPageIndices_.clear();
+    active_->synchronizingRecordingModeControls_ = false;
+    active_->generalRecordingModeToggle_ = nullptr;
+    active_->generalLocalRecordingContentRoot_ = nullptr;
+    active_->generalEncodingDropdowns_.fill(nullptr);
+    active_->livestreamConfigurationControls_.clear();
+    active_->connectTwitchButton_ = nullptr;
+    active_->twitchAccountStatusText_ = nullptr;
+    active_->livestreamServerInputs_.fill(nullptr);
+    active_->livestreamKeyInputs_.fill(nullptr);
+    active_->livestreamDestinationContentRoots_.fill(nullptr);
+    active_->setLivestreamServerButtons_.fill(nullptr);
+    active_->setLivestreamKeyButtons_.fill(nullptr);
+    active_->clearLivestreamKeyButtons_.fill(nullptr);
+    active_->livestreamKeyVisibility_.fill(false);
+    active_->livestreamServerPasteWarningModal_ = nullptr;
+    active_->recordingEncodingControls_.clear();
     active_->audioInputStatusText_ = nullptr;
     active_->audioLevelMeterText_ = nullptr;
     active_->audioLevelMeterValueText_ = nullptr;
@@ -2134,6 +2195,11 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->audioLevelMeterClipFill_ = nullptr;
     active_->audioLevelMeterThreshold_ = nullptr;
     active_->audioLevelThresholdSlider_ = nullptr;
+    active_->audioVolumeSliders_.fill(nullptr);
+    active_->gameAudioToggle_ = nullptr;
+    active_->microphoneEnabledToggle_ = nullptr;
+    active_->microphoneModeDropdown_ = nullptr;
+    active_->highPassToggle_ = nullptr;
     active_->pushToTalkControlsRoot_ = nullptr;
     active_->voiceActivationControlsRoot_ = nullptr;
     active_->compressorControlsRoot_ = nullptr;
@@ -2196,27 +2262,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         rect->set_offsetMin({left, bottom});
         rect->set_offsetMax({-right, -top});
     };
-    // This is the same native segmented-control pattern the pre-removal avatar
-    // center menu used, now populated without changing the verified geometry.
-    active_->centerDebugTabs_ = BSML::Lite::CreateTextSegmentedControl(
-        view,
-        {0.0F, 0.0F},
-        {112.0F, 7.0F},
-        tabNames,
-        [](int index) {
-            if (active_) active_->ShowCenterDebugTab(index);
-        });
-    if (active_->centerDebugTabs_) {
-        auto tabsRect = active_->centerDebugTabs_->get_transform()
-            .cast<UnityEngine::RectTransform>();
-        tabsRect->set_anchorMin({0.0F, 1.0F});
-        tabsRect->set_anchorMax({1.0F, 1.0F});
-        tabsRect->set_pivot({0.5F, 1.0F});
-        tabsRect->set_anchoredPosition({0.0F, -1.5F});
-        tabsRect->set_sizeDelta({-4.0F, 7.0F});
-    }
-
-    for (std::size_t index = 0; index < tabNames.size(); ++index) {
+    for (std::size_t index = 0;
+         index < active_->centerDebugTabViewRoots_.size();
+         ++index) {
         const auto pageName = "SaberStage Center Tab Page " + std::to_string(index + 1);
         auto* page = UnityEngine::GameObject::New_ctor(StringW(pageName));
         if (!page) continue;
@@ -2278,7 +2326,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         [](auto* page) { return page == nullptr; });
     if (missingPage) {
         Logging::Logger.error(
-            "Could not create all five center-panel tab pages");
+            "Could not create all ten center-panel tab pages");
         return;
     }
 
@@ -2754,11 +2802,12 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         active_->audioLevelThresholdSlider_ = WithHint(
             BSML::Lite::CreateSliderSetting(
                 meterRoot->get_transform(), "", 1.0F,
-                active_->root_.Settings().Get().audio.gateOpenThresholdDb,
+                SelectedAudioProcessing(
+                    active_->root_.Settings().Get()).gateOpenThresholdDb,
                 -60.0F, -5.0F, 0.05F, false, {0.0F, 0.0F}, [](float value) {
                     if (!active_) return;
                     SetGateOpenPreservingCutoffOffset(
-                        active_->root_.Settings().Edit().audio, value);
+                        SelectedAudioProcessing(active_->root_.Settings().Edit()), value);
                     active_->ApplyAudioSettings();
                     // Keep the detailed Open/offset controls synchronized
                     // without recursively invoking their callbacks.
@@ -2849,88 +2898,655 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
               {kAudioMeterCenterX, -6.5F}, {kAudioMeterWidth, 3.0F});
     };
 
-    auto* overview = active_->centerDebugTabContentRoots_[0];
-    auto* overviewSection = makeSection(overview, "Broadcast Sound");
-    makeStatus(
-        overviewSection,
-        "Audio contains the Quest microphone, gate, compressor, limiter, and recording/stream routing. Chat TTS contains fully local chat speech and output routing.");
-    auto* safetySection = makeSection(overview, "Quest Performance and Privacy");
-    makeStatus(
-        safetySection,
-        "Both systems are optional. TTS is off by default and uses a bounded queue. The microphone remains captured only while its master switch is enabled; disabling it releases Android audio input.");
+    auto* generalPage = active_->centerDebugTabContentRoots_[0];
+    auto* recordingModeSection = makeSection(generalPage, "Recording Control Mode");
+    auto [recordingModeRow, recordingModeWidth] = makePaddedRow(
+        recordingModeSection, 1, 10.0F);
+    (void)recordingModeWidth;
+    recordingModeRow->set_spacing(3.0F);
+    auto* recordModeLabel = BSML::Lite::CreateText(
+        recordingModeRow->get_transform(), "Record", kCenterControlLabelTextSize);
+    recordModeLabel->set_alignment(TMPro::TextAlignmentOptions::MidlineRight);
+    recordModeLabel->set_enableWordWrapping(false);
+    ConfigureLayout(recordModeLabel, 30.0F, 8.5F, 0.0F, 0.0F);
+    active_->generalRecordingModeToggle_ = fitBareToggle(
+        BSML::Lite::CreateToggle(
+            recordingModeRow->get_gameObject(), "",
+            active_->root_.Settings().Get().recording.worldControlsStreamMode,
+            [](bool streamMode) {
+                if (active_) active_->SetRecordingWorldPanelStreamMode(streamMode);
+            }),
+        16.0F,
+        0.5F);
+    auto* streamModeLabel = BSML::Lite::CreateText(
+        recordingModeRow->get_transform(), "Stream", kCenterControlLabelTextSize);
+    streamModeLabel->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
+    streamModeLabel->set_enableWordWrapping(false);
+    ConfigureLayout(streamModeLabel, 30.0F, 8.5F, 0.0F, 0.0F);
+    makeResetGlyphButton(recordingModeRow->get_gameObject(), [] {
+        if (active_) active_->ResetRecordingWorldPanelPose();
+    }, "Moves the always-visible floating recording controls back to their default reachable position.");
 
-    auto* audioPage = active_->centerDebugTabContentRoots_[1];
-    const auto& initialBroadcast = active_->root_.Settings().Get().broadcast;
-    const auto& initialAudio = active_->root_.Settings().Get().audio;
+    active_->generalLocalRecordingContentRoot_ = makeSection(
+        generalPage, "Local Recording Behavior");
+    auto [localBehaviorRow, localBehaviorWidth] = makePaddedRow(
+        active_->generalLocalRecordingContentRoot_, 1, 10.0F);
+    auto* gameplayOnly = WithHint(BSML::Lite::CreateToggle(
+        localBehaviorRow->get_gameObject(), "Gameplay Only",
+        active_->root_.Settings().Get().recording.gameplayOnly,
+        [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().recording.gameplayOnly = value;
+            std::string error;
+            if (!active_->root_.Settings().Save(&error)) {
+                Logging::Logger.error(
+                    "Could not save Gameplay Only setting: {}", error);
+            }
+        }), "When enabled, Start arms recording for the next song and stops it after gameplay. Leave this off to record menus, results, and songs continuously.");
+    fitCenterSetting(gameplayOnly, localBehaviorWidth);
+    active_->generalLocalRecordingContentRoot_->SetActive(
+        !active_->root_.Settings().Get().recording.worldControlsStreamMode);
 
-    auto* mixSection = makeSection(audioPage, "Sources and Routing");
-    auto [sourceRow, sourceColumnWidth] = makePaddedRow(
-        mixSection, 3, 14.0F);
-    auto gameAudioTile = makeSettingTile(
-        sourceRow->get_gameObject(), sourceColumnWidth, "Game Audio");
-    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
-        gameAudioTile.controls->get_gameObject(), "", initialBroadcast.gameAudioEnabled, [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.gameAudioEnabled = value;
-            active_->ApplyAudioSettings();
-        }), "Includes Beat Saber's sound in recordings and live streams. This does not change the volume heard in the headset."),
-        sourceColumnWidth, 0.0F);
-    auto questMicrophoneTile = makeSettingTile(
-        sourceRow->get_gameObject(), sourceColumnWidth, "Enable Quest Microphone");
-    questMicrophoneTile.label->set_alignment(TMPro::TextAlignmentOptions::Midline);
-    questMicrophoneTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
-    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
-        questMicrophoneTile.controls->get_gameObject(), "",
-        initialBroadcast.microphoneEnabled, [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.microphoneEnabled = value;
-            active_->ApplyAudioSettings(value);
-        }), "Master microphone control. It opens persistent Quest capture for the meter and DSP; Mic Output selects where the processed signal is used."),
-        sourceColumnWidth, 0.5F);
-    static std::array<std::string_view, 3> microphoneRoutes{
-        "Local Only", "Stream Only", "Both"};
-    const auto microphoneRouteLabel =
-        initialAudio.includeMicrophoneInRecordings &&
-                !initialAudio.includeMicrophoneInLivestreams
-            ? "Local Only"
-            : !initialAudio.includeMicrophoneInRecordings &&
-                    initialAudio.includeMicrophoneInLivestreams
-                ? "Stream Only"
-                : "Both";
-    auto microphoneRouteTile = makeSettingTile(
-        sourceRow->get_gameObject(), sourceColumnWidth, "Mic Output");
-    microphoneRouteTile.label->set_alignment(TMPro::TextAlignmentOptions::MidlineRight);
-    microphoneRouteTile.controls->set_childAlignment(UnityEngine::TextAnchor::MiddleRight);
-    fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
-        microphoneRouteTile.controls->get_gameObject(), "", microphoneRouteLabel,
-        microphoneRoutes, [](StringW value) {
-            if (!active_) return;
+    const auto& initialOutputProfile = SelectedOutputProfile(
+        active_->root_.Settings().Get());
+    const auto encoderSettingsEditable = [] {
+        if (!active_) return false;
+        const auto recording = active_->root_.Recording().Snapshot();
+        const auto livestream = active_->root_.Recording().LivestreamSnapshot();
+        return recording.CanStart() && !broadcast::CanStop(livestream.state);
+    };
+    const auto saveOutputProfile = [] {
+        if (!active_) return;
+        std::string error;
+        if (!active_->root_.Settings().Save(&error)) {
+            Logging::Logger.error("Could not save output-profile setting: {}", error);
+        }
+        active_->RefreshOutputProfileControls(true);
+    };
+    const auto rememberGeneralDropdown = [](BSML::DropdownListSetting* setting,
+                                             std::size_t index) {
+        if (!active_ || !setting || index >= active_->generalEncodingDropdowns_.size()) {
+            return setting;
+        }
+        active_->generalEncodingDropdowns_[index] = setting;
+        RememberSelectables(setting, active_->recordingEncodingControls_);
+        return setting;
+    };
+
+    auto* videoSection = makeSection(generalPage, "Video Output");
+    auto [videoRow, videoColumnWidth] = makePaddedRow(videoSection, 3, 14.0F);
+    auto resolutionTile = makeSettingTile(
+        videoRow->get_gameObject(), videoColumnWidth, "Resolution");
+    static std::array<std::string_view, 3> outputResolutions{"720p", "1080p", "1440p"};
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        resolutionTile.controls->get_gameObject(), "",
+        settings::ToString(initialOutputProfile.resolution), outputResolutions,
+        [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            settings::RecordingResolution parsed{};
+            if (!settings::TryParse(static_cast<std::string>(value), parsed)) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).resolution = parsed;
+            saveOutputProfile();
+        }), "Sets the saved or streamed video size. Higher resolutions require more camera rendering and bitrate."),
+        videoColumnWidth), 0);
+    auto frameRateTile = makeSettingTile(
+        videoRow->get_gameObject(), videoColumnWidth, "Frame Rate");
+    static std::array<std::string_view, 2> outputFrameRates{"30 FPS", "60 FPS"};
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        frameRateTile.controls->get_gameObject(), "",
+        initialOutputProfile.framesPerSecond == 60 ? "60 FPS" : "30 FPS",
+        outputFrameRates, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).framesPerSecond =
+                static_cast<std::string>(value) == "60 FPS" ? 60 : 30;
+            saveOutputProfile();
+        }), "30 FPS has the lowest gameplay cost. 60 FPS looks smoother but roughly doubles camera rendering work."),
+        videoColumnWidth), 1);
+
+    auto targetBitrateTile = makeSettingTile(
+        videoRow->get_gameObject(), videoColumnWidth, "Target Bitrate");
+    static std::array<std::string_view, 12> outputBitrates{
+        "3 Mbps", "4 Mbps", "4.5 Mbps", "6 Mbps", "8 Mbps", "10 Mbps",
+        "12 Mbps", "15 Mbps", "16 Mbps", "20 Mbps", "24 Mbps", "30 Mbps"};
+    const auto selectedTargetBitrate = FormatMegabitsPerSecond(
+        initialOutputProfile.bitrateBitsPerSecond);
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        targetBitrateTile.controls->get_gameObject(), "", selectedTargetBitrate,
+        outputBitrates, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            const auto bits = ParseMegabitsPerSecond(
+                static_cast<std::string>(value));
+            auto& profile = SelectedOutputProfile(active_->root_.Settings().Edit());
+            profile.bitrateBitsPerSecond = bits;
+            profile.peakBitrateBitsPerSecond = std::max(
+                profile.peakBitrateBitsPerSecond, bits);
+            saveOutputProfile();
+        }), "Controls the average video data used each second. Local files and live streams keep independent values."),
+        videoColumnWidth), 2);
+
+    auto [directMainRow, directMainColumnWidth] = makePaddedRow(
+        videoSection, 3, 14.0F);
+    const auto selectedPeakBitrate = FormatMegabitsPerSecond(
+        initialOutputProfile.peakBitrateBitsPerSecond);
+    auto peakTile = makeSettingTile(
+        directMainRow->get_gameObject(), directMainColumnWidth, "Peak Bitrate");
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        peakTile.controls->get_gameObject(), "", selectedPeakBitrate, outputBitrates,
+        [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            const auto bits = ParseMegabitsPerSecond(
+                static_cast<std::string>(value));
+            auto& profile = SelectedOutputProfile(active_->root_.Settings().Edit());
+            profile.peakBitrateBitsPerSecond = std::max(bits, profile.bitrateBitsPerSecond);
+            saveOutputProfile();
+        }), "Limits short video-bitrate spikes while using Variable Bitrate."),
+        directMainColumnWidth), 3);
+    static std::array<std::string_view, 2> outputRateControls{"CBR", "VBR"};
+    auto rateTile = makeSettingTile(
+        directMainRow->get_gameObject(), directMainColumnWidth, "Rate Control");
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        rateTile.controls->get_gameObject(), "",
+        initialOutputProfile.rateControl == settings::RateControlMode::ConstantBitrate
+            ? "CBR" : "VBR", outputRateControls,
+        [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).rateControl =
+                static_cast<std::string>(value) == "CBR"
+                    ? settings::RateControlMode::ConstantBitrate
+                    : settings::RateControlMode::VariableBitrate;
+            saveOutputProfile();
+        }), "CBR keeps bandwidth steady. VBR can spend more data on complex scenes and less on simple scenes."),
+        directMainColumnWidth), 4);
+    static std::array<std::string_view, 3> outputPriorities{
+        "Performance", "Balanced", "Quality"};
+    const auto selectedPriority =
+        initialOutputProfile.encoderPriority == settings::EncoderPriority::Performance
+            ? "Performance"
+            : initialOutputProfile.encoderPriority == settings::EncoderPriority::Quality
+                ? "Quality" : "Balanced";
+    auto priorityTile = makeSettingTile(
+        directMainRow->get_gameObject(), directMainColumnWidth, "Encoder Tuning");
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        priorityTile.controls->get_gameObject(), "", selectedPriority,
+        outputPriorities, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
             const auto selected = static_cast<std::string>(value);
-            auto& audio = active_->root_.Settings().Edit().audio;
-            audio.includeMicrophoneInRecordings = selected != "Stream Only";
-            audio.includeMicrophoneInLivestreams = selected != "Local Only";
-            active_->ApplyAudioSettings();
-        }), "Selects whether processed Quest microphone audio is added to local recordings, live streams, or both."),
-        sourceColumnWidth);
+            SelectedOutputProfile(active_->root_.Settings().Edit()).encoderPriority =
+                selected == "Performance" ? settings::EncoderPriority::Performance
+                : selected == "Quality" ? settings::EncoderPriority::Quality
+                                        : settings::EncoderPriority::Balanced;
+            saveOutputProfile();
+        }), "Asks the Quest hardware encoder to favor lower overhead, balance, or compression quality."),
+        directMainColumnWidth), 5);
 
+    auto [directFormatRow, directFormatColumnWidth] = makePaddedRow(
+        videoSection, 3, 14.0F);
+    static std::array<std::string_view, 4> outputProfiles{
+        "Auto", "Baseline", "Main", "High"};
+    const auto selectedProfile =
+        initialOutputProfile.h264Profile == settings::H264Profile::Baseline ? "Baseline"
+        : initialOutputProfile.h264Profile == settings::H264Profile::Main ? "Main"
+        : initialOutputProfile.h264Profile == settings::H264Profile::High ? "High"
+                                                                         : "Auto";
+    auto profileTile = makeSettingTile(
+        directFormatRow->get_gameObject(), directFormatColumnWidth, "H.264 Profile");
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        profileTile.controls->get_gameObject(), "", selectedProfile,
+        outputProfiles, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            const auto selected = static_cast<std::string>(value);
+            SelectedOutputProfile(active_->root_.Settings().Edit()).h264Profile =
+                selected == "Baseline" ? settings::H264Profile::Baseline
+                : selected == "Main" ? settings::H264Profile::Main
+                : selected == "High" ? settings::H264Profile::High
+                                      : settings::H264Profile::Automatic;
+            saveOutputProfile();
+        }), "Selects the H.264 compatibility profile used by the hardware encoder."),
+        directFormatColumnWidth), 6);
+    static std::array<std::string_view, 6> outputLevels{
+        "Auto", "3.1", "4.0", "4.1", "4.2", "5.0"};
+    auto levelTile = makeSettingTile(
+        directFormatRow->get_gameObject(), directFormatColumnWidth, "H.264 Level");
+    const auto selectedLevel = settings::ToString(initialOutputProfile.h264Level) == "auto"
+        ? std::string("Auto") : std::string(settings::ToString(initialOutputProfile.h264Level));
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        levelTile.controls->get_gameObject(), "", selectedLevel, outputLevels,
+        [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            auto selected = static_cast<std::string>(value);
+            if (selected == "Auto") selected = "auto";
+            settings::H264Level parsed{};
+            if (!settings::TryParse(selected, parsed)) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).h264Level = parsed;
+            saveOutputProfile();
+        }), "Limits resolution, frame rate, and bitrate combinations for decoder compatibility."),
+        directFormatColumnWidth), 7);
+    static std::array<std::string_view, 4> outputKeyframes{
+        "1 second", "2 seconds", "3 seconds", "4 seconds"};
+    const auto selectedKeyframes =
+        std::to_string(initialOutputProfile.keyframeIntervalSeconds) +
+        (initialOutputProfile.keyframeIntervalSeconds == 1 ? " second" : " seconds");
+    auto keyframeTile = makeSettingTile(
+        directFormatRow->get_gameObject(), directFormatColumnWidth, "Keyframe Interval");
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        keyframeTile.controls->get_gameObject(), "", selectedKeyframes,
+        outputKeyframes, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).keyframeIntervalSeconds =
+                std::stoi(static_cast<std::string>(value));
+            saveOutputProfile();
+        }), "Controls how often the stream creates a full recovery frame. Two seconds is the compatible streaming default."),
+        directFormatColumnWidth), 8);
+
+    auto* audioEncodingSection = makeSection(generalPage, "Audio Encoding");
+    auto [audioEncodingRow, audioEncodingColumnWidth] = makePaddedRow(
+        audioEncodingSection, 3, 14.0F);
+    auto audioBitrateTile = makeSettingTile(
+        audioEncodingRow->get_gameObject(), audioEncodingColumnWidth, "AAC Bitrate");
+    static std::array<std::string_view, 5> outputAudioBitrates{
+        "96 kbps", "128 kbps", "160 kbps", "192 kbps", "256 kbps"};
+    const auto selectedAudioBitrate =
+        std::to_string(initialOutputProfile.audioBitrateBitsPerSecond / 1000) + " kbps";
+    rememberGeneralDropdown(fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+        audioBitrateTile.controls->get_gameObject(), "", selectedAudioBitrate,
+        outputAudioBitrates, [encoderSettingsEditable, saveOutputProfile](StringW value) {
+            if (!active_ || !encoderSettingsEditable()) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).audioBitrateBitsPerSecond =
+                std::stoi(static_cast<std::string>(value)) * 1000;
+            saveOutputProfile();
+        }), "Sets AAC sound quality independently for local recordings and live streams."),
+        audioEncodingColumnWidth), 9);
+    auto gameAudioTile = makeSettingTile(
+        audioEncodingRow->get_gameObject(), audioEncodingColumnWidth, "Game Audio");
+    active_->gameAudioToggle_ = fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        gameAudioTile.controls->get_gameObject(), "",
+        initialOutputProfile.gameAudioEnabled, [](bool value) {
+            if (!active_) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).gameAudioEnabled = value;
+            active_->ApplyAudioSettings();
+        }), "Includes Beat Saber's sound in the selected Record or Stream profile. This does not change the volume heard in the headset."),
+        audioEncodingColumnWidth, 0.0F);
+    auto microphoneTile = makeSettingTile(
+        audioEncodingRow->get_gameObject(), audioEncodingColumnWidth, "Mic Enabled");
+    active_->microphoneEnabledToggle_ = fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        microphoneTile.controls->get_gameObject(), "",
+        initialOutputProfile.microphoneEnabled, [](bool value) {
+            if (!active_) return;
+            SelectedOutputProfile(active_->root_.Settings().Edit()).microphoneEnabled = value;
+            active_->ApplyAudioSettings(value);
+        }), "Enables Quest microphone capture and reveals the Audio tab for the selected Record or Stream profile."),
+        audioEncodingColumnWidth, 0.0F);
+
+    auto* sharedPanelSection = makeSection(generalPage, "Shared Stream Panels");
+    auto [sharedPanelRow, sharedPanelColumnWidth] = makePaddedRow(
+        sharedPanelSection, 3, 14.0F);
+    auto showChatTile = makeSettingTile(
+        sharedPanelRow->get_gameObject(), sharedPanelColumnWidth, "Show Twitch Chat Panel");
+    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        showChatTile.controls->get_gameObject(), "",
+        active_->root_.Settings().Get().chat.enabled,
+        [](bool visible) {
+            if (active_) active_->SetChatWorldPanelVisible(visible);
+        }), "Shows the movable HMD-only chat panel. This setting is shared because chat display is separate from which media destinations are enabled."),
+        sharedPanelColumnWidth, 0.0F);
+    auto resetChatTile = makeSettingTile(
+        sharedPanelRow->get_gameObject(), sharedPanelColumnWidth, "Reset Chat Panel");
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        resetChatTile.controls->get_gameObject(), "Reset Position and Size", [] {
+            if (active_) active_->ResetChatWorldPanelPose();
+        }), "Returns the Twitch chat panel to its default position and size."),
+        sharedPanelColumnWidth - 2.0F);
+    auto mapInfoTile = makeSettingTile(
+        sharedPanelRow->get_gameObject(), sharedPanelColumnWidth,
+        "Post Map Info to Twitch Chat");
+    fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        mapInfoTile.controls->get_gameObject(), "",
+        active_->root_.Settings().Get().broadcast.postMapInfoToChat,
+        [](bool enabled) {
+            if (!active_) return;
+            auto& document = active_->root_.Settings().Edit();
+            document.broadcast.postMapInfoToChat = enabled;
+            active_->root_.Settings().Save(nullptr);
+            if (enabled && !document.broadcast.twitchAccount.chatWriteAuthorized) {
+                active_->BeginTwitchAuthorization();
+            }
+            active_->RefreshTwitchControls();
+        }), "Posts one map summary from the connected Twitch account when gameplay starts. It is a shared stream feature even though Twitch currently supplies the chat connection."),
+        sharedPanelColumnWidth, 0.0F);
+
+    const auto& streamSettings = active_->root_.Settings().Get().broadcast;
+    auto* reliabilitySection = makeSection(generalPage, "Stream Reliability");
+    auto [reliabilityRow, reliabilityColumnWidth] = makePaddedRow(
+        reliabilitySection, 3, 14.0F);
+    auto keepAwakeTile = makeSettingTile(
+        reliabilityRow->get_gameObject(), reliabilityColumnWidth,
+        "Keep Headset Awake");
+    auto* keepHeadsetAwake = fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        keepAwakeTile.controls->get_gameObject(), "",
+        streamSettings.keepHeadsetAwake,
+        [](bool enabled) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.keepHeadsetAwake = enabled;
+            active_->root_.Settings().Save(nullptr);
+        }), "Keeps the display, encoder, and network active when the headset is removed during a stream. This remains locked while a stream is live."),
+        reliabilityColumnWidth, 0.0F);
+    RememberSelectables(keepHeadsetAwake, active_->livestreamConfigurationControls_);
+
+    auto reconnectTile = makeSettingTile(
+        reliabilityRow->get_gameObject(), reliabilityColumnWidth,
+        "Automatic Reconnect");
+    auto* reconnect = fitBareToggle(WithHint(BSML::Lite::CreateToggle(
+        reconnectTile.controls->get_gameObject(), "", streamSettings.reconnectEnabled,
+        [](bool value) {
+            if (!active_) return;
+            active_->root_.Settings().Edit().broadcast.reconnectEnabled = value;
+            active_->root_.Settings().Save(nullptr);
+        }), "Retries each dropped service independently. One service exhausting its attempts does not consume another service's retry allowance."),
+        reliabilityColumnWidth, 0.0F);
+    RememberSelectables(reconnect, active_->livestreamConfigurationControls_);
+
+    auto reconnectAttemptsTile = makeSettingTile(
+        reliabilityRow->get_gameObject(), reliabilityColumnWidth,
+        "Retries per Service");
+    static std::array<std::string_view, 5> reconnectAttempts{
+        "0", "3", "5", "8", "12"};
+    auto* reconnectAttemptsDropdown = fitBareDropdown(WithHint(
+        BSML::Lite::CreateDropdown(
+            reconnectAttemptsTile.controls->get_gameObject(), "",
+            std::to_string(streamSettings.reconnectAttempts), reconnectAttempts,
+            [](StringW value) {
+                if (!active_) return;
+                active_->root_.Settings().Edit().broadcast.reconnectAttempts =
+                    std::stoi(static_cast<std::string>(value));
+                active_->root_.Settings().Save(nullptr);
+            }), "Maximum reconnect attempts for each active service. Zero ends only the failed service immediately."),
+        reliabilityColumnWidth);
+    RememberSelectables(
+        reconnectAttemptsDropdown, active_->livestreamConfigurationControls_);
+
+    auto* afkSection = makeSection(generalPage, "Paused Stream Screen");
+    active_->afkSelectionText_ = makeStatus(
+        afkSection, "Pause screen: built-in SaberStage AFK image", 7.0F);
+    auto [afkRow, afkColumnWidth] = makePaddedRow(afkSection, 2, 10.0F);
+    auto* chooseAfkSlot = makeCenteredControlSlot(
+        afkRow->get_gameObject(), afkColumnWidth, 9.5F);
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        chooseAfkSlot, "Choose AFK Picture or GIF", [] {
+            if (active_) active_->OpenAfkFilePicker();
+        }), "Selects a PNG, JPEG, or animated GIF shown instead of the camera while live streams are paused."),
+        afkColumnWidth - 2.0F);
+    auto* defaultAfkSlot = makeCenteredControlSlot(
+        afkRow->get_gameObject(), afkColumnWidth, 9.5F);
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        defaultAfkSlot, "Use Built-in AFK Screen", [] {
+            if (!active_) return;
+            std::string error;
+            if (!active_->root_.Recording().PrepareAfkMedia({}, &error)) {
+                active_->ShowLivestreamActionError(error);
+                return;
+            }
+            active_->root_.Settings().Edit().broadcast.afkMediaPath.clear();
+            active_->root_.Settings().Save(nullptr);
+            if (active_->afkSelectionText_) {
+                active_->afkSelectionText_->set_text(
+                    "Pause screen: built-in SaberStage AFK image");
+            }
+        }), "Returns paused live streams to SaberStage's built-in AFK screen without deleting the custom file."),
+        afkColumnWidth - 2.0F);
+
+    const auto makeServicePage = [&](settings::LivestreamProvider provider,
+                                     std::size_t pageIndex) {
+        auto* page = active_->centerDebugTabContentRoots_[pageIndex];
+        const auto index = LivestreamProviderIndex(provider);
+        const auto providerName = std::string(LivestreamProviderLabel(provider));
+        const auto& initialDestination = settings::DestinationForProvider(
+            active_->root_.Settings().Get().broadcast, provider);
+
+        auto* enableSection = makeSection(page, providerName + " Streaming");
+        auto [enableRow, enableWidth] = makePaddedRow(enableSection, 1, 10.0F);
+        auto* enableToggle = WithHint(BSML::Lite::CreateToggle(
+            enableRow->get_gameObject(), "Enable " + providerName,
+            initialDestination.enabled,
+            [provider](bool enabled) {
+                if (!active_) return;
+                settings::DestinationForProvider(
+                    active_->root_.Settings().Edit().broadcast, provider).enabled = enabled;
+                std::string saveError;
+                if (!active_->root_.Settings().Save(&saveError)) {
+                    Logging::Logger.error(
+                        "Could not save {} stream enable state: {}",
+                        settings::ToString(provider), saveError);
+                }
+                active_->RefreshLivestreamDestinationVisibility(provider);
+                active_->RefreshRecordingStatus();
+            }), "Includes this destination when Start Stream performs its all-or-nothing configuration and bandwidth preflight.");
+        fitInlineToggleSetting(enableToggle, enableWidth);
+        RememberSelectables(enableToggle, active_->livestreamConfigurationControls_);
+
+        // Keep disabled destinations simple: only their master switch remains
+        // visible. Enabling the service reveals the complete provider-specific
+        // configuration and causes the vertical scroll layout to close the gap.
+        auto* details = BSML::Lite::CreateVerticalLayoutGroup(page->get_transform());
+        details->set_spacing(1.35F);
+        details->set_childControlWidth(true);
+        details->set_childControlHeight(true);
+        details->set_childForceExpandWidth(true);
+        details->set_childForceExpandHeight(false);
+        if (auto* layout = details->get_gameObject()->AddComponent<UnityEngine::UI::LayoutElement*>()) {
+            layout->set_preferredWidth(106.0F);
+        }
+        active_->livestreamDestinationContentRoots_[index] = details->get_gameObject();
+
+        const auto maximum = settings::MaximumLivestreamVideoBitrate(
+            provider,
+            active_->root_.Settings().Get().recording.livestream,
+            initialDestination);
+        auto* policySection = makeSection(details->get_gameObject(), "Service Limits");
+        std::string policy = "Maximum video bitrate: " +
+            std::to_string(maximum / 1'000'000) + " Mbps.";
+        if (provider == settings::LivestreamProvider::Twitch) {
+            policy += " Up to 1080p60, CBR, 2-second keyframes, and up to 160 kbps AAC.";
+        } else if (provider == settings::LivestreamProvider::Kick) {
+            policy += " Up to 1080p60, H.264 CBR, and 2-second keyframes.";
+        } else if (provider == settings::LivestreamProvider::YouTube) {
+            policy += " The maximum adjusts to resolution and frame rate; H.264 CBR and no more than 4-second keyframes are enforced.";
+        } else {
+            policy += " This user-defined cap protects a custom endpoint whose policy SaberStage cannot discover. Shared settings must also stay within every other enabled service's limits.";
+        }
+        makeStatus(policySection, policy, 12.0F);
+        if (provider != settings::LivestreamProvider::Custom) {
+            auto [recommendedRow, recommendedWidth] = makePaddedRow(
+                policySection, 1, 9.5F);
+            auto* recommendedSlot = makeCenteredControlSlot(
+                recommendedRow->get_gameObject(), recommendedWidth, 9.5F);
+            auto* applyRecommended = WithHint(BSML::Lite::CreateUIButton(
+                recommendedSlot, "Apply Recommended Settings", [provider] {
+                    if (active_) {
+                        active_->ApplyRecommendedLivestreamSettings(provider);
+                    }
+                }), "Applies this service's documented H.264 settings to the shared Stream profile. Resolution and frame rate are preserved unless this service does not support them.");
+            fitActionButton(applyRecommended, 48.0F);
+            RememberSelectables(
+                applyRecommended, active_->livestreamConfigurationControls_);
+        }
+
+        auto* endpointSection = makeSection(details->get_gameObject(), "Connection");
+        auto [serverRow, serverWidth] = makePaddedRow(endpointSection, 1, 14.0F);
+        auto serverTile = makeSettingTile(
+            serverRow->get_gameObject(), serverWidth, "RTMP / RTMPS Server Address");
+        auto* pasteServer = WithHint(BSML::Lite::CreateUIButton(
+            serverTile.controls->get_gameObject(), "Paste", [provider] {
+                if (active_) active_->ShowLivestreamServerPasteWarning(provider);
+            }), "Shows a warning before replacing the typed server address with the clipboard value.");
+        fitActionButton(pasteServer, 13.0F);
+        RememberSelectables(pasteServer, active_->livestreamConfigurationControls_);
+        auto* serverInput = WithHint(BSML::Lite::CreateStringSetting(
+            serverTile.controls->get_gameObject(), "",
+            active_->root_.Recording().StreamServerUrl(provider)),
+            "Enter this service's RTMP or RTMPS ingest address. Press Set to choose session-only or durable storage.");
+        active_->livestreamServerInputs_[index] = serverInput;
+        ConfigureRightPanelInput(serverInput, 2048, serverWidth - 28.0F);
+        RememberSelectables(serverInput, active_->livestreamConfigurationControls_);
+        auto* setServer = WithHint(BSML::Lite::CreateUIButton(
+            serverTile.controls->get_gameObject(), "Set", [provider] {
+                if (active_) active_->ShowLivestreamValueConfirmation(provider, 1);
+            }), "Choose whether this server address is used once or saved locally for this service.");
+        active_->setLivestreamServerButtons_[index] = setServer;
+        fitActionButton(setServer, 11.0F);
+        RememberSelectables(setServer, active_->livestreamConfigurationControls_);
+
+        auto [keyRow, keyWidth] = makePaddedRow(endpointSection, 1, 14.0F);
+        auto keyTile = makeSettingTile(
+            keyRow->get_gameObject(), keyWidth, "Private Stream Key");
+        auto* pasteKey = WithHint(BSML::Lite::CreateUIButton(
+            keyTile.controls->get_gameObject(), "Paste", [provider] {
+                if (active_) active_->PasteLivestreamKey(provider);
+            }), "Pastes the clipboard into this service's private key field. Press Set afterward to choose one-session or saved use.");
+        fitActionButton(pasteKey, 13.0F);
+        RememberSelectables(pasteKey, active_->livestreamConfigurationControls_);
+        auto* keyInput = WithHint(BSML::Lite::CreateStringSetting(
+            keyTile.controls->get_gameObject(), "",
+            active_->root_.Recording().StreamKey(provider),
+            [provider](StringW) {
+                if (active_) active_->RefreshLivestreamKeyDisplay(provider);
+            }), "The private key for only this service. It is masked, never logged, and redacted from support archives.");
+        active_->livestreamKeyInputs_[index] = keyInput;
+        ConfigureRightPanelInput(keyInput, 512, keyWidth - 28.0F);
+        RememberSelectables(keyInput, active_->livestreamConfigurationControls_);
+        auto* setKey = WithHint(BSML::Lite::CreateUIButton(
+            keyTile.controls->get_gameObject(), "Set", [provider] {
+                if (active_) active_->ShowLivestreamValueConfirmation(provider, 2);
+            }), "Choose whether this private key is used once or saved locally for this service.");
+        active_->setLivestreamKeyButtons_[index] = setKey;
+        fitActionButton(setKey, 11.0F);
+        RememberSelectables(setKey, active_->livestreamConfigurationControls_);
+
+        auto [keyActionRow, keyActionWidth] = makePaddedRow(endpointSection, 2, 10.0F);
+        auto* visibilitySlot = makeCenteredControlSlot(
+            keyActionRow->get_gameObject(), keyActionWidth, 9.5F);
+        fitInlineToggleSetting(WithHint(BSML::Lite::CreateToggle(
+            visibilitySlot->get_gameObject(), "Show Stream Key", false,
+            [provider](bool visible) {
+                if (!active_) return;
+                active_->livestreamKeyVisibility_[LivestreamProviderIndex(provider)] = visible;
+                active_->RefreshLivestreamKeyDisplay(provider);
+            }), "Shows or masks the key in this service tab."), keyActionWidth);
+        auto* clearSlot = makeCenteredControlSlot(
+            keyActionRow->get_gameObject(), keyActionWidth, 9.5F);
+        auto* clearKey = WithHint(BSML::Lite::CreateUIButton(
+            clearSlot, "Clear Stream Key", [provider] {
+                if (!active_) return;
+                auto& destination = settings::DestinationForProvider(
+                    active_->root_.Settings().Edit().broadcast, provider);
+                const auto previous = destination.streamKey;
+                destination.streamKey.clear();
+                std::string saveError;
+                if (!active_->root_.Settings().Save(&saveError)) {
+                    destination.streamKey = previous;
+                    Logging::Logger.error(
+                        "Could not clear {} stream key: {}",
+                        settings::ToString(provider), saveError);
+                    return;
+                }
+                active_->root_.Recording().ClearStreamKey(provider);
+                if (auto* input = active_->livestreamKeyInputs_[
+                        LivestreamProviderIndex(provider)]) {
+                    input->SetText("");
+                }
+                active_->RefreshLivestreamKeyDisplay(provider);
+                active_->RefreshRecordingStatus();
+            }), "Removes this service's saved and session-only stream key without changing another destination.");
+        active_->clearLivestreamKeyButtons_[index] = clearKey;
+        fitActionButton(clearKey, 34.0F);
+        RememberSelectables(clearKey, active_->livestreamConfigurationControls_);
+
+        if (provider == settings::LivestreamProvider::Custom) {
+            auto* customSection = makeSection(
+                details->get_gameObject(), "Custom Endpoint Policy");
+            auto [customRow, customWidth] = makePaddedRow(customSection, 1, 14.0F);
+            auto customTile = makeSettingTile(
+                customRow->get_gameObject(), customWidth, "Maximum Video Bitrate");
+            static std::array<std::string_view, 10> customBitrates{
+                "3 Mbps", "4 Mbps", "6 Mbps", "8 Mbps", "10 Mbps",
+                "12 Mbps", "16 Mbps", "20 Mbps", "30 Mbps", "50 Mbps"};
+            const auto selected = std::to_string(
+                initialDestination.maximumVideoBitrateBitsPerSecond / 1'000'000) + " Mbps";
+            fitBareDropdown(WithHint(BSML::Lite::CreateDropdown(
+                customTile.controls->get_gameObject(), "", selected, customBitrates,
+                [](StringW value) {
+                    if (!active_) return;
+                    settings::DestinationForProvider(
+                        active_->root_.Settings().Edit().broadcast,
+                        settings::LivestreamProvider::Custom)
+                        .maximumVideoBitrateBitsPerSecond =
+                            std::stoi(static_cast<std::string>(value)) * 1'000'000;
+                    active_->root_.Settings().Save(nullptr);
+                }), "Sets the explicit maximum accepted by the custom endpoint and is checked before any destination starts."), customWidth);
+        }
+
+        if (provider == settings::LivestreamProvider::Twitch) {
+            auto* twitchSection = makeSection(
+                details->get_gameObject(), "Twitch Account and Channel");
+            active_->twitchAccountStatusText_ = makeStatus(
+                twitchSection, "Twitch account status is loading...", 16.0F);
+            auto [accountRow, accountWidth] = makePaddedRow(twitchSection, 2, 9.5F);
+            auto* connectSlot = makeCenteredControlSlot(
+                accountRow->get_gameObject(), accountWidth, 9.5F);
+            active_->connectTwitchButton_ = WithHint(BSML::Lite::CreateUIButton(
+                connectSlot, "Connect Twitch Account", [] {
+                    if (active_) active_->BeginTwitchAuthorization();
+                }), "Links Twitch for title updates, live chat, and optional map announcements. The RTMP stream key remains separate.");
+            fitActionButton(active_->connectTwitchButton_, accountWidth - 2.0F);
+            auto* disconnectSlot = makeCenteredControlSlot(
+                accountRow->get_gameObject(), accountWidth, 9.5F);
+            fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+                disconnectSlot, "Disconnect Twitch", [] {
+                    if (!active_) return;
+                    active_->root_.Twitch().DisconnectAccount();
+                    active_->SetChatWorldPanelVisible(false);
+                    active_->RefreshTwitchControls();
+                }), "Removes Twitch OAuth authorization without erasing the separate RTMP key."),
+                accountWidth - 2.0F);
+            auto [channelRow, channelWidth] = makePaddedRow(twitchSection, 1, 9.5F);
+            auto* titleSlot = makeCenteredControlSlot(
+                channelRow->get_gameObject(), channelWidth, 9.5F);
+            fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+                titleSlot, "Set Stream Title", [] {
+                    if (active_) active_->ShowStreamTitleEditor();
+                }), "Saves the next Twitch title or updates it while Twitch is live."),
+                channelWidth - 2.0F);
+        }
+        details->get_gameObject()->SetActive(initialDestination.enabled);
+        active_->RefreshLivestreamKeyDisplay(provider);
+    };
+
+    makeServicePage(settings::LivestreamProvider::Twitch, 1);
+    makeServicePage(settings::LivestreamProvider::Kick, 2);
+    makeServicePage(settings::LivestreamProvider::YouTube, 3);
+    makeServicePage(settings::LivestreamProvider::Custom, 4);
+
+    auto* audioPage = active_->centerDebugTabContentRoots_[6];
+    const auto& initialAudioProfile = SelectedOutputProfile(
+        active_->root_.Settings().Get());
+    const auto& initialAudio = initialAudioProfile.audio;
+
+    auto* mixSection = makeSection(audioPage, "Levels and Meter");
     auto [volumeRow, volumeColumnWidth] = makePaddedRow(mixSection, 2, 14.0F);
     auto gameVolumeTile = makeSettingTile(
         volumeRow->get_gameObject(), volumeColumnWidth, "Game Volume");
     active_->audioVolumeSliders_[0] = showWholeNumber(fitBareSlider(WithHint(
         BSML::Lite::CreateSliderSetting(
             gameVolumeTile.controls->get_gameObject(), "", 1.0F,
-            initialBroadcast.gameAudioVolumePercent,
+            initialAudioProfile.gameAudioVolumePercent,
         0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = value;
-            active_->root_.Recording().SetLivestreamGameAudioVolumePercent(value);
+            SelectedOutputProfile(active_->root_.Settings().Edit()).gameAudioVolumePercent = value;
             active_->ApplyAudioSettings();
-        }), "Game-sound mix level for local recordings and live streams. It remains adjustable while active."),
-        volumeColumnWidth - 7.75F), initialBroadcast.gameAudioVolumePercent, true);
+        }), "Game-sound mix level for the selected Record or Stream profile. It remains adjustable while active."),
+        volumeColumnWidth - 7.75F), initialAudioProfile.gameAudioVolumePercent, true);
     makeResetGlyphButton(gameVolumeTile.controls->get_gameObject(), [] {
         if (!active_) return;
-        active_->root_.Settings().Edit().broadcast.gameAudioVolumePercent = 100.0F;
-        active_->root_.Recording().SetLivestreamGameAudioVolumePercent(100.0F);
+        SelectedOutputProfile(active_->root_.Settings().Edit()).gameAudioVolumePercent = 100.0F;
         active_->ApplyAudioSettings();
         active_->RefreshAudioControlState(true);
     }, "Resets game volume to 100%.");
@@ -2940,18 +3556,16 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->audioVolumeSliders_[1] = showWholeNumber(fitBareSlider(WithHint(
         BSML::Lite::CreateSliderSetting(
             microphoneVolumeTile.controls->get_gameObject(), "", 1.0F,
-            initialBroadcast.microphoneVolumePercent,
+            initialAudioProfile.microphoneVolumePercent,
         0.0F, 200.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = value;
-            active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(value);
+            SelectedOutputProfile(active_->root_.Settings().Edit()).microphoneVolumePercent = value;
             active_->ApplyAudioSettings();
-        }), "Microphone level after gate, compression, and limiting. It remains adjustable while active."),
-        volumeColumnWidth - 7.75F), initialBroadcast.microphoneVolumePercent, true);
+        }), "Microphone level after gate, compression, and limiting for the selected output profile."),
+        volumeColumnWidth - 7.75F), initialAudioProfile.microphoneVolumePercent, true);
     makeResetGlyphButton(microphoneVolumeTile.controls->get_gameObject(), [] {
         if (!active_) return;
-        active_->root_.Settings().Edit().broadcast.microphoneVolumePercent = 100.0F;
-        active_->root_.Recording().SetLivestreamMicrophoneVolumePercent(100.0F);
+        SelectedOutputProfile(active_->root_.Settings().Edit()).microphoneVolumePercent = 100.0F;
         active_->ApplyAudioSettings();
         active_->RefreshAudioControlState(true);
     }, "Resets microphone volume to 100%.");
@@ -2974,26 +3588,26 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     (void)ignoredMicrophoneModeWidth;
     constexpr float kMicrophoneModeWidth = 62.0F;
     constexpr float kHighPassWidth = 42.0F;
-    fitCenterSetting(WithHint(BSML::Lite::CreateDropdown(
+    active_->microphoneModeDropdown_ = WithHint(BSML::Lite::CreateDropdown(
         microphoneModeRow->get_gameObject(), "Microphone Mode", modeLabel,
         microphoneModes, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
-            active_->root_.Settings().Edit().audio.microphoneMode = selected == "Push to Talk"
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).microphoneMode = selected == "Push to Talk"
                 ? settings::MicrophoneMode::PushToTalk
                 : selected == "Voice Activated" ? settings::MicrophoneMode::VoiceActivated
                                                   : settings::MicrophoneMode::Open;
             active_->ApplyAudioSettings();
-        }), "Open keeps the mic on. Push to Talk opens it while a controller grip is held. Voice Activated opens it when your voice is loud enough."),
-        kMicrophoneModeWidth);
-    fitCenterSetting(WithHint(BSML::Lite::CreateToggle(
+        }), "Open keeps the mic on. Push to Talk opens it while a controller grip is held. Voice Activated opens it when your voice is loud enough.");
+    fitCenterSetting(active_->microphoneModeDropdown_, kMicrophoneModeWidth);
+    active_->highPassToggle_ = WithHint(BSML::Lite::CreateToggle(
         microphoneModeRow->get_gameObject(), "High-pass Filter",
         initialAudio.highPassEnabled, [](bool value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.highPassEnabled = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).highPassEnabled = value;
             active_->ApplyAudioSettings();
-        }), "Reduces deep headset rumble and breath noise before the microphone decides whether speech is present."),
-        kHighPassWidth);
+        }), "Reduces deep headset rumble and breath noise before the microphone decides whether speech is present.");
+    fitCenterSetting(active_->highPassToggle_, kHighPassWidth);
     const auto handLabel = initialAudio.pushToTalkHand == settings::PushToTalkHand::Left
         ? "Left Grip" : initialAudio.pushToTalkHand == settings::PushToTalkHand::Right
             ? "Right Grip" : "Either Grip";
@@ -3012,7 +3626,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         pttHands, [](StringW value) {
             if (!active_) return;
             const auto selected = static_cast<std::string>(value);
-            active_->root_.Settings().Edit().audio.pushToTalkHand = selected == "Left Grip"
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).pushToTalkHand = selected == "Left Grip"
                 ? settings::PushToTalkHand::Left
                 : selected == "Right Grip" ? settings::PushToTalkHand::Right
                                              : settings::PushToTalkHand::Either;
@@ -3028,14 +3642,14 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
         0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.pushToTalkReleaseMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).pushToTalkReleaseMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "Keeps the mic open briefly after you release the grip so the last part of a word is not cut off."),
         kPushToTalkReleaseWidth - 7.75F),
         initialAudio.pushToTalkReleaseMilliseconds, false);
     makeResetGlyphButton(pushToTalkReleaseTile.controls->get_gameObject(), [] {
         if (!active_) return;
-        active_->root_.Settings().Edit().audio.pushToTalkReleaseMilliseconds =
+        SelectedAudioProcessing(active_->root_.Settings().Edit()).pushToTalkReleaseMilliseconds =
             settings::AudioProcessingSettings{}.pushToTalkReleaseMilliseconds;
         active_->ApplyAudioSettings();
         active_->RefreshAudioControlState(true);
@@ -3055,7 +3669,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         -60.0F, -5.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
             SetGateOpenPreservingCutoffOffset(
-                active_->root_.Settings().Edit().audio, value);
+                SelectedAudioProcessing(active_->root_.Settings().Edit()), value);
             active_->ApplyAudioSettings();
             active_->RefreshAudioControlState(true);
         }), "How loud your voice must be before Voice Activated turns the microphone on. The yellow meter bar and this slider move together."),
@@ -3072,7 +3686,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         kGateCutoffOffsetMinimumDb, kGateCutoffOffsetMaximumDb,
         0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            SetGateCutoffOffset(active_->root_.Settings().Edit().audio, value);
+            SetGateCutoffOffset(SelectedAudioProcessing(active_->root_.Settings().Edit()), value);
             active_->ApplyAudioSettings();
             active_->RefreshAudioControlState(true);
         }), "Sets how far below Open the volume must fall before the microphone closes. Open -38 with a 5 dB offset closes below -43 dBFS."),
@@ -3088,7 +3702,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.gatePreRollMilliseconds,
         0.0F, 80.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gatePreRollMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).gatePreRollMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "Keeps a tiny amount of sound from just before the mic opened. Increase it if the beginning of words is being cut off."),
         gateThresholdColumnWidth), initialAudio.gatePreRollMilliseconds, false);
@@ -3106,7 +3720,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.gateAttackMilliseconds,
         1.0F, 100.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateAttackMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).gateAttackMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How quickly the mic reaches full volume after it opens. Lower values start speech faster; higher values fade it in more gently."),
         gateTimingColumnWidth), initialAudio.gateAttackMilliseconds, false);
@@ -3121,7 +3735,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.gateHoldMilliseconds,
         0.0F, 1000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateHoldMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).gateHoldMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How long the mic stays fully open during a short pause in your speech. Increase it if the mic closes between words."),
         gateTimingColumnWidth), initialAudio.gateHoldMilliseconds, false);
@@ -3136,7 +3750,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.gateReleaseMilliseconds,
         10.0F, 2000.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.gateReleaseMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).gateReleaseMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How quickly the mic fades out after the hold time ends. Increase it if the ends of words sound abruptly cut off."),
         gateTimingColumnWidth), initialAudio.gateReleaseMilliseconds, false);
@@ -3161,7 +3775,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         compressorEnabledRow->get_gameObject(), "Enable Compressor",
         initialAudio.compressorEnabled, [](bool value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorEnabled = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorEnabled = value;
             active_->ApplyAudioSettings();
         }), "Turns on compression, which lowers loud speech before makeup gain and limiting.");
     fitCenterSetting(active_->compressorToggle_, 44.0F);
@@ -3177,7 +3791,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.compressorThresholdDb,
         -60.0F, 0.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorThresholdDb = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorThresholdDb = value;
             active_->ApplyAudioSettings();
         }), "Compression begins above this dBFS level."),
         compressorMainColumnWidth), initialAudio.compressorThresholdDb, false);
@@ -3190,7 +3804,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.compressorRatio,
         1.0F, 20.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorRatio = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorRatio = value;
             active_->ApplyAudioSettings();
         }), "Controls how strongly loud speech is reduced above the threshold."),
         compressorMainColumnWidth);
@@ -3205,7 +3819,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.compressorAttackMilliseconds, 1.0F, 200.0F,
         0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorAttackMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorAttackMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How quickly the compressor reacts to a louder microphone signal."),
         compressorTimingColumnWidth), initialAudio.compressorAttackMilliseconds, false);
@@ -3218,7 +3832,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.compressorReleaseMilliseconds, 10.0F, 2000.0F,
         0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorReleaseMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorReleaseMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How quickly compression recovers after speech falls below the threshold."),
         compressorTimingColumnWidth), initialAudio.compressorReleaseMilliseconds, false);
@@ -3233,7 +3847,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.compressorMakeupDb,
         -12.0F, 24.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.compressorMakeupDb = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).compressorMakeupDb = value;
             active_->ApplyAudioSettings();
         }), "Raises the compressed microphone before the limiter."),
         makeupGainColumnWidth);
@@ -3255,7 +3869,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         limiterEnabledRow->get_gameObject(), "Enable Limiter",
         initialAudio.limiterEnabled, [](bool value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.limiterEnabled = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).limiterEnabled = value;
             active_->ApplyAudioSettings();
         }), "Turns on the final safety limiter so microphone peaks cannot pass the selected ceiling.");
     fitCenterSetting(active_->limiterToggle_, 38.0F);
@@ -3271,7 +3885,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.limiterCeilingDb,
         -12.0F, 0.0F, 0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.limiterCeilingDb = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).limiterCeilingDb = value;
             active_->ApplyAudioSettings();
         }), "Maximum microphone peak before it is mixed with game sound."),
         limiterSettingsColumnWidth);
@@ -3284,7 +3898,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         initialAudio.limiterReleaseMilliseconds, 10.0F, 2000.0F,
         0.15F, true, {0.0F, 0.0F}, [](float value) {
             if (!active_) return;
-            active_->root_.Settings().Edit().audio.limiterReleaseMilliseconds = value;
+            SelectedAudioProcessing(active_->root_.Settings().Edit()).limiterReleaseMilliseconds = value;
             active_->ApplyAudioSettings();
         }), "How quickly the limiter returns to unity after suppressing a peak."),
         limiterSettingsColumnWidth), initialAudio.limiterReleaseMilliseconds, false);
@@ -3297,7 +3911,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }), "Asks for confirmation before restoring the limiter defaults."),
         30.0F);
 
-    auto* ttsPage = active_->centerDebugTabContentRoots_[2];
+    auto* ttsPage = active_->centerDebugTabContentRoots_[7];
     const auto& initialTts = active_->root_.Settings().Get().tts;
     auto* ttsMainSection = makeSection(ttsPage, "Local Chat Speech");
     auto [ttsMainRow, ttsMainColumnWidth] = makePaddedRow(
@@ -3511,8 +4125,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }), "Skips queued speech that is too old to be useful after a burst of chat."),
         queueLimitColumnWidth), initialTts.staleAfterSeconds, false);
 
-    auto* configureStreamPage = active_->centerDebugTabContentRoots_[3];
-    auto* liveStreamPage = active_->centerDebugTabContentRoots_[4];
+    auto* configureStreamPage = active_->centerDebugTabContentRoots_[8];
+    auto* liveStreamPage = active_->centerDebugTabContentRoots_[9];
     auto* discordSection = makeSection(
         liveStreamPage, "Discord Live Stream");
     makeStatus(
@@ -3579,12 +4193,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
             : "No saved connection test result. No measured upload bitrate limit is active.",
         27.0F);
 
-    active_->ShowCenterDebugTab(0);
-    active_->RefreshAudioControlState();
+    active_->RefreshRecordingModeControls(true);
+    active_->RefreshOutputProfileControls(true);
     active_->RefreshDiscordScreenControls();
-    if (active_->centerDebugTabs_) {
-        active_->centerDebugTabs_->SelectCellWithNumber(0);
-    }
 }
 
 void MenuController::TickRuntimePanels() noexcept {
@@ -3616,9 +4227,9 @@ void MenuController::TickRuntimePanels() noexcept {
 
     // Metering is visual-only and intentionally capped at 10 Hz. The audio
     // callback publishes atomics; it never touches Unity UI or emits logs.
-    if (selectedCenterDebugTab_ == 1 &&
-            IsAlive(centerDebugTabViewRoots_[1]) &&
-            centerDebugTabViewRoots_[1]->get_activeInHierarchy()) {
+    if (selectedCenterDebugTab_ == 6 &&
+            IsAlive(centerDebugTabViewRoots_[6]) &&
+            centerDebugTabViewRoots_[6]->get_activeInHierarchy()) {
         audioMeterRefreshSeconds_ += std::max(
             0.0F, UnityEngine::Time::get_unscaledDeltaTime());
         if (audioMeterRefreshSeconds_ >= 0.1F) {
@@ -3668,6 +4279,7 @@ void MenuController::TickRuntimePanels() noexcept {
         // Refresh at the existing bounded UI cadence so its connection state
         // and packet counters become visible without touching Unity off-thread.
         RefreshDiscordScreenControls();
+        ObserveLivestreamDestinationFailures();
     }
 
     TickRecordingWorldPanel();
@@ -3733,19 +4345,10 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     active_->twitchConnectionSuccessModal_ = nullptr;
     active_->twitchConnectionSuccessText_ = nullptr;
     active_->twitchAuthorizationAwaitingCompletion_ = false;
-    active_->twitchAccountStatusText_ = nullptr;
-    active_->livestreamProviderFeatureText_ = nullptr;
     static std::array<std::string_view, 3> tabNames{"Record", "Live Stream", "Files"};
     active_->recordingTabViewRoots_.fill(nullptr);
-    active_->livestreamContentRoot_ = nullptr;
-    active_->livestreamServiceReference_ = nullptr;
-    active_->recordingEncodingControls_.clear();
-    active_->directRecordingEncodingControls_.clear();
-    active_->livestreamConfigurationControls_.clear();
-    active_->livestreamGameAudioVolumeSlider_ = nullptr;
-    active_->livestreamMicrophoneVolumeSlider_ = nullptr;
-    active_->connectTwitchButton_ = nullptr;
-    active_->livestreamKeyVisible_ = false;
+    // Encoder controls are owned by the center General tab. Do not clear its
+    // selectable registry when this action panel is rebuilt independently.
     active_->selectedRecordingTab_ = 0;
 
     active_->recordingTabs_ = BSML::Lite::CreateTextSegmentedControl(
@@ -3847,282 +4450,14 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
     }), "Stops recording and finishes the MP4 in the SaberStage Recordings folder. This also ends a live stream that is using the same encoder.");
     ConfigureRightPanelButton(active_->stopRecordingButton_);
 
-    const auto& recording = active_->root_.Settings().Get().recording;
-    CreateRightPanelSubheader(recordPage->get_transform(), "Options");
-    auto* gameplayOnly = WithHint(BSML::Lite::CreateToggle(recordPage, "Gameplay Only", recording.gameplayOnly, [](bool value) {
-        if (!active_) return;
-        active_->root_.Settings().Edit().recording.gameplayOnly = value;
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) {
-            Logging::Logger.error("Could not save Gameplay Only setting: {}", error);
-        }
-    }), "When enabled, Start arms recording for the next song and stops it after gameplay. Leave this off to record menus, results, and songs continuously.");
-    ConstrainRightPanelRow(gameplayOnly);
-    auto* controllerShortcut = WithHint(BSML::Lite::CreateToggle(
-        recordPage,
-        "Controller Shortcut",
-        recording.controllerShortcutEnabled,
-        [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().recording.controllerShortcutEnabled = value;
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) {
-                Logging::Logger.error("Could not save controller shortcut setting: {}", error);
-            }
-        }), "Lets you hold both thumbsticks during a song: release after 0.75 seconds to start, pause, or resume; hold 2.5 seconds to stop and save.");
-    ConstrainRightPanelRow(controllerShortcut);
-    auto* floatingControlsRow = CreateRightPanelInputActionRow(recordPage->get_transform());
-    auto* floatingControls = WithHint(BSML::Lite::CreateToggle(
-        floatingControlsRow,
-        "Floating Recording Controls",
-        recording.worldControlsVisible,
-        [](bool value) {
-            if (active_) active_->SetRecordingWorldPanelVisible(value);
-        }), "Shows a small movable world panel with start and stop buttons, elapsed time, recording/stream status, and optional FPS counters.");
-    ConfigureLayout(floatingControls, 38.0F, 7.0F, 1.0F);
-    auto* resetFloatingControls = WithHint(BSML::Lite::CreateUIButton(
-        floatingControlsRow, "↻", [] {
-            if (active_) active_->ResetRecordingWorldPanelPose();
-        }), "Moves the floating recording controls back to their default reachable position.");
-    ConfigureRightPanelInlineButton(resetFloatingControls);
-    auto* panelFpsCounters = WithHint(BSML::Lite::CreateToggle(
-        recordPage,
-        "Panel FPS Counters",
-        recording.worldControlsShowFps,
-        [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().recording.worldControlsShowFps = value;
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) {
-                Logging::Logger.error("Could not save panel FPS counter setting: {}", error);
-            }
-            // The floating panel notices the change on its next tick and
-            // rebuilds itself with or without the FPS row.
-        }), "Adds a live row to the Floating Recording Controls showing the capture frame rate and the headset frame rate.");
-    ConstrainRightPanelRow(panelFpsCounters);
-
-    CreateRightPanelSubheader(recordPage->get_transform(), "Encoder");
-    const auto settingsEditable = [] {
-        return active_ && active_->root_.Recording().Snapshot().CanStart();
-    };
-    const auto saveRecordingSettings = [] {
-        if (!active_) return;
-        std::string error;
-        if (!active_->root_.Settings().Save(&error)) {
-            Logging::Logger.error("Could not save recording encoder setting: {}", error);
-        }
-    };
-
-    static std::array<std::string_view, 2> backends{"Hollywood", "Direct FFmpeg (Hardware)"};
-    auto* backend = WithHint(BSML::Lite::CreateDropdown(
-        recordPage,
-        "Recording Backend",
-        recording.backend == settings::RecordingBackend::Hollywood ? "Hollywood" : "Direct FFmpeg (Hardware)",
-        backends,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            active_->root_.Settings().Edit().recording.backend =
-                static_cast<std::string>(value) == "Hollywood"
-                    ? settings::RecordingBackend::Hollywood
-                    : settings::RecordingBackend::DirectFfmpegHardware;
-            saveRecordingSettings();
-            active_->RefreshRecordingStatus();
-        }),
-        "Hollywood keeps the established capture library. Direct FFmpeg uses SaberStage's private FFmpeg hardware path. Both use the Quest H.264 hardware encoder; there is no software-video fallback.");
-    RememberSelectables(backend, active_->recordingEncodingControls_);
-    ConstrainRightPanelRow(backend);
-
-    static std::array<std::string_view, 3> resolutions{"720p", "1080p", "1440p"};
-    auto* resolution = WithHint(BSML::Lite::CreateDropdown(
-        recordPage,
-        "Recording Resolution",
-        settings::ToString(recording.resolution),
-        resolutions,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            settings::RecordingResolution parsed{};
-            if (settings::TryParse(static_cast<std::string>(value), parsed)) {
-                active_->root_.Settings().Edit().recording.resolution = parsed;
-                saveRecordingSettings();
-            }
-        }),
-        "Sets the saved or streamed video size. 720p uses the least GPU and encoder bandwidth. 1080p is the default. 1440p is available only if the headset hardware accepts it; start fails safely instead of using software encoding.");
-    RememberSelectables(resolution, active_->recordingEncodingControls_);
-    ConstrainRightPanelRow(resolution);
-
-    static std::array<std::string_view, 2> frameRates{"30 FPS", "60 FPS"};
-    auto* frameRate = WithHint(BSML::Lite::CreateDropdown(
-        recordPage,
-        "Recording Rate",
-        recording.framesPerSecond == 60 ? "60 FPS" : "30 FPS",
-        frameRates,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            active_->root_.Settings().Edit().recording.framesPerSecond =
-                static_cast<std::string>(value) == "60 FPS" ? 60 : 30;
-            saveRecordingSettings();
-        }), "30 FPS has the lowest gameplay cost and is enough for most streams. 60 FPS looks smoother but roughly doubles camera rendering work and needs more bitrate.");
-    RememberSelectables(frameRate, active_->recordingEncodingControls_);
-    ConstrainRightPanelRow(frameRate);
-
-    static std::array<std::string_view, 10> bitrates{
-        "3 Mbps", "4 Mbps", "6 Mbps", "8 Mbps", "10 Mbps",
-        "12 Mbps", "16 Mbps", "20 Mbps", "24 Mbps", "30 Mbps"};
-    std::string selectedBitrate = "8 Mbps";
-    for (const auto option : bitrates) {
-        const auto amount = std::stoi(std::string(option.substr(0, option.find(' '))));
-        if (recording.bitrateBitsPerSecond == amount * 1'000'000) selectedBitrate = std::string(option);
-    }
-    auto* targetBitrate = WithHint(BSML::Lite::CreateDropdown(
-        recordPage,
-        "Target Bitrate",
-        selectedBitrate,
-        bitrates,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            const auto selected = static_cast<std::string>(value);
-            const auto mbps = std::stoi(selected.substr(0, selected.find(' ')));
-            auto& editable = active_->root_.Settings().Edit().recording;
-            editable.bitrateBitsPerSecond = mbps * 1'000'000;
-            editable.peakBitrateBitsPerSecond = std::max(
-                editable.peakBitrateBitsPerSecond, editable.bitrateBitsPerSecond);
-            saveRecordingSettings();
-        }), "Controls the average amount of video data used each second. More bitrate preserves detail but creates larger files and needs faster upload bandwidth when live.");
-    RememberSelectables(targetBitrate, active_->recordingEncodingControls_);
-    ConstrainRightPanelRow(targetBitrate);
-
-    // Everything below applies only to the Direct FFmpeg backend; grouping it
-    // under one subheader keeps the common controls above compact and makes
-    // the interactable/grayed state of these rows self-explanatory.
-    CreateRightPanelSubheader(recordPage->get_transform(), "Advanced - Direct FFmpeg");
-    std::string selectedPeak = std::to_string(recording.peakBitrateBitsPerSecond / 1'000'000) + " Mbps";
-    auto* peakBitrate = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "Peak Bitrate", selectedPeak, bitrates,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            const auto selected = static_cast<std::string>(value);
-            const auto mbps = std::stoi(selected.substr(0, selected.find(' ')));
-            auto& editable = active_->root_.Settings().Edit().recording;
-            editable.peakBitrateBitsPerSecond = std::max(
-                mbps * 1'000'000, editable.bitrateBitsPerSecond);
-            saveRecordingSettings();
-        }), "Direct FFmpeg only. Limits short bitrate spikes in Variable Bitrate mode when the Quest codec supports Android's maximum-bitrate control. Constant Bitrate mainly follows Target Bitrate.");
-    RememberSelectables(peakBitrate, active_->recordingEncodingControls_);
-    RememberSelectables(peakBitrate, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(peakBitrate);
-
-    static std::array<std::string_view, 2> rateControls{"CBR", "VBR"};
-    auto* rateControl = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "Rate Control",
-        recording.rateControl == settings::RateControlMode::ConstantBitrate ? "CBR" : "VBR",
-        rateControls,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            active_->root_.Settings().Edit().recording.rateControl =
-                static_cast<std::string>(value) == "CBR"
-                    ? settings::RateControlMode::ConstantBitrate
-                    : settings::RateControlMode::VariableBitrate;
-            saveRecordingSettings();
-        }), "Direct FFmpeg only. CBR keeps bandwidth steady and is required by Twitch and Kick. VBR can spend more data on complex scenes and less on simple scenes, which is useful for local recordings.");
-    RememberSelectables(rateControl, active_->recordingEncodingControls_);
-    RememberSelectables(rateControl, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(rateControl);
-
-    static std::array<std::string_view, 3> priorities{"Performance", "Balanced", "Quality"};
-    std::string priority = recording.encoderPriority == settings::EncoderPriority::Performance
-        ? "Performance" : recording.encoderPriority == settings::EncoderPriority::Quality ? "Quality" : "Balanced";
-    auto* encoderPriority = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "Encoder Tuning", priority, priorities,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            const auto selected = static_cast<std::string>(value);
-            active_->root_.Settings().Edit().recording.encoderPriority =
-                selected == "Performance" ? settings::EncoderPriority::Performance
-                : selected == "Quality" ? settings::EncoderPriority::Quality
-                                        : settings::EncoderPriority::Balanced;
-            saveRecordingSettings();
-        }), "Asks the Direct FFmpeg hardware encoder to favor lower overhead, a balance, or more compression work. Unsupported Quest codecs may ignore this hint; no software encoder is used.");
-    RememberSelectables(encoderPriority, active_->recordingEncodingControls_);
-    RememberSelectables(encoderPriority, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(encoderPriority);
-
-    static std::array<std::string_view, 4> profiles{"Auto", "Baseline", "Main", "High"};
-    std::string profile = recording.h264Profile == settings::H264Profile::Baseline ? "Baseline"
-        : recording.h264Profile == settings::H264Profile::Main ? "Main"
-        : recording.h264Profile == settings::H264Profile::High ? "High" : "Auto";
-    auto* h264Profile = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "H.264 Profile", profile, profiles,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            const auto selected = static_cast<std::string>(value);
-            active_->root_.Settings().Edit().recording.h264Profile =
-                selected == "Baseline" ? settings::H264Profile::Baseline
-                : selected == "Main" ? settings::H264Profile::Main
-                : selected == "High" ? settings::H264Profile::High
-                                     : settings::H264Profile::Automatic;
-            saveRecordingSettings();
-        }), "Direct FFmpeg only. High normally gives the best compression and is supported by modern streaming services. Auto lets the Quest codec choose. Baseline is mainly for older decoders.");
-    RememberSelectables(h264Profile, active_->recordingEncodingControls_);
-    RememberSelectables(h264Profile, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(h264Profile);
-
-    static std::array<std::string_view, 6> levels{"Auto", "3.1", "4.0", "4.1", "4.2", "5.0"};
-    auto* h264Level = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "H.264 Level", settings::ToString(recording.h264Level) == "auto" ? "Auto" : settings::ToString(recording.h264Level), levels,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            auto selected = static_cast<std::string>(value);
-            if (selected == "Auto") selected = "auto";
-            settings::H264Level parsed{};
-            if (settings::TryParse(selected, parsed)) {
-                active_->root_.Settings().Edit().recording.h264Level = parsed;
-                saveRecordingSettings();
-            }
-        }), "Direct FFmpeg only. Level limits combinations of resolution, frame rate, and bitrate for decoder compatibility. 4.1 fits 1080p30, while 4.2 is safer for 1080p60. Auto lets the hardware choose.");
-    RememberSelectables(h264Level, active_->recordingEncodingControls_);
-    RememberSelectables(h264Level, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(h264Level);
-
-    static std::array<std::string_view, 4> keyframes{"1 second", "2 seconds", "3 seconds", "4 seconds"};
-    const auto selectedKeyframes = std::to_string(recording.keyframeIntervalSeconds) +
-        (recording.keyframeIntervalSeconds == 1 ? " second" : " seconds");
-    auto* keyframeInterval = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "Keyframe Interval", selectedKeyframes, keyframes,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            active_->root_.Settings().Edit().recording.keyframeIntervalSeconds =
-                std::stoi(static_cast<std::string>(value));
-            saveRecordingSettings();
-        }), "Direct FFmpeg only. Controls how often the stream creates a full recovery frame. Two seconds is the compatible default for Twitch, Kick, and YouTube and makes reconnects recover quickly.");
-    RememberSelectables(keyframeInterval, active_->recordingEncodingControls_);
-    RememberSelectables(keyframeInterval, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(keyframeInterval);
-
-    static std::array<std::string_view, 5> audioBitrates{"96 kbps", "128 kbps", "160 kbps", "192 kbps", "256 kbps"};
-    const auto selectedAudio = std::to_string(recording.audioBitrateBitsPerSecond / 1000) + " kbps";
-    auto* audioBitrate = WithHint(BSML::Lite::CreateDropdown(
-        recordPage, "Audio Bitrate", selectedAudio, audioBitrates,
-        [settingsEditable, saveRecordingSettings](StringW value) {
-            if (!settingsEditable()) return;
-            active_->root_.Settings().Edit().recording.audioBitrateBitsPerSecond =
-                std::stoi(static_cast<std::string>(value)) * 1000;
-            saveRecordingSettings();
-        }), "Sets AAC game-audio quality for Direct FFmpeg streaming and final files. 128 kbps is a good default; Twitch accepts up to 160 kbps in its normal recommendations.");
-    RememberSelectables(audioBitrate, active_->recordingEncodingControls_);
-    RememberSelectables(audioBitrate, active_->directRecordingEncodingControls_);
-    ConstrainRightPanelRow(audioBitrate);
-
-    auto* captureNote = BSML::Lite::CreateText(
-        recordPage->get_transform(),
-        "Encoder changes apply to the next session. Direct FFmpeg never falls back to software video. Start fails safely when the selected resolution/profile is unsupported.",
-        3.0F, {0.0F, 0.0F}, {48.0F, 18.0F});
-    captureNote->set_enableWordWrapping(true);
-    captureNote->set_alignment(TMPro::TextAlignmentOptions::Center);
+    // Encoder and output-audio settings live in the center General tab so the
+    // shared Record/Stream selector can display the independently persisted
+    // profile without duplicating controls in this recording-action panel.
 
     // ---- Live Stream tab --------------------------------------------------
-    // Same shape as the Record tab: status first, the two primary actions
-    // directly under it, then the one-time service setup, then reliability.
-    // Mid-session the user only needs the top of this page.
+    // This narrow action panel owns transport and shared session behavior.
+    // Per-service credentials and enable switches live in the wider center
+    // tabs, where they can be configured without crowding these controls.
     auto* liveHeading = BSML::Lite::CreateText(
         livestreamPage->get_transform(), "Direct Live Stream", 4.0F,
         {0.0F, 0.0F}, {kRightPanelRowWidth, 6.5F});
@@ -4148,264 +4483,12 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
         }), "Ends the broadcast. A stream-only capture stops completely; an explicitly started local recording keeps running until you use Stop & Save.");
     ConfigureRightPanelHalfButton(active_->stopLivestreamButton_);
 
-    auto* keepHeadsetAwake = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage,
-        "Keep Headset Awake",
-        active_->root_.Settings().Get().broadcast.keepHeadsetAwake,
-        [](bool enabled) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.keepHeadsetAwake = enabled;
-            active_->root_.Settings().Save(nullptr);
-        }),
-        "Keeps the Quest display, game, encoder, and network stream running when the headset is removed. This prevents off-head sleep from ending Twitch playback with error 2000, but increases battery use and leaves the display active until the stream stops. This setting cannot be changed during a live stream.");
-    RememberSelectables(keepHeadsetAwake, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(keepHeadsetAwake);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Service Setup");
-    const auto& stream = active_->root_.Settings().Get().broadcast;
-    static std::array<std::string_view, 4> providers{
-        "Twitch", "YouTube (Not Supported)", "Kick (Not Supported)", "Custom"};
-    std::string selectedProvider(LivestreamProviderLabel(stream.provider));
-    auto* provider = WithHint(BSML::Lite::CreateDropdown(
-        livestreamPage, "Service", selectedProvider, providers,
-        [](StringW value) {
-            if (!active_) return;
-            const auto selected = static_cast<std::string>(value);
-            auto& editable = active_->root_.Settings().Edit().broadcast;
-            editable.provider = LivestreamProviderFromLabel(selected);
-            if (active_->livestreamServerInput_) {
-                active_->livestreamServerInput_->SetText(
-                    active_->root_.Recording().StreamServerUrl(editable.provider));
-            }
-            if (active_->livestreamKeyInput_) {
-                active_->livestreamKeyInput_->SetText(
-                    active_->root_.Recording().StreamKey(editable.provider));
-            }
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) {
-                Logging::Logger.error("Could not save live-stream service: {}", error);
-            }
-            active_->RefreshLivestreamKeyDisplay();
-            active_->RefreshTwitchControls();
-            active_->RefreshRecordingStatus();
-        }), "Selects which service-specific server address and stream key are being edited. Switching services does not overwrite another service's values.");
-    RememberSelectables(provider, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(provider);
-
-    active_->livestreamProviderFeatureText_ = BSML::Lite::CreateText(
-        livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {kRightPanelRowWidth, 11.0F});
-    active_->livestreamProviderFeatureText_->set_enableWordWrapping(true);
-    active_->livestreamProviderFeatureText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Twitch Channel Controls");
-    active_->twitchAccountStatusText_ = BSML::Lite::CreateText(
-        livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {kRightPanelRowWidth, 11.0F});
-    active_->twitchAccountStatusText_->set_enableWordWrapping(true);
-    active_->twitchAccountStatusText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
-
-    auto* twitchAppText = BSML::Lite::CreateText(
-        livestreamPage->get_transform(),
-        "Secure device sign-in; no Client ID or secret entry is required.",
-        2.8F, {0.0F, 0.0F}, {kRightPanelRowWidth, 7.0F});
-    twitchAppText->set_enableWordWrapping(true);
-    twitchAppText->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
-    auto* twitchAccountActions = CreateRightPanelInputActionRow(
-        livestreamPage->get_transform());
-    active_->connectTwitchButton_ = WithHint(BSML::Lite::CreateUIButton(
-        twitchAccountActions, "Connect", "PlayButton", [] {
-            if (active_) active_->BeginTwitchAuthorization();
-        }), "Links Twitch through its device authorization page so SaberStage can set the channel title, read live chat, and optionally post map information. Accounts connected before map announcements were added must reconnect once. The RTMP stream key remains separate.");
-    ConfigureRightPanelHalfButton(active_->connectTwitchButton_);
-    auto* disconnectTwitch = WithHint(BSML::Lite::CreateUIButton(
-        twitchAccountActions, "Disconnect", "PlayButton", [] {
-            if (!active_) return;
-            active_->root_.Twitch().DisconnectAccount();
-            active_->SetChatWorldPanelVisible(false);
-            active_->RefreshTwitchControls();
-        }), "Removes SaberStage's saved Twitch authorization. This does not erase the separately configured RTMP stream key.");
-    ConfigureRightPanelHalfButton(disconnectTwitch);
-    auto* titleActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    auto* titleButton = WithHint(BSML::Lite::CreateUIButton(
-        titleActions, "Set Stream Title", [] {
-            if (active_) active_->ShowStreamTitleEditor();
-        }), "Saves the Twitch title for the next stream, or updates it immediately when a Twitch stream is already live. YouTube and Kick title control are not supported yet.");
-    ConfigureRightPanelButton(titleButton);
-
-    auto* postMapInfo = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage,
-        "Post Map Info to Chat",
-        active_->root_.Settings().Get().broadcast.postMapInfoToChat,
-        [](bool enabled) {
-            if (!active_) return;
-            auto& settings = active_->root_.Settings().Edit();
-            settings.broadcast.postMapInfoToChat = enabled;
-            std::string saveError;
-            if (!active_->root_.Settings().Save(&saveError)) {
-                Logging::Logger.error(
-                    "Could not save Twitch map-announcement preference: {}", saveError);
-            }
-            if (enabled && !settings.broadcast.twitchAccount.chatWriteAuthorized) {
-                // Older account links do not contain user:write:chat. Start the
-                // one-time Twitch device flow from the option that needs it
-                // instead of leaving an enabled-but-inoperative setting.
-                active_->BeginTwitchAuthorization();
-            }
-            active_->RefreshTwitchControls();
-        }),
-        "Posts one map summary from your connected Twitch account when gameplay starts. It includes song, artist, difficulty, mapper, duration, NPS, and locally available map-extension or rating data. Network work never runs on the gameplay thread. Existing Twitch links must reconnect once for permission.");
-    ConstrainRightPanelRow(postMapInfo);
-
-    auto* chatRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    auto* showChat = WithHint(BSML::Lite::CreateToggle(
-        chatRow,
-        "Show Twitch Chat Panel",
-        active_->root_.Settings().Get().chat.enabled,
-        [](bool visible) {
-            if (active_) active_->SetChatWorldPanelVisible(visible);
-        }), "Shows a movable, HMD-only Twitch chat panel. Twitch account linking is required; YouTube and Kick chat are not supported yet.");
-    ConfigureLayout(showChat, kRightPanelRowWidth - 10.0F, 7.0F, 1.0F);
-    auto* resetChat = WithHint(BSML::Lite::CreateUIButton(
-        chatRow, "↻", [] {
-            if (active_) active_->ResetChatWorldPanelPose();
-        }), "Returns the Twitch chat panel to its default position and size.");
-    ConfigureRightPanelInlineButton(resetChat);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Paused Stream Screen");
-    active_->afkSelectionText_ = BSML::Lite::CreateText(
-        livestreamPage->get_transform(), "", 3.0F,
-        {0.0F, 0.0F}, {kRightPanelRowWidth, 8.0F});
-    active_->afkSelectionText_->set_enableWordWrapping(true);
-    active_->afkSelectionText_->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
-    auto* chooseAfkActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    auto* chooseAfk = WithHint(BSML::Lite::CreateUIButton(
-        chooseAfkActions, "Choose AFK Picture or GIF", [] {
-            if (active_) active_->OpenAfkFilePicker();
-        }), "Selects a PNG, JPEG, or animated GIF shown instead of the camera while a Twitch stream is paused.");
-    ConfigureRightPanelButton(chooseAfk);
-    auto* builtInAfkActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    auto* builtInAfk = WithHint(BSML::Lite::CreateUIButton(
-        builtInAfkActions, "Use Built-in AFK Screen", [] {
-            if (!active_) return;
-            std::string error;
-            if (!active_->root_.Recording().PrepareAfkMedia({}, &error)) {
-                active_->ShowLivestreamActionError(error);
-                return;
-            }
-            active_->root_.Settings().Edit().broadcast.afkMediaPath.clear();
-            active_->root_.Settings().Save(nullptr);
-            if (active_->afkSelectionText_) {
-                active_->afkSelectionText_->set_text("Pause screen: built-in SaberStage AFK image");
-            }
-        }), "Returns paused Twitch streams to SaberStage's built-in AFK screen without deleting your image or GIF file.");
-    ConfigureRightPanelButton(builtInAfk);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Server Address");
-    auto* serverInputRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    active_->livestreamServerInput_ = WithHint(BSML::Lite::CreateStringSetting(
-        serverInputRow,
-        "Enter RTMP or RTMPS server address",
-        active_->root_.Recording().StreamServerUrl(stream.provider)),
-        "The selected service's RTMP or RTMPS ingest address. Editing does not apply it until Set is pressed, where you can use it once or save it for later sessions.");
-    RememberSelectables(active_->livestreamServerInput_, active_->livestreamConfigurationControls_);
-    ConfigureRightPanelInput(
-        active_->livestreamServerInput_, 2048, kRightPanelRowWidth - 10.0F);
-    active_->setLivestreamServerButton_ = WithHint(BSML::Lite::CreateUIButton(
-        serverInputRow, "Set", [] {
-            if (active_) active_->ShowLivestreamValueConfirmation(1);
-        }), "Choose whether the typed server address is used only this session or saved in SaberStage settings.");
-    ConfigureRightPanelInlineButton(active_->setLivestreamServerButton_);
-    RememberSelectables(active_->setLivestreamServerButton_, active_->livestreamConfigurationControls_);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Key");
-    auto* streamKeyInputRow = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    active_->livestreamKeyInput_ = WithHint(BSML::Lite::CreateStringSetting(
-        streamKeyInputRow,
-        "Enter private stream key",
-        active_->root_.Recording().StreamKey(stream.provider),
-        [](StringW) {
-            if (active_) active_->RefreshLivestreamKeyDisplay();
-        }), "Paste the selected service's private stream key. Set lets you keep it for this session only or explicitly save it in local SaberStage settings. It is never logged and is redacted from support archives.");
-    ConfigureRightPanelInput(
-        active_->livestreamKeyInput_, 512, kRightPanelRowWidth - 10.0F);
-    RememberSelectables(active_->livestreamKeyInput_, active_->livestreamConfigurationControls_);
-    active_->setLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
-        streamKeyInputRow, "Set", [] {
-            if (active_) active_->ShowLivestreamValueConfirmation(2);
-        }), "Choose whether the typed private stream key is used only this session or saved in SaberStage settings.");
-    ConfigureRightPanelInlineButton(active_->setLivestreamKeyButton_);
-    RememberSelectables(active_->setLivestreamKeyButton_, active_->livestreamConfigurationControls_);
-    auto* livestreamKeyVisibility = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage,
-        "Show Stream Key",
-        false,
-        [](bool visible) {
-            if (!active_) return;
-            active_->livestreamKeyVisible_ = visible;
-            active_->RefreshLivestreamKeyDisplay();
-        }), "Shows the private stream key in this field. Leave this off to display password-style masking whether the key is session-only or saved locally.");
-    ConstrainRightPanelRow(livestreamKeyVisibility);
-
-    auto* clearKeyActions = CreateRightPanelInputActionRow(livestreamPage->get_transform());
-    active_->clearLivestreamKeyButton_ = WithHint(BSML::Lite::CreateUIButton(
-        clearKeyActions, "Clear Stream Key", [] {
-            if (!active_) return;
-            auto& broadcastSettings = active_->root_.Settings().Edit().broadcast;
-            const auto provider = broadcastSettings.provider;
-            auto& savedKey = settings::DestinationForProvider(
-                broadcastSettings, provider).streamKey;
-            const auto previous = savedKey;
-            savedKey.clear();
-            std::string error;
-            if (!active_->root_.Settings().Save(&error)) {
-                savedKey = previous;
-                Logging::Logger.error("Could not clear the saved live-stream key: {}", error);
-                return;
-            }
-            active_->root_.Recording().ClearStreamKey(provider);
-            if (active_->livestreamKeyInput_) active_->livestreamKeyInput_->SetText("");
-            active_->RefreshLivestreamKeyDisplay();
-            active_->RefreshRecordingStatus();
-        }), "Removes only the selected service's current session key and saved key. Other streaming services are not changed. It cannot be cleared while a stream is active.");
-    ConfigureRightPanelButton(active_->clearLivestreamKeyButton_);
-    RememberSelectables(
-        active_->clearLivestreamKeyButton_, active_->livestreamConfigurationControls_);
-
-    CreateRightPanelSubheader(livestreamPage->get_transform(), "Reliability");
-    auto* reconnect = WithHint(BSML::Lite::CreateToggle(
-        livestreamPage, "Automatic Reconnect", stream.reconnectEnabled,
-        [](bool value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.reconnectEnabled = value;
-            active_->root_.Settings().Save(nullptr);
-        }), "Retries a dropped connection in the background with increasing delays while gameplay and the live capture continue.");
-    RememberSelectables(reconnect, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(reconnect);
-
-    static std::array<std::string_view, 5> attempts{"0", "3", "5", "8", "12"};
-    auto* reconnectAttempts = WithHint(BSML::Lite::CreateDropdown(
-        livestreamPage, "Reconnect Attempts", std::to_string(stream.reconnectAttempts), attempts,
-        [](StringW value) {
-            if (!active_) return;
-            active_->root_.Settings().Edit().broadcast.reconnectAttempts =
-                std::stoi(static_cast<std::string>(value));
-            active_->root_.Settings().Save(nullptr);
-        }), "Limits how many times SaberStage retries a lost stream. Zero means a network failure ends the stream immediately.");
-    RememberSelectables(reconnectAttempts, active_->livestreamConfigurationControls_);
-    ConstrainRightPanelRow(reconnectAttempts);
-
     auto* liveNote = BSML::Lite::CreateText(
         livestreamPage->get_transform(),
-        "Use CBR and a 2-second keyframe interval for Twitch and Kick. Recommended starting points: Twitch 1080p60 at 6 Mbps; Kick up to 1080p60 at 8 Mbps; YouTube 1080p60 at 12 Mbps or 1440p60 at 24 Mbps.",
+        "Start Stream validates every enabled service before any connection opens. Twitch is capped at 6 Mbps, Kick at 8 Mbps, and YouTube uses its resolution/FPS-specific H.264 limits. Combined output must fit within 70% of the saved Cloudflare upload result.",
         3.0F, {0.0F, 0.0F}, {kRightPanelRowWidth, 23.0F});
     liveNote->set_enableWordWrapping(true);
     liveNote->set_alignment(TMPro::TextAlignmentOptions::TopLeft);
-
-    // Store the reference without altering it. ShowRecordingTab applies the
-    // other rows' geometry after this initially hidden page becomes visible.
-    active_->livestreamContentRoot_ = livestreamPage;
-    active_->livestreamServiceReference_ = provider;
 
     auto* filesHeading = BSML::Lite::CreateText(
         filesPage->get_transform(), "Saved Recordings", 4.0F, {0.0F, 0.0F}, {48.0F, 6.5F});
@@ -4769,7 +4852,17 @@ void MenuController::BuildTabbedSettings(HMUI::ViewController* view) {
 }
 
 void MenuController::ShowCenterDebugTab(int index) {
-    index = std::clamp(index, 0, 4);
+    index = std::clamp(
+        index, 0, static_cast<int>(centerDebugTabViewRoots_.size()) - 1);
+    // The tab strip is rebuilt whenever mode or microphone availability
+    // changes. Reject a stale callback for a page which is no longer present
+    // instead of activating content the player cannot navigate back to.
+    if (!visibleCenterTabPageIndices_.empty() &&
+            std::find(visibleCenterTabPageIndices_.begin(),
+                      visibleCenterTabPageIndices_.end(), index) ==
+                visibleCenterTabPageIndices_.end()) {
+        index = kCenterGeneralPage;
+    }
     selectedCenterDebugTab_ = index;
     for (int page = 0;
          page < static_cast<int>(centerDebugTabViewRoots_.size());
@@ -4789,11 +4882,149 @@ void MenuController::ShowCenterDebugTab(int index) {
         UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(rect);
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
-    if (selectedCenterDebugTab_ == 1) RefreshAudioMeter();
-    if (selectedCenterDebugTab_ == 4) {
+    if (selectedCenterDebugTab_ == kCenterAudioPage) RefreshAudioMeter();
+    if (selectedCenterDebugTab_ == kCenterLiveStreamPage) {
         discordHelperAvailability_ =
             broadcast::QueryDiscordHelperAvailability();
         RefreshDiscordScreenControls();
+    }
+}
+
+void MenuController::RebuildCenterTabStrip() {
+    if (!IsAlive(settingsView_)) return;
+
+    const auto& document = root_.Settings().Get();
+    const bool streamMode = document.recording.worldControlsStreamMode;
+    const bool microphoneEnabled =
+        SelectedOutputProfile(document).microphoneEnabled;
+
+    if (IsAlive(centerDebugTabs_)) {
+        UnityEngine::Object::Destroy(centerDebugTabs_->get_gameObject());
+        centerDebugTabs_ = nullptr;
+    }
+
+    std::vector<std::string_view> tabNames{"General"};
+    visibleCenterTabPageIndices_ = {kCenterGeneralPage};
+    const auto addTab = [&](std::string_view name, int pageIndex) {
+        tabNames.push_back(name);
+        visibleCenterTabPageIndices_.push_back(pageIndex);
+    };
+    if (streamMode) {
+        addTab("Twitch", kCenterTwitchPage);
+        addTab("Kick", kCenterKickPage);
+        addTab("YouTube", kCenterYouTubePage);
+        addTab("Custom", kCenterCustomPage);
+    }
+    if (microphoneEnabled) addTab("Audio", kCenterAudioPage);
+    if (streamMode) addTab("Chat TTS", kCenterTtsPage);
+    addTab("Configure Stream", kCenterConfigureStreamPage);
+    addTab("Live Stream", kCenterLiveStreamPage);
+
+    // Translate the segmented control's compact visible index back into the
+    // stable page slot. Stable page slots let each page keep its existing UI
+    // state while optional tabs are inserted or removed around it.
+    const auto selectVisibleTab = [](int visibleIndex) {
+        if (!active_ || visibleIndex < 0 ||
+                visibleIndex >= static_cast<int>(
+                    active_->visibleCenterTabPageIndices_.size())) {
+            return;
+        }
+        active_->ShowCenterDebugTab(
+            active_->visibleCenterTabPageIndices_[visibleIndex]);
+    };
+    centerDebugTabs_ = BSML::Lite::CreateTextSegmentedControl(
+        settingsView_, {0.0F, 0.0F}, {112.0F, 7.0F},
+        std::span<std::string_view>(tabNames), selectVisibleTab);
+    if (!IsAlive(centerDebugTabs_)) {
+        centerTabStripSignature_ = -1;
+        Logging::Logger.error(
+            "Could not rebuild the center tab strip for {} mode with the microphone {}",
+            streamMode ? "Stream" : "Record",
+            microphoneEnabled ? "enabled" : "disabled");
+        return;
+    }
+
+    auto tabsRect = centerDebugTabs_->get_transform()
+        .cast<UnityEngine::RectTransform>();
+    tabsRect->set_anchorMin({0.0F, 1.0F});
+    tabsRect->set_anchorMax({1.0F, 1.0F});
+    tabsRect->set_pivot({0.5F, 1.0F});
+    tabsRect->set_anchoredPosition({0.0F, -1.5F});
+    tabsRect->set_sizeDelta({-4.0F, 7.0F});
+    centerTabStripSignature_ = (streamMode ? 1 : 0) |
+        (microphoneEnabled ? 2 : 0);
+
+    int pageIndex = selectedCenterDebugTab_;
+    const auto selected = std::find(
+        visibleCenterTabPageIndices_.begin(),
+        visibleCenterTabPageIndices_.end(), pageIndex);
+    if (selected == visibleCenterTabPageIndices_.end()) {
+        pageIndex = kCenterGeneralPage;
+    }
+    const auto visible = std::find(
+        visibleCenterTabPageIndices_.begin(),
+        visibleCenterTabPageIndices_.end(), pageIndex);
+    const int visibleIndex = static_cast<int>(std::distance(
+        visibleCenterTabPageIndices_.begin(), visible));
+    centerDebugTabs_->SelectCellWithNumber(visibleIndex);
+    ShowCenterDebugTab(pageIndex);
+}
+
+void MenuController::RefreshLivestreamDestinationVisibility(
+        settings::LivestreamProvider provider) {
+    auto* details = livestreamDestinationContentRoots_[
+        LivestreamProviderIndex(provider)];
+    if (!IsAlive(details)) return;
+    const bool enabled = settings::DestinationForProvider(
+        root_.Settings().Get().broadcast, provider).enabled;
+    details->SetActive(enabled);
+}
+
+void MenuController::RefreshRecordingModeControls(bool forceTabStripRebuild) {
+    const auto& document = root_.Settings().Get();
+    const bool streamMode = document.recording.worldControlsStreamMode;
+    const bool microphoneEnabled =
+        SelectedOutputProfile(document).microphoneEnabled;
+
+    // Use the stock Toggle setter so its handle, background, and animation all
+    // update. The guard prevents the resulting callbacks from saving or
+    // recursively synchronizing the second representation of the same value.
+    if (!synchronizingRecordingModeControls_) {
+        synchronizingRecordingModeControls_ = true;
+        const auto synchronizeToggle = [streamMode](BSML::ToggleSetting* setting) {
+            if (!IsAlive(setting) || !IsAlive(setting->toggle)) return;
+            setting->currentValue = streamMode;
+            if (setting->toggle->get_isOn() != streamMode) {
+                setting->toggle->set_isOn(streamMode);
+            }
+        };
+        try {
+            synchronizeToggle(generalRecordingModeToggle_);
+            synchronizeToggle(recordingWorldPanelModeToggle_);
+        } catch (const std::exception& exception) {
+            Logging::Logger.error(
+                "Could not synchronize Record/Stream switches: {}",
+                exception.what());
+        } catch (...) {
+            Logging::Logger.error(
+                "Could not synchronize Record/Stream switches because of an unknown error");
+        }
+        synchronizingRecordingModeControls_ = false;
+    }
+
+    if (IsAlive(generalLocalRecordingContentRoot_)) {
+        generalLocalRecordingContentRoot_->SetActive(!streamMode);
+    }
+
+    const int requestedTabStripSignature = (streamMode ? 1 : 0) |
+        (microphoneEnabled ? 2 : 0);
+    if (forceTabStripRebuild ||
+            centerTabStripSignature_ != requestedTabStripSignature ||
+            !IsAlive(centerDebugTabs_)) {
+        RebuildCenterTabStrip();
+    }
+    for (const auto provider : settings::kLivestreamProviders) {
+        RefreshLivestreamDestinationVisibility(provider);
     }
 }
 
@@ -4813,28 +5044,32 @@ void MenuController::ShowSettingsTab(int index) {
     }
 }
 
-void MenuController::RefreshLivestreamKeyDisplay() {
-    if (!IsAlive(livestreamKeyInput_)) return;
-    auto* textView = livestreamKeyInput_->_textView.ptr();
+void MenuController::RefreshLivestreamKeyDisplay(
+    settings::LivestreamProvider provider) {
+    const auto index = LivestreamProviderIndex(provider);
+    auto* input = livestreamKeyInputs_[index];
+    if (!IsAlive(input)) return;
+    auto* textView = input->_textView.ptr();
     if (!IsAlive(textView)) return;
-    auto display = static_cast<std::string>(livestreamKeyInput_->get_text());
-    if (!livestreamKeyVisible_ && !display.empty()) {
+    auto display = static_cast<std::string>(input->get_text());
+    if (!livestreamKeyVisibility_[index] && !display.empty()) {
         display.assign(display.size(), '*');
     }
     textView->set_text(StringW(display));
     textView->SetAllDirty();
 }
 
-void MenuController::ShowLivestreamValueConfirmation(int valueKind) {
+void MenuController::ShowLivestreamValueConfirmation(
+    settings::LivestreamProvider provider,
+    int valueKind) {
     if (valueKind != 1 && valueKind != 2) return;
+    pendingLivestreamProvider_ = provider;
     pendingLivestreamValueKind_ = valueKind;
     if (!livestreamValueConfirmationModal_) {
-        if (!IsAlive(recordingView_)) return;
-        // Parent the modal to the currently active Recording side panel. BSML
-        // renders this modal above that flow controller, keeping it visible and
-        // clickable even when other SaberStage panels are open.
+        auto* modalParent = IsAlive(settingsView_) ? settingsView_ : recordingView_;
+        if (!IsAlive(modalParent)) return;
         livestreamValueConfirmationModal_ = BSML::Lite::CreateModal(
-            recordingView_, {76.0F, 54.0F}, nullptr, true);
+            modalParent, {76.0F, 54.0F}, nullptr, true);
         if (!livestreamValueConfirmationModal_) return;
         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
             livestreamValueConfirmationModal_->get_transform());
@@ -4867,7 +5102,6 @@ void MenuController::ShowLivestreamValueConfirmation(int valueKind) {
         }), "Saves this value locally for only the selected streaming service so it is available in later sessions.");
     }
     if (!livestreamValueConfirmationModal_ || !livestreamValueConfirmationText_) return;
-    const auto provider = root_.Settings().Get().broadcast.provider;
     const auto providerName = LivestreamProviderLabel(provider);
     livestreamValueConfirmationText_->set_text(valueKind == 1
         ? StringW(std::string("Apply the server address for ") + std::string(providerName) +
@@ -4887,14 +5121,15 @@ void MenuController::ResolveLivestreamValueConfirmation(int action) {
     if ((valueKind != 1 && valueKind != 2) || (action != 1 && action != 2)) return;
 
     auto& broadcastSettings = root_.Settings().Edit().broadcast;
-    const auto provider = broadcastSettings.provider;
+    const auto provider = pendingLivestreamProvider_;
+    const auto index = LivestreamProviderIndex(provider);
     const auto providerName = LivestreamProviderLabel(provider);
     const auto value = valueKind == 1
-        ? (IsAlive(livestreamServerInput_)
-               ? static_cast<std::string>(livestreamServerInput_->get_text())
+        ? (IsAlive(livestreamServerInputs_[index])
+               ? static_cast<std::string>(livestreamServerInputs_[index]->get_text())
                : std::string{})
-        : (IsAlive(livestreamKeyInput_)
-               ? static_cast<std::string>(livestreamKeyInput_->get_text())
+        : (IsAlive(livestreamKeyInputs_[index])
+               ? static_cast<std::string>(livestreamKeyInputs_[index]->get_text())
                : std::string{});
     std::string error;
     const auto valid = valueKind == 1
@@ -4940,7 +5175,172 @@ void MenuController::ResolveLivestreamValueConfirmation(int action) {
 
     pendingLivestreamValueKind_ = 0;
     if (livestreamValueConfirmationModal_) livestreamValueConfirmationModal_->Hide();
-    RefreshLivestreamKeyDisplay();
+    RefreshLivestreamKeyDisplay(provider);
+    RefreshRecordingStatus();
+}
+
+void MenuController::ShowLivestreamServerPasteWarning(
+    settings::LivestreamProvider provider) {
+    pendingLivestreamPasteProvider_ = provider;
+    if (!livestreamServerPasteWarningModal_) {
+        auto* modalParent = IsAlive(settingsView_) ? settingsView_ : recordingView_;
+        if (!IsAlive(modalParent)) return;
+        livestreamServerPasteWarningModal_ = BSML::Lite::CreateModal(
+            modalParent, {72.0F, 38.0F}, nullptr, true);
+        if (!livestreamServerPasteWarningModal_) return;
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            livestreamServerPasteWarningModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* warning = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "The default RTMP address is supplied by the streaming service. Change it only when the service instructs you to use another ingest address or you are troubleshooting a connection problem.\n\nPaste the clipboard value into this field?",
+            3.5F, {0.0F, 0.0F}, {64.0F, 23.0F});
+        warning->set_enableWordWrapping(true);
+        warning->set_alignment(TMPro::TextAlignmentOptions::Center);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(
+            layout->get_transform());
+        actions->set_spacing(3.0F);
+        actions->set_childControlWidth(true);
+        actions->set_childForceExpandWidth(true);
+        ConfigureLayout(actions, 60.0F, 8.0F, 1.0F);
+        BSML::Lite::CreateUIButton(actions, "Cancel", [] {
+            if (active_) active_->ResolveLivestreamServerPasteWarning(false);
+        });
+        BSML::Lite::CreateUIButton(actions, "Paste", [] {
+            if (active_) active_->ResolveLivestreamServerPasteWarning(true);
+        });
+    }
+    livestreamServerPasteWarningModal_->Show();
+}
+
+void MenuController::ResolveLivestreamServerPasteWarning(bool pasteValue) {
+    if (livestreamServerPasteWarningModal_) {
+        livestreamServerPasteWarningModal_->Hide();
+    }
+    if (!pasteValue) return;
+    try {
+        const auto clipboard = static_cast<std::string>(
+            UnityEngine::GUIUtility::get_systemCopyBuffer());
+        if (clipboard.empty()) {
+            ShowLivestreamActionError(
+                "The clipboard is empty. Copy the RTMP or RTMPS address and try again.");
+            return;
+        }
+        auto* input = livestreamServerInputs_[
+            LivestreamProviderIndex(pendingLivestreamPasteProvider_)];
+        if (!IsAlive(input)) {
+            ShowLivestreamActionError(
+                "The stream-address field is not available. Reopen SaberStage settings and try again.");
+            return;
+        }
+        input->SetText(StringW(clipboard));
+    } catch (const std::exception& exception) {
+        Logging::Logger.error(
+            "Could not paste a live-stream server address: {}", exception.what());
+        ShowLivestreamActionError(
+            "SaberStage could not read the Quest clipboard. Copy the address and try again.");
+    } catch (...) {
+        Logging::Logger.error(
+            "Could not paste a live-stream server address because of an unknown error");
+        ShowLivestreamActionError(
+            "SaberStage could not read the Quest clipboard. Copy the address and try again.");
+    }
+}
+
+void MenuController::PasteLivestreamKey(settings::LivestreamProvider provider) {
+    try {
+        const auto clipboard = static_cast<std::string>(
+            UnityEngine::GUIUtility::get_systemCopyBuffer());
+        if (clipboard.empty()) {
+            ShowLivestreamActionError(
+                "The clipboard is empty. Copy the private stream key and try again.");
+            return;
+        }
+        auto* input = livestreamKeyInputs_[LivestreamProviderIndex(provider)];
+        if (!IsAlive(input)) {
+            ShowLivestreamActionError(
+                "The stream-key field is not available. Reopen SaberStage settings and try again.");
+            return;
+        }
+        // Never validate or log the clipboard here: Set owns validation, and
+        // keeping this path value-blind prevents a private key from reaching a
+        // diagnostic line if the user's clipboard contains unexpected data.
+        input->SetText(StringW(clipboard));
+        RefreshLivestreamKeyDisplay(provider);
+    } catch (const std::exception& exception) {
+        Logging::Logger.error(
+            "Could not paste a private live-stream key: {}", exception.what());
+        ShowLivestreamActionError(
+            "SaberStage could not read the Quest clipboard. Copy the key and try again.");
+    } catch (...) {
+        Logging::Logger.error(
+            "Could not paste a private live-stream key because of an unknown error");
+        ShowLivestreamActionError(
+            "SaberStage could not read the Quest clipboard. Copy the key and try again.");
+    }
+}
+
+void MenuController::ApplyRecommendedLivestreamSettings(
+    settings::LivestreamProvider provider) {
+    if (provider == settings::LivestreamProvider::Custom) return;
+    if (broadcast::CanStop(root_.Recording().LivestreamSnapshot().state)) {
+        ShowLivestreamActionError(
+            "Stop the active stream before changing its shared encoder settings.");
+        return;
+    }
+    auto& document = root_.Settings().Edit();
+    const auto previous = document.recording.livestream;
+    const auto candidate = settings::RecommendedLivestreamProfile(provider, previous);
+
+    std::vector<std::string> limitingServices;
+    for (const auto enabledProvider : settings::kLivestreamProviders) {
+        const auto& destination = settings::DestinationForProvider(
+            document.broadcast, enabledProvider);
+        if (!destination.enabled) continue;
+        const auto reason = settings::ValidateLivestreamEncodingForProvider(
+            enabledProvider, candidate, destination);
+        if (!reason.empty()) {
+            limitingServices.emplace_back(
+                std::string(LivestreamProviderLabel(enabledProvider)) + ": " + reason);
+        }
+    }
+    if (!limitingServices.empty()) {
+        std::ostringstream message;
+        message << LivestreamProviderLabel(provider)
+                << " recommended settings were not applied because the video and audio settings are shared by every enabled stream service.\n\n";
+        for (std::size_t index = 0; index < limitingServices.size(); ++index) {
+            if (index > 0) message << '\n';
+            message << limitingServices[index];
+        }
+        message << "\n\nDisable the limiting service before applying higher-quality settings, or choose settings that every enabled service supports.";
+        ShowLivestreamActionError(message.str());
+        return;
+    }
+
+    document.recording.livestream = candidate;
+    std::string saveError;
+    if (!root_.Settings().Save(&saveError)) {
+        document.recording.livestream = previous;
+        Logging::Logger.error(
+            "Could not save {} recommended livestream settings: {}",
+            settings::ToString(provider), saveError);
+        ShowLivestreamActionError(
+            "The recommended settings could not be saved. Your previous Stream profile was restored.");
+        return;
+    }
+    Logging::Logger.info(
+        "Applied {} livestream recommendation: {} {}fps, {} video, {} kbps AAC",
+        settings::ToString(provider), settings::ToString(candidate.resolution),
+        candidate.framesPerSecond,
+        FormatMegabitsPerSecond(candidate.bitrateBitsPerSecond),
+        candidate.audioBitrateBitsPerSecond / 1000);
+    if (document.recording.worldControlsStreamMode) {
+        RefreshOutputProfileControls(true);
+    }
     RefreshRecordingStatus();
 }
 
@@ -4961,10 +5361,11 @@ void MenuController::ShowLivestreamActionError(
 }
 
 void MenuController::ShowStreamTitleEditor() {
-    if (!IsAlive(recordingView_)) return;
+    auto* modalParent = IsAlive(settingsView_) ? settingsView_ : recordingView_;
+    if (!IsAlive(modalParent)) return;
     if (!streamTitleModal_) {
         streamTitleModal_ = BSML::Lite::CreateModal(
-            recordingView_, {76.0F, 46.0F}, nullptr, true);
+            modalParent, {76.0F, 46.0F}, nullptr, true);
         if (!streamTitleModal_) return;
         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(streamTitleModal_->get_transform());
         layout->set_spacing(2.0F);
@@ -4995,13 +5396,7 @@ void MenuController::ShowStreamTitleEditor() {
         ConfigureLayout(cancel, 30.0F, 7.0F, 1.0F);
         ConfigureLayout(save, 34.0F, 7.0F, 1.0F);
     }
-    const auto provider = root_.Settings().Get().broadcast.provider;
-    if (provider != settings::LivestreamProvider::Twitch) {
-        ShowLivestreamActionError(
-            std::string(LivestreamProviderLabel(provider)) +
-            " title control is not supported yet. Twitch is supported in this build.");
-        return;
-    }
+    constexpr auto provider = settings::LivestreamProvider::Twitch;
     if (streamTitleModalInput_) {
         streamTitleModalInput_->SetText(
             settings::DestinationForProvider(root_.Settings().Get().broadcast, provider).streamTitle);
@@ -5057,8 +5452,10 @@ void MenuController::SaveStreamTitle() {
 void MenuController::BeginTwitchAuthorization() {
     std::string error;
     if (!twitchAuthorizationModal_) {
+        auto* modalParent = IsAlive(settingsView_) ? settingsView_ : recordingView_;
+        if (!IsAlive(modalParent)) return;
         twitchAuthorizationModal_ = BSML::Lite::CreateModal(
-            recordingView_, {64.0F, 32.0F}, nullptr, true);
+            modalParent, {64.0F, 32.0F}, nullptr, true);
         if (!twitchAuthorizationModal_) return;
         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
             twitchAuthorizationModal_->get_transform());
@@ -5107,16 +5504,6 @@ void MenuController::BeginTwitchAuthorization() {
 }
 
 void MenuController::RefreshTwitchControls() {
-    const auto provider = root_.Settings().Get().broadcast.provider;
-    if (livestreamProviderFeatureText_) {
-        livestreamProviderFeatureText_->set_text(
-            provider == settings::LivestreamProvider::Twitch
-                ? "Twitch streaming, title control, and live chat are supported. YouTube and Kick support is coming later."
-                : provider == settings::LivestreamProvider::Custom
-                    ? "Custom RTMP/RTMPS is available for advanced endpoint testing. Provider-specific title and chat controls are not available."
-                    : std::string(LivestreamProviderLabel(provider)) +
-                        " cannot start a stream yet. Twitch is the first supported service.");
-    }
     const auto twitch = root_.Twitch().Snapshot();
     if (connectTwitchButton_) {
         const bool needsChatPermission =
@@ -5132,7 +5519,9 @@ void MenuController::RefreshTwitchControls() {
         const auto& title = settings::DestinationForProvider(
             root_.Settings().Get().broadcast,
             settings::LivestreamProvider::Twitch).streamTitle;
-        const bool live = broadcast::CanStop(root_.Recording().LivestreamSnapshot().state);
+        const bool live = broadcast::CanStop(
+            root_.Recording().LivestreamDestinationSnapshot(
+                settings::LivestreamProvider::Twitch).state);
         status += title.empty()
             ? (live ? "\nLive/saved title: unchanged" : "\nNext title: unchanged")
             : (live ? "\nLive/saved title: " : "\nNext title: ") + title;
@@ -5168,8 +5557,15 @@ void MenuController::RefreshTwitchControls() {
                 twitchAuthorizationAwaitingCompletion_ = false;
                 if (twitchAuthorizationModal_) twitchAuthorizationModal_->Hide();
                 if (!twitchConnectionSuccessModal_) {
+                    auto* modalParent = IsAlive(settingsView_)
+                        ? settingsView_ : recordingView_;
+                    if (!IsAlive(modalParent)) {
+                        Logging::Logger.error(
+                            "Could not show Twitch connection confirmation because no menu view is active");
+                        return;
+                    }
                     twitchConnectionSuccessModal_ = BSML::Lite::CreateModal(
-                        recordingView_, {52.0F, 22.0F}, nullptr, true);
+                        modalParent, {52.0F, 22.0F}, nullptr, true);
                     if (twitchConnectionSuccessModal_) {
                         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
                             twitchConnectionSuccessModal_->get_transform());
@@ -5206,15 +5602,6 @@ void MenuController::RefreshTwitchControls() {
 }
 
 void MenuController::TryStartLivestreamWithTitle() {
-    const auto provider = root_.Settings().Get().broadcast.provider;
-    if (provider == settings::LivestreamProvider::YouTube ||
-            provider == settings::LivestreamProvider::Kick) {
-        ShowLivestreamActionError(
-            std::string(LivestreamProviderLabel(provider)) +
-            " cannot be used yet. Twitch is the first fully supported service; "
-            "YouTube and Kick support will be added later.");
-        return;
-    }
     std::string error;
     if (!root_.Recording().StartLivestream(&error)) {
         Logging::Logger.error("Live stream start failed: {}", error);
@@ -5229,8 +5616,8 @@ void MenuController::TryStartLivestreamWithTitle() {
     // were healthy.  Start broadcasting first, then update the saved title in
     // parallel and report any metadata failure without stopping the stream.
     const auto& destination = settings::DestinationForProvider(
-        root_.Settings().Get().broadcast, provider);
-    if (provider == settings::LivestreamProvider::Twitch && !destination.streamTitle.empty()) {
+        root_.Settings().Get().broadcast, settings::LivestreamProvider::Twitch);
+    if (destination.enabled && !destination.streamTitle.empty()) {
         const auto twitch = root_.Twitch().Snapshot();
         if (twitch.authorizationState == broadcast::TwitchAuthorizationState::Connected) {
             std::string titleError;
@@ -5254,7 +5641,47 @@ void MenuController::TryStartLivestreamWithTitle() {
     RefreshTwitchControls();
 }
 
+void MenuController::ObserveLivestreamDestinationFailures() {
+    for (const auto provider : settings::kLivestreamProviders) {
+        const auto index = LivestreamProviderIndex(provider);
+        const auto snapshot = root_.Recording().LivestreamDestinationSnapshot(provider);
+        if (snapshot.state == broadcast::LivestreamState::Failed &&
+                observedLivestreamStates_[index] != broadcast::LivestreamState::Failed) {
+            bool anotherDestinationActive = false;
+            for (const auto otherProvider : settings::kLivestreamProviders) {
+                if (otherProvider == provider) continue;
+                anotherDestinationActive = anotherDestinationActive ||
+                    broadcast::CanStop(
+                        root_.Recording().LivestreamDestinationSnapshot(otherProvider).state);
+            }
+            auto message = std::string(settings::ToString(provider)) +
+                " stopped streaming after its reconnect attempts were exhausted.";
+            if (!snapshot.status.empty()) message += "\n\n" + snapshot.status;
+            message += anotherDestinationActive
+                ? "\n\nOther destinations remain active. Correct or disable this service before the next stream."
+                : "\n\nNo other live destination remains active. Correct or disable this service before the next stream.";
+            deferredLivestreamFailureMessages_.push_back(message);
+            Logging::Logger.error(
+                "{} destination failed independently; other livestream sinks were left running: {}",
+                settings::ToString(provider), snapshot.status);
+        }
+        observedLivestreamStates_[index] = snapshot.state;
+    }
+
+    // Never create or enqueue a modal while a map owns the GameCore scene.
+    // A transport can fail during gameplay without disrupting input or frame
+    // pacing; the oldest pending notice is presented after returning to menus.
+    if (!IsGameplaySceneActive() && !deferredLivestreamFailureMessages_.empty()) {
+        auto message = std::move(deferredLivestreamFailureMessages_.front());
+        deferredLivestreamFailureMessages_.pop_front();
+        ShowLivestreamActionError(
+            message,
+            broadcast::CanStop(root_.Recording().LivestreamSnapshot().state));
+    }
+}
+
 void MenuController::RefreshRecordingStatus() {
+    RefreshRecordingModeControls();
     const auto snapshot = root_.Recording().Snapshot();
     const auto livestream = root_.Recording().LivestreamSnapshot();
     if (recordingStatusText_) {
@@ -5285,22 +5712,8 @@ void MenuController::RefreshRecordingStatus() {
     for (auto* selectable : recordingEncodingControls_) {
         if (selectable) selectable->set_interactable(encoderSettingsEditable);
     }
-    const auto directSettingsEditable = encoderSettingsEditable &&
-        root_.Settings().Get().recording.backend == settings::RecordingBackend::DirectFfmpegHardware;
-    for (auto* selectable : directRecordingEncodingControls_) {
-        if (selectable) selectable->set_interactable(directSettingsEditable);
-    }
     for (auto* selectable : livestreamConfigurationControls_) {
         if (selectable) selectable->set_interactable(!broadcast::CanStop(livestream.state));
-    }
-    const auto& audioMix = root_.Settings().Get().broadcast;
-    if (livestreamGameAudioVolumeSlider_) {
-        livestreamGameAudioVolumeSlider_->set_interactable(
-            audioMix.gameAudioEnabled);
-    }
-    if (livestreamMicrophoneVolumeSlider_) {
-        livestreamMicrophoneVolumeSlider_->set_interactable(
-            audioMix.microphoneEnabled);
     }
     if (livestreamStatusText_) {
         auto text = livestream.status;
@@ -5321,50 +5734,31 @@ void MenuController::RefreshRecordingStatus() {
     }
     if (startLivestreamButton_) {
         startLivestreamButton_->set_interactable(
-            broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured);
+            broadcast::CanStart(livestream.state));
     }
     if (stopLivestreamButton_) {
         stopLivestreamButton_->set_interactable(broadcast::CanStop(livestream.state));
     }
-    if (clearLivestreamKeyButton_) {
-        clearLivestreamKeyButton_->set_interactable(!broadcast::CanStop(livestream.state));
+    for (auto* button : clearLivestreamKeyButtons_) {
+        if (button) button->set_interactable(!broadcast::CanStop(livestream.state));
     }
-    RefreshLivestreamKeyDisplay();
+    for (const auto provider : settings::kLivestreamProviders) {
+        RefreshLivestreamKeyDisplay(provider);
+    }
     RefreshRecordingWorldPanel();
-}
-
-void MenuController::SetRecordingWorldPanelVisible(bool visible) {
-    auto& settings = root_.Settings().Edit().recording;
-    if (!visible && IsAlive(recordingWorldPanelScreen_)) {
-        const auto pose = ReadWorldPose(recordingWorldPanelScreen_->get_transform().ptr());
-        settings.worldControlsPosition = pose.position;
-        const auto euler = ToUnity(pose.rotation).get_eulerAngles();
-        settings.worldControlsRotationDegrees = {
-            camera::NormalizeDegrees(euler.x),
-            camera::NormalizeDegrees(euler.y),
-            camera::NormalizeDegrees(euler.z)};
-    }
-    settings.worldControlsVisible = visible;
-    std::string error;
-    if (!root_.Settings().Save(&error)) {
-        Logging::Logger.error("Could not save floating recording-controls setting: {}", error);
-    }
-    if (visible) EnsureRecordingWorldPanel();
-    else DestroyRecordingWorldPanel();
 }
 
 void MenuController::EnsureRecordingWorldPanel() {
     if (IsAlive(recordingWorldPanelScreen_) ||
-            !root_.Settings().Get().recording.worldControlsVisible ||
             !FloatingUiServicesReady()) {
         return;
     }
 
     const auto& settings = root_.Settings().Get().recording;
-    // The panel height depends on the FPS-counters setting; remember which
-    // variant was built so the tick can rebuild when the toggle changes.
-    recordingWorldPanelShowsFps_ = settings.worldControlsShowFps;
-    const auto panelSize = RecordingPanelSize(recordingWorldPanelShowsFps_);
+    // The floating controls are a permanent operational surface. Its geometry
+    // is fixed and always reserves the FPS row so controls do not shift as
+    // recording state changes.
+    const auto panelSize = RecordingPanelSize();
     recordingWorldPanelScreen_ = BSML::FloatingScreen::CreateFloatingScreen(
         panelSize,
         true,
@@ -5511,25 +5905,20 @@ void MenuController::EnsureRecordingWorldPanel() {
     ConfigureWorldPanelText(
         recordingWorldPanelTimeText_, {11.0F, headerY}, {22.0F, 6.0F}, 5.0F);
 
-    // Optional FPS band directly under the header: capture rate on the left,
+    // Permanent FPS band directly under the header: capture rate on the left,
     // headset rate on the right, refreshed at 2 Hz by TickRecordingWorldPanel.
-    recordingWorldPanelFpsText_ = nullptr;
-    if (recordingWorldPanelShowsFps_) {
-        const float fpsY = half - 1.0F - kRecordingPanelModeRowHeight -
-            kRecordingPanelHeaderHeight -
-            kRecordingPanelFpsRowHeight * 0.5F;
-        recordingWorldPanelFpsText_ = BSML::Lite::CreateText(
-            parent, "REC --.- FPS   HMD AVG --.- FPS", TMPro::FontStyles::Normal, 3.4F);
-        ConfigureWorldPanelText(
-            recordingWorldPanelFpsText_, {0.0F, fpsY}, {panelSize.x - 4.0F, 5.0F}, 3.4F);
-        if (IsAlive(recordingWorldPanelFpsText_)) {
-            recordingWorldPanelFpsText_->set_color({0.65F, 0.82F, 0.92F, 1.0F});
-        }
+    const float fpsY = half - 1.0F - kRecordingPanelModeRowHeight -
+        kRecordingPanelHeaderHeight - kRecordingPanelFpsRowHeight * 0.5F;
+    recordingWorldPanelFpsText_ = BSML::Lite::CreateText(
+        parent, "REC --.- FPS   HMD AVG --.- FPS", TMPro::FontStyles::Normal, 3.4F);
+    ConfigureWorldPanelText(
+        recordingWorldPanelFpsText_, {0.0F, fpsY}, {panelSize.x - 4.0F, 5.0F}, 3.4F);
+    if (IsAlive(recordingWorldPanelFpsText_)) {
+        recordingWorldPanelFpsText_->set_color({0.65F, 0.82F, 0.92F, 1.0F});
     }
 
     const float dropY = half - 1.0F - kRecordingPanelModeRowHeight -
-        kRecordingPanelHeaderHeight -
-        (recordingWorldPanelShowsFps_ ? kRecordingPanelFpsRowHeight : 0.0F) -
+        kRecordingPanelHeaderHeight - kRecordingPanelFpsRowHeight -
         kRecordingPanelDropRowHeight * 0.5F;
     recordingWorldPanelDropText_ = BSML::Lite::CreateText(
         parent, "Current Frame Loss: 0   Total Frames Lost: 0", TMPro::FontStyles::Normal, 3.2F);
@@ -5804,7 +6193,7 @@ void MenuController::RefreshRecordingWorldPanel() {
             .cast<UnityEngine::RectTransform>();
         rect->set_anchoredPosition({
             -10.0F,
-            -RecordingPanelSize(recordingWorldPanelShowsFps_).y * 0.5F + 12.8F});
+            -RecordingPanelSize().y * 0.5F + 12.8F});
         rect->set_sizeDelta({30.0F, 5.5F});
     }
     const auto& controlIcons = EmbeddedRecordingPanelIcons();
@@ -5846,8 +6235,7 @@ void MenuController::RefreshRecordingWorldPanel() {
             !streamMode && snapshot.CanResume() ? "RESUME" : "START");
         recordingWorldPanelPrimaryButton_->set_interactable(streamMode
             ? (livestream.afk ||
-               (!liveOutputActive && broadcast::CanStart(livestream.state) &&
-                livestream.streamKeyConfigured))
+               (!liveOutputActive && broadcast::CanStart(livestream.state)))
             : (snapshot.CanStart() || snapshot.CanResume()));
     }
     if (IsAlive(recordingWorldPanelPauseButton_)) {
@@ -5959,9 +6347,20 @@ void MenuController::RecordingWorldPanelGameAudioAction() {
 }
 
 void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode) {
+    if (synchronizingRecordingModeControls_) return;
     auto& settings = root_.Settings().Edit().recording;
     settings.worldControlsStreamMode = streamMode;
-    root_.Settings().Save(nullptr);
+    std::string saveError;
+    if (!root_.Settings().Save(&saveError)) {
+        Logging::Logger.error(
+            "Could not save the shared recording-control mode: {}", saveError);
+    }
+
+    RefreshRecordingModeControls();
+    // General and Audio are two views of the selected output profile. Refresh
+    // them together without invoking callbacks so changing this selector never
+    // copies local values into the stream profile (or vice versa).
+    RefreshOutputProfileControls(true);
     recordingWorldPanelDisplayedState_ = -1;
     recordingWorldPanelDisplayedSecond_ = -1;
     recordingWorldPanelDropSamples_.clear();
@@ -5984,7 +6383,7 @@ void MenuController::ResetRecordingWorldPanelPose() {
     settings.worldControlsRotationDegrees = {};
     root_.Settings().Save(nullptr);
     DestroyRecordingWorldPanel();
-    if (settings.worldControlsVisible) EnsureRecordingWorldPanel();
+    EnsureRecordingWorldPanel();
 }
 
 void MenuController::UpdateRecordingWorldPanelPersistence() {
@@ -6020,16 +6419,6 @@ void MenuController::UpdateRecordingWorldPanelPersistence() {
 void MenuController::TickRecordingWorldPanel() noexcept {
     try {
         const auto& recordingSettings = root_.Settings().Get().recording;
-        if (!recordingSettings.worldControlsVisible) {
-            DestroyRecordingWorldPanel();
-            return;
-        }
-        // The FPS row changes the panel height, so a toggle flip while the
-        // panel exists rebuilds it in place at its saved world pose.
-        if (IsAlive(recordingWorldPanelScreen_) &&
-                recordingWorldPanelShowsFps_ != recordingSettings.worldControlsShowFps) {
-            DestroyRecordingWorldPanel();
-        }
         EnsureRecordingWorldPanel();
         if (!IsAlive(recordingWorldPanelScreen_)) return;
         UpdateWorldPanelHandleRotation(recordingWorldPanelScreen_);
@@ -7200,116 +7589,6 @@ void MenuController::TickChatWorldPanel() noexcept {
     }
 }
 
-void MenuController::ApplyLivestreamReferenceLayout() {
-    if (!IsAlive(livestreamContentRoot_) || !IsAlive(livestreamServiceReference_)) return;
-    auto content = livestreamContentRoot_->get_transform();
-    auto* contentRect = livestreamContentRoot_->GetComponent<UnityEngine::RectTransform*>();
-    if (!contentRect) return;
-
-    // DropdownListSetting lives on the selector child. Walk to the immediate
-    // page child to find Service's real group, rather than resizing the inner
-    // selector and accidentally leaving the rest of the page at another width.
-    auto reference = livestreamServiceReference_->get_transform();
-    while (reference && reference->get_parent() != content) reference = reference->get_parent();
-    if (!reference) return;
-    auto labelTransform = reference->Find("Label");
-    auto* referenceRect = reference->GetComponent<UnityEngine::RectTransform*>();
-    auto* labelRect = labelTransform ? labelTransform->GetComponent<UnityEngine::RectTransform*>() : nullptr;
-    auto* selectorRect = livestreamServiceReference_->GetComponent<UnityEngine::RectTransform*>();
-    if (!referenceRect || !labelRect || !selectorRect) {
-        Logging::Logger.error("Live Stream layout: Service reference row/label/selector missing; no layout applied");
-        return;
-    }
-
-    UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(contentRect);
-    UnityEngine::Canvas::ForceUpdateCanvases();
-    auto referenceBounds = referenceRect->get_rect();
-    auto labelBounds = labelRect->get_rect();
-    auto selectorBounds = selectorRect->get_rect();
-    const float rowWidth = referenceBounds.get_width();
-    auto* label = labelRect->GetComponent<TMPro::TextMeshProUGUI*>();
-    const float labelMargin = label ? label->get_margin().x : 0.0F;
-    const auto relativeX = [&](UnityEngine::RectTransform* rect, float x) {
-        // Work in Service-row units, not world/panel offsets. The two side
-        // panels can be rotated in the room without changing this alignment.
-        return referenceRect->InverseTransformPoint(rect->TransformPoint({x, 0.0F, 0.0F})).x
-            - referenceBounds.get_xMin();
-    };
-    const float leftInset = relativeX(labelRect, labelBounds.get_xMin() + labelMargin);
-    const float selectorLeft = relativeX(selectorRect, selectorBounds.get_xMin());
-    const float rightInset = rowWidth - relativeX(selectorRect, selectorBounds.get_xMax());
-    if (!std::isfinite(rowWidth) || !std::isfinite(leftInset) || !std::isfinite(rightInset) ||
-        !std::isfinite(selectorLeft) || rowWidth <= 0.0F || selectorLeft <= leftInset ||
-        rowWidth - rightInset <= selectorLeft) {
-        Logging::Logger.warn("Live Stream layout: Service geometry not ready; no guessed width applied");
-        return;
-    }
-
-    // Pass 1: size every peer's OUTER row/group first. Keep the existing
-    // centered page layout; moving that parent left shifts the reference too.
-    // Service (including all of its descendants) is deliberately excluded.
-    const int rowCount = content->get_childCount();
-    for (int row = 0; row < rowCount; ++row) {
-        auto child = content->GetChild(row);
-        if (child == reference) continue;
-        SetLivestreamRowWidth(child->get_gameObject(), rowWidth);
-    }
-
-    // Pass 2: fit each row's own contents inside the SAME visible span. Native
-    // buttons/sliders keep their visual hierarchy and input handling; only
-    // layout bounds change. No descendant-wide repositioning or raycast edits.
-    int actionRows = 0;
-    for (int row = 0; row < rowCount; ++row) {
-        auto child = content->GetChild(row);
-        if (child == reference) continue;
-        auto* object = child->get_gameObject().ptr();
-        if (auto* slider = object->GetComponent<BSML::SliderSetting*>()) {
-            if (auto title = child->Find("Title")) {
-                FitLivestreamHorizontalSpan(title->GetComponent<UnityEngine::RectTransform*>(),
-                    leftInset, rowWidth - selectorLeft + 1.0F);
-            }
-            if (slider->slider) {
-                FitLivestreamHorizontalSpan(slider->slider->GetComponent<UnityEngine::RectTransform*>(),
-                    selectorLeft, rightInset);
-            }
-        } else if (auto* toggle = object->GetComponent<BSML::ToggleSetting*>()) {
-            FitLivestreamToggle(toggle, leftInset, rightInset);
-        } else if (auto* text = object->GetComponent<TMPro::TextMeshProUGUI*>()) {
-            // Text is itself the outer row; margins provide the same content
-            // inset without adding another container or changing its height.
-            auto margin = text->get_margin();
-            margin.x = leftInset;
-            margin.z = rightInset;
-            text->set_margin(margin);
-        } else if (auto* dropdown = object->GetComponentInChildren<BSML::DropdownListSetting*>(true)) {
-            if (auto caption = child->Find("Label")) {
-                FitLivestreamHorizontalSpan(caption->GetComponent<UnityEngine::RectTransform*>(),
-                    leftInset, rowWidth - selectorLeft + 1.0F);
-                if (auto* text = caption->GetComponent<TMPro::TextMeshProUGUI*>()) {
-                    text->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
-                    text->set_enableWordWrapping(false);
-                    text->set_overflowMode(TMPro::TextOverflowModes::Ellipsis);
-                }
-            }
-            FitLivestreamHorizontalSpan(dropdown->GetComponent<UnityEngine::RectTransform*>(),
-                selectorLeft, rightInset);
-        } else if (auto* group = object->GetComponent<UnityEngine::UI::HorizontalLayoutGroup*>()) {
-            FitLivestreamActionRow(group, rowWidth, leftInset, rightInset);
-            ++actionRows;
-        }
-    }
-    UnityEngine::UI::LayoutRebuilder::ForceRebuildLayoutImmediate(contentRect);
-    UnityEngine::Canvas::ForceUpdateCanvases();
-    for (auto* slider : {livestreamGameAudioVolumeSlider_, livestreamMicrophoneVolumeSlider_}) {
-        if (IsAlive(slider) && slider->slider) slider->slider->UpdateVisuals();
-    }
-    // Geometry only: never include input-field contents, stream keys or tokens.
-    Logging::Logger.info(
-        "Live Stream layout matched Service: outerWidth={:.2f}, leftInset={:.2f}, "
-        "selectorLeft={:.2f}, rightInset={:.2f}, peerRows={}, actionGroups={}",
-        rowWidth, leftInset, selectorLeft, rightInset, rowCount - 1, actionRows);
-}
-
 void MenuController::ShowRecordingTab(int index) {
     index = std::clamp(index, 0, 2);
     selectedRecordingTab_ = index;
@@ -7317,9 +7596,6 @@ void MenuController::ShowRecordingTab(int index) {
         if (recordingTabViewRoots_[page]) recordingTabViewRoots_[page]->SetActive(page == selectedRecordingTab_);
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
-    // Hidden native prefabs have stale rectangles. Resolve the ruler only on
-    // tab activation, not in Update or in streaming/status refresh callbacks.
-    if (selectedRecordingTab_ == 1) ApplyLivestreamReferenceLayout();
 }
 
 } // namespace saberstage::ui

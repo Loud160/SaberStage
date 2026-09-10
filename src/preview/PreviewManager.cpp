@@ -613,8 +613,8 @@ private:
     }
 
     bool CreateOpaquePreviewMaterial(SafePtrUnity<UnityEngine::Material>& material, const char* name) {
-        // The camera's post-effect texture contains correct RGB (Hollywood
-        // records it correctly) but its alpha channel is Beat Saber's bloom
+        // The camera's post-effect texture contains correct RGB, but its alpha
+        // channel is Beat Saber's bloom
         // weight, not ordinary image opacity. UI materials alpha-blend with
         // that channel and consequently show only emissive effects, pointers,
         // and floor markers.

@@ -223,9 +223,12 @@ MAKE_HOOK_MATCH(
         g_application->Twitch().Requests().GameplayStarted(announcement->levelHash);
         const auto& broadcastSettings = g_application->Settings().Get().broadcast;
         if (!broadcastSettings.postMapInfoToChat ||
-                broadcastSettings.provider != saberstage::settings::LivestreamProvider::Twitch ||
+                !saberstage::settings::DestinationForProvider(
+                    broadcastSettings,
+                    saberstage::settings::LivestreamProvider::Twitch).enabled ||
                 !saberstage::broadcast::CanStop(
-                    g_application->Recording().LivestreamSnapshot().state)) {
+                    g_application->Recording().LivestreamDestinationSnapshot(
+                        saberstage::settings::LivestreamProvider::Twitch).state)) {
             return;
         }
         std::string error;

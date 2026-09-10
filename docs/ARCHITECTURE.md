@@ -1,6 +1,6 @@
 # SaberStage architecture
 
-Status: camera/editor/preview baseline plus an unvalidated Stage 1 Hollywood recording integration. Device behavior remains gated by the proofs listed in `TEST_PLAN.md`.
+Status: camera/editor/preview baseline plus a Direct FFmpeg/MediaCodec recording and multi-destination streaming integration. Device behavior remains gated by the proofs listed in `TEST_PLAN.md`.
 
 ## Product boundary and delivery stages
 
@@ -84,11 +84,11 @@ The preview has its own semantic placement, scale, visibility, camera ID, and re
 
 ## Capture architecture
 
-The first local-recording milestone uses Hollywood 1.2.2, as explicitly approved by the user. SaberStage gives Hollywood the existing Primary camera's encoder render texture, points preview consumers at that same texture, captures game audio through a persistent HMD-positioned Unity audio listener, and writes partial H.264/WAV files. Both Hollywood and Direct FFmpeg captures are finalized by SaberStage's private offset-aware FFmpeg muxer; this avoids forcing independently started raw streams to the same zero timestamp. Start begins recording immediately by default. The persistent spectator encoder is retargeted when Beat Saber replaces its scene camera so a single recording continues through menus, loading, gameplay, and results until the user stops it. Optional Gameplay Only mode may arm in a menu and stop at the end of gameplay. The final MP4 is promoted only after successful muxing; partial inputs remain after failure.
+SaberStage gives its Direct FFmpeg/MediaCodec encoder the existing Primary camera's render texture, points preview consumers at that same texture, captures game audio through a persistent HMD-positioned Unity audio listener, and writes partial H.264/WAV files for local recordings. SaberStage's private offset-aware FFmpeg muxer avoids forcing independently started raw streams to the same zero timestamp. Start begins recording immediately by default. The persistent spectator encoder is retargeted when Beat Saber replaces its scene camera so a single recording continues through menus, loading, gameplay, and results until the user stops it. Optional Gameplay Only mode may arm in a menu and stop at the end of gameplay. The final MP4 is promoted only after successful muxing; partial inputs remain after failure.
 
 An optional compact movable HMD-only control panel exposes glyph play/pause and stop actions plus elapsed time and the current `LOCAL`/`LIVE STREAM` output type. Its visibility and pose persist independently. An invisible native handle occupies the panel's outer padding rather than adding a visible grab bar or blocking the buttons, and the complete panel is excluded from spectator output.
 
-This adapter is a deliberate milestone implementation, not the final streaming architecture. Hollywood's raw callback does not supply SaberStage's future timestamped packet contract, so the direct encoder/fan-out path below remains necessary before simultaneous local, companion, and livestream sinks.
+The direct encoder/fan-out path supplies timestamped packets to compatible local, companion, and livestream sinks without starting a second video encoder.
 
 The compositor produces a final Vulkan-compatible GPU image. A backend-specific bridge presents scheduled frames to an Android `MediaCodec` AVC encoder configured with an input `Surface`. Normal operation must not use CPU `ReadPixels`. Video and audio share one monotonic capture epoch; Direct FFmpeg preserves scheduled frame PTS (including dropped-frame gaps), measures the first audio/video arrival skew, trims or offsets audio at mux time, and bounds the audio tail to the picture timeline. Drain, mux, file, and network work occur off the game thread through bounded queues. When pressure rises, spectator frames are dropped before gameplay is delayed.
 
@@ -136,7 +136,7 @@ in addition to its runtime catches.
 
 - Reject copying or porting existing camera or recording code; public projects are behavior and feasibility references only.
 - Reject Meta MRC as the core: it needs external tooling, is not the desired local recorder, and does not provide the required unified packet fan-out.
-- Hollywood is an accepted Stage 1 dependency for local H.264/audio capture and FFmpeg MP4 finalization. Do not mistake that adapter for the later timestamped packet fan-out required by streaming.
+- Reject an alternate recording-backend dependency: local recording and streaming share SaberStage's one Direct FFmpeg/MediaCodec implementation.
 - Reject CPU readback/software H.264 as a production fallback.
 - Reject a separate camera or encoder per destination.
 - Reject modifying Discord, self-bots, user tokens, private APIs, root, or unsupported hooks.

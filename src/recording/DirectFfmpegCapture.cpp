@@ -208,7 +208,7 @@ std::string_view MediaCodecLevelOption(settings::H264Level level) {
 
 class DirectEncoder final {
 public:
-    DirectEncoder(const settings::RecordingSettings& settings, EncodedVideoCallback callback)
+    DirectEncoder(const settings::RecordingProfileSettings& settings, EncodedVideoCallback callback)
         : settings_(settings), callback_(std::move(callback)) {
         settings::ResolutionDimensions(settings_.resolution, width_, height_);
         Open();
@@ -449,7 +449,7 @@ private:
         av_frame_free(&frame);
     }
 
-    settings::RecordingSettings settings_;
+    settings::RecordingProfileSettings settings_;
     EncodedVideoCallback callback_;
     AVBufferRef* hardwareDevice_ = nullptr;
     AVCodecContext* codecContext_ = nullptr;
@@ -853,7 +853,7 @@ UnityEngine::RenderTexture* CreateCaptureTexture(std::int32_t width, std::int32_
 class DirectFfmpegCaptureImpl final {
 public:
     DirectFfmpegCaptureImpl(
-        const settings::RecordingSettings& settings,
+        const settings::RecordingProfileSettings& settings,
         GLuint sourceTexture,
         EncodedVideoCallback callback)
         : encoder_(std::make_shared<DirectEncoder>(settings, std::move(callback))),
@@ -1004,7 +1004,7 @@ void DirectFfmpegCapture::Awake() {
 }
 
 void DirectFfmpegCapture::Init(
-    const settings::RecordingSettings& settings,
+    const settings::RecordingProfileSettings& settings,
     float fieldOfViewDegrees,
     EncodedVideoCallback callback) {
     if (!camera_) Awake();

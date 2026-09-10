@@ -29,7 +29,7 @@ public:
     using StatusHandler = std::function<void()>;
 
     DirectLivestreamSink(
-        settings::RecordingSettings recording,
+        settings::RecordingProfileSettings recording,
         settings::LivestreamSettings livestream,
         std::string streamKey,
         StatusHandler statusHandler = {});

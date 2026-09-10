@@ -12,7 +12,6 @@
 
 #pragma once
 
-#include "saberstage/recording/ControllerShortcut.hpp"
 #include "saberstage/recording/RecordingState.hpp"
 #include "saberstage/recording/MicrophoneDsp.hpp"
 #include "saberstage/settings/SettingsModel.hpp"
@@ -32,10 +31,6 @@
 #include <string_view>
 #include <thread>
 #include <vector>
-
-namespace Hollywood {
-class CameraCapture;
-}
 
 namespace UnityEngine {
 class AudioListener;
@@ -83,9 +78,8 @@ struct RecordingSnapshot {
     std::filesystem::path outputDirectory;
     std::filesystem::path lastSavedFile;
     double elapsedSeconds = 0.0;
-    // Monotonic count of encoded video packets across the whole session
-    // (both Hollywood and Direct FFmpeg increment it from their encoder
-    // callbacks). UI consumers difference it over wall time to display the
+    // Monotonic count of encoded Direct FFmpeg video packets across the whole
+    // session. UI consumers difference it over wall time to display the
     // achieved capture frame rate; it is never reset mid-recording.
     std::uint64_t encodedFrameCount = 0;
     // Capture losses only. Network losses belong to LivestreamSnapshot and
@@ -150,11 +144,6 @@ public:
     [[nodiscard]] static MicrophonePermissionStatus QueryMicrophonePermission() noexcept;
     bool PauseLivestream(std::string* error = nullptr);
     bool ResumeLivestream(std::string* error = nullptr);
-    // Gain changes are deliberately safe while live: the audio worker reads
-    // these cached values only while holding livestreamMutex_. The shared mic
-    // master is reconciled separately because it owns persistent AAudio input.
-    void SetLivestreamGameAudioVolumePercent(float value);
-    void SetLivestreamMicrophoneVolumePercent(float value);
     // Reconciles persistent microphone ownership with saved settings. UI
     // enable/disable callbacks call this immediately; capture sessions also
     // call it defensively before starting.
@@ -189,6 +178,8 @@ public:
         settings::LivestreamProvider provider) const;
     [[nodiscard]] std::string StreamKey(settings::LivestreamProvider provider) const;
     [[nodiscard]] broadcast::LivestreamSnapshot LivestreamSnapshot() const;
+    [[nodiscard]] broadcast::LivestreamSnapshot LivestreamDestinationSnapshot(
+        settings::LivestreamProvider provider) const;
     [[nodiscard]] broadcast::DiscordScreenSnapshot DiscordScreenSnapshot() const;
     void Shutdown() noexcept;
     void Tick() noexcept;
@@ -196,16 +187,15 @@ public:
     [[nodiscard]] RecordingSnapshot Snapshot() const;
 
 private:
-    // A live broadcast always requires the Direct FFmpeg packet callback, but
-    // that must not overwrite the user's preferred local-recording backend.
-    // forceDirectHardware changes only this capture session. writeLocalOutput
-    // controls whether H.264/WAV/MP4 files are created; Go Live passes false.
+    // Every output uses SaberStage's Direct FFmpeg hardware encoder.
+    // writeLocalOutput controls whether H.264/WAV/MP4 files are created;
+    // stream-only and Discord sessions pass false.
     bool StartCapture(
         std::string* error,
         bool forceContinuous = false,
-        bool forceDirectHardware = false,
         bool writeLocalOutput = true,
-        bool captureAudio = true);
+        bool captureAudio = true,
+        const settings::RecordingProfileSettings* sessionProfile = nullptr);
     void StartVideoSegment();
     void StopVideoSegment(bool recordCaptureFailure = true) noexcept;
     void LogCapturePerformance(std::string_view reason) const noexcept;
@@ -225,8 +215,6 @@ private:
     void DisableLivestreamWakeGuard() noexcept;
     void HandleRuntimeCameraInvalidated() noexcept;
     void HandleRuntimeCameraReady() noexcept;
-    void HandleSpectatorRendered() noexcept;
-    void HandleControllerShortcut() noexcept;
     bool TryTransition(
         std::initializer_list<RecordingState> expectedStates,
         RecordingState next,
@@ -242,8 +230,7 @@ private:
         std::int32_t framesPerSecond,
         std::int32_t audioBitrateBitsPerSecond,
         double audioStartOffsetSeconds,
-        std::vector<std::int64_t> videoPresentationFrames,
-        settings::RecordingBackend backend) noexcept;
+        std::vector<std::int64_t> videoPresentationFrames) noexcept;
     void CleanupCaptureObjects() noexcept;
     std::filesystem::path CreateUniqueBasePath() const;
 
@@ -256,7 +243,6 @@ private:
     std::filesystem::path partialOutputPath_;
     std::filesystem::path finalOutputPath_;
     std::filesystem::path lastSavedFile_;
-    Hollywood::CameraCapture* videoCapture_ = nullptr;
     DirectFfmpegCapture* directVideoCapture_ = nullptr;
     RealtimeAudioCapture* audioCapture_ = nullptr;
     UnityEngine::Camera* activeRuntimeCamera_ = nullptr;
@@ -287,12 +273,6 @@ private:
     std::vector<std::int64_t> videoPresentationFrames_;
     std::int64_t videoSegmentFrameBase_ = 0;
     std::int64_t videoSegmentLastPresentationFrame_ = -1;
-    // Hollywood does not expose MediaCodec PTS values. Record the real
-    // spectator-camera render deadlines instead so missed Unity frames remain
-    // gaps in the MP4 timeline instead of shortening the video relative to
-    // continuously captured audio.
-    std::int64_t hollywoodLastPresentationFrame_ = -1;
-    std::uint64_t hollywoodSkippedPresentationFrames_ = 0;
     // Direct capture components are replaced on pause/resume. Keep finished
     // segment losses here so session totals do not jump backwards to zero.
     std::uint64_t completedDirectSkippedFrames_ = 0;
@@ -307,19 +287,21 @@ private:
     std::int32_t activeWidth_ = 0;
     std::int32_t activeHeight_ = 0;
     std::int32_t activeFramesPerSecond_ = 0;
-    std::int32_t activeBitrateBitsPerSecond_ = 0;
-    settings::RecordingBackend activeBackend_ = settings::RecordingBackend::Hollywood;
+    // Captured once when the hardware session starts. UI mode changes can edit
+    // the other profile without changing an encoder during pause/resume.
+    settings::RecordingProfileSettings activeProfileSettings_{};
     float activeFovDegrees_ = 0.0F;
     bool gameplayOnlySession_ = false;
     // True only when Go Live had to create an encoder/audio session of its
     // own. Such a session feeds the network sink but never opens local media
     // files, and Stop Stream must tear it down completely.
     bool streamOnlySession_ = false;
-    bool directFallbackAttempted_ = false;
-    ControllerShortcut controllerShortcut_;
     std::uint32_t audioListenerRefreshFrame_ = 0;
     mutable std::mutex livestreamMutex_;
-    std::unique_ptr<broadcast::DirectLivestreamSink> livestreamSink_;
+    // Every destination consumes the same encoded packet callback, but owns a
+    // separate mux/network worker. A failed service therefore cannot stop or
+    // stall any other enabled service.
+    std::array<std::unique_ptr<broadcast::DirectLivestreamSink>, 4> livestreamSinks_{};
     mutable std::mutex discordScreenMutex_;
     std::unique_ptr<broadcast::DiscordScreenSink> discordScreenSink_;
     std::unique_ptr<AfkMediaSource> afkMedia_;
@@ -329,14 +311,25 @@ private:
     // can mix concurrently with UI-driven settings and stream transitions.
     std::unique_ptr<MicrophoneCapture> livestreamMicrophone_;
     std::vector<float> livestreamMixScratch_;
+    // One mono hardware capture is copied into two preallocated scratch
+    // buffers so local and live profiles can apply independent DSP without
+    // allocating or locking a second microphone device on the audio thread.
     std::vector<float> livestreamMicrophoneScratch_;
+    std::vector<float> localProcessedMicrophoneScratch_;
+    std::vector<float> livestreamProcessedMicrophoneScratch_;
     std::vector<float> ttsMixScratch_;
-    MicrophoneDsp microphoneDsp_;
+    MicrophoneDsp localMicrophoneDsp_;
+    MicrophoneDsp livestreamMicrophoneDsp_;
     // SettingsService is main-thread owned. RefreshAudioConfiguration copies
     // the values needed by the audio worker under livestreamMutex_; the worker
     // must never read the mutable settings document directly.
-    settings::AudioProcessingSettings activeAudioSettings_{};
+    settings::AudioProcessingSettings activeLocalAudioSettings_{};
+    settings::AudioProcessingSettings activeLivestreamAudioSettings_{};
     std::int32_t activeAudioDspSampleRate_ = 0;
+    bool localGameAudioEnabled_ = true;
+    float localGameAudioGain_ = 1.0F;
+    bool localMicrophoneEnabled_ = false;
+    float localMicrophoneGain_ = 1.0F;
     bool livestreamGameAudioEnabled_ = true;
     float livestreamGameAudioGain_ = 1.0F;
     bool livestreamGameAudioMuted_ = false;
@@ -352,7 +345,7 @@ private:
     std::array<std::string, 4> streamKeyOverrides_{};
     std::atomic<bool> livestreamAfk_{false};
     // A live stream can temporarily own both Unity's inactivity timeout and
-    // Quest's proximity-power override. The exact Unity value and normal
+    // Quest's native display/proximity guard. The exact Unity value and normal
     // proximity behavior are restored when streaming ends or startup fails.
     bool livestreamWakeGuardActive_ = false;
     bool livestreamProximityGuardActive_ = false;

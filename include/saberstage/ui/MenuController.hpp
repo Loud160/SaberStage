@@ -13,7 +13,9 @@
 #pragma once
 
 #include "saberstage/broadcast/DiscordScreenSink.hpp"
+#include "saberstage/broadcast/LivestreamState.hpp"
 #include "saberstage/camera/Math.hpp"
+#include "saberstage/settings/SettingsModel.hpp"
 #include "saberstage/ui/ChatPanelDiagnostics.hpp"
 #include "saberstage/ui/ChatPanelScrollGeometry.hpp"
 
@@ -98,9 +100,15 @@ private:
     void EditCamera(const std::function<void(camera::CameraProfile&)>& edit, std::string_view reason);
     void RefreshScriptStatus();
     void RefreshRecordingStatus();
-    void RefreshLivestreamKeyDisplay();
-    void ShowLivestreamValueConfirmation(int valueKind);
+    void RefreshLivestreamKeyDisplay(settings::LivestreamProvider provider);
+    void ShowLivestreamValueConfirmation(
+        settings::LivestreamProvider provider,
+        int valueKind);
     void ResolveLivestreamValueConfirmation(int action);
+    void ShowLivestreamServerPasteWarning(settings::LivestreamProvider provider);
+    void ResolveLivestreamServerPasteWarning(bool pasteValue);
+    void PasteLivestreamKey(settings::LivestreamProvider provider);
+    void ApplyRecommendedLivestreamSettings(settings::LivestreamProvider provider);
     void ShowLivestreamActionError(
         std::string_view message,
         bool streamStillLive = false);
@@ -111,8 +119,8 @@ private:
     void SelectAfkFile(const std::filesystem::path& path);
     void BeginTwitchAuthorization();
     void RefreshTwitchControls();
+    void ObserveLivestreamDestinationFailures();
     void TryStartLivestreamWithTitle();
-    void SetRecordingWorldPanelVisible(bool visible);
     void EnsureRecordingWorldPanel();
     void DestroyRecordingWorldPanel() noexcept;
     void RefreshRecordingWorldPanel();
@@ -141,7 +149,12 @@ private:
     void UpdateChatWorldPanelPersistence();
     void TickChatWorldPanel() noexcept;
     void ShowCenterDebugTab(int index);
+    void RefreshRecordingModeControls(bool forceTabStripRebuild = false);
+    void RebuildCenterTabStrip();
+    void RefreshLivestreamDestinationVisibility(
+        settings::LivestreamProvider provider);
     void ApplyAudioSettings(bool requestPermission = false);
+    void RefreshOutputProfileControls(bool synchronizeValues = false);
     void RefreshAudioControlState(bool synchronizeValues = false);
     void RefreshAudioMeter();
     void ShowAudioResetConfirmation(int resetKind);
@@ -160,7 +173,6 @@ private:
     void ShowDiscordHelperInstallInstructions();
     void ShowSettingsTab(int index);
     void ShowRecordingTab(int index);
-    void ApplyLivestreamReferenceLayout();
     static MenuController* active_;
     app::ApplicationRoot& root_;
     TMPro::TextMeshProUGUI* scriptStatusText_ = nullptr;
@@ -169,8 +181,18 @@ private:
     // roots let the debug colors expose both bounds while tab visibility and
     // native scroll layout remain independently controlled.
     HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 5> centerDebugTabViewRoots_{};
-    std::array<UnityEngine::GameObject*, 5> centerDebugTabContentRoots_{};
+    std::array<UnityEngine::GameObject*, 10> centerDebugTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 10> centerDebugTabContentRoots_{};
+    // The center-menu and movable-panel switches are two views of the same
+    // persisted recording mode. Programmatic synchronization uses Unity's
+    // guarded callback path so changing either switch cannot recurse while the
+    // stock toggle still performs its complete visual transition.
+    BSML::ToggleSetting* generalRecordingModeToggle_ = nullptr;
+    int centerTabStripSignature_ = -1;
+    std::vector<int> visibleCenterTabPageIndices_;
+    bool synchronizingRecordingModeControls_ = false;
+    UnityEngine::GameObject* generalLocalRecordingContentRoot_ = nullptr;
+    std::array<BSML::DropdownListSetting*, 10> generalEncodingDropdowns_{};
     TMPro::TextMeshProUGUI* audioInputStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* audioLevelMeterText_ = nullptr;
     TMPro::TextMeshProUGUI* audioLevelMeterValueText_ = nullptr;
@@ -206,6 +228,10 @@ private:
     std::uint64_t connectionTestDisplayedRevision_ = 0;
     bool connectionTestCompletionShown_ = false;
     std::array<BSML::SliderSetting*, 2> audioVolumeSliders_{};
+    BSML::ToggleSetting* gameAudioToggle_ = nullptr;
+    BSML::ToggleSetting* microphoneEnabledToggle_ = nullptr;
+    BSML::DropdownListSetting* microphoneModeDropdown_ = nullptr;
+    BSML::ToggleSetting* highPassToggle_ = nullptr;
     BSML::DropdownListSetting* pushToTalkControlDropdown_ = nullptr;
     BSML::SliderSetting* pushToTalkReleaseSlider_ = nullptr;
     std::array<BSML::SliderSetting*, 6> voiceActivationSliders_{};
@@ -218,23 +244,27 @@ private:
     std::array<std::vector<BSML::SliderSetting*>, 4> tabSliders_{};
     HMUI::TextSegmentedControl* recordingTabs_ = nullptr;
     std::array<UnityEngine::GameObject*, 3> recordingTabViewRoots_{};
-    // Service is the user's fixed visual reference. Measure its native outer
-    // row only after the Live tab is visible; the dropdown component itself
-    // belongs to the inner selector, not to that row.
-    UnityEngine::GameObject* livestreamContentRoot_ = nullptr;
-    BSML::DropdownListSetting* livestreamServiceReference_ = nullptr;
     TMPro::TextMeshProUGUI* recordingStatusText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingOutputText_ = nullptr;
     TMPro::TextMeshProUGUI* livestreamStatusText_ = nullptr;
-    HMUI::InputFieldView* livestreamServerInput_ = nullptr;
-    HMUI::InputFieldView* livestreamKeyInput_ = nullptr;
+    std::array<HMUI::InputFieldView*, 4> livestreamServerInputs_{};
+    std::array<HMUI::InputFieldView*, 4> livestreamKeyInputs_{};
+    std::array<UnityEngine::GameObject*, 4> livestreamDestinationContentRoots_{};
+    std::array<UnityEngine::UI::Button*, 4> setLivestreamServerButtons_{};
+    std::array<UnityEngine::UI::Button*, 4> setLivestreamKeyButtons_{};
+    std::array<UnityEngine::UI::Button*, 4> clearLivestreamKeyButtons_{};
+    std::array<bool, 4> livestreamKeyVisibility_{};
+    settings::LivestreamProvider pendingLivestreamProvider_ =
+        settings::LivestreamProvider::Twitch;
     HMUI::InputFieldView* streamTitleInput_ = nullptr;
     TMPro::TextMeshProUGUI* twitchAccountStatusText_ = nullptr;
-    TMPro::TextMeshProUGUI* livestreamProviderFeatureText_ = nullptr;
     HMUI::ViewController* recordingView_ = nullptr;
     BSML::ModalView* livestreamValueConfirmationModal_ = nullptr;
     TMPro::TextMeshProUGUI* livestreamValueConfirmationText_ = nullptr;
     int pendingLivestreamValueKind_ = 0;
+    BSML::ModalView* livestreamServerPasteWarningModal_ = nullptr;
+    settings::LivestreamProvider pendingLivestreamPasteProvider_ =
+        settings::LivestreamProvider::Twitch;
     BSML::ModalView* streamTitleModal_ = nullptr;
     HMUI::InputFieldView* streamTitleModalInput_ = nullptr;
     BSML::ModalView* twitchAuthorizationModal_ = nullptr;
@@ -248,8 +278,7 @@ private:
     bool twitchAuthorizationAwaitingCompletion_ = false;
     TMPro::TextMeshProUGUI* recordingWorldPanelTypeText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelTimeText_ = nullptr;
-    // Optional FPS row on the floating recording controls; null when the
-    // "Panel FPS Counters" setting is off (the panel is built shorter then).
+    // The floating recording controls always expose capture and headset FPS.
     TMPro::TextMeshProUGUI* recordingWorldPanelFpsText_ = nullptr;
     TMPro::TextMeshProUGUI* recordingWorldPanelDropText_ = nullptr;
     BSML::ToggleSetting* recordingWorldPanelModeToggle_ = nullptr;
@@ -268,13 +297,7 @@ private:
     UnityEngine::UI::Button* connectTwitchButton_ = nullptr;
     UnityEngine::UI::Button* startDiscordScreenButton_ = nullptr;
     UnityEngine::UI::Button* stopDiscordScreenButton_ = nullptr;
-    UnityEngine::UI::Button* setLivestreamServerButton_ = nullptr;
-    UnityEngine::UI::Button* setLivestreamKeyButton_ = nullptr;
-    UnityEngine::UI::Button* clearLivestreamKeyButton_ = nullptr;
-    BSML::SliderSetting* livestreamGameAudioVolumeSlider_ = nullptr;
-    BSML::SliderSetting* livestreamMicrophoneVolumeSlider_ = nullptr;
     std::vector<UnityEngine::UI::Selectable*> recordingEncodingControls_;
-    std::vector<UnityEngine::UI::Selectable*> directRecordingEncodingControls_;
     std::vector<UnityEngine::UI::Selectable*> livestreamConfigurationControls_;
     BSML::FloatingScreen* recordingWorldPanelScreen_ = nullptr;
     UnityEngine::UI::Button* recordingWorldPanelPrimaryButton_ = nullptr;
@@ -329,7 +352,6 @@ private:
     // frame time for the active recording/stream session, matching Big
     // Screen's mathematically correct average instead of averaging individual
     // instantaneous rates or an exponential moving average.
-    bool recordingWorldPanelShowsFps_ = false;
     float recordingWorldPanelFpsWindowSeconds_ = 0.0F;
     std::uint64_t recordingWorldPanelFpsWindowStartFrames_ = 0;
     double recordingWorldPanelHmdTotalFrameSeconds_ = 0.0;
@@ -365,7 +387,12 @@ private:
     bool recordingWorldPanelCreationFailureLogged_ = false;
     bool recordingWorldPanelTickFailureLogged_ = false;
     UnityEngine::GameObject* menuRuntimeDriverObject_ = nullptr;
-    bool livestreamKeyVisible_ = false;
+    std::array<broadcast::LivestreamState, 4> observedLivestreamStates_{
+        broadcast::LivestreamState::Offline,
+        broadcast::LivestreamState::Offline,
+        broadcast::LivestreamState::Offline,
+        broadcast::LivestreamState::Offline};
+    std::deque<std::string> deferredLivestreamFailureMessages_;
     // Distinguishes an in-place title change from the title update that must
     // finish before a new Twitch stream is allowed to start.
     bool pendingLiveTwitchTitleUpdate_ = false;

@@ -101,20 +101,21 @@ int main() {
               enlargedChat.chat.height == defaults.chat.height,
           "undersized saved chat dimensions still reset to defaults");
     Check(!defaults.recording.gameplayOnly, "recording defaults to continuous menu and gameplay capture");
-    Check(!defaults.recording.controllerShortcutEnabled, "controller recording shortcut defaults off");
-    Check(!defaults.recording.worldControlsVisible, "movable recording controls default off");
-    Check(defaults.recording.backend == RecordingBackend::Hollywood,
-          "existing hardware recording backend remains the migration-safe default");
-    Check(defaults.recording.resolution == RecordingResolution::P1080 &&
-              defaults.recording.framesPerSecond == 30,
-          "recording defaults protect gameplay with 1080p30 output");
-    Check(defaults.recording.peakBitrateBitsPerSecond >= defaults.recording.bitrateBitsPerSecond,
-          "default peak bitrate is not below target bitrate");
-    Check(!defaults.broadcast.microphoneEnabled &&
-              defaults.audio.microphoneMode == MicrophoneMode::Open &&
-              defaults.audio.includeMicrophoneInRecordings &&
-              defaults.audio.includeMicrophoneInLivestreams,
-          "Quest microphone capture defaults off while routing defaults remain ready");
+    Check(defaults.recording.local.resolution == RecordingResolution::P1080 &&
+              defaults.recording.local.framesPerSecond == 30 &&
+              defaults.recording.livestream.resolution == RecordingResolution::P1080 &&
+              defaults.recording.livestream.framesPerSecond == 30,
+          "both output profiles default to gameplay-safe 1080p30 output");
+    Check(defaults.recording.local.peakBitrateBitsPerSecond >=
+              defaults.recording.local.bitrateBitsPerSecond &&
+              defaults.recording.livestream.peakBitrateBitsPerSecond >=
+                  defaults.recording.livestream.bitrateBitsPerSecond,
+          "default peak bitrate is not below target bitrate in either profile");
+    Check(!defaults.recording.local.microphoneEnabled &&
+              !defaults.recording.livestream.microphoneEnabled &&
+              defaults.recording.local.audio.microphoneMode == MicrophoneMode::Open &&
+              defaults.recording.livestream.audio.microphoneMode == MicrophoneMode::Open,
+          "Quest microphone capture defaults off in both independent profiles");
     Check(!defaults.tts.enabled && defaults.tts.ignoreKnownBots &&
               defaults.tts.ignoreCommands && !defaults.tts.speakUrls &&
               !defaults.tts.speakEmoteNames && defaults.tts.queueCapacity == 4 &&
@@ -124,20 +125,95 @@ int main() {
               defaults.connectionTest.sustainedUploadMegabitsPerSecond == 0.0F,
           "connection test defaults do not impose an unmeasured stream ceiling");
     Check(defaults.broadcast.provider == LivestreamProvider::Twitch &&
+              defaults.broadcast.twitch.enabled &&
+              !defaults.broadcast.kick.enabled &&
+              !defaults.broadcast.youtube.enabled &&
+              !defaults.broadcast.custom.enabled &&
+              defaults.broadcast.twitch.maximumVideoBitrateBitsPerSecond == 6'000'000 &&
+              defaults.broadcast.kick.maximumVideoBitrateBitsPerSecond == 8'000'000 &&
               defaults.broadcast.twitch.serverUrl.rfind("rtmp://", 0) == 0 &&
               defaults.broadcast.youtube.serverUrl.rfind("rtmps://", 0) == 0 &&
               defaults.broadcast.twitch.streamKey.empty() &&
               defaults.broadcast.youtube.streamKey.empty() &&
               defaults.broadcast.twitchAccount.clientId == kSaberStageTwitchClientId &&
               defaults.broadcast.keepHeadsetAwake &&
-              defaults.broadcast.gameAudioEnabled &&
-              defaults.broadcast.gameAudioVolumePercent == 100.0F &&
-              !defaults.broadcast.microphoneEnabled &&
-              defaults.broadcast.microphoneVolumePercent == 100.0F &&
+              defaults.recording.livestream.gameAudioEnabled &&
+              defaults.recording.livestream.gameAudioVolumePercent == 100.0F &&
+              !defaults.recording.livestream.microphoneEnabled &&
+              defaults.recording.livestream.microphoneVolumePercent == 100.0F &&
                !defaults.broadcast.postMapInfoToChat &&
                !defaults.broadcast.twitchAccount.chatWriteAuthorized &&
                defaults.broadcast.twitchAccount.protectedTokenEnvelope.empty(),
            "livestream defaults keep independent endpoints and SaberStage's public Twitch identity");
+    auto providerProfile = defaults.recording.livestream;
+    auto providerDestination = defaults.broadcast.twitch;
+    providerDestination.streamKey = "test-key";
+    Check(ValidateLivestreamProfileForProvider(
+              LivestreamProvider::Twitch, providerProfile, providerDestination).empty(),
+          "Twitch's default 1080p30 CBR profile satisfies its published limits");
+    auto recommendedProfile = providerProfile;
+    recommendedProfile.resolution = RecordingResolution::P1440;
+    recommendedProfile.framesPerSecond = 30;
+    recommendedProfile.h264Level = H264Level::L50;
+    recommendedProfile = RecommendedLivestreamProfile(
+        LivestreamProvider::Twitch, recommendedProfile);
+    Check(recommendedProfile.resolution == RecordingResolution::P1080 &&
+              recommendedProfile.framesPerSecond == 30 &&
+              recommendedProfile.bitrateBitsPerSecond == 4'500'000 &&
+              recommendedProfile.peakBitrateBitsPerSecond == 4'500'000 &&
+              recommendedProfile.rateControl == RateControlMode::ConstantBitrate &&
+              recommendedProfile.h264Level == H264Level::Automatic &&
+              recommendedProfile.keyframeIntervalSeconds == 2 &&
+              recommendedProfile.audioBitrateBitsPerSecond == 160'000,
+          "Twitch recommendations preserve supported frame rate, lower unsupported 1440p, and reset shared encoder constraints");
+    providerProfile.bitrateBitsPerSecond = 8'000'000;
+    const auto twitchBitrateError = ValidateLivestreamProfileForProvider(
+        LivestreamProvider::Twitch, providerProfile, providerDestination);
+    Check(twitchBitrateError.find("at most 6 Mbps") != std::string::npos &&
+              twitchBitrateError.find("set to 8 Mbps") != std::string::npos,
+          "Twitch preflight reports both configured and allowed bitrate");
+    providerProfile = defaults.recording.livestream;
+    providerProfile.bitrateBitsPerSecond = 8'000'000;
+    providerDestination = defaults.broadcast.kick;
+    providerDestination.streamKey = "test-key";
+    Check(ValidateLivestreamProfileForProvider(
+              LivestreamProvider::Kick, providerProfile, providerDestination).empty(),
+          "Kick accepts its published 8 Mbps 1080p CBR ceiling");
+    providerProfile.resolution = RecordingResolution::P1440;
+    Check(ValidateLivestreamProfileForProvider(
+              LivestreamProvider::Kick, providerProfile, providerDestination)
+              .find("1920x1080") != std::string::npos,
+          "Kick preflight rejects output above its published resolution cap");
+    providerProfile = defaults.recording.livestream;
+    providerProfile.framesPerSecond = 60;
+    providerProfile.bitrateBitsPerSecond = 10'000'000;
+    providerDestination = defaults.broadcast.youtube;
+    providerDestination.streamKey = "test-key";
+    Check(MaximumLivestreamVideoBitrate(
+              LivestreamProvider::YouTube, providerProfile, providerDestination) == 12'000'000 &&
+              ValidateLivestreamProfileForProvider(
+                  LivestreamProvider::YouTube, providerProfile, providerDestination).empty(),
+          "YouTube applies its 1080p60 H.264 bitrate ceiling");
+    recommendedProfile = providerProfile;
+    recommendedProfile.resolution = RecordingResolution::P1440;
+    recommendedProfile.framesPerSecond = 60;
+    recommendedProfile = RecommendedLivestreamProfile(
+        LivestreamProvider::YouTube, recommendedProfile);
+    Check(recommendedProfile.resolution == RecordingResolution::P1440 &&
+              recommendedProfile.framesPerSecond == 60 &&
+              recommendedProfile.bitrateBitsPerSecond == 24'000'000 &&
+              recommendedProfile.audioBitrateBitsPerSecond == 128'000,
+          "YouTube recommendations preserve its supported 1440p60 selection");
+    providerProfile = defaults.recording.livestream;
+    providerProfile.bitrateBitsPerSecond = 7'000'000;
+    providerDestination = defaults.broadcast.custom;
+    providerDestination.serverUrl = "rtmps://custom.example/live";
+    providerDestination.streamKey = "test-key";
+    providerDestination.maximumVideoBitrateBitsPerSecond = 6'000'000;
+    Check(ValidateLivestreamProfileForProvider(
+              LivestreamProvider::Custom, providerProfile, providerDestination)
+              .find("at most 6 Mbps") != std::string::npos,
+          "custom destinations enforce their user-configured bitrate ceiling");
     auto refreshFixture = defaults.broadcast.twitchAccount;
     refreshFixture.accessToken = "access";
     refreshFixture.refreshToken = "refresh";
@@ -168,21 +244,20 @@ int main() {
     invalid.preview.scale = -1.0F;
     invalid.preview.selectedCameraId = "missing";
     invalid.preview.position.x = 2000.0F;
-    invalid.recording.framesPerSecond = 1000;
-    invalid.recording.bitrateBitsPerSecond = 20'000'000;
-    invalid.recording.peakBitrateBitsPerSecond = 5'000'000;
+    invalid.recording.local.framesPerSecond = 1000;
+    invalid.recording.local.bitrateBitsPerSecond = 20'000'000;
+    invalid.recording.local.peakBitrateBitsPerSecond = 5'000'000;
     invalid.broadcast.reconnectAttempts = 1000;
-    invalid.broadcast.gameAudioVolumePercent = -20.0F;
-    invalid.broadcast.microphoneVolumePercent = 500.0F;
-    invalid.audio.includeMicrophoneInRecordings = false;
-    invalid.audio.includeMicrophoneInLivestreams = false;
+    invalid.recording.livestream.gameAudioVolumePercent = -20.0F;
+    invalid.recording.livestream.microphoneVolumePercent = 500.0F;
     invalid.broadcast.youtube.serverUrl = "https://not-an-rtmp-endpoint";
     invalid.broadcast.kick.streamKey = "invalid key with spaces";
-    invalid.audio.gateOpenThresholdDb = std::numeric_limits<float>::quiet_NaN();
-    invalid.audio.gateCloseThresholdDb = 4.0F;
-    invalid.audio.pushToTalkReleaseMilliseconds = 5000.0F;
-    invalid.audio.compressorRatio = -2.0F;
-    invalid.audio.limiterCeilingDb = 6.0F;
+    invalid.recording.livestream.audio.gateOpenThresholdDb =
+        std::numeric_limits<float>::quiet_NaN();
+    invalid.recording.livestream.audio.gateCloseThresholdDb = 4.0F;
+    invalid.recording.livestream.audio.pushToTalkReleaseMilliseconds = 5000.0F;
+    invalid.recording.livestream.audio.compressorRatio = -2.0F;
+    invalid.recording.livestream.audio.limiterCeilingDb = 6.0F;
     invalid.tts.maximumCharacters = 50'000;
     invalid.tts.queueCapacity = 0;
     invalid.tts.speechRate = std::numeric_limits<float>::infinity();
@@ -197,32 +272,34 @@ int main() {
     Check((invalid.camera.Primary().requestedWidth & 1) == 0, "odd encoder dimension becomes even");
     Check(invalid.camera.Primary().multisampleCount == 1,
           "unsupported third-person MSAA repairs to the Quest-safe default");
-    Check(invalid.recording.framesPerSecond == 30, "recording FPS repairs to a supported hardware rate");
-    Check(invalid.recording.peakBitrateBitsPerSecond == invalid.recording.bitrateBitsPerSecond,
+    Check(invalid.recording.local.framesPerSecond == 30, "recording FPS repairs to a supported hardware rate");
+    Check(invalid.recording.local.peakBitrateBitsPerSecond ==
+              invalid.recording.local.bitrateBitsPerSecond,
           "recording peak bitrate repairs to at least the target bitrate");
     Check(invalid.broadcast.reconnectAttempts == defaults.broadcast.reconnectAttempts,
           "livestream reconnect count repairs to its bounded default");
-    Check(invalid.broadcast.gameAudioVolumePercent == 100.0F &&
-              invalid.broadcast.microphoneVolumePercent == 100.0F,
+    Check(invalid.recording.livestream.gameAudioVolumePercent == 100.0F &&
+              invalid.recording.livestream.microphoneVolumePercent == 100.0F,
           "livestream audio mix volumes repair to safe defaults");
-    Check(invalid.audio.includeMicrophoneInRecordings &&
-              invalid.audio.includeMicrophoneInLivestreams,
-          "legacy microphone routing with no destination repairs to Both");
     Check(invalid.broadcast.youtube.serverUrl == defaults.broadcast.youtube.serverUrl &&
               invalid.broadcast.kick.streamKey.empty(),
           "invalid service-specific livestream destinations repair without exposing credentials");
-    Check(invalid.audio.gateOpenThresholdDb == defaults.audio.gateOpenThresholdDb &&
-              invalid.audio.gateCloseThresholdDb <= invalid.audio.gateOpenThresholdDb &&
-              invalid.audio.pushToTalkReleaseMilliseconds ==
-                  defaults.audio.pushToTalkReleaseMilliseconds &&
-              invalid.audio.compressorRatio == defaults.audio.compressorRatio &&
-              invalid.audio.limiterCeilingDb == defaults.audio.limiterCeilingDb,
+    Check(invalid.recording.livestream.audio.gateOpenThresholdDb ==
+                  defaults.recording.livestream.audio.gateOpenThresholdDb &&
+              invalid.recording.livestream.audio.gateCloseThresholdDb <=
+                  invalid.recording.livestream.audio.gateOpenThresholdDb &&
+              invalid.recording.livestream.audio.pushToTalkReleaseMilliseconds ==
+                  defaults.recording.livestream.audio.pushToTalkReleaseMilliseconds &&
+              invalid.recording.livestream.audio.compressorRatio ==
+                  defaults.recording.livestream.audio.compressorRatio &&
+              invalid.recording.livestream.audio.limiterCeilingDb ==
+                  defaults.recording.livestream.audio.limiterCeilingDb,
           "invalid microphone DSP values repair to safe finite settings");
     auto wideGateOffset = defaults;
-    wideGateOffset.audio.gateOpenThresholdDb = -60.0F;
-    wideGateOffset.audio.gateCloseThresholdDb = -90.0F;
+    wideGateOffset.recording.local.audio.gateOpenThresholdDb = -60.0F;
+    wideGateOffset.recording.local.audio.gateCloseThresholdDb = -90.0F;
     ValidateAndRepair(wideGateOffset);
-    Check(wideGateOffset.audio.gateCloseThresholdDb == -90.0F,
+    Check(wideGateOffset.recording.local.audio.gateCloseThresholdDb == -90.0F,
           "voice gate preserves a 30 dB cutoff offset at the quietest open threshold");
     Check(invalid.tts.maximumCharacters == defaults.tts.maximumCharacters &&
               invalid.tts.queueCapacity == defaults.tts.queueCapacity &&
@@ -259,9 +336,10 @@ int main() {
     reset.preview.visible = true;
     ResetSubsystem(reset, Subsystem::Preview);
     Check(!reset.preview.visible, "preview reset restores defaults");
-    reset.recording.framesPerSecond = 60;
+    reset.recording.local.framesPerSecond = 60;
     ResetSubsystem(reset, Subsystem::Recording);
-    Check(reset.recording.framesPerSecond == defaults.recording.framesPerSecond, "recording reset restores defaults");
+    Check(reset.recording.local.framesPerSecond == defaults.recording.local.framesPerSecond,
+          "recording reset restores defaults");
     reset.companion.enabled = true;
     ResetSubsystem(reset, Subsystem::Companion);
     Check(!reset.companion.enabled, "companion reset restores defaults");
@@ -301,23 +379,41 @@ int main() {
     first.Edit().preview.floatingResolutionWidth = 1280;
     first.Edit().preview.floatingFramesPerSecond = 24;
     first.Edit().recording.gameplayOnly = true;
-    first.Edit().recording.controllerShortcutEnabled = true;
-    first.Edit().recording.worldControlsVisible = true;
     first.Edit().recording.worldControlsStreamMode = true;
     first.Edit().recording.worldControlsPosition = {0.45F, 1.35F, 1.55F};
     first.Edit().recording.worldControlsRotationDegrees = {4.0F, 170.0F, -2.0F};
-    first.Edit().recording.backend = RecordingBackend::DirectFfmpegHardware;
-    first.Edit().recording.resolution = RecordingResolution::P1440;
-    first.Edit().recording.framesPerSecond = 60;
-    first.Edit().recording.bitrateBitsPerSecond = 16'000'000;
-    first.Edit().recording.peakBitrateBitsPerSecond = 20'000'000;
-    first.Edit().recording.rateControl = RateControlMode::VariableBitrate;
-    first.Edit().recording.encoderPriority = EncoderPriority::Performance;
-    first.Edit().recording.h264Profile = H264Profile::Main;
-    first.Edit().recording.h264Level = H264Level::L42;
-    first.Edit().recording.keyframeIntervalSeconds = 3;
-    first.Edit().recording.audioBitrateBitsPerSecond = 192'000;
+    auto& savedLocalProfile = first.Edit().recording.local;
+    savedLocalProfile.resolution = RecordingResolution::P1440;
+    savedLocalProfile.framesPerSecond = 60;
+    savedLocalProfile.bitrateBitsPerSecond = 16'000'000;
+    savedLocalProfile.peakBitrateBitsPerSecond = 20'000'000;
+    savedLocalProfile.rateControl = RateControlMode::VariableBitrate;
+    savedLocalProfile.encoderPriority = EncoderPriority::Performance;
+    savedLocalProfile.h264Profile = H264Profile::Main;
+    savedLocalProfile.h264Level = H264Level::L42;
+    savedLocalProfile.keyframeIntervalSeconds = 3;
+    savedLocalProfile.audioBitrateBitsPerSecond = 192'000;
+    savedLocalProfile.gameAudioEnabled = true;
+    savedLocalProfile.gameAudioVolumePercent = 85.0F;
+    savedLocalProfile.microphoneEnabled = false;
+    savedLocalProfile.audio.microphoneMode = MicrophoneMode::PushToTalk;
+
+    auto& savedStreamProfile = first.Edit().recording.livestream;
+    savedStreamProfile.resolution = RecordingResolution::P720;
+    savedStreamProfile.framesPerSecond = 30;
+    savedStreamProfile.bitrateBitsPerSecond = 6'000'000;
+    savedStreamProfile.peakBitrateBitsPerSecond = 8'000'000;
+    savedStreamProfile.rateControl = RateControlMode::ConstantBitrate;
+    savedStreamProfile.encoderPriority = EncoderPriority::Quality;
+    savedStreamProfile.h264Profile = H264Profile::High;
+    savedStreamProfile.h264Level = H264Level::L41;
+    savedStreamProfile.keyframeIntervalSeconds = 2;
+    savedStreamProfile.audioBitrateBitsPerSecond = 160'000;
     first.Edit().broadcast.provider = LivestreamProvider::YouTube;
+    first.Edit().broadcast.twitch.enabled = false;
+    first.Edit().broadcast.youtube.enabled = true;
+    first.Edit().broadcast.kick.enabled = true;
+    first.Edit().broadcast.custom.enabled = true;
     first.Edit().broadcast.twitch.serverUrl = "rtmps://twitch.example/app";
     first.Edit().broadcast.twitch.streamKey = "test-twitch-key";
     first.Edit().broadcast.twitch.streamTitle = "Test Twitch title";
@@ -327,33 +423,32 @@ int main() {
     first.Edit().broadcast.kick.streamKey = "test-kick-key";
     first.Edit().broadcast.custom.serverUrl = "rtmp://custom.example/live";
     first.Edit().broadcast.custom.streamKey = "test-custom-key";
+    first.Edit().broadcast.custom.maximumVideoBitrateBitsPerSecond = 14'000'000;
     first.Edit().broadcast.reconnectAttempts = 12;
     first.Edit().broadcast.afkMediaPath = "/sdcard/Pictures/afk.gif";
     first.Edit().broadcast.keepHeadsetAwake = false;
-    first.Edit().broadcast.gameAudioEnabled = false;
-    first.Edit().broadcast.gameAudioVolumePercent = 65.0F;
-    first.Edit().broadcast.microphoneEnabled = true;
-    first.Edit().broadcast.microphoneVolumePercent = 135.0F;
+    savedStreamProfile.gameAudioEnabled = false;
+    savedStreamProfile.gameAudioVolumePercent = 65.0F;
+    savedStreamProfile.microphoneEnabled = true;
+    savedStreamProfile.microphoneVolumePercent = 135.0F;
     first.Edit().broadcast.postMapInfoToChat = true;
-    first.Edit().audio.microphoneMode = MicrophoneMode::VoiceActivated;
-    first.Edit().audio.pushToTalkHand = PushToTalkHand::Right;
-    first.Edit().audio.pushToTalkReleaseMilliseconds = 230.0F;
-    first.Edit().audio.includeMicrophoneInRecordings = false;
-    first.Edit().audio.includeMicrophoneInLivestreams = true;
-    first.Edit().audio.highPassEnabled = false;
-    first.Edit().audio.gateOpenThresholdDb = -33.0F;
-    first.Edit().audio.gateCloseThresholdDb = -44.0F;
-    first.Edit().audio.gateAttackMilliseconds = 17.0F;
-    first.Edit().audio.gateHoldMilliseconds = 260.0F;
-    first.Edit().audio.gateReleaseMilliseconds = 310.0F;
-    first.Edit().audio.gatePreRollMilliseconds = 50.0F;
-    first.Edit().audio.compressorThresholdDb = -21.0F;
-    first.Edit().audio.compressorRatio = 4.0F;
-    first.Edit().audio.compressorAttackMilliseconds = 13.0F;
-    first.Edit().audio.compressorReleaseMilliseconds = 180.0F;
-    first.Edit().audio.compressorMakeupDb = 4.0F;
-    first.Edit().audio.limiterCeilingDb = -2.0F;
-    first.Edit().audio.limiterReleaseMilliseconds = 90.0F;
+    savedStreamProfile.audio.microphoneMode = MicrophoneMode::VoiceActivated;
+    savedStreamProfile.audio.pushToTalkHand = PushToTalkHand::Right;
+    savedStreamProfile.audio.pushToTalkReleaseMilliseconds = 230.0F;
+    savedStreamProfile.audio.highPassEnabled = false;
+    savedStreamProfile.audio.gateOpenThresholdDb = -33.0F;
+    savedStreamProfile.audio.gateCloseThresholdDb = -44.0F;
+    savedStreamProfile.audio.gateAttackMilliseconds = 17.0F;
+    savedStreamProfile.audio.gateHoldMilliseconds = 260.0F;
+    savedStreamProfile.audio.gateReleaseMilliseconds = 310.0F;
+    savedStreamProfile.audio.gatePreRollMilliseconds = 50.0F;
+    savedStreamProfile.audio.compressorThresholdDb = -21.0F;
+    savedStreamProfile.audio.compressorRatio = 4.0F;
+    savedStreamProfile.audio.compressorAttackMilliseconds = 13.0F;
+    savedStreamProfile.audio.compressorReleaseMilliseconds = 180.0F;
+    savedStreamProfile.audio.compressorMakeupDb = 4.0F;
+    savedStreamProfile.audio.limiterCeilingDb = -2.0F;
+    savedStreamProfile.audio.limiterReleaseMilliseconds = 90.0F;
     first.Edit().tts.enabled = true;
     first.Edit().tts.speakUsernames = false;
     first.Edit().tts.ignoreKnownBots = false;
@@ -420,25 +515,34 @@ int main() {
               second.Get().preview.floatingResolutionWidth == 1280 && second.Get().preview.floatingFramesPerSecond == 24,
           "independent preview resolution and FPS settings survive restart");
     Check(second.Get().recording.gameplayOnly, "gameplay-only recording preference survives restart");
-    Check(second.Get().recording.controllerShortcutEnabled,
-          "controller recording shortcut preference survives restart");
-    Check(second.Get().recording.worldControlsVisible &&
-              second.Get().recording.worldControlsStreamMode &&
+    Check(second.Get().recording.worldControlsStreamMode &&
               second.Get().recording.worldControlsPosition.x == 0.45F &&
               second.Get().recording.worldControlsRotationDegrees.y == 170.0F,
-          "movable recording controls visibility and pose survive restart");
-    Check(second.Get().recording.backend == RecordingBackend::DirectFfmpegHardware &&
-              second.Get().recording.resolution == RecordingResolution::P1440 &&
-              second.Get().recording.framesPerSecond == 60 &&
-              second.Get().recording.bitrateBitsPerSecond == 16'000'000 &&
-              second.Get().recording.peakBitrateBitsPerSecond == 20'000'000 &&
-              second.Get().recording.rateControl == RateControlMode::VariableBitrate &&
-              second.Get().recording.encoderPriority == EncoderPriority::Performance &&
-              second.Get().recording.h264Profile == H264Profile::Main &&
-              second.Get().recording.h264Level == H264Level::L42 &&
-              second.Get().recording.keyframeIntervalSeconds == 3 &&
-              second.Get().recording.audioBitrateBitsPerSecond == 192'000,
-          "all direct hardware encoder controls survive restart");
+          "movable recording controls mode and pose survive restart");
+    const auto& loadedLocalProfile = second.Get().recording.local;
+    const auto& loadedStreamProfile = second.Get().recording.livestream;
+    Check(loadedLocalProfile.resolution == RecordingResolution::P1440 &&
+              loadedLocalProfile.framesPerSecond == 60 &&
+              loadedLocalProfile.bitrateBitsPerSecond == 16'000'000 &&
+              loadedLocalProfile.peakBitrateBitsPerSecond == 20'000'000 &&
+              loadedLocalProfile.rateControl == RateControlMode::VariableBitrate &&
+              loadedLocalProfile.encoderPriority == EncoderPriority::Performance &&
+              loadedLocalProfile.h264Profile == H264Profile::Main &&
+              loadedLocalProfile.h264Level == H264Level::L42 &&
+              loadedLocalProfile.keyframeIntervalSeconds == 3 &&
+              loadedLocalProfile.audioBitrateBitsPerSecond == 192'000 &&
+              loadedLocalProfile.gameAudioVolumePercent == 85.0F &&
+              !loadedLocalProfile.microphoneEnabled &&
+              loadedLocalProfile.audio.microphoneMode == MicrophoneMode::PushToTalk,
+          "all local output-profile controls survive restart");
+    Check(loadedStreamProfile.resolution == RecordingResolution::P720 &&
+              loadedStreamProfile.framesPerSecond == 30 &&
+              loadedStreamProfile.bitrateBitsPerSecond == 6'000'000 &&
+              loadedStreamProfile.peakBitrateBitsPerSecond == 8'000'000 &&
+              loadedStreamProfile.rateControl == RateControlMode::ConstantBitrate &&
+              loadedStreamProfile.encoderPriority == EncoderPriority::Quality &&
+              loadedStreamProfile.audioBitrateBitsPerSecond == 160'000,
+          "stream encoder settings persist independently from local recording");
     const auto serializedSettings = Read(path);
     Check(serializedSettings.find("test-access-token") == std::string::npos &&
               serializedSettings.find("test-refresh-token") == std::string::npos &&
@@ -446,6 +550,10 @@ int main() {
               serializedSettings.find("\"refreshToken\"") == std::string::npos,
           "Twitch OAuth plaintext is never serialized to settings");
     Check(second.Get().broadcast.provider == LivestreamProvider::YouTube &&
+              !second.Get().broadcast.twitch.enabled &&
+              second.Get().broadcast.youtube.enabled &&
+              second.Get().broadcast.kick.enabled &&
+              second.Get().broadcast.custom.enabled &&
               second.Get().broadcast.twitch.serverUrl == "rtmps://twitch.example/app" &&
               second.Get().broadcast.twitch.streamKey == "test-twitch-key" &&
               second.Get().broadcast.twitch.streamTitle == "Test Twitch title" &&
@@ -455,13 +563,10 @@ int main() {
               second.Get().broadcast.kick.streamKey == "test-kick-key" &&
               second.Get().broadcast.custom.serverUrl == "rtmp://custom.example/live" &&
               second.Get().broadcast.custom.streamKey == "test-custom-key" &&
+              second.Get().broadcast.custom.maximumVideoBitrateBitsPerSecond == 14'000'000 &&
               second.Get().broadcast.reconnectAttempts == 12 &&
               second.Get().broadcast.afkMediaPath == "/sdcard/Pictures/afk.gif" &&
                !second.Get().broadcast.keepHeadsetAwake &&
-               !second.Get().broadcast.gameAudioEnabled &&
-               second.Get().broadcast.gameAudioVolumePercent == 65.0F &&
-               second.Get().broadcast.microphoneEnabled &&
-               second.Get().broadcast.microphoneVolumePercent == 135.0F &&
                second.Get().broadcast.postMapInfoToChat &&
                second.Get().broadcast.twitchAccount.clientId == kSaberStageTwitchClientId &&
                second.Get().broadcast.twitchAccount.accessToken.empty() &&
@@ -473,26 +578,28 @@ int main() {
               second.Get().broadcast.twitchAccount.expiresAtUnixSeconds == 1'800'000'000 &&
               second.Get().broadcast.twitchAccount.chatWriteAuthorized,
           "livestream destinations, AFK media, and protected Twitch account state survive restart");
-    Check(second.Get().audio.microphoneMode == MicrophoneMode::VoiceActivated &&
-              second.Get().audio.pushToTalkHand == PushToTalkHand::Right &&
-              second.Get().audio.pushToTalkReleaseMilliseconds == 230.0F &&
-              !second.Get().audio.includeMicrophoneInRecordings &&
-              second.Get().audio.includeMicrophoneInLivestreams &&
-              !second.Get().audio.highPassEnabled &&
-              second.Get().audio.gateOpenThresholdDb == -33.0F &&
-              second.Get().audio.gateCloseThresholdDb == -44.0F &&
-              second.Get().audio.gateAttackMilliseconds == 17.0F &&
-              second.Get().audio.gateHoldMilliseconds == 260.0F &&
-              second.Get().audio.gateReleaseMilliseconds == 310.0F &&
-              second.Get().audio.gatePreRollMilliseconds == 50.0F &&
-              second.Get().audio.compressorThresholdDb == -21.0F &&
-              second.Get().audio.compressorRatio == 4.0F &&
-              second.Get().audio.compressorAttackMilliseconds == 13.0F &&
-              second.Get().audio.compressorReleaseMilliseconds == 180.0F &&
-              second.Get().audio.compressorMakeupDb == 4.0F &&
-              second.Get().audio.limiterCeilingDb == -2.0F &&
-              second.Get().audio.limiterReleaseMilliseconds == 90.0F,
-          "microphone modes, routing, and DSP values survive restart");
+    Check(!loadedStreamProfile.gameAudioEnabled &&
+              loadedStreamProfile.gameAudioVolumePercent == 65.0F &&
+              loadedStreamProfile.microphoneEnabled &&
+              loadedStreamProfile.microphoneVolumePercent == 135.0F &&
+              loadedStreamProfile.audio.microphoneMode == MicrophoneMode::VoiceActivated &&
+              loadedStreamProfile.audio.pushToTalkHand == PushToTalkHand::Right &&
+              loadedStreamProfile.audio.pushToTalkReleaseMilliseconds == 230.0F &&
+              !loadedStreamProfile.audio.highPassEnabled &&
+              loadedStreamProfile.audio.gateOpenThresholdDb == -33.0F &&
+              loadedStreamProfile.audio.gateCloseThresholdDb == -44.0F &&
+              loadedStreamProfile.audio.gateAttackMilliseconds == 17.0F &&
+              loadedStreamProfile.audio.gateHoldMilliseconds == 260.0F &&
+              loadedStreamProfile.audio.gateReleaseMilliseconds == 310.0F &&
+              loadedStreamProfile.audio.gatePreRollMilliseconds == 50.0F &&
+              loadedStreamProfile.audio.compressorThresholdDb == -21.0F &&
+              loadedStreamProfile.audio.compressorRatio == 4.0F &&
+              loadedStreamProfile.audio.compressorAttackMilliseconds == 13.0F &&
+              loadedStreamProfile.audio.compressorReleaseMilliseconds == 180.0F &&
+              loadedStreamProfile.audio.compressorMakeupDb == 4.0F &&
+              loadedStreamProfile.audio.limiterCeilingDb == -2.0F &&
+              loadedStreamProfile.audio.limiterReleaseMilliseconds == 90.0F,
+          "stream microphone mix and DSP values survive independently from local audio");
     Check(second.Get().tts.enabled && !second.Get().tts.speakUsernames &&
               !second.Get().tts.ignoreKnownBots && !second.Get().tts.ignoreCommands &&
               second.Get().tts.speakUrls && second.Get().tts.speakEmoteNames &&
@@ -543,10 +650,6 @@ int main() {
     Check(migration.Get().schemaVersion == kCurrentSchemaVersion, "migration writes current schema");
     Check(migration.Get().camera.Primary().fovDegrees == 105.0F, "migration preserves recognized valid value");
     Check(!migration.Get().recording.gameplayOnly, "older settings migrate to continuous recording by default");
-    Check(!migration.Get().recording.controllerShortcutEnabled,
-          "older settings migrate with the controller shortcut disabled");
-    Check(!migration.Get().recording.worldControlsVisible,
-          "older settings migrate with movable recording controls disabled");
 
     Write(path, R"({"schemaVersion":20,"preview":{"position":{"x":0.0,"y":1.15,"z":2.1},"rotationDegrees":{"x":0.0,"y":180.0,"z":0.0}},"recording":{"worldControlsPosition":{"x":0.42,"y":1.25,"z":1.45},"worldControlsRotationDegrees":{"x":0.0,"y":180.0,"z":0.0}}})");
     SettingsService legacyWorldPanels(path);
@@ -570,6 +673,47 @@ int main() {
               legacyCustomChat.Get().chat.fontSize == 5.7F,
           "schema 30 custom chat text size is preserved during migration");
 
+    // Schema 35 used one shared encoder profile, kept stream mixing under
+    // broadcast, and kept microphone processing/routing in a top-level audio
+    // object. Migration must seed both new profiles without losing the user's
+    // established recording or stream behavior.
+    Write(path, R"({"schemaVersion":35,"recording":{"backend":"hollywood","resolution":"720p","framesPerSecond":30,"bitrateBitsPerSecond":8000000,"peakBitrateBitsPerSecond":10000000,"rateControl":"vbr","encoderPriority":"quality","h264Profile":"high","h264Level":"4.1","keyframeIntervalSeconds":3,"audioBitrateBitsPerSecond":160000},"broadcast":{"gameAudioEnabled":false,"gameAudioVolumePercent":45.0,"microphoneEnabled":true,"microphoneVolumePercent":35.0},"audio":{"microphoneMode":"voice_activated","pushToTalkHand":"right","includeMicrophoneInRecordings":false,"includeMicrophoneInLivestreams":true,"highPassEnabled":false,"gateOpenThresholdDb":-32.0,"gateCloseThresholdDb":-43.0,"compressorEnabled":true,"limiterEnabled":false}})");
+    SettingsService legacySharedOutputProfile(path);
+    const auto legacySharedProfileLoad = legacySharedOutputProfile.Load();
+    const auto& migratedLocal = legacySharedOutputProfile.Get().recording.local;
+    const auto& migratedStream = legacySharedOutputProfile.Get().recording.livestream;
+    Check(legacySharedProfileLoad.migrated &&
+              migratedLocal.resolution == RecordingResolution::P720 &&
+              migratedStream.resolution == RecordingResolution::P720 &&
+              migratedLocal.framesPerSecond == 30 &&
+              migratedStream.framesPerSecond == 30 &&
+              migratedLocal.bitrateBitsPerSecond == 8'000'000 &&
+              migratedStream.peakBitrateBitsPerSecond == 10'000'000 &&
+              migratedLocal.rateControl == RateControlMode::VariableBitrate &&
+              migratedStream.encoderPriority == EncoderPriority::Quality &&
+              migratedLocal.h264Profile == H264Profile::High &&
+              migratedStream.h264Level == H264Level::L41 &&
+              migratedLocal.keyframeIntervalSeconds == 3 &&
+              migratedStream.audioBitrateBitsPerSecond == 160'000,
+          "schema 35 shared encoder settings seed independent local and stream profiles");
+    Check(migratedLocal.gameAudioEnabled &&
+              !migratedStream.gameAudioEnabled &&
+              migratedStream.gameAudioVolumePercent == 45.0F &&
+              !migratedLocal.microphoneEnabled &&
+              migratedStream.microphoneEnabled &&
+              migratedLocal.microphoneVolumePercent == 35.0F &&
+              migratedStream.microphoneVolumePercent == 35.0F,
+          "schema 35 stream mix and legacy microphone routing retain their prior behavior");
+    Check(migratedLocal.audio.microphoneMode == MicrophoneMode::VoiceActivated &&
+              migratedStream.audio.microphoneMode == MicrophoneMode::VoiceActivated &&
+              migratedLocal.audio.pushToTalkHand == PushToTalkHand::Right &&
+              !migratedStream.audio.highPassEnabled &&
+              migratedLocal.audio.gateOpenThresholdDb == -32.0F &&
+              migratedStream.audio.gateCloseThresholdDb == -43.0F &&
+              migratedLocal.audio.compressorEnabled &&
+              !migratedStream.audio.limiterEnabled,
+          "schema 35 microphone processing is copied into both output profiles");
+
     Write(path, R"({"schemaVersion":19,"broadcast":{"provider":"kick","serverUrl":"rtmps://legacy-kick.example/app","reconnectAttempts":5}})");
     SettingsService legacyLivestream(path);
     const auto legacyLivestreamLoad = legacyLivestream.Load();
@@ -581,6 +725,16 @@ int main() {
           "schema 19 moves its shared endpoint into only the selected service");
     Check(Read(path).find("\"destinations\"") != std::string::npos,
           "legacy livestream migration rewrites the service-specific schema");
+
+    Write(path, R"({"schemaVersion":36,"broadcast":{"provider":"kick","destinations":{"twitch":{"enabled":true,"serverUrl":"rtmp://twitch.example/app","streamKey":"tw"},"kick":{"serverUrl":"rtmps://kick.example/app","streamKey":"kick"},"youtube":{"enabled":true,"serverUrl":"rtmps://youtube.example/live2","streamKey":"yt"},"custom":{"enabled":true,"serverUrl":"rtmp://custom.example/live","streamKey":"custom"}}}})");
+    SettingsService legacySingleDestination(path);
+    const auto legacySingleDestinationLoad = legacySingleDestination.Load();
+    Check(legacySingleDestinationLoad.migrated &&
+              !legacySingleDestination.Get().broadcast.twitch.enabled &&
+              legacySingleDestination.Get().broadcast.kick.enabled &&
+              !legacySingleDestination.Get().broadcast.youtube.enabled &&
+              !legacySingleDestination.Get().broadcast.custom.enabled,
+          "schema 36 migration enables only the previously selected destination");
 
     Write(path, R"({"schemaVersion":25,"broadcast":{"twitchAccount":{"clientId":"legacy-client-id","accessToken":"legacy-access-secret","refreshToken":"legacy-refresh-secret","login":"legacy-login","userId":"654321","expiresAtUnixSeconds":1800000000,"chatWriteAuthorized":true}}})");
     SettingsService legacyPlaintextTwitch(path);

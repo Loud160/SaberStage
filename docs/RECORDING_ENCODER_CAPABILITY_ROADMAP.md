@@ -34,7 +34,7 @@ At the time of this audit, Saber Stage already has several useful foundations:
 - Encoded video packets already support bounded worker/fan-out handling rather than performing file I/O in the encoder callback.
 - Livestream audio is already encoded to AAC in real time.
 - Direct livestreaming already consumes the hardware AVC output rather than launching a second video encoder.
-- Hollywood remains an independently selectable hardware recording backend.
+- Local recording and streaming use the same Direct FFmpeg hardware encoder path.
 
 The present local-recording format is not yet the intended final architecture:
 
@@ -79,7 +79,7 @@ The writer should:
 - work with both hardware AVC and hardware HEVC packets;
 - avoid H.264-only assumptions in keyframe, parameter-set, or recovery logic.
 
-Hollywood and Direct FFmpeg should ultimately feed the same live recording-sink contract where their packet and timing interfaces permit it. Backend-specific timestamp limitations must be explicit rather than hidden.
+Direct FFmpeg should feed the same live recording-sink contract for every compatible local and remote consumer. Packet and timestamp limitations must be explicit rather than hidden.
 
 ### Optional normal-MP4 conversion
 
@@ -449,7 +449,7 @@ HEVC should initially be a local-recording option. It should not be exposed for 
 1. Define a shared codec-neutral encoded-video and encoded-audio packet contract.
 2. Add a shared live fragmented-MP4 writer for hardware AVC plus real-time AAC.
 3. Route Direct FFmpeg local recording through that writer.
-4. Adapt Hollywood local recording to the same sink contract where its callback and timestamp information allow it.
+4. Adapt the current local recording output to the same sink contract used by remote consumers.
 5. Remove the requirement to retain a raw WAV for normal local recording by encoding AAC during capture.
 6. Make Stop close the active fragment and release the session quickly enough to start another recording immediately.
 

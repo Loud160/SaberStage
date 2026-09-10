@@ -157,7 +157,7 @@ public:
                 if (!externalOutputActive_) {
                     DestroyRuntimeCamera();
                 } else {
-                    // Hollywood owns an encoder component on this persistent
+                    // Direct FFmpeg owns an encoder component on this persistent
                     // camera object. Keep it alive so one recording/stream can
                     // span menu, loading, gameplay, and results scenes.
                     mainCamera_ = nullptr;

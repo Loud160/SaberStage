@@ -101,6 +101,26 @@ const LivestreamDestinationSettings& DestinationForProvider(
     return settings.twitch;
 }
 
+std::string FormatMegabits(std::int32_t bitsPerSecond) {
+    const auto whole = bitsPerSecond / 1'000'000;
+    const auto tenths = (bitsPerSecond % 1'000'000) / 100'000;
+    return tenths == 0
+        ? std::to_string(whole)
+        : std::to_string(whole) + "." + std::to_string(tenths);
+}
+
+RecordingProfileSettings& RecordingProfileForMode(
+    RecordingSettings& settings,
+    bool livestream) noexcept {
+    return livestream ? settings.livestream : settings.local;
+}
+
+const RecordingProfileSettings& RecordingProfileForMode(
+    const RecordingSettings& settings,
+    bool livestream) noexcept {
+    return livestream ? settings.livestream : settings.local;
+}
+
 bool IsValidLivestreamServerUrl(std::string_view value) noexcept {
     if (value.size() < 8 || value.size() > 2048 ||
         (value.rfind("rtmp://", 0) != 0 && value.rfind("rtmps://", 0) != 0)) {
@@ -116,6 +136,131 @@ bool IsValidStreamKey(std::string_view value) noexcept {
     return std::none_of(value.begin(), value.end(), [](unsigned char character) {
         return character <= 0x20 || character == 0x7F;
     });
+}
+
+bool IsLivestreamDestinationEnabled(
+    const LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept {
+    return DestinationForProvider(settings, provider).enabled;
+}
+
+std::int32_t MaximumLivestreamVideoBitrate(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination) noexcept {
+    switch (provider) {
+        case LivestreamProvider::Twitch: return 6'000'000;
+        case LivestreamProvider::Kick: return 8'000'000;
+        case LivestreamProvider::YouTube:
+            if (profile.resolution == RecordingResolution::P1440) {
+                return profile.framesPerSecond > 30 ? 24'000'000 : 15'000'000;
+            }
+            if (profile.resolution == RecordingResolution::P1080) {
+                return profile.framesPerSecond > 30 ? 12'000'000 : 10'000'000;
+            }
+            return profile.framesPerSecond > 30 ? 6'000'000 : 4'000'000;
+        case LivestreamProvider::Custom:
+            return destination.maximumVideoBitrateBitsPerSecond;
+    }
+    return 0;
+}
+
+RecordingProfileSettings RecommendedLivestreamProfile(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& current) noexcept {
+    auto profile = current;
+    if ((provider == LivestreamProvider::Twitch ||
+            provider == LivestreamProvider::Kick) &&
+            profile.resolution == RecordingResolution::P1440) {
+        profile.resolution = RecordingResolution::P1080;
+    }
+    profile.framesPerSecond = std::min(profile.framesPerSecond, 60);
+    profile.rateControl = RateControlMode::ConstantBitrate;
+    profile.encoderPriority = EncoderPriority::Quality;
+    profile.h264Level = H264Level::Automatic;
+    profile.keyframeIntervalSeconds = 2;
+
+    if (provider == LivestreamProvider::Twitch) {
+        profile.bitrateBitsPerSecond =
+            profile.resolution == RecordingResolution::P720
+                ? (profile.framesPerSecond > 30 ? 4'500'000 : 3'000'000)
+                : (profile.framesPerSecond > 30 ? 6'000'000 : 4'500'000);
+        profile.h264Profile = H264Profile::High;
+        profile.audioBitrateBitsPerSecond = 160'000;
+    } else if (provider == LivestreamProvider::Kick) {
+        profile.bitrateBitsPerSecond = 8'000'000;
+        profile.h264Profile = H264Profile::Main;
+        profile.audioBitrateBitsPerSecond = 160'000;
+    } else if (provider == LivestreamProvider::YouTube) {
+        profile.bitrateBitsPerSecond = MaximumLivestreamVideoBitrate(
+            provider, profile, LivestreamDestinationSettings{});
+        profile.h264Profile = H264Profile::High;
+        profile.audioBitrateBitsPerSecond = 128'000;
+    }
+    profile.peakBitrateBitsPerSecond = profile.bitrateBitsPerSecond;
+    return profile;
+}
+
+std::string ValidateLivestreamEncodingForProvider(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination) {
+    const auto providerName = std::string(ToString(provider));
+    const auto maximumBitrate = MaximumLivestreamVideoBitrate(
+        provider, profile, destination);
+    const auto configuredBitrate = profile.rateControl == RateControlMode::VariableBitrate
+        ? std::max(profile.bitrateBitsPerSecond, profile.peakBitrateBitsPerSecond)
+        : profile.bitrateBitsPerSecond;
+    if (maximumBitrate <= 0 || configuredBitrate > maximumBitrate) {
+        return providerName + " allows at most " +
+            FormatMegabits(maximumBitrate) +
+            " Mbps video, but the Stream profile is set to " +
+            FormatMegabits(configuredBitrate) + " Mbps.";
+    }
+    if (profile.framesPerSecond > 60) {
+        return providerName + " allows at most 60 FPS.";
+    }
+    if ((provider == LivestreamProvider::Twitch ||
+            provider == LivestreamProvider::Kick) &&
+            profile.resolution == RecordingResolution::P1440) {
+        return providerName + " allows at most 1920x1080 output.";
+    }
+    if ((provider == LivestreamProvider::Twitch ||
+            provider == LivestreamProvider::Kick ||
+            provider == LivestreamProvider::YouTube) &&
+            profile.rateControl != RateControlMode::ConstantBitrate) {
+        return providerName + " requires constant bitrate (CBR).";
+    }
+    if ((provider == LivestreamProvider::Twitch ||
+            provider == LivestreamProvider::Kick) &&
+            profile.keyframeIntervalSeconds != 2) {
+        return providerName + " requires a 2-second keyframe interval.";
+    }
+    if (provider == LivestreamProvider::YouTube &&
+            profile.keyframeIntervalSeconds > 4) {
+        return "YouTube allows a keyframe interval of at most 4 seconds.";
+    }
+    if (provider == LivestreamProvider::Twitch &&
+            profile.audioBitrateBitsPerSecond > 160'000) {
+        return "Twitch allows at most 160 kbps AAC audio, but the Stream profile is set to " +
+            std::to_string(profile.audioBitrateBitsPerSecond / 1000) + " kbps.";
+    }
+    return {};
+}
+
+std::string ValidateLivestreamProfileForProvider(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination) {
+    const auto providerName = std::string(ToString(provider));
+    if (!IsValidLivestreamServerUrl(destination.serverUrl)) {
+        return providerName +
+            " server address is missing or is not a valid RTMP/RTMPS URL.";
+    }
+    if (!IsValidStreamKey(destination.streamKey)) {
+        return providerName + " stream key has not been configured.";
+    }
+    return ValidateLivestreamEncodingForProvider(provider, profile, destination);
 }
 
 ValidationResult ValidateAndRepair(SettingsDocument& settings) {
@@ -185,60 +330,84 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
         preview::ValidPreviewFrameRate(settings.preview.floorFramesPerSecond));
     repairPreviewChoice(settings.preview.floatingFramesPerSecond, defaults.preview.floatingFramesPerSecond,
         preview::ValidPreviewFrameRate(settings.preview.floatingFramesPerSecond));
-    RepairEnum(
-        settings.recording.backend,
-        RecordingBackend::Hollywood,
-        RecordingBackend::DirectFfmpegHardware,
-        defaults.recording.backend,
-        result);
-    RepairEnum(
-        settings.recording.resolution,
-        RecordingResolution::P720,
-        RecordingResolution::P1440,
-        defaults.recording.resolution,
-        result);
-    if (settings.recording.framesPerSecond != 30 && settings.recording.framesPerSecond != 60) {
-        settings.recording.framesPerSecond = defaults.recording.framesPerSecond;
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    RepairRange(settings.recording.bitrateBitsPerSecond, 500'000, 80'000'000,
-                defaults.recording.bitrateBitsPerSecond, result);
-    RepairRange(settings.recording.peakBitrateBitsPerSecond, 500'000, 100'000'000,
-                defaults.recording.peakBitrateBitsPerSecond, result);
-    if (settings.recording.peakBitrateBitsPerSecond < settings.recording.bitrateBitsPerSecond) {
-        settings.recording.peakBitrateBitsPerSecond = settings.recording.bitrateBitsPerSecond;
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    RepairEnum(
-        settings.recording.rateControl,
-        RateControlMode::ConstantBitrate,
-        RateControlMode::VariableBitrate,
-        defaults.recording.rateControl,
-        result);
-    RepairEnum(
-        settings.recording.encoderPriority,
-        EncoderPriority::Performance,
-        EncoderPriority::Quality,
-        defaults.recording.encoderPriority,
-        result);
-    RepairEnum(
-        settings.recording.h264Profile,
-        H264Profile::Automatic,
-        H264Profile::High,
-        defaults.recording.h264Profile,
-        result);
-    RepairEnum(
-        settings.recording.h264Level,
-        H264Level::Automatic,
-        H264Level::L50,
-        defaults.recording.h264Level,
-        result);
-    RepairRange(settings.recording.keyframeIntervalSeconds, 1, 10,
-                defaults.recording.keyframeIntervalSeconds, result);
-    RepairRange(settings.recording.audioBitrateBitsPerSecond, 64'000, 320'000,
-                defaults.recording.audioBitrateBitsPerSecond, result);
+    const auto repairOutputProfile = [&result](
+        RecordingProfileSettings& profile,
+        const RecordingProfileSettings& fallback) {
+        RepairEnum(profile.resolution, RecordingResolution::P720,
+                   RecordingResolution::P1440, fallback.resolution, result);
+        if (profile.framesPerSecond != 30 && profile.framesPerSecond != 60) {
+            profile.framesPerSecond = fallback.framesPerSecond;
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        RepairRange(profile.bitrateBitsPerSecond, 500'000, 80'000'000,
+                    fallback.bitrateBitsPerSecond, result);
+        RepairRange(profile.peakBitrateBitsPerSecond, 500'000, 100'000'000,
+                    fallback.peakBitrateBitsPerSecond, result);
+        if (profile.peakBitrateBitsPerSecond < profile.bitrateBitsPerSecond) {
+            profile.peakBitrateBitsPerSecond = profile.bitrateBitsPerSecond;
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        RepairEnum(profile.rateControl, RateControlMode::ConstantBitrate,
+                   RateControlMode::VariableBitrate, fallback.rateControl, result);
+        RepairEnum(profile.encoderPriority, EncoderPriority::Performance,
+                   EncoderPriority::Quality, fallback.encoderPriority, result);
+        RepairEnum(profile.h264Profile, H264Profile::Automatic,
+                   H264Profile::High, fallback.h264Profile, result);
+        RepairEnum(profile.h264Level, H264Level::Automatic,
+                   H264Level::L50, fallback.h264Level, result);
+        RepairRange(profile.keyframeIntervalSeconds, 1, 10,
+                    fallback.keyframeIntervalSeconds, result);
+        RepairRange(profile.audioBitrateBitsPerSecond, 64'000, 320'000,
+                    fallback.audioBitrateBitsPerSecond, result);
+        RepairFloat(profile.gameAudioVolumePercent, 0.0F, 200.0F,
+                    fallback.gameAudioVolumePercent, result);
+        RepairFloat(profile.microphoneVolumePercent, 0.0F, 200.0F,
+                    fallback.microphoneVolumePercent, result);
+
+        auto& audio = profile.audio;
+        const auto& defaultAudio = fallback.audio;
+        RepairEnum(audio.microphoneMode, MicrophoneMode::Open,
+                   MicrophoneMode::VoiceActivated, defaultAudio.microphoneMode, result);
+        RepairEnum(audio.pushToTalkHand, PushToTalkHand::Left,
+                   PushToTalkHand::Either, defaultAudio.pushToTalkHand, result);
+        RepairFloat(audio.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
+                    defaultAudio.pushToTalkReleaseMilliseconds, result);
+        RepairFloat(audio.gateOpenThresholdDb, -60.0F, -5.0F,
+                    defaultAudio.gateOpenThresholdDb, result);
+        RepairFloat(audio.gateCloseThresholdDb, -90.0F, -5.0F,
+                    defaultAudio.gateCloseThresholdDb, result);
+        if (audio.gateCloseThresholdDb > audio.gateOpenThresholdDb) {
+            audio.gateCloseThresholdDb = audio.gateOpenThresholdDb - 3.0F;
+            result.changed = true;
+            ++result.repairedFields;
+        }
+        RepairFloat(audio.gateAttackMilliseconds, 1.0F, 100.0F,
+                    defaultAudio.gateAttackMilliseconds, result);
+        RepairFloat(audio.gateHoldMilliseconds, 0.0F, 1000.0F,
+                    defaultAudio.gateHoldMilliseconds, result);
+        RepairFloat(audio.gateReleaseMilliseconds, 10.0F, 2000.0F,
+                    defaultAudio.gateReleaseMilliseconds, result);
+        RepairFloat(audio.gatePreRollMilliseconds, 0.0F, 80.0F,
+                    defaultAudio.gatePreRollMilliseconds, result);
+        RepairFloat(audio.compressorThresholdDb, -60.0F, 0.0F,
+                    defaultAudio.compressorThresholdDb, result);
+        RepairFloat(audio.compressorRatio, 1.0F, 20.0F,
+                    defaultAudio.compressorRatio, result);
+        RepairFloat(audio.compressorAttackMilliseconds, 1.0F, 200.0F,
+                    defaultAudio.compressorAttackMilliseconds, result);
+        RepairFloat(audio.compressorReleaseMilliseconds, 10.0F, 2000.0F,
+                    defaultAudio.compressorReleaseMilliseconds, result);
+        RepairFloat(audio.compressorMakeupDb, -12.0F, 24.0F,
+                    defaultAudio.compressorMakeupDb, result);
+        RepairFloat(audio.limiterCeilingDb, -12.0F, 0.0F,
+                    defaultAudio.limiterCeilingDb, result);
+        RepairFloat(audio.limiterReleaseMilliseconds, 10.0F, 2000.0F,
+                    defaultAudio.limiterReleaseMilliseconds, result);
+    };
+    repairOutputProfile(settings.recording.local, defaults.recording.local);
+    repairOutputProfile(settings.recording.livestream, defaults.recording.livestream);
     RepairVector(
         settings.recording.worldControlsPosition,
         defaults.recording.worldControlsPosition,
@@ -292,6 +461,12 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
             result.changed = true;
             ++result.repairedFields;
         }
+        RepairRange(
+            destination.maximumVideoBitrateBitsPerSecond,
+            500'000,
+            80'000'000,
+            defaultDestination.maximumVideoBitrateBitsPerSecond,
+            result);
     }
     const auto safeIdentifier = [](std::string_view value, std::size_t maximum) {
         return value.size() <= maximum &&
@@ -379,66 +554,6 @@ ValidationResult ValidateAndRepair(SettingsDocument& settings) {
                 defaults.broadcast.reconnectAttempts, result);
     RepairRange(settings.broadcast.reconnectInitialDelaySeconds, 1, 30,
                 defaults.broadcast.reconnectInitialDelaySeconds, result);
-    RepairFloat(
-        settings.broadcast.gameAudioVolumePercent,
-        0.0F,
-        200.0F,
-        defaults.broadcast.gameAudioVolumePercent,
-        result);
-    RepairFloat(
-        settings.broadcast.microphoneVolumePercent,
-        0.0F,
-        200.0F,
-        defaults.broadcast.microphoneVolumePercent,
-        result);
-    RepairEnum(settings.audio.microphoneMode, MicrophoneMode::Open,
-               MicrophoneMode::VoiceActivated, defaults.audio.microphoneMode, result);
-    RepairEnum(settings.audio.pushToTalkHand, PushToTalkHand::Left,
-               PushToTalkHand::Either, defaults.audio.pushToTalkHand, result);
-    RepairFloat(settings.audio.pushToTalkReleaseMilliseconds, 10.0F, 500.0F,
-                defaults.audio.pushToTalkReleaseMilliseconds, result);
-    // The Audio page now exposes one three-state routing selector rather than
-    // two contradictory switches. "Neither" has no selectable representation;
-    // the microphone master switch is the single control for disabling all
-    // capture, so legacy neither-route documents migrate to the safe default.
-    if (!settings.audio.includeMicrophoneInRecordings &&
-            !settings.audio.includeMicrophoneInLivestreams) {
-        settings.audio.includeMicrophoneInRecordings = true;
-        settings.audio.includeMicrophoneInLivestreams = true;
-        result.changed = true;
-        result.repairedFields += 2;
-    }
-    RepairFloat(settings.audio.gateOpenThresholdDb, -60.0F, -5.0F,
-                defaults.audio.gateOpenThresholdDb, result);
-    RepairFloat(settings.audio.gateCloseThresholdDb, -90.0F, -5.0F,
-                defaults.audio.gateCloseThresholdDb, result);
-    if (settings.audio.gateCloseThresholdDb > settings.audio.gateOpenThresholdDb) {
-        settings.audio.gateCloseThresholdDb = settings.audio.gateOpenThresholdDb - 3.0F;
-        result.changed = true;
-        ++result.repairedFields;
-    }
-    RepairFloat(settings.audio.gateAttackMilliseconds, 1.0F, 100.0F,
-                defaults.audio.gateAttackMilliseconds, result);
-    RepairFloat(settings.audio.gateHoldMilliseconds, 0.0F, 1000.0F,
-                defaults.audio.gateHoldMilliseconds, result);
-    RepairFloat(settings.audio.gateReleaseMilliseconds, 10.0F, 2000.0F,
-                defaults.audio.gateReleaseMilliseconds, result);
-    RepairFloat(settings.audio.gatePreRollMilliseconds, 0.0F, 80.0F,
-                defaults.audio.gatePreRollMilliseconds, result);
-    RepairFloat(settings.audio.compressorThresholdDb, -60.0F, 0.0F,
-                defaults.audio.compressorThresholdDb, result);
-    RepairFloat(settings.audio.compressorRatio, 1.0F, 20.0F,
-                defaults.audio.compressorRatio, result);
-    RepairFloat(settings.audio.compressorAttackMilliseconds, 1.0F, 200.0F,
-                defaults.audio.compressorAttackMilliseconds, result);
-    RepairFloat(settings.audio.compressorReleaseMilliseconds, 10.0F, 2000.0F,
-                defaults.audio.compressorReleaseMilliseconds, result);
-    RepairFloat(settings.audio.compressorMakeupDb, -12.0F, 24.0F,
-                defaults.audio.compressorMakeupDb, result);
-    RepairFloat(settings.audio.limiterCeilingDb, -12.0F, 0.0F,
-                defaults.audio.limiterCeilingDb, result);
-    RepairFloat(settings.audio.limiterReleaseMilliseconds, 10.0F, 2000.0F,
-                defaults.audio.limiterReleaseMilliseconds, result);
     RepairEnum(settings.tts.outputRoute, TtsOutputRoute::HeadsetOnly,
                TtsOutputRoute::HeadsetAndBroadcast, defaults.tts.outputRoute, result);
     RepairRange(settings.tts.maximumCharacters, 32, 500,
@@ -568,6 +683,17 @@ bool Migrate(SettingsDocument& settings, std::uint32_t sourceSchemaVersion) {
         settings.chat.fontSize = 4.6F;
     }
 
+    if (sourceSchemaVersion < 37) {
+        // Schema 36 selected exactly one provider. Preserve that behavior by
+        // enabling only the previously selected service. The new destinations
+        // remain opt-in instead of unexpectedly broadcasting an existing key.
+        for (const auto provider : kLivestreamProviders) {
+            DestinationForProvider(settings.broadcast, provider).enabled = false;
+        }
+        DestinationForProvider(
+            settings.broadcast, settings.broadcast.provider).enabled = true;
+    }
+
     // Earlier versions otherwise map directly; newly introduced fields retain
     // their safe defaults.
     settings.schemaVersion = kCurrentSchemaVersion;
@@ -603,14 +729,6 @@ std::string_view SubsystemName(Subsystem subsystem) {
         case Subsystem::Chat: return "Chat";
     }
     return "Unknown";
-}
-
-std::string_view ToString(RecordingBackend value) noexcept {
-    switch (value) {
-        case RecordingBackend::Hollywood: return "hollywood";
-        case RecordingBackend::DirectFfmpegHardware: return "direct_ffmpeg_hardware";
-    }
-    return "hollywood";
 }
 
 std::string_view ToString(RecordingResolution value) noexcept {
@@ -701,11 +819,6 @@ std::string_view ToString(TtsOutputRoute value) noexcept {
 #define SABERSTAGE_PARSE_ENUM_CASE(text, member) \
     if (value == text) { result = member; return true; }
 
-bool TryParse(std::string_view value, RecordingBackend& result) noexcept {
-    SABERSTAGE_PARSE_ENUM_CASE("hollywood", RecordingBackend::Hollywood)
-    SABERSTAGE_PARSE_ENUM_CASE("direct_ffmpeg_hardware", RecordingBackend::DirectFfmpegHardware)
-    return false;
-}
 bool TryParse(std::string_view value, RecordingResolution& result) noexcept {
     SABERSTAGE_PARSE_ENUM_CASE("720p", RecordingResolution::P720)
     SABERSTAGE_PARSE_ENUM_CASE("1080p", RecordingResolution::P1080)

@@ -309,10 +309,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("twitchAuthorizationAwaitingCompletion_", menu)
         self.assertIn("if (twitchAuthorizationModal_) twitchAuthorizationModal_->Hide();", menu)
         self.assertIn('"Twitch account connected.\\n\\nSigned in as " + twitch.login', menu)
-        self.assertIn('recordingView_, {52.0F, 22.0F}', menu)
+        self.assertIn('modalParent, {52.0F, 22.0F}', menu)
         self.assertNotIn("client_secret", service.lower())
         self.assertNotIn("Twitch App Client ID", menu)
-        self.assertIn("no Client ID or secret entry is required", menu)
+        self.assertIn('"Connect Twitch Account"', menu)
         self.assertIn("pendingLiveTwitchTitleUpdate_", menu)
         self.assertIn("update the active stream without ending it", menu)
 
@@ -475,7 +475,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_chat_virtual_content_has_one_layout_owner_and_visible_native_controls(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         chat = menu[menu.index("void MenuController::EnsureChatWorldPanel()"):
-                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
+                    menu.index("void MenuController::ShowRecordingTab(")]
         self.assertIn("disableContentLayout(scrollContent)", chat)
         self.assertIn("disableContentLayout(outerContent->get_gameObject())", chat)
         self.assertIn("GetComponent<BSML::ScrollViewContent*>()", chat)
@@ -506,7 +506,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_idle_chat_does_not_reassign_sprite_assets_at_headset_rate(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
+                    menu.index("void MenuController::ShowRecordingTab(")]
         # TMP's setter dirties geometry/layout even when the pointer is unchanged.
         # Atlas revision changes already enter the bounded reflow/reuse path.
         self.assertNotIn("set_spriteAsset(", tick)
@@ -731,7 +731,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_chat_missing_pointer_does_not_abort_message_processing(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
+                    menu.index("void MenuController::ShowRecordingTab(")]
         input_path = tick[tick.index('SetOperation("read current UI event system")'):
                           tick.index('SetOperation("assign native chat scroll hover state")')]
         self.assertIn("if (eventSystem)", input_path)
@@ -745,7 +745,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_chat_hover_wakes_native_scroll_without_button_selection(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         tick = menu[menu.index("void MenuController::TickChatWorldPanel() noexcept"):
-                    menu.index("void MenuController::ApplyLivestreamReferenceLayout(")]
+                    menu.index("void MenuController::ShowRecordingTab(")]
         hover = tick[tick.index('SetOperation("assign native chat scroll hover state")'):
                      tick.index("// The stock BSML scroll control")]
         # HMUI stops its Update when idle. A hover flag alone cannot restart it;
@@ -832,7 +832,8 @@ class RepositoryInvariantTests(unittest.TestCase):
             },
         )
         dependencies = {item["id"] for item in qpm["dependencies"]}
-        self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types", "hollywood"} <= dependencies)
+        self.assertTrue({"beatsaber-hook", "scotland2", "bsml", "custom-types"} <= dependencies)
+        self.assertNotIn("hollywood", dependencies)
         self.assertNotIn("paper2_scotland2", dependencies)
 
     def test_device_reset_fixture_has_only_planned_nondefaults(self):
@@ -894,18 +895,18 @@ class RepositoryInvariantTests(unittest.TestCase):
         pause_menu = (ROOT / "src/ui/PauseMenuRecordingControls.cpp").read_text(encoding="utf-8")
         main = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
         camera = (ROOT / "src/camera/CameraManager.cpp").read_text(encoding="utf-8")
-        self.assertIn("Hollywood::CameraCapture", controller)
         self.assertIn("RealtimeAudioCapture", controller)
         self.assertIn("DirectFfmpegCapture", controller)
         self.assertIn("MuxSaberStageRecording", controller)
-        self.assertNotIn("Hollywood::MuxFilesSync", controller)
+        self.assertNotIn("Hollywood::", controller)
+        self.assertNotIn("RecordingBackend", controller)
         self.assertIn("RecordingState::Armed", controller)
         self.assertIn("settings_.Get().recording.gameplayOnly", controller)
         self.assertIn("gameplayOnlySession_", controller)
         self.assertIn('name == "GameCore"', controller)
         self.assertIn('kRecordingDemandId = "recording"', controller)
         self.assertIn("BeginExternalRenderOutput", controller)
-        self.assertIn("SetExternalOutputTexture(videoCapture_->texture)", controller)
+        self.assertIn("SetExternalOutputTexture(directVideoCapture_->texture)", controller)
         self.assertIn('".partial.h264"', controller)
         self.assertIn('".partial.wav"', controller)
         self.assertIn('".partial.mp4"', controller)
@@ -936,7 +937,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("StopVideoSegment()", controller)
         self.assertIn("accumulatedPaused_", (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8"))
 
-    def test_direct_capture_reports_each_pipeline_stage_and_falls_back_before_saving_empty_video(self):
+    def test_direct_capture_reports_each_pipeline_stage_and_stops_before_saving_empty_video(self):
         direct = (ROOT / "src/recording/DirectFfmpegCapture.cpp").read_text(encoding="utf-8")
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         header = (ROOT / "include/saberstage/recording/DirectFfmpegCapture.hpp").read_text(encoding="utf-8")
@@ -951,9 +952,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("result == AVERROR(EAGAIN)", direct)
         self.assertIn("continue;", direct)
         self.assertIn("HandleDirectCaptureHealth", controller)
-        self.assertIn("StopVideoSegment(false)", controller)
-        self.assertIn("activeBackend_ = settings::RecordingBackend::Hollywood", controller)
-        self.assertIn("Direct encoder was unavailable; recording is continuing with Hollywood.", controller)
+        self.assertIn('Stop("Direct video encoder failed.")', controller)
+        self.assertNotIn("RecordingBackend", controller)
+        self.assertNotIn("Hollywood::", controller)
         self.assertIn("Capture stream finalization check", controller)
 
     def test_recording_buttons_have_explicit_native_layout_size(self):
@@ -1047,7 +1048,7 @@ class RepositoryInvariantTests(unittest.TestCase):
     def test_movable_recording_panel_is_compact_persistent_and_capture_excluded(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
         settings = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
-        self.assertIn('"Floating Recording Controls"', menu)
+        self.assertIn('"Recording Control Mode"', menu)
         # The floating panel selects one output mode and exposes explicit text
         # buttons; world-space hover hints previously rendered as blank boxes,
         # so explanations remain in the ordinary menu rather than this panel.
@@ -1071,17 +1072,18 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("recordingWorldPanelHmdTotalFrameSeconds_", menu)
         # A thin full-panel movement collider sits behind the UI. Buttons and
         # toggles remain the nearer hit targets while uncovered black backdrop
-        # regions can move the panel. The panel remains height-variant.
+        # regions can move the panel. FPS is a permanent row, so the panel has
+        # one stable height and never shifts while the player is using it.
         self.assertIn("HideAndFitWorldPanelHandleBehindContent", menu)
         self.assertIn("RecordingPanelSize(", menu)
         self.assertIn("kRecordingPanelButtonBandHeight", menu)
-        self.assertIn('"Panel FPS Counters"', menu)
+        self.assertNotIn('"Panel FPS Counters"', menu)
         self.assertIn("encodedFrameCount", menu)
         self.assertIn("RegisterCaptureExcludedRoot(screenObject)", menu)
         self.assertNotIn("SaberStage Recording Grab Bar", menu)
         self.assertNotIn("HideAndPlaceWorldPanelHandleInPadding", menu)
-        self.assertIn('"worldControlsVisible"', settings)
-        self.assertIn('"worldControlsShowFps"', settings)
+        self.assertNotIn('"worldControlsVisible"', settings)
+        self.assertNotIn('"worldControlsShowFps"', settings)
         self.assertIn('"worldControlsStreamMode"', settings)
         self.assertIn('"worldControlsPosition"', settings)
         self.assertIn('"worldControlsRotationDegrees"', settings)
@@ -1109,6 +1111,52 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertGreaterEqual(menu.count("->get_gameObject()->SetActive(true)"), 2)
         self.assertIn("recordingWorldPanelGameAudioButton_->set_interactable(true)", menu)
         self.assertIn("recordingWorldPanelMicrophoneButton_->set_interactable(true)", menu)
+
+    def test_general_tab_and_world_panel_share_mode_and_dynamic_tabs(self):
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "include/saberstage/ui/MenuController.hpp").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("constexpr int kCenterGeneralPage = 0", menu)
+        self.assertIn("constexpr int kCenterAudioPage = 6", menu)
+        self.assertIn("constexpr int kCenterTtsPage = 7", menu)
+        self.assertNotIn('"Overview"', menu)
+        self.assertIn("std::array<UnityEngine::GameObject*, 10> centerDebugTabViewRoots_", header)
+        self.assertIn("std::array<UnityEngine::GameObject*, 10> centerDebugTabContentRoots_", header)
+        self.assertIn("std::vector<int> visibleCenterTabPageIndices_", header)
+        self.assertIn("generalRecordingModeToggle_", header)
+        self.assertIn('makeSection(generalPage, "Recording Control Mode")', menu)
+        self.assertIn('recordingModeRow->get_transform(), "Record"', menu)
+        self.assertIn('recordingModeRow->get_transform(), "Stream"', menu)
+        self.assertIn('"Gameplay Only"', menu)
+        self.assertIn('"Game Audio"', menu)
+        self.assertIn('"Mic Enabled"', menu)
+
+        setter = menu.split(
+            "void MenuController::SetRecordingWorldPanelStreamMode(bool streamMode)", 1
+        )[1].split("void MenuController::ResetRecordingWorldPanelPose()", 1)[0]
+        self.assertIn("settings.worldControlsStreamMode = streamMode", setter)
+        self.assertIn("synchronizingRecordingModeControls_", setter)
+        self.assertIn("RefreshRecordingModeControls()", setter)
+
+        synchronization = menu.split(
+            "void MenuController::RefreshRecordingModeControls(", 1
+        )[1].split("void MenuController::ShowSettingsTab", 1)[0]
+        self.assertIn("synchronizeToggle(generalRecordingModeToggle_)", synchronization)
+        self.assertIn("synchronizeToggle(recordingWorldPanelModeToggle_)", synchronization)
+        self.assertIn("setting->toggle->set_isOn(streamMode)", synchronization)
+        self.assertIn("generalLocalRecordingContentRoot_->SetActive(!streamMode)", synchronization)
+        self.assertIn("RebuildCenterTabStrip()", synchronization)
+
+        tab_strip = menu.split(
+            "void MenuController::RebuildCenterTabStrip()", 1
+        )[1].split("void MenuController::RefreshLivestreamDestinationVisibility", 1)[0]
+        self.assertIn('std::vector<std::string_view> tabNames{"General"}', tab_strip)
+        self.assertIn('addTab("Twitch", kCenterTwitchPage)', tab_strip)
+        self.assertIn('if (microphoneEnabled) addTab("Audio", kCenterAudioPage)', tab_strip)
+        self.assertIn('if (streamMode) addTab("Chat TTS", kCenterTtsPage)', tab_strip)
+        self.assertIn("visibleCenterTabPageIndices_[visibleIndex]", tab_strip)
 
     def test_recording_panel_retains_unused_icon_variants_and_guards_white_fallback(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
@@ -1427,111 +1475,80 @@ class RepositoryInvariantTests(unittest.TestCase):
                        source.index("void ApplySettings()")]
         self.assertIn("auto reset = settings_.Get().preview;", reset)
 
-    def test_recording_side_panel_overrides_center_panel_prefab_widths(self):
+    def test_service_configuration_is_grouped_in_center_tabs(self):
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        self.assertIn("layout->set_preferredWidth(kRightPanelRowWidth)", menu)
-        self.assertIn(
-            "active_->livestreamKeyInput_, 512, kRightPanelRowWidth - 10.0F",
-            menu,
+        header = (ROOT / "include/saberstage/ui/MenuController.hpp").read_text(
+            encoding="utf-8"
         )
-        self.assertIn('CreateUIButton(\n        streamKeyInputRow, "Set"', menu)
-        self.assertIn('CreateUIButton(\n        serverInputRow, "Set"', menu)
+
+        self.assertIn("const auto makeServicePage =", menu)
+        self.assertIn("makeServicePage(settings::LivestreamProvider::Twitch, 1);", menu)
+        self.assertIn("makeServicePage(settings::LivestreamProvider::Kick, 2);", menu)
+        self.assertIn("makeServicePage(settings::LivestreamProvider::YouTube, 3);", menu)
+        self.assertIn("makeServicePage(settings::LivestreamProvider::Custom, 4);", menu)
+        self.assertIn('makeSection(page, providerName + " Streaming")', menu)
+        self.assertIn('makeSection(details->get_gameObject(), "Connection")', menu)
+        self.assertIn('"Enable " + providerName', menu)
+        self.assertIn('serverTile.controls->get_gameObject(), "Set"', menu)
+        self.assertIn('keyTile.controls->get_gameObject(), "Set"', menu)
         self.assertIn('CreateUIButton(actions, "Use Once"', menu)
         self.assertIn('CreateUIButton(actions, "Save in Settings"', menu)
-        self.assertIn('CreateRightPanelSubheader(livestreamPage->get_transform(), "Server Address")', menu)
-        self.assertIn('CreateRightPanelSubheader(livestreamPage->get_transform(), "Stream Key")', menu)
         self.assertIn('"Show Stream Key"', menu)
         self.assertIn("display.assign(display.size(), '*')", menu)
-        self.assertIn("ShowLivestreamActionError(error)", menu)
         self.assertIn(
-            "broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured",
-            menu,
+            "std::array<HMUI::InputFieldView*, 4> livestreamServerInputs_", header
         )
-        self.assertNotIn(
-            "broadcast::CanStart(livestream.state) && livestream.streamKeyConfigured &&",
-            menu,
+        self.assertIn(
+            "std::array<HMUI::InputFieldView*, 4> livestreamKeyInputs_", header
         )
-        self.assertIn("rows->set_childForceExpandWidth(false)", menu)
-        self.assertIn("scroll->set_sizeDelta({0.0F, -13.0F})", menu)
-        self.assertIn("BSML::SliderSetting* ConstrainRightPanelRow", menu)
-        self.assertIn("kRightPanelLabelFraction", menu)
-        self.assertIn("constexpr float kRightPanelRowWidth = 54.0F", menu)
-        # Preserve the page's native centered placement. Live Stream now sizes
-        # its other rows from Service's actual outer row on tab activation;
-        # changing the page to UpperLeft would move that fixed reference too.
-        self.assertIn("rows->set_childAlignment(UnityEngine::TextAnchor::UpperCenter)", menu)
-        self.assertNotIn("LeftAlignLivestreamSettingRows", menu)
-        self.assertIn("FitRectToParentRegion(", menu)
-        self.assertIn('livestreamTransport, "Start Stream", "PlayButton"', menu)
-        self.assertIn('livestreamTransport, "Stop Stream", "PlayButton"', menu)
-        self.assertIn("ConfigureRightPanelButton(active_->startRecordingButton_)", menu)
+        self.assertIn(
+            "std::array<UnityEngine::GameObject*, 4> livestreamDestinationContentRoots_",
+            header,
+        )
+        self.assertIn("details->get_gameObject()->SetActive(initialDestination.enabled)", menu)
+        self.assertIn("RefreshLivestreamDestinationVisibility(provider)", menu)
+        destination_visibility = menu.split(
+            "void MenuController::RefreshLivestreamDestinationVisibility(", 1
+        )[1].split("void MenuController::RefreshRecordingModeControls", 1)[0]
+        self.assertIn("details->SetActive(enabled)", destination_visibility)
+        # Provider credentials no longer live in the narrow right-side
+        # transport/status panel.
+        right_panel = menu[menu.index("void MenuController::BuildRecordingPanel("):
+                           menu.index("void MenuController::SetEditorPreviewActive(")]
+        self.assertNotIn("CreateStringSetting", right_panel)
+        self.assertNotIn('"Server Address"', right_panel)
+        self.assertNotIn('"Stream Key"', right_panel)
 
-    def test_livestream_layout_uses_untouched_service_outer_row(self):
+    def test_livestream_preflight_and_runtime_failures_are_provider_isolated(self):
+        controller = (ROOT / "src/recording/RecordingController.cpp").read_text(
+            encoding="utf-8"
+        )
+        sink = (ROOT / "src/broadcast/DirectLivestreamSink.cpp").read_text(
+            encoding="utf-8"
+        )
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        reference_start = menu.index("    auto* provider = WithHint")
-        reference_end = menu.index(
-            "    active_->livestreamProviderFeatureText_ = BSML::Lite::CreateText",
-            reference_start,
+        header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(
+            encoding="utf-8"
         )
-        # The user explicitly froze this reference widget. Catch accidental
-        # changes to its creation, constraints or event setup in later fixes.
-        self.assertEqual(
-            hashlib.sha256(menu[reference_start:reference_end].encode()).hexdigest(),
-            "f3e165787f6c4a348777db640b7af82caf881216b6ebce44d22e0cbd6e02947b",
-        )
-        apply = menu.split("void MenuController::ApplyLivestreamReferenceLayout()", 1)[1]
-        apply = apply.split("void MenuController::ShowRecordingTab", 1)[0]
-        self.assertIn("reference->get_parent() != content", apply)
-        self.assertIn('reference->Find("Label")', apply)
-        self.assertIn("referenceBounds.get_width()", apply)
-        self.assertIn("label->get_margin().x", apply)
-        self.assertIn("selectorBounds.get_xMax()", apply)
-        self.assertEqual(apply.count("if (child == reference) continue;"), 2)
-        self.assertLess(
-            apply.index("SetLivestreamRowWidth(child->get_gameObject(), rowWidth)"),
-            apply.index("FitLivestreamActionRow(group, rowWidth, leftInset, rightInset)"),
-        )
-        self.assertNotIn("kRightPanelRowWidth", apply)
-        self.assertNotIn("referenceRect->set_", apply)
-        self.assertNotIn("labelRect->set_", apply)
-        self.assertNotIn("selectorRect->set_", apply)
-        self.assertIn("margin.x = leftInset", apply)
-        self.assertIn("margin.z = rightInset", apply)
-        self.assertIn("slider->slider->UpdateVisuals()", apply)
-        horizontal = menu.split("void FitLivestreamHorizontalSpan(", 1)[1]
-        horizontal = horizontal.split("void FitLivestreamToggle", 1)[0]
-        self.assertIn("anchorMin.x = 0.0F", horizontal)
-        self.assertIn("offsetMax.x = -rightInset", horizontal)
-        self.assertNotIn(".y =", horizontal)
-        # This is a one-time tab-entry layout, not work repeated by every UI
-        # tick, chat message, audio slider callback or stream-status refresh.
-        self.assertEqual(menu.count("ApplyLivestreamReferenceLayout();"), 1)
-        show = menu.split("void MenuController::ShowRecordingTab(int index)", 1)[1]
-        self.assertIn("if (selectedRecordingTab_ == 1) ApplyLivestreamReferenceLayout();", show)
-        self.assertLess(show.index("SetActive("), show.index("ApplyLivestreamReferenceLayout();"))
 
-    def test_livestream_action_groups_fit_inside_service_content_edges(self):
-        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        fit = menu.split("void FitLivestreamActionRow(", 1)[1]
-        fit = fit.split("std::string Lower", 1)[0]
-        self.assertIn("std::lround(leftInset)", fit)
-        self.assertIn("std::lround(rightInset)", fit)
-        self.assertIn("rowWidth - leftPadding - rightPadding", fit)
-        self.assertIn("SetLivestreamRowWidth(object, width)", fit)
-        self.assertIn("FitLivestreamToggle(toggle, 0.0F, 0.0F)", fit)
-        # Single-action rows also need a Service-width outer group; widening
-        # the button itself to that group width would cover the native insets.
-        for name, caption in (
-            ("titleActions", "Set Stream Title"),
-            ("chooseAfkActions", "Choose AFK Picture or GIF"),
-            ("builtInAfkActions", "Use Built-in AFK Screen"),
-            ("clearKeyActions", "Clear Stream Key"),
-        ):
-            self.assertIn(
-                f"auto* {name} = CreateRightPanelInputActionRow(livestreamPage->get_transform());",
-                menu,
-            )
-            self.assertIn(f'{name}, "{caption}"', menu)
+        self.assertIn("livestreamSinks_", header)
+        self.assertIn("for (const auto provider : settings::kLivestreamProviders)", controller)
+        self.assertIn("ValidateLivestreamProfileForProvider", controller)
+        self.assertIn("safeUpload", controller)
+        self.assertIn("aggregateRate", controller)
+        self.assertIn("LivestreamDestinationSnapshot", controller)
+        self.assertIn("ObserveLivestreamDestinationFailures", menu)
+        self.assertIn("deferredLivestreamFailureMessages_", menu)
+        self.assertIn("if (!IsGameplaySceneActive()", menu)
+        # A failed provider's worker has exited. Shared encoder/audio packets
+        # must be rejected by that dead sink while the other sinks continue.
+        self.assertGreaterEqual(
+            sink.count("!CanStop(state_.load(std::memory_order_acquire))"), 2
+        )
+        self.assertIn(
+            "const auto streamOutput = AnyLivestreamSinkActive(livestreamSinks_)",
+            controller,
+        )
 
     def test_livestream_uses_ffmpeg_native_annex_b_to_flv_conversion(self):
         sink = (ROOT / "src/broadcast/DirectLivestreamSink.cpp").read_text(encoding="utf-8")
@@ -1549,7 +1566,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         audio = (ROOT / "src/recording/RealtimeAudioCapture.cpp").read_text(encoding="utf-8")
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        self.assertIn("StartCapture(error, true, true, false)", controller)
+        self.assertIn(
+            "StartCapture(error, true, false, true, &recording)",
+            controller,
+        )
         self.assertIn("if (writeLocalOutput) {", controller)
         self.assertIn("audioCapture_->OpenConsumerOnly", controller)
         self.assertIn("if (videoWriter_ && !videoWriter_->TrySubmit", controller)
@@ -1563,7 +1583,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
 
-        self.assertIn("StartCapture(error, true, true, false, true)", controller)
+        self.assertIn("StartCapture(error, true, false, true, &recording)", controller)
+        self.assertIn("SameVideoProfile(activeProfileSettings_, recording)", controller)
         self.assertIn("discordScreenSink_->SubmitVideo(packet)", controller)
         self.assertIn("discordScreenSink_->SubmitAudio(", controller)
         self.assertIn("CreatePersistentAudioCapture();", controller)
@@ -1613,8 +1634,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("restoreValue", controller)
         self.assertIn('"Keep Headset Awake"', menu)
         self.assertIn("broadcast.keepHeadsetAwake", menu)
-        self.assertIn("Hollywood::SetScreenOn(true)", controller)
-        self.assertIn("Hollywood::SetScreenOn(false)", controller)
+        self.assertIn("SetQuestDisplayWakeGuard(true)", controller)
+        self.assertIn("SetQuestDisplayWakeGuard(false)", controller)
+        self.assertIn('"addFlags"', controller)
+        self.assertIn('"clearFlags"', controller)
         self.assertIn("livestreamProximityGuardActive_", header)
 
     def test_shared_microphone_and_tts_mix_is_bounded_and_permission_aware(self):
@@ -1635,21 +1658,22 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("livestreamMicrophoneScratch_", header)
         self.assertIn("ttsMixScratch_", header)
         self.assertIn("SubmitLivestreamAudioLocked", controller)
-        self.assertIn("microphoneDsp_.Process", controller)
+        self.assertIn("localMicrophoneDsp_.Process", controller)
+        self.assertIn("livestreamMicrophoneDsp_.Process", controller)
         self.assertIn("tts_.ReadBroadcast", controller)
-        self.assertIn("includeMicrophoneInRecordings", controller)
-        self.assertIn("includeMicrophoneInLivestreams", controller)
-        self.assertIn("streamGame + streamMic + speech", controller)
-        self.assertIn("localGame + localMic + speech", controller)
+        self.assertIn("localGameAudioEnabled_", controller)
+        self.assertIn("livestreamGameAudioEnabled_", controller)
+        self.assertIn("streamGame + mixedStreamMic + speech", controller)
+        self.assertIn("localGame + mixedLocalMic + speech", controller)
         self.assertIn("android.permission.RECORD_AUDIO", controller)
         self.assertIn('"Game Audio"', menu)
         self.assertIn('"Game Volume"', menu)
-        self.assertIn('"Enable Quest Microphone"', menu)
+        self.assertIn('"Mic Enabled"', menu)
         self.assertIn('"Mic Volume"', menu)
         self.assertIn("without Microphone Access", menu)
         self.assertIn("repatch Beat Saber", menu)
-        self.assertIn('"Local Only", "Stream Only", "Both"', menu)
-        self.assertIn('"Mic Output"', menu)
+        self.assertIn("SelectedOutputProfile", menu)
+        self.assertNotIn('"Mic Output"', menu)
         self.assertNotIn('"Recording Mic"', menu)
         self.assertNotIn('"Streaming Mic"', menu)
         self.assertIn('"Chat TTS"', menu)
@@ -1707,8 +1731,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertNotIn("constexpr float kContentWidth = 72.0F", menu)
         self.assertIn('"PTT Release Tail (ms)"', menu)
         self.assertIn('"Release (ms)"', menu)
-        self.assertIn("SetLivestreamGameAudioVolumePercent(value)", menu)
-        self.assertIn("SetLivestreamMicrophoneVolumePercent(value)", menu)
+        self.assertIn("RefreshAudioConfiguration()", menu)
         self.assertNotIn(
             "livestreamSettingsEditable && audioMix.gameAudioEnabled", menu
         )
@@ -1741,19 +1764,23 @@ class RepositoryInvariantTests(unittest.TestCase):
             self.assertTrue((ROOT / "assets" / icon).is_file())
             self.assertIn(icon.removesuffix(".png"), cmake)
 
-    def test_twitch_is_the_only_supported_service_preset_for_now(self):
+    def test_all_builtin_and_custom_livestream_destinations_are_available(self):
+        model = (ROOT / "include/saberstage/settings/SettingsModel.hpp").read_text(
+            encoding="utf-8"
+        )
+        implementation = (ROOT / "src/settings/SettingsModel.cpp").read_text(
+            encoding="utf-8"
+        )
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        self.assertIn('"YouTube (Not Supported)"', menu)
-        self.assertIn('"Kick (Not Supported)"', menu)
-        self.assertIn(
-            "provider == settings::LivestreamProvider::YouTube ||",
-            menu,
-        )
-        self.assertIn(
-            "provider == settings::LivestreamProvider::Kick",
-            menu,
-        )
-        self.assertIn("cannot be used yet. Twitch is the first fully supported service", menu)
+
+        self.assertIn("kLivestreamProviders", model)
+        for provider in ("Twitch", "Kick", "YouTube", "Custom"):
+            self.assertIn(f"LivestreamProvider::{provider}", model)
+            self.assertIn(f"LivestreamProvider::{provider}", implementation)
+            self.assertIn(f'"{provider}"', menu)
+        self.assertIn("MaximumLivestreamVideoBitrate", implementation)
+        self.assertIn("ValidateLivestreamProfileForProvider", implementation)
+        self.assertNotIn("cannot be used yet", menu)
 
     def test_development_launchers_are_present(self):
         expected = {

@@ -16,7 +16,7 @@
 # This recipe intentionally enables no software video encoder. H.264 encoding
 # is available only through Android MediaCodec; audio uses FFmpeg's native AAC
 # encoder. The private SONAME suffix and symbol namespace keep this runtime
-# from binding to Hollywood's independently packaged FFmpeg libraries.
+# from binding to another mod's independently packaged FFmpeg libraries.
 
 set -euo pipefail
 
@@ -98,7 +98,7 @@ if [[ ! -d "${mbedtls_source}" ]]; then
 fi
 
 # Android disables ELF symbol versioning in upstream configure. SaberStage
-# enables it and assigns a private namespace so Hollywood's unversioned FFmpeg
+# enables it and assigns a private namespace so another unversioned FFmpeg
 # cannot satisfy these imports when both backends are installed.
 sed -i '/^[[:space:]]*android)$/,/^[[:space:]]*;;/ s/^[[:space:]]*disable symver$/        enable symver/' \
     "${source_root}/configure"

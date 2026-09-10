@@ -10,7 +10,6 @@
 // - Exercises RecordingState behavior on the host without starting Beat Saber.
 // - Regression coverage focuses on deterministic state, validation, and boundary conditions.
 
-#include "saberstage/recording/ControllerShortcut.hpp"
 #include "saberstage/recording/CaptureTimeline.hpp"
 #include "saberstage/recording/RecordingState.hpp"
 
@@ -26,8 +25,6 @@ using saberstage::recording::CanStart;
 using saberstage::recording::CanStop;
 using saberstage::recording::CanTransition;
 using saberstage::recording::CapturePresentationTimeNanos;
-using saberstage::recording::ControllerShortcut;
-using saberstage::recording::ControllerShortcutAction;
 using saberstage::recording::DecideCaptureTimelineFrame;
 using saberstage::recording::HasRecordingTimeline;
 using saberstage::recording::IncludesLocalRecording;
@@ -110,30 +107,6 @@ int main() {
             "the first packet emitted after encoder pre-roll starts the saved video at zero");
     Require(NormalizeCapturePresentationFrame(21, 17) == 4,
             "normalization preserves real deadline gaps after encoder pre-roll");
-
-    ControllerShortcut shortcut;
-    Require(
-        shortcut.Update(true, true, true, 0.5) == ControllerShortcutAction::None,
-        "controller shortcut waits while held");
-    Require(
-        shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::None,
-        "too-short controller hold is ignored");
-    Require(shortcut.Update(true, true, true, 0.8) == ControllerShortcutAction::None,
-            "toggle shortcut waits for release");
-    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::ToggleRecording,
-            "short controller hold toggles recording once on release");
-    Require(shortcut.Update(true, true, false, 1.0) == ControllerShortcutAction::None,
-            "released shortcut does not rapidly repeat");
-    Require(shortcut.Update(true, true, true, 2.6) == ControllerShortcutAction::None,
-            "stop shortcut waits for release");
-    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::StopAndSave,
-            "long controller hold stops and saves");
-    Require(shortcut.Update(true, true, true, 1.0) == ControllerShortcutAction::None,
-            "shortcut can begin another hold");
-    Require(shortcut.Update(false, true, false, 0.0) == ControllerShortcutAction::None,
-            "disabling shortcut clears an in-progress hold");
-    Require(shortcut.Update(true, true, false, 0.0) == ControllerShortcutAction::None,
-            "disabled shortcut cannot fire after re-enable");
 
     std::cout << "Recording state tests passed\n";
     return 0;

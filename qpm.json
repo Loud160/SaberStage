@@ -30,7 +30,6 @@
     {"id": "bs-cordl", "versionRange": "4008.*", "additionalData": {}},
     {"id": "bsml", "versionRange": "^0.4.55", "additionalData": {"includeQmod": true}},
     {"id": "custom-types", "versionRange": "^0.18.4", "additionalData": {"includeQmod": true}},
-    {"id": "hollywood", "versionRange": "^1.2.2", "additionalData": {"includeQmod": true}},
     {"id": "songcore", "versionRange": "=1.1.26", "additionalData": {"includeQmod": true}},
     {"id": "rapidjson", "versionRange": "^0.1.20250205132808", "additionalData": {}}
   ]

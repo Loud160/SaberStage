@@ -77,7 +77,7 @@ DECLARE_CLASS_CODEGEN(
 
 public:
     void Init(
-        const saberstage::settings::RecordingSettings& settings,
+        const saberstage::settings::RecordingProfileSettings& settings,
         float fieldOfViewDegrees,
         saberstage::recording::EncodedVideoCallback callback);
     void Stop() noexcept;

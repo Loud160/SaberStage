@@ -22,8 +22,8 @@ Camera2-format movement scripts, movable and floor previews, and scene/recenter
 recovery. Rendering is consumer-driven, so an unused camera does not keep
 rendering off-screen frames.
 
-Local recording supports Hollywood and SaberStage's Direct FFmpeg hardware
-path, 720p/1080p/1440p, 30/60 FPS, bitrate and codec controls, synchronized game
+Local recording uses SaberStage's Direct FFmpeg hardware path with
+720p/1080p/1440p, 30/60 FPS, bitrate and codec controls, synchronized game
 audio, pause/resume, gameplay-only mode, and uniquely named MP4 output.
 Recordings continue across ordinary menu, loading, gameplay, and results scenes
 until explicitly stopped.
@@ -34,8 +34,8 @@ backed by Android Keystore, title updates, automatic token refresh, an HMD-only
 movable chat panel, current-map announcements, AFK media, stream audio mixing,
 bounded reconnect behavior, optional OBS-style Quest microphone processing, and
 fully local bounded neural speech for messages accepted by the chat panel.
-YouTube and Kick remain visible but are
-marked unsupported. Rich Twitch chat and song-request work is still under
+Twitch, Kick, YouTube, and custom RTMP/RTMPS destinations can share one hardware
+encode while retaining independent connection state. Rich Twitch chat and song-request work is still under
 development. TTS defaults off; microphone capture requires Beat Saber to be
 patched with MBF's Microphone Access permission.
 
@@ -72,7 +72,6 @@ ownership model in [the architecture document](docs/ARCHITECTURE.md).
 - bs-cordl `4008.*`
 - BSML `^0.4.55`
 - custom-types `^0.18.4`
-- Hollywood `^1.2.2`
 - Quest SongCore `1.1.26`
 - [Native Logger Quest](https://github.com/Loud160/NativeLoggerQuest) `1.0.0`
   (SHA-pinned and statically linked)

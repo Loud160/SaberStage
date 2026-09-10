@@ -140,18 +140,29 @@ void DecodeLivestreamDestination(
         repaired = true;
         return;
     }
+    destination.enabled = Bool(*source, "enabled", destination.enabled, repaired);
     destination.serverUrl = String(*source, "serverUrl", destination.serverUrl, repaired);
     destination.streamKey = String(*source, "streamKey", destination.streamKey, repaired);
     destination.streamTitle = String(*source, "streamTitle", destination.streamTitle, repaired);
+    destination.maximumVideoBitrateBitsPerSecond = Int(
+        *source,
+        "maximumVideoBitrateBitsPerSecond",
+        destination.maximumVideoBitrateBitsPerSecond,
+        repaired);
 }
 
 Value EncodeLivestreamDestination(
     const LivestreamDestinationSettings& destination,
     Document::AllocatorType& allocator) {
     Value value(rapidjson::kObjectType);
+    value.AddMember("enabled", destination.enabled, allocator);
     value.AddMember("serverUrl", Value(destination.serverUrl.c_str(), allocator), allocator);
     value.AddMember("streamKey", Value(destination.streamKey.c_str(), allocator), allocator);
     value.AddMember("streamTitle", Value(destination.streamTitle.c_str(), allocator), allocator);
+    value.AddMember(
+        "maximumVideoBitrateBitsPerSecond",
+        destination.maximumVideoBitrateBitsPerSecond,
+        allocator);
     return value;
 }
 
@@ -240,6 +251,123 @@ Value EncodeCameraProfile(const camera::CameraProfile& profile, Document::Alloca
     return result;
 }
 
+void DecodeAudioProcessing(
+    const Value& source,
+    AudioProcessingSettings& audio,
+    bool& repaired) {
+    audio.microphoneMode = EnumValue(
+        source, "microphoneMode", audio.microphoneMode,
+        [](std::string_view value, MicrophoneMode& parsed) { return TryParse(value, parsed); }, repaired);
+    audio.pushToTalkHand = EnumValue(
+        source, "pushToTalkHand", audio.pushToTalkHand,
+        [](std::string_view value, PushToTalkHand& parsed) { return TryParse(value, parsed); }, repaired);
+    audio.pushToTalkReleaseMilliseconds = Float(
+        source, "pushToTalkReleaseMilliseconds", audio.pushToTalkReleaseMilliseconds, repaired);
+    audio.highPassEnabled = Bool(source, "highPassEnabled", audio.highPassEnabled, repaired);
+    audio.gateOpenThresholdDb = Float(source, "gateOpenThresholdDb", audio.gateOpenThresholdDb, repaired);
+    audio.gateCloseThresholdDb = Float(source, "gateCloseThresholdDb", audio.gateCloseThresholdDb, repaired);
+    audio.gateAttackMilliseconds = Float(source, "gateAttackMilliseconds", audio.gateAttackMilliseconds, repaired);
+    audio.gateHoldMilliseconds = Float(source, "gateHoldMilliseconds", audio.gateHoldMilliseconds, repaired);
+    audio.gateReleaseMilliseconds = Float(source, "gateReleaseMilliseconds", audio.gateReleaseMilliseconds, repaired);
+    audio.gatePreRollMilliseconds = Float(source, "gatePreRollMilliseconds", audio.gatePreRollMilliseconds, repaired);
+    audio.compressorEnabled = Bool(source, "compressorEnabled", audio.compressorEnabled, repaired);
+    audio.compressorThresholdDb = Float(source, "compressorThresholdDb", audio.compressorThresholdDb, repaired);
+    audio.compressorRatio = Float(source, "compressorRatio", audio.compressorRatio, repaired);
+    audio.compressorAttackMilliseconds = Float(source, "compressorAttackMilliseconds", audio.compressorAttackMilliseconds, repaired);
+    audio.compressorReleaseMilliseconds = Float(source, "compressorReleaseMilliseconds", audio.compressorReleaseMilliseconds, repaired);
+    audio.compressorMakeupDb = Float(source, "compressorMakeupDb", audio.compressorMakeupDb, repaired);
+    audio.limiterEnabled = Bool(source, "limiterEnabled", audio.limiterEnabled, repaired);
+    audio.limiterCeilingDb = Float(source, "limiterCeilingDb", audio.limiterCeilingDb, repaired);
+    audio.limiterReleaseMilliseconds = Float(source, "limiterReleaseMilliseconds", audio.limiterReleaseMilliseconds, repaired);
+}
+
+void DecodeRecordingProfile(
+    const Value& source,
+    RecordingProfileSettings& profile,
+    bool& repaired) {
+    profile.resolution = EnumValue(
+        source, "resolution", profile.resolution,
+        [](std::string_view value, RecordingResolution& parsed) { return TryParse(value, parsed); }, repaired);
+    profile.framesPerSecond = Int(source, "framesPerSecond", profile.framesPerSecond, repaired);
+    profile.bitrateBitsPerSecond = Int(source, "bitrateBitsPerSecond", profile.bitrateBitsPerSecond, repaired);
+    profile.peakBitrateBitsPerSecond = Int(
+        source, "peakBitrateBitsPerSecond", profile.peakBitrateBitsPerSecond, repaired);
+    profile.rateControl = EnumValue(
+        source, "rateControl", profile.rateControl,
+        [](std::string_view value, RateControlMode& parsed) { return TryParse(value, parsed); }, repaired);
+    profile.encoderPriority = EnumValue(
+        source, "encoderPriority", profile.encoderPriority,
+        [](std::string_view value, EncoderPriority& parsed) { return TryParse(value, parsed); }, repaired);
+    profile.h264Profile = EnumValue(
+        source, "h264Profile", profile.h264Profile,
+        [](std::string_view value, H264Profile& parsed) { return TryParse(value, parsed); }, repaired);
+    profile.h264Level = EnumValue(
+        source, "h264Level", profile.h264Level,
+        [](std::string_view value, H264Level& parsed) { return TryParse(value, parsed); }, repaired);
+    profile.keyframeIntervalSeconds = Int(
+        source, "keyframeIntervalSeconds", profile.keyframeIntervalSeconds, repaired);
+    profile.audioBitrateBitsPerSecond = Int(
+        source, "audioBitrateBitsPerSecond", profile.audioBitrateBitsPerSecond, repaired);
+    profile.gameAudioEnabled = Bool(source, "gameAudioEnabled", profile.gameAudioEnabled, repaired);
+    profile.gameAudioVolumePercent = Float(
+        source, "gameAudioVolumePercent", profile.gameAudioVolumePercent, repaired);
+    profile.microphoneEnabled = Bool(source, "microphoneEnabled", profile.microphoneEnabled, repaired);
+    profile.microphoneVolumePercent = Float(
+        source, "microphoneVolumePercent", profile.microphoneVolumePercent, repaired);
+    if (const auto* audio = Member(source, "microphoneProcessing")) {
+        if (!audio->IsObject()) repaired = true;
+        else DecodeAudioProcessing(*audio, profile.audio, repaired);
+    }
+}
+
+Value EncodeAudioProcessing(
+    const AudioProcessingSettings& audio,
+    Document::AllocatorType& allocator) {
+    Value value(rapidjson::kObjectType);
+    value.AddMember("microphoneMode", Value(ToString(audio.microphoneMode).data(), allocator), allocator);
+    value.AddMember("pushToTalkHand", Value(ToString(audio.pushToTalkHand).data(), allocator), allocator);
+    value.AddMember("pushToTalkReleaseMilliseconds", audio.pushToTalkReleaseMilliseconds, allocator);
+    value.AddMember("highPassEnabled", audio.highPassEnabled, allocator);
+    value.AddMember("gateOpenThresholdDb", audio.gateOpenThresholdDb, allocator);
+    value.AddMember("gateCloseThresholdDb", audio.gateCloseThresholdDb, allocator);
+    value.AddMember("gateAttackMilliseconds", audio.gateAttackMilliseconds, allocator);
+    value.AddMember("gateHoldMilliseconds", audio.gateHoldMilliseconds, allocator);
+    value.AddMember("gateReleaseMilliseconds", audio.gateReleaseMilliseconds, allocator);
+    value.AddMember("gatePreRollMilliseconds", audio.gatePreRollMilliseconds, allocator);
+    value.AddMember("compressorEnabled", audio.compressorEnabled, allocator);
+    value.AddMember("compressorThresholdDb", audio.compressorThresholdDb, allocator);
+    value.AddMember("compressorRatio", audio.compressorRatio, allocator);
+    value.AddMember("compressorAttackMilliseconds", audio.compressorAttackMilliseconds, allocator);
+    value.AddMember("compressorReleaseMilliseconds", audio.compressorReleaseMilliseconds, allocator);
+    value.AddMember("compressorMakeupDb", audio.compressorMakeupDb, allocator);
+    value.AddMember("limiterEnabled", audio.limiterEnabled, allocator);
+    value.AddMember("limiterCeilingDb", audio.limiterCeilingDb, allocator);
+    value.AddMember("limiterReleaseMilliseconds", audio.limiterReleaseMilliseconds, allocator);
+    return value;
+}
+
+Value EncodeRecordingProfile(
+    const RecordingProfileSettings& profile,
+    Document::AllocatorType& allocator) {
+    Value value(rapidjson::kObjectType);
+    value.AddMember("resolution", Value(ToString(profile.resolution).data(), allocator), allocator);
+    value.AddMember("framesPerSecond", profile.framesPerSecond, allocator);
+    value.AddMember("bitrateBitsPerSecond", profile.bitrateBitsPerSecond, allocator);
+    value.AddMember("peakBitrateBitsPerSecond", profile.peakBitrateBitsPerSecond, allocator);
+    value.AddMember("rateControl", Value(ToString(profile.rateControl).data(), allocator), allocator);
+    value.AddMember("encoderPriority", Value(ToString(profile.encoderPriority).data(), allocator), allocator);
+    value.AddMember("h264Profile", Value(ToString(profile.h264Profile).data(), allocator), allocator);
+    value.AddMember("h264Level", Value(ToString(profile.h264Level).data(), allocator), allocator);
+    value.AddMember("keyframeIntervalSeconds", profile.keyframeIntervalSeconds, allocator);
+    value.AddMember("audioBitrateBitsPerSecond", profile.audioBitrateBitsPerSecond, allocator);
+    value.AddMember("gameAudioEnabled", profile.gameAudioEnabled, allocator);
+    value.AddMember("gameAudioVolumePercent", profile.gameAudioVolumePercent, allocator);
+    value.AddMember("microphoneEnabled", profile.microphoneEnabled, allocator);
+    value.AddMember("microphoneVolumePercent", profile.microphoneVolumePercent, allocator);
+    value.AddMember("microphoneProcessing", EncodeAudioProcessing(profile.audio, allocator), allocator);
+    return value;
+}
+
 bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& sourceVersion,
             bool& repaired, std::string& error) {
     Document document;
@@ -312,48 +440,22 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
     if (const auto* recording = Member(document, "recording")) {
         if (!recording->IsObject()) repaired = true;
         else {
-            settings.recording.backend = EnumValue(
-                *recording, "backend", settings.recording.backend,
-                [](std::string_view value, RecordingBackend& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.resolution = EnumValue(
-                *recording, "resolution", settings.recording.resolution,
-                [](std::string_view value, RecordingResolution& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.framesPerSecond = Int(*recording, "framesPerSecond", settings.recording.framesPerSecond, repaired);
-            settings.recording.bitrateBitsPerSecond = Int(*recording, "bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, repaired);
-            settings.recording.peakBitrateBitsPerSecond = Int(
-                *recording, "peakBitrateBitsPerSecond", settings.recording.peakBitrateBitsPerSecond, repaired);
-            settings.recording.rateControl = EnumValue(
-                *recording, "rateControl", settings.recording.rateControl,
-                [](std::string_view value, RateControlMode& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.encoderPriority = EnumValue(
-                *recording, "encoderPriority", settings.recording.encoderPriority,
-                [](std::string_view value, EncoderPriority& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.h264Profile = EnumValue(
-                *recording, "h264Profile", settings.recording.h264Profile,
-                [](std::string_view value, H264Profile& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.h264Level = EnumValue(
-                *recording, "h264Level", settings.recording.h264Level,
-                [](std::string_view value, H264Level& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.recording.keyframeIntervalSeconds = Int(
-                *recording, "keyframeIntervalSeconds", settings.recording.keyframeIntervalSeconds, repaired);
-            settings.recording.audioBitrateBitsPerSecond = Int(
-                *recording, "audioBitrateBitsPerSecond", settings.recording.audioBitrateBitsPerSecond, repaired);
+            const auto* localProfile = Member(*recording, "localProfile");
+            const auto* livestreamProfile = Member(*recording, "livestreamProfile");
+            if (localProfile || livestreamProfile) {
+                if (!localProfile || !localProfile->IsObject()) repaired = true;
+                else DecodeRecordingProfile(*localProfile, settings.recording.local, repaired);
+                if (!livestreamProfile || !livestreamProfile->IsObject()) repaired = true;
+                else DecodeRecordingProfile(
+                    *livestreamProfile, settings.recording.livestream, repaired);
+            } else {
+                // Schema 35 and earlier stored one encoder profile. Use it as
+                // the starting point for both modes so the upgrade does not
+                // unexpectedly change the user's established output quality.
+                DecodeRecordingProfile(*recording, settings.recording.local, repaired);
+                settings.recording.livestream = settings.recording.local;
+            }
             settings.recording.gameplayOnly = Bool(*recording, "gameplayOnly", settings.recording.gameplayOnly, repaired);
-            settings.recording.controllerShortcutEnabled = Bool(
-                *recording,
-                "controllerShortcutEnabled",
-                settings.recording.controllerShortcutEnabled,
-                repaired);
-            settings.recording.worldControlsVisible = Bool(
-                *recording,
-                "worldControlsVisible",
-                settings.recording.worldControlsVisible,
-                repaired);
-            settings.recording.worldControlsShowFps = Bool(
-                *recording,
-                "worldControlsShowFps",
-                settings.recording.worldControlsShowFps,
-                repaired);
             settings.recording.worldControlsStreamMode = Bool(
                 *recording,
                 "worldControlsStreamMode",
@@ -422,26 +524,25 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
                 "keepHeadsetAwake",
                 settings.broadcast.keepHeadsetAwake,
                 repaired);
-            settings.broadcast.gameAudioEnabled = Bool(
-                *broadcast,
-                "gameAudioEnabled",
-                settings.broadcast.gameAudioEnabled,
-                repaired);
-            settings.broadcast.gameAudioVolumePercent = Float(
-                *broadcast,
-                "gameAudioVolumePercent",
-                settings.broadcast.gameAudioVolumePercent,
-                repaired);
-            settings.broadcast.microphoneEnabled = Bool(
-                *broadcast,
-                "microphoneEnabled",
-                settings.broadcast.microphoneEnabled,
-                repaired);
-            settings.broadcast.microphoneVolumePercent = Float(
-                *broadcast,
-                "microphoneVolumePercent",
-                settings.broadcast.microphoneVolumePercent,
-                repaired);
+            if (sourceVersion < 36) {
+                // The old broadcast object owned the stream mix while its
+                // microphone gain was also reused by local recording. Split
+                // those values into the two new durable output profiles.
+                auto& local = settings.recording.local;
+                auto& livestream = settings.recording.livestream;
+                livestream.gameAudioEnabled = Bool(
+                    *broadcast, "gameAudioEnabled", livestream.gameAudioEnabled, repaired);
+                livestream.gameAudioVolumePercent = Float(
+                    *broadcast, "gameAudioVolumePercent", livestream.gameAudioVolumePercent, repaired);
+                const auto microphoneEnabled = Bool(
+                    *broadcast, "microphoneEnabled", livestream.microphoneEnabled, repaired);
+                const auto microphoneVolume = Float(
+                    *broadcast, "microphoneVolumePercent", livestream.microphoneVolumePercent, repaired);
+                local.microphoneEnabled = microphoneEnabled;
+                livestream.microphoneEnabled = microphoneEnabled;
+                local.microphoneVolumePercent = microphoneVolume;
+                livestream.microphoneVolumePercent = microphoneVolume;
+            }
             settings.broadcast.postMapInfoToChat = Bool(
                 *broadcast,
                 "postMapInfoToChat",
@@ -481,33 +582,19 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
         if (!audio->IsObject()) {
             repaired = true;
         } else {
-            settings.audio.microphoneMode = EnumValue(
-                *audio, "microphoneMode", settings.audio.microphoneMode,
-                [](std::string_view value, MicrophoneMode& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.audio.pushToTalkHand = EnumValue(
-                *audio, "pushToTalkHand", settings.audio.pushToTalkHand,
-                [](std::string_view value, PushToTalkHand& parsed) { return TryParse(value, parsed); }, repaired);
-            settings.audio.pushToTalkReleaseMilliseconds = Float(
-                *audio, "pushToTalkReleaseMilliseconds",
-                settings.audio.pushToTalkReleaseMilliseconds, repaired);
-            settings.audio.includeMicrophoneInRecordings = Bool(*audio, "includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, repaired);
-            settings.audio.includeMicrophoneInLivestreams = Bool(*audio, "includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, repaired);
-            settings.audio.highPassEnabled = Bool(*audio, "highPassEnabled", settings.audio.highPassEnabled, repaired);
-            settings.audio.gateOpenThresholdDb = Float(*audio, "gateOpenThresholdDb", settings.audio.gateOpenThresholdDb, repaired);
-            settings.audio.gateCloseThresholdDb = Float(*audio, "gateCloseThresholdDb", settings.audio.gateCloseThresholdDb, repaired);
-            settings.audio.gateAttackMilliseconds = Float(*audio, "gateAttackMilliseconds", settings.audio.gateAttackMilliseconds, repaired);
-            settings.audio.gateHoldMilliseconds = Float(*audio, "gateHoldMilliseconds", settings.audio.gateHoldMilliseconds, repaired);
-            settings.audio.gateReleaseMilliseconds = Float(*audio, "gateReleaseMilliseconds", settings.audio.gateReleaseMilliseconds, repaired);
-            settings.audio.gatePreRollMilliseconds = Float(*audio, "gatePreRollMilliseconds", settings.audio.gatePreRollMilliseconds, repaired);
-            settings.audio.compressorEnabled = Bool(*audio, "compressorEnabled", settings.audio.compressorEnabled, repaired);
-            settings.audio.compressorThresholdDb = Float(*audio, "compressorThresholdDb", settings.audio.compressorThresholdDb, repaired);
-            settings.audio.compressorRatio = Float(*audio, "compressorRatio", settings.audio.compressorRatio, repaired);
-            settings.audio.compressorAttackMilliseconds = Float(*audio, "compressorAttackMilliseconds", settings.audio.compressorAttackMilliseconds, repaired);
-            settings.audio.compressorReleaseMilliseconds = Float(*audio, "compressorReleaseMilliseconds", settings.audio.compressorReleaseMilliseconds, repaired);
-            settings.audio.compressorMakeupDb = Float(*audio, "compressorMakeupDb", settings.audio.compressorMakeupDb, repaired);
-            settings.audio.limiterEnabled = Bool(*audio, "limiterEnabled", settings.audio.limiterEnabled, repaired);
-            settings.audio.limiterCeilingDb = Float(*audio, "limiterCeilingDb", settings.audio.limiterCeilingDb, repaired);
-            settings.audio.limiterReleaseMilliseconds = Float(*audio, "limiterReleaseMilliseconds", settings.audio.limiterReleaseMilliseconds, repaired);
+            // Schema 35 used one microphone processor plus routing flags. Copy
+            // the processor into both profiles, then translate the routing
+            // flags into each profile's independent microphone master switch.
+            DecodeAudioProcessing(*audio, settings.recording.local.audio, repaired);
+            settings.recording.livestream.audio = settings.recording.local.audio;
+            const auto includeLocal = Bool(
+                *audio, "includeMicrophoneInRecordings", true, repaired);
+            const auto includeLivestream = Bool(
+                *audio, "includeMicrophoneInLivestreams", true, repaired);
+            settings.recording.local.microphoneEnabled =
+                settings.recording.local.microphoneEnabled && includeLocal;
+            settings.recording.livestream.microphoneEnabled =
+                settings.recording.livestream.microphoneEnabled && includeLivestream;
         }
     }
     if (const auto* tts = Member(document, "tts")) {
@@ -675,21 +762,11 @@ std::string Encode(const SettingsDocument& settings) {
     document.AddMember("preview", preview, allocator);
 
     Value recording(rapidjson::kObjectType);
-    recording.AddMember("backend", Value(ToString(settings.recording.backend).data(), allocator), allocator);
-    recording.AddMember("resolution", Value(ToString(settings.recording.resolution).data(), allocator), allocator);
-    recording.AddMember("framesPerSecond", settings.recording.framesPerSecond, allocator);
-    recording.AddMember("bitrateBitsPerSecond", settings.recording.bitrateBitsPerSecond, allocator);
-    recording.AddMember("peakBitrateBitsPerSecond", settings.recording.peakBitrateBitsPerSecond, allocator);
-    recording.AddMember("rateControl", Value(ToString(settings.recording.rateControl).data(), allocator), allocator);
-    recording.AddMember("encoderPriority", Value(ToString(settings.recording.encoderPriority).data(), allocator), allocator);
-    recording.AddMember("h264Profile", Value(ToString(settings.recording.h264Profile).data(), allocator), allocator);
-    recording.AddMember("h264Level", Value(ToString(settings.recording.h264Level).data(), allocator), allocator);
-    recording.AddMember("keyframeIntervalSeconds", settings.recording.keyframeIntervalSeconds, allocator);
-    recording.AddMember("audioBitrateBitsPerSecond", settings.recording.audioBitrateBitsPerSecond, allocator);
+    recording.AddMember(
+        "localProfile", EncodeRecordingProfile(settings.recording.local, allocator), allocator);
+    recording.AddMember(
+        "livestreamProfile", EncodeRecordingProfile(settings.recording.livestream, allocator), allocator);
     recording.AddMember("gameplayOnly", settings.recording.gameplayOnly, allocator);
-    recording.AddMember("controllerShortcutEnabled", settings.recording.controllerShortcutEnabled, allocator);
-    recording.AddMember("worldControlsVisible", settings.recording.worldControlsVisible, allocator);
-    recording.AddMember("worldControlsShowFps", settings.recording.worldControlsShowFps, allocator);
     recording.AddMember("worldControlsStreamMode", settings.recording.worldControlsStreamMode, allocator);
     AddVector(recording, "worldControlsPosition", settings.recording.worldControlsPosition, allocator);
     AddVector(
@@ -723,12 +800,6 @@ std::string Encode(const SettingsDocument& settings) {
     broadcast.AddMember(
         "afkMediaPath", Value(settings.broadcast.afkMediaPath.c_str(), allocator), allocator);
     broadcast.AddMember("keepHeadsetAwake", settings.broadcast.keepHeadsetAwake, allocator);
-    broadcast.AddMember("gameAudioEnabled", settings.broadcast.gameAudioEnabled, allocator);
-    broadcast.AddMember(
-        "gameAudioVolumePercent", settings.broadcast.gameAudioVolumePercent, allocator);
-    broadcast.AddMember("microphoneEnabled", settings.broadcast.microphoneEnabled, allocator);
-    broadcast.AddMember(
-        "microphoneVolumePercent", settings.broadcast.microphoneVolumePercent, allocator);
     broadcast.AddMember("postMapInfoToChat", settings.broadcast.postMapInfoToChat, allocator);
     Value twitchAccount(rapidjson::kObjectType);
     twitchAccount.AddMember(
@@ -749,30 +820,6 @@ std::string Encode(const SettingsDocument& settings) {
         "chatWriteAuthorized", settings.broadcast.twitchAccount.chatWriteAuthorized, allocator);
     broadcast.AddMember("twitchAccount", twitchAccount, allocator);
     document.AddMember("broadcast", broadcast, allocator);
-
-    Value audio(rapidjson::kObjectType);
-    audio.AddMember("microphoneMode", Value(ToString(settings.audio.microphoneMode).data(), allocator), allocator);
-    audio.AddMember("pushToTalkHand", Value(ToString(settings.audio.pushToTalkHand).data(), allocator), allocator);
-    audio.AddMember("pushToTalkReleaseMilliseconds", settings.audio.pushToTalkReleaseMilliseconds, allocator);
-    audio.AddMember("includeMicrophoneInRecordings", settings.audio.includeMicrophoneInRecordings, allocator);
-    audio.AddMember("includeMicrophoneInLivestreams", settings.audio.includeMicrophoneInLivestreams, allocator);
-    audio.AddMember("highPassEnabled", settings.audio.highPassEnabled, allocator);
-    audio.AddMember("gateOpenThresholdDb", settings.audio.gateOpenThresholdDb, allocator);
-    audio.AddMember("gateCloseThresholdDb", settings.audio.gateCloseThresholdDb, allocator);
-    audio.AddMember("gateAttackMilliseconds", settings.audio.gateAttackMilliseconds, allocator);
-    audio.AddMember("gateHoldMilliseconds", settings.audio.gateHoldMilliseconds, allocator);
-    audio.AddMember("gateReleaseMilliseconds", settings.audio.gateReleaseMilliseconds, allocator);
-    audio.AddMember("gatePreRollMilliseconds", settings.audio.gatePreRollMilliseconds, allocator);
-    audio.AddMember("compressorEnabled", settings.audio.compressorEnabled, allocator);
-    audio.AddMember("compressorThresholdDb", settings.audio.compressorThresholdDb, allocator);
-    audio.AddMember("compressorRatio", settings.audio.compressorRatio, allocator);
-    audio.AddMember("compressorAttackMilliseconds", settings.audio.compressorAttackMilliseconds, allocator);
-    audio.AddMember("compressorReleaseMilliseconds", settings.audio.compressorReleaseMilliseconds, allocator);
-    audio.AddMember("compressorMakeupDb", settings.audio.compressorMakeupDb, allocator);
-    audio.AddMember("limiterEnabled", settings.audio.limiterEnabled, allocator);
-    audio.AddMember("limiterCeilingDb", settings.audio.limiterCeilingDb, allocator);
-    audio.AddMember("limiterReleaseMilliseconds", settings.audio.limiterReleaseMilliseconds, allocator);
-    document.AddMember("audio", audio, allocator);
 
     Value tts(rapidjson::kObjectType);
     tts.AddMember("enabled", settings.tts.enabled, allocator);

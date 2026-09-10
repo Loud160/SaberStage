@@ -112,9 +112,9 @@ void UnbindSpectatorRenderGuard(CameraManager* manager) noexcept {
 void SpectatorRenderGuard::OnPreCull() {
     if (activeManager != nullptr) activeManager->SetPreviewCaptureExcluded(true);
     HideTransitioningViewControllers();
-    // Hollywood installs a broad custom culling matrix during Init(). Restore
-    // Unity's transform-derived matrix at the render boundary so this movable
-    // camera culls from its current pose rather than its recording-start pose.
+    // Restore Unity's transform-derived matrix at the render boundary so this
+    // movable camera culls from its current pose rather than retaining a stale
+    // matrix after a scene or encoder-surface transition.
     if (auto* camera = GetComponent<UnityEngine::Camera*>()) camera->ResetCullingMatrix();
 }
 

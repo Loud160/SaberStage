@@ -133,7 +133,7 @@ std::string JoinEndpointAndKey(std::string endpoint, const std::string& key) {
 class DirectLivestreamSink::Impl final {
 public:
     Impl(
-        settings::RecordingSettings recording,
+        settings::RecordingProfileSettings recording,
         settings::LivestreamSettings livestream,
         std::string streamKey,
         StatusHandler statusHandler)
@@ -188,7 +188,16 @@ public:
     }
 
     bool SubmitVideo(const recording::EncodedVideoPacketView& packet) noexcept {
-        if (!packet.data || packet.size == 0 || stopRequested_.load(std::memory_order_acquire)) return false;
+        // A provider worker owns its queue only while it can still connect,
+        // reconnect, or write. Once that provider reaches Failed/Offline its
+        // worker has exited, so accepting more shared-encoder packets would
+        // fill a dead queue and charge CPU/memory to a destination that can no
+        // longer consume them. Other provider sinks remain unaffected.
+        if (!packet.data || packet.size == 0 ||
+            !CanStop(state_.load(std::memory_order_acquire)) ||
+            stopRequested_.load(std::memory_order_acquire)) {
+            return false;
+        }
         try {
             std::lock_guard lock(queueMutex_);
             if (queuedVideoBytes_ + packet.size > kMaximumVideoQueueBytes) {
@@ -217,6 +226,7 @@ public:
         std::int32_t channels,
         std::int32_t sampleRate) noexcept {
         if (!samples || count == 0 || channels <= 0 || sampleRate <= 0 ||
+            !CanStop(state_.load(std::memory_order_acquire)) ||
             stopRequested_.load(std::memory_order_acquire)) return false;
         try {
             std::lock_guard lock(queueMutex_);
@@ -690,7 +700,7 @@ private:
         streamKey_.shrink_to_fit();
     }
 
-    settings::RecordingSettings recording_;
+    settings::RecordingProfileSettings recording_;
     settings::LivestreamSettings livestream_;
     std::string streamKey_;
     StatusHandler statusHandler_;
@@ -731,7 +741,7 @@ private:
 };
 
 DirectLivestreamSink::DirectLivestreamSink(
-    settings::RecordingSettings recording,
+    settings::RecordingProfileSettings recording,
     settings::LivestreamSettings livestream,
     std::string streamKey,
     StatusHandler statusHandler)

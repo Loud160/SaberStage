@@ -85,7 +85,7 @@ def main() -> int:
         fail("QMOD contains an unexpected payload category")
 
     dependency_ids = {item.get("id") for item in manifest.get("dependencies", [])}
-    required = {"beatsaber-hook", "bsml", "custom-types", "hollywood", "songcore"}
+    required = {"beatsaber-hook", "bsml", "custom-types", "songcore"}
     if not required <= dependency_ids:
         fail(f"QMOD dependencies are missing: {sorted(required - dependency_ids)}")
     songcore = next(item for item in manifest["dependencies"] if item.get("id") == "songcore")

@@ -15,6 +15,7 @@
 
 #include "saberstage/camera/CameraProfile.hpp"
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -22,17 +23,12 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 35;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 38;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.
 inline constexpr std::string_view kSaberStageTwitchClientId =
     "p6shnc5g4vtb46a7xd26d1uh6xr6ee";
-
-enum class RecordingBackend {
-    Hollywood,
-    DirectFfmpegHardware,
-};
 
 enum class RecordingResolution {
     P720,
@@ -133,8 +129,42 @@ struct PreviewSettings {
     float scale = 1.0F;
 };
 
-struct RecordingSettings {
-    RecordingBackend backend = RecordingBackend::Hollywood;
+struct AudioProcessingSettings {
+    // Each output profile owns a complete microphone-processing configuration.
+    // A streamer can therefore use different gating and dynamics for a live
+    // broadcast without changing the microphone sound saved to local videos.
+    MicrophoneMode microphoneMode = MicrophoneMode::Open;
+    PushToTalkHand pushToTalkHand = PushToTalkHand::Either;
+    float pushToTalkReleaseMilliseconds = 150.0F;
+    bool highPassEnabled = true;
+    float gateOpenThresholdDb = -38.0F;
+    float gateCloseThresholdDb = -43.0F;
+    float gateAttackMilliseconds = 10.0F;
+    float gateHoldMilliseconds = 200.0F;
+    float gateReleaseMilliseconds = 150.0F;
+    float gatePreRollMilliseconds = 40.0F;
+    bool compressorEnabled = true;
+    float compressorThresholdDb = -18.0F;
+    float compressorRatio = 3.0F;
+    float compressorAttackMilliseconds = 8.0F;
+    float compressorReleaseMilliseconds = 120.0F;
+    float compressorMakeupDb = 3.0F;
+    bool limiterEnabled = true;
+    float limiterCeilingDb = -1.0F;
+    float limiterReleaseMilliseconds = 60.0F;
+};
+
+inline constexpr std::array<LivestreamProvider, 4> kLivestreamProviders{
+    LivestreamProvider::Twitch,
+    LivestreamProvider::YouTube,
+    LivestreamProvider::Kick,
+    LivestreamProvider::Custom};
+
+// One self-contained Direct FFmpeg hardware-output profile. Local recording
+// and live streaming use separate instances so editing either mode cannot
+// silently rewrite the other. SaberStage deliberately owns one encoder path;
+// there is no alternate backend whose capabilities can diverge from this UI.
+struct RecordingProfileSettings {
     RecordingResolution resolution = RecordingResolution::P1080;
     std::int32_t framesPerSecond = 30;
     std::int32_t bitrateBitsPerSecond = 8'000'000;
@@ -145,12 +175,26 @@ struct RecordingSettings {
     H264Level h264Level = H264Level::L41;
     std::int32_t keyframeIntervalSeconds = 2;
     std::int32_t audioBitrateBitsPerSecond = 128'000;
+    bool gameAudioEnabled = true;
+    float gameAudioVolumePercent = 100.0F;
+    bool microphoneEnabled = false;
+    float microphoneVolumePercent = 100.0F;
+    AudioProcessingSettings audio;
+};
+
+struct RecordingSettings {
+    RecordingProfileSettings local{};
+    // Fresh installations must begin with a profile that can pass the default
+    // enabled Twitch destination's preflight. Keeping this construction next to
+    // the profile declaration also prevents local-recording defaults from
+    // silently becoming livestream defaults when new fields are added.
+    RecordingProfileSettings livestream = [] {
+        RecordingProfileSettings profile;
+        profile.bitrateBitsPerSecond = 6'000'000;
+        profile.peakBitrateBitsPerSecond = 6'000'000;
+        return profile;
+    }();
     bool gameplayOnly = false;
-    bool controllerShortcutEnabled = false;
-    bool worldControlsVisible = false;
-    // Adds a live "capture FPS / headset FPS" row to the floating recording
-    // controls. On by default; off keeps the compact two-row panel.
-    bool worldControlsShowFps = true;
     // The movable panel controls exactly one output at a time. Persisting the
     // selector keeps the panel predictable after a restart without coupling
     // the local-recording and livestream setting records.
@@ -160,6 +204,9 @@ struct RecordingSettings {
 };
 
 struct LivestreamDestinationSettings {
+    // One hardware encoder fans packets out to every enabled destination.
+    // Destination workers reconnect and fail independently.
+    bool enabled = false;
     std::string serverUrl;
     // Empty remains the safe default. A key is written here only after the
     // user explicitly chooses Save in Settings from the confirmation dialog.
@@ -170,6 +217,9 @@ struct LivestreamDestinationSettings {
     // remain independent so YouTube/Kick support can be added without a
     // migration that accidentally shares one title across services.
     std::string streamTitle;
+    // Built-in providers use their published limits. Custom endpoints have no
+    // discoverable policy, so this supplies their explicit preflight ceiling.
+    std::int32_t maximumVideoBitrateBitsPerSecond = 8'000'000;
 };
 
 struct TwitchAccountSettings {
@@ -203,13 +253,6 @@ struct TwitchAccountSettings {
 struct LivestreamSettings {
     bool enabled = false;
     LivestreamProvider provider = LivestreamProvider::Twitch;
-    // Streaming owns a separate, non-destructive audio mix. These values do
-    // not alter local recording audio or Beat Saber's audible output. Gains
-    // are percentages so the UI can expose a direct 0-200% balance control.
-    bool gameAudioEnabled = true;
-    float gameAudioVolumePercent = 100.0F;
-    bool microphoneEnabled = false;
-    float microphoneVolumePercent = 100.0F;
     // Quest's proximity power manager can suspend the app when the headset is
     // removed even if Unity's ordinary inactivity timer is disabled. While a
     // stream is active, opt into both guards so an unattended broadcast is not
@@ -219,12 +262,13 @@ struct LivestreamSettings {
     // Each service owns an independent endpoint and key. Selecting or editing
     // one provider must never replace another provider's credentials.
     LivestreamDestinationSettings twitch{
-        "rtmp://ingest.global-contribute.live-video.net/app", {}, {}};
+        true, "rtmp://ingest.global-contribute.live-video.net/app", {}, {}, 6'000'000};
     LivestreamDestinationSettings youtube{
-        "rtmps://a.rtmps.youtube.com/live2", {}, {}};
+        false, "rtmps://a.rtmps.youtube.com/live2", {}, {}, 30'000'000};
     LivestreamDestinationSettings kick{
-        "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app", {}, {}};
-    LivestreamDestinationSettings custom{"rtmps://", {}, {}};
+        false, "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app", {}, {}, 8'000'000};
+    LivestreamDestinationSettings custom{
+        false, "rtmps://", {}, {}, 8'000'000};
     bool reconnectEnabled = true;
     std::int32_t reconnectAttempts = 8;
     std::int32_t reconnectInitialDelaySeconds = 2;
@@ -235,35 +279,6 @@ struct LivestreamSettings {
     // streamer's connected Twitch account when gameplay actually starts.
     bool postMapInfoToChat = false;
     TwitchAccountSettings twitchAccount;
-};
-
-struct AudioProcessingSettings {
-    // Microphone enable and input gain retain the established broadcast fields
-    // for settings compatibility. These fields describe routing and DSP only.
-    MicrophoneMode microphoneMode = MicrophoneMode::Open;
-    PushToTalkHand pushToTalkHand = PushToTalkHand::Either;
-    // PTT releases over a short, independent tail so consonants are not cut
-    // off when the player lets go of the controller grip. Voice-activation
-    // hold/release timing must not be reused for this separate interaction.
-    float pushToTalkReleaseMilliseconds = 150.0F;
-    bool includeMicrophoneInRecordings = true;
-    bool includeMicrophoneInLivestreams = true;
-    bool highPassEnabled = true;
-    float gateOpenThresholdDb = -38.0F;
-    float gateCloseThresholdDb = -43.0F;
-    float gateAttackMilliseconds = 10.0F;
-    float gateHoldMilliseconds = 200.0F;
-    float gateReleaseMilliseconds = 150.0F;
-    float gatePreRollMilliseconds = 40.0F;
-    bool compressorEnabled = true;
-    float compressorThresholdDb = -18.0F;
-    float compressorRatio = 3.0F;
-    float compressorAttackMilliseconds = 8.0F;
-    float compressorReleaseMilliseconds = 120.0F;
-    float compressorMakeupDb = 3.0F;
-    bool limiterEnabled = true;
-    float limiterCeilingDb = -1.0F;
-    float limiterReleaseMilliseconds = 60.0F;
 };
 
 struct TtsSettings {
@@ -361,7 +376,6 @@ struct SettingsDocument {
     FeatureSettings companion;
     FeatureSettings scenes;
     LivestreamSettings broadcast;
-    AudioProcessingSettings audio;
     TtsSettings tts;
     ConnectionTestSettings connectionTest;
     ChatSettings chat;
@@ -381,12 +395,41 @@ SettingsDocument Defaults();
     LivestreamProvider provider) noexcept;
 [[nodiscard]] bool IsValidLivestreamServerUrl(std::string_view value) noexcept;
 [[nodiscard]] bool IsValidStreamKey(std::string_view value) noexcept;
+[[nodiscard]] bool IsLivestreamDestinationEnabled(
+    const LivestreamSettings& settings,
+    LivestreamProvider provider) noexcept;
+[[nodiscard]] std::int32_t MaximumLivestreamVideoBitrate(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination) noexcept;
+// Builds the provider's documented H.264 recommendation while preserving the
+// selected resolution and frame rate whenever that provider supports them.
+// Twitch and Kick lower 1440p to their highest supported 1080p output.
+[[nodiscard]] RecordingProfileSettings RecommendedLivestreamProfile(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& current) noexcept;
+// Validates only the shared encoder format. Endpoint and key validation remain
+// in ValidateLivestreamProfileForProvider so recommendation previews do not
+// depend on whether credentials have already been entered.
+[[nodiscard]] std::string ValidateLivestreamEncodingForProvider(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination);
+[[nodiscard]] std::string ValidateLivestreamProfileForProvider(
+    LivestreamProvider provider,
+    const RecordingProfileSettings& profile,
+    const LivestreamDestinationSettings& destination);
+[[nodiscard]] RecordingProfileSettings& RecordingProfileForMode(
+    RecordingSettings& settings,
+    bool livestream) noexcept;
+[[nodiscard]] const RecordingProfileSettings& RecordingProfileForMode(
+    const RecordingSettings& settings,
+    bool livestream) noexcept;
 ValidationResult ValidateAndRepair(SettingsDocument& settings);
 bool Migrate(SettingsDocument& settings, std::uint32_t sourceSchemaVersion);
 void ResetSubsystem(SettingsDocument& settings, Subsystem subsystem);
 void FactoryReset(SettingsDocument& settings);
 std::string_view SubsystemName(Subsystem subsystem);
-std::string_view ToString(RecordingBackend value) noexcept;
 std::string_view ToString(RecordingResolution value) noexcept;
 std::string_view ToString(RateControlMode value) noexcept;
 std::string_view ToString(EncoderPriority value) noexcept;
@@ -396,7 +439,6 @@ std::string_view ToString(LivestreamProvider value) noexcept;
 std::string_view ToString(MicrophoneMode value) noexcept;
 std::string_view ToString(PushToTalkHand value) noexcept;
 std::string_view ToString(TtsOutputRoute value) noexcept;
-bool TryParse(std::string_view value, RecordingBackend& result) noexcept;
 bool TryParse(std::string_view value, RecordingResolution& result) noexcept;
 bool TryParse(std::string_view value, RateControlMode& result) noexcept;
 bool TryParse(std::string_view value, EncoderPriority& result) noexcept;
