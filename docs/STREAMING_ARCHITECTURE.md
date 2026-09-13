@@ -6,13 +6,13 @@ Protocol layers are discovery/pairing, authenticated control, stream negotiation
 
 The companion first proves live view and synchronized desktop recording, then exposes a stable OBS handoff. It may remux encoded H.264/AAC without transcoding when compatible. Network loss drops/reconnects that sink independently.
 
-The Quest Discord screen-source helper is a narrower local companion path. It
+The Quest Discord screen-source receiver is a narrower local companion path. It
 reuses the Direct MediaCodec H.264 packets and the already-mixed game,
 microphone, and TTS PCM, sending both over authenticated TCP loopback to an
-ordinary Android activity named `SaberStage Camera`. Android 14 and Discord
-perform user-consented single-app sharing of that activity. The helper
+ordinary Android activity named `TCP Media Receiver`. Android 14 and Discord
+perform user-consented single-app sharing of that activity. The receiver
 hardware-decodes video to a surface and writes PCM through a capture-enabled
-`AudioTrack` associated with the helper app; it never starts at boot and stops
+`AudioTrack` associated with the receiver app; it never starts at boot and stops
 on protocol stop, heartbeat loss, or disconnect timeout. This path is
 documented separately in [Discord screen source](DISCORD_SCREEN_SOURCE.md).
 

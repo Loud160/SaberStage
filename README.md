@@ -40,16 +40,16 @@ development. TTS defaults off; microphone capture requires Beat Saber to be
 patched with MBF's Microphone Access permission.
 
 Discord app sharing is available through the separately installed
-**SaberStage Helper** APK. The mod reuses its existing Direct hardware encoder,
+**TCP Media Receiver** APK. The mod reuses its existing Direct hardware encoder,
 feeds bounded H.264 packets and the existing game/microphone/TTS stream-audio
 mix over authenticated Quest loopback, and presents them through an ordinary
-Android activity named `SaberStage Camera`. This lets the Quest Discord app
+Android activity named `TCP Media Receiver`. This lets the Quest Discord app
 select the third-person view and capturable app audio through Android 14's
 app-sharing picker without a browser, desktop relay, second encoder, or
 persistent boot service. The center menu's **Live Stream** tab checks whether
-the helper is installed, offers the newest GitHub release when an explicit
+the receiver is installed, offers the newest GitHub release when an explicit
 launch proves it is absent, opens Discord before the camera-source window, and
-starts or stops the session-only helper service. The status area reports the
+starts or stops the session-only receiver service. The status area reports the
 exact Android `MediaCodec` decoder selected for the negotiated format so
 hardware acceleration can be verified without placing diagnostics inside the
 Discord-captured window. See

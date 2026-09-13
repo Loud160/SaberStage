@@ -188,7 +188,7 @@ constexpr float kAudioMeterClipStartDb = 0.0F;
 constexpr float kGateCutoffOffsetMinimumDb = 3.0F;
 constexpr float kGateCutoffOffsetMaximumDb = 30.0F;
 constexpr float kGateCloseThresholdMinimumDb = -90.0F;
-constexpr std::string_view kDiscordHelperApkName = "SaberStage-Helper.apk";
+constexpr std::string_view kDiscordHelperApkName = "TCP-Media-Receiver.apk";
 // Fixed page slots keep feature code and persistent Unity objects stable while
 // the visible tab strip changes with Record/Stream mode and microphone state.
 // Slot 5 was the removed Overview page and intentionally remains unused so the
@@ -203,7 +203,7 @@ constexpr int kCenterTtsPage = 7;
 constexpr int kCenterConfigureStreamPage = 8;
 constexpr int kCenterLiveStreamPage = 9;
 constexpr std::string_view kDiscordHelperLatestReleaseUrl =
-    "https://github.com/Loud160/SaberStage-Helper/releases/latest/download/SaberStage-Helper.apk";
+    "https://github.com/Loud160/TCP-Media-Receiver/releases/latest/download/TCP-Media-Receiver.apk";
 
 float GateCutoffOffsetDb(const settings::AudioProcessingSettings& audio) {
     return std::clamp(
@@ -1955,7 +1955,7 @@ void MenuController::HandleDiscordLiveStreamAction() {
         if (discordHelperAvailability_ ==
                 broadcast::DiscordHelperAvailability::NotInstalled) {
             Logging::Logger.info(
-                "Discord live stream requested without SaberStage Helper installed");
+                "Discord live stream requested without TCP Media Receiver installed");
             ShowDiscordHelperInstallPrompt();
             RefreshDiscordScreenControls();
             return;
@@ -2001,7 +2001,7 @@ void MenuController::ShowDiscordHelperInstallPrompt() {
             settingsView_, {86.0F, 46.0F}, nullptr, true);
         if (!IsAlive(discordHelperInstallModal_)) {
             Logging::Logger.error(
-                "Could not create the SaberStage Helper installation dialog");
+                "Could not create the TCP Media Receiver installation dialog");
             return;
         }
         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
@@ -2012,14 +2012,14 @@ void MenuController::ShowDiscordHelperInstallPrompt() {
         layout->set_childForceExpandWidth(true);
         layout->set_childForceExpandHeight(false);
         auto* title = BSML::Lite::CreateText(
-            layout->get_transform(), "SaberStage Helper Required", 3.9F,
+            layout->get_transform(), "TCP Media Receiver Required", 3.9F,
             {0.0F, 0.0F}, {78.0F, 7.0F});
         title->set_enableWordWrapping(false);
         title->set_alignment(TMPro::TextAlignmentOptions::Center);
         ConfigureLayout(title, 78.0F, 7.0F, 1.0F);
         auto* message = BSML::Lite::CreateText(
             layout->get_transform(),
-            "Discord streaming requires the separate SaberStage Helper APK, and it is not installed. Download the newest SaberStage-Helper.apk from the current GitHub release?",
+            "Discord streaming requires the separate TCP Media Receiver APK, and it is not installed. Download the newest TCP-Media-Receiver.apk from the current GitHub release?",
             3.15F, {0.0F, 0.0F}, {76.0F, 23.0F});
         message->set_enableWordWrapping(true);
         message->set_overflowMode(TMPro::TextOverflowModes::Overflow);
@@ -2051,19 +2051,19 @@ void MenuController::BeginDiscordHelperDownload() {
     ShowDiscordHelperInstallInstructions();
     try {
         Logging::Logger.info(
-            "Opening current SaberStage Helper release asset '{}' from '{}'",
+            "Opening current TCP Media Receiver release asset '{}' from '{}'",
             kDiscordHelperApkName,
             kDiscordHelperLatestReleaseUrl);
         UnityEngine::Application::OpenURL(std::string(kDiscordHelperLatestReleaseUrl));
     } catch (const std::exception& exception) {
         Logging::Logger.error(
-            "Could not open the SaberStage Helper download in the Quest browser: {}",
+            "Could not open the TCP Media Receiver download in the Quest browser: {}",
             exception.what());
         ShowLivestreamActionError(
             std::string("The Quest browser could not be opened: ") + exception.what());
     } catch (...) {
         Logging::Logger.error(
-            "Could not open the SaberStage Helper download because of an unknown error");
+            "Could not open the TCP Media Receiver download because of an unknown error");
         ShowLivestreamActionError(
             "The Quest browser could not be opened. Details were written to the SaberStage log.");
     }
@@ -2076,7 +2076,7 @@ void MenuController::ShowDiscordHelperInstallInstructions() {
             settingsView_, {94.0F, 60.0F}, nullptr, true);
         if (!IsAlive(discordHelperInstructionsModal_)) {
             Logging::Logger.error(
-                "Could not create the SaberStage Helper installation instructions");
+                "Could not create the TCP Media Receiver installation instructions");
             return;
         }
         auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
@@ -2087,15 +2087,15 @@ void MenuController::ShowDiscordHelperInstallInstructions() {
         layout->set_childForceExpandWidth(true);
         layout->set_childForceExpandHeight(false);
         auto* title = BSML::Lite::CreateText(
-            layout->get_transform(), "Install SaberStage Helper", 3.9F,
+            layout->get_transform(), "Install TCP Media Receiver", 3.9F,
             {0.0F, 0.0F}, {86.0F, 7.0F});
         title->set_enableWordWrapping(false);
         title->set_alignment(TMPro::TextAlignmentOptions::Center);
         ConfigureLayout(title, 86.0F, 7.0F, 1.0F);
         auto* message = BSML::Lite::CreateText(
             layout->get_transform(),
-            "The Quest browser is downloading SaberStage-Helper.apk from the newest GitHub release.\n\n"
-            "In the browser's Downloads list, select SaberStage-Helper.apk, open it with Quest Package Manager, and follow the package manager instructions.\n\n"
+            "The Quest browser is downloading TCP-Media-Receiver.apk from the newest GitHub release.\n\n"
+            "In the browser's Downloads list, select TCP-Media-Receiver.apk, open it with Quest Package Manager, and follow the package manager instructions.\n\n"
             "Installing a sideloaded APK requires Unknown Sources to be enabled. When installation finishes, return to Beat Saber and press Discord Live Steam again.",
             3.0F, {0.0F, 0.0F}, {84.0F, 39.0F});
         message->set_enableWordWrapping(true);
@@ -2121,11 +2121,11 @@ void MenuController::RefreshDiscordScreenControls() {
             if (broadcast::CanStart(snapshot.state) &&
                     discordHelperAvailability_ ==
                         broadcast::DiscordHelperAvailability::NotInstalled) {
-                text << "SaberStage Helper is not installed. Press Discord Live Steam to download it.";
+                text << "TCP Media Receiver is not installed. Press Discord Live Steam to download it.";
             } else if (broadcast::CanStart(snapshot.state) &&
                     discordHelperAvailability_ ==
                         broadcast::DiscordHelperAvailability::Installed) {
-                text << "SaberStage Helper is installed and ready.";
+                text << "TCP Media Receiver is installed and ready.";
             } else {
                 text << snapshot.status;
             }
@@ -4131,7 +4131,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         liveStreamPage, "Discord Live Stream");
     makeStatus(
         discordSection,
-        "Uses the separate SaberStage Helper app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. The button opens Discord first and SaberStage Camera second so both remain available. Select the existing Discord panel, choose SaberStage Camera in its app-sharing picker, enable application audio, then return to Beat Saber.",
+        "Uses the separate TCP Media Receiver app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. The button opens Discord first and TCP Media Receiver second so both remain available. Select the existing Discord panel, choose TCP Media Receiver in its app-sharing picker, enable application audio, then return to Beat Saber.",
         16.0F);
     auto [discordActionRow, discordActionWidth] = makePaddedRow(
         discordSection, 2, 9.5F);
@@ -4141,7 +4141,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         discordStartSlot, "Discord Live Steam", [] {
             if (active_) active_->HandleDiscordLiveStreamAction();
         }),
-        "Checks for SaberStage Helper, opens Discord before the source window, starts the session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
+        "Checks for TCP Media Receiver, opens Discord before the source window, starts the session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
     fitActionButton(active_->startDiscordScreenButton_, 45.0F);
     if (auto* icon = CreateRecordingPanelButtonIcon(
             active_->startDiscordScreenButton_,
@@ -4164,7 +4164,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     fitActionButton(active_->stopDiscordScreenButton_, 36.0F);
     active_->discordScreenStatusText_ = makeStatus(
         discordSection,
-        "Stopped. Press Discord Live Steam to check or start SaberStage Helper.",
+        "Stopped. Press Discord Live Steam to check or start TCP Media Receiver.",
         16.0F);
 
     auto* connectionSection = makeSection(

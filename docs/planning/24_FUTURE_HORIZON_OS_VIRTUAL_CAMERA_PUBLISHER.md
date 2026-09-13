@@ -5,7 +5,7 @@
 **Deferred concept only. No implementation is currently planned.**
 
 This document records a possible future replacement for, or complement to,
-the SaberStage Helper Discord screen-source path. It is based on Meta's
+the TCP Media Receiver Discord screen-source path. It is based on Meta's
 experimental Virtual Camera Publisher API as documented on September 9, 2026.
 The API is currently version `0.0.1`, is supplied on an as-is basis, and is new
 enough that its behavior, packaging, permissions, and compatibility may change
@@ -108,12 +108,12 @@ This creates two separate questions:
 SaberStage cannot add a permission to Discord. If Discord does not support this
 API, a successfully published SaberStage camera still will not appear in
 Discord's virtual-camera selector. This must be proven on the headset before
-the existing helper path is removed or redesigned.
+the existing receiver path is removed or redesigned.
 
 ## Proposed SaberStage design
 
 The first integration should be isolated behind a compile-time experimental
-feature and should coexist with the current helper path.
+feature and should coexist with the current receiver path.
 
 ### Camera registration
 
@@ -191,7 +191,7 @@ Before implementation, determine:
 
 Do not patch undocumented Horizon services, replace compositor textures, hook
 system casting internals, or modify the player's eye buffers as a workaround.
-If the supported publisher API cannot be integrated safely, retain the helper
+If the supported publisher API cannot be integrated safely, retain the receiver
 architecture.
 
 ## Audio boundary
@@ -209,13 +209,13 @@ The proof of concept must separately verify:
   unsynchronized audio;
 - whether pause/AFK behavior can provide silent audio while replacing video.
 
-The existing helper explicitly receives SaberStage's mixed game, microphone,
-and TTS audio. The helper must remain available until the virtual-camera path
+The existing receiver explicitly receives SaberStage's mixed game, microphone,
+and TTS audio. The receiver must remain available until the virtual-camera path
 matches the required audio behavior or a separate supported audio route exists.
 
 ## Performance questions
 
-Although this path should remove SaberStage's helper transport and decode
+Although this path should remove SaberStage's receiver transport and decode
 stages, it is not automatically free. Horizon OS may still request a separately
 rendered camera and perform its own color conversion and encoding.
 
@@ -227,7 +227,7 @@ Measure all of the following on Quest 2 and Quest 3:
 - additional Unity camera render cost;
 - texture allocation and copy behavior;
 - output frame pacing at 30, 45, and 60 FPS where supported;
-- latency compared with the current helper path;
+- latency compared with the current receiver path;
 - behavior with bloom, post-processing, avatars on layer 3, UI exclusion, and
   SaberStage motion scripts;
 - behavior while Twitch streaming or recording simultaneously.
@@ -250,21 +250,21 @@ already responsible for encoding the published camera.
    Android, Java/JNI, graphics, and manifest dependencies without changing
    SaberStage.
 5. **Create an isolated SaberStage prototype.** Publish one conservative
-   third-person camera. Do not remove or alter the helper implementation.
+   third-person camera. Do not remove or alter the receiver implementation.
 6. **Verify lifecycle.** Exercise game startup, menu-to-map transitions,
    pause/resume, camera recreation, capture start/stop, Beat Saber exit, and
    unexpected consumer disconnects.
 7. **Verify media behavior.** Confirm the selected third-person view, aspect
    ratio, post-processing, layer visibility, audio, AFK behavior, and latency.
 8. **Benchmark both paths.** Compare the virtual camera with the existing
-   Direct encoder plus helper decoder under the same scene and capture settings.
+   Direct encoder plus receiver decoder under the same scene and capture settings.
 9. **Make a product decision.** Keep both paths, make virtual camera preferred
-   with helper fallback, or defer it again based on measured compatibility and
+   with receiver fallback, or defer it again based on measured compatibility and
    reliability.
 
 ## Minimum acceptance criteria
 
-The feature is not ready to replace the helper unless all of these are true:
+The feature is not ready to replace the receiver unless all of these are true:
 
 - The camera registers without destabilizing Beat Saber.
 - It appears consistently after cold start and across scene transitions.
@@ -278,13 +278,13 @@ The feature is not ready to replace the helper unless all of these are true:
 - Stopping capture releases all graphics and platform resources.
 - An idle registered camera has negligible performance cost.
 - Active capture performs better than, or offers a clear reliability advantage
-  over, the helper pipeline on Quest 2 and Quest 3.
+  over, the receiver pipeline on Quest 2 and Quest 3.
 - Failure leaves recording, Twitch streaming, Beat Saber, and the existing
-  helper fallback usable.
+  receiver fallback usable.
 
 ## References
 
 - Meta documentation: <https://developers.meta.com/horizon/documentation/unity/unity-sample-virtual-camera-publisher/>
 - Meta sample repository: <https://github.com/oculus-samples/Unity-VirtualCameraPublisher>
 - Package onboarding documentation: <https://github.com/oculus-samples/Unity-VirtualCameraPublisher/blob/dev/com.meta.xr.virtualcamerapublisher/README.md>
-- Current SaberStage helper design: [`../DISCORD_SCREEN_SOURCE.md`](../DISCORD_SCREEN_SOURCE.md)
+- Current TCP Media Receiver design: [`../DISCORD_SCREEN_SOURCE.md`](../DISCORD_SCREEN_SOURCE.md)

@@ -7,7 +7,7 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Opens Discord before launching the selectable SaberStage Camera activity.
+// - Opens Discord before launching the selectable TCP Media Receiver activity.
 //   Meta's 2D window manager removes an existing sideloaded panel when Discord
 //   is launched from the Quest library; opening the source last keeps both
 //   tasks alive so Discord's single-app picker can enumerate the helper.
@@ -50,11 +50,8 @@ using Jni = UnityEngine::AndroidJNI;
 using JHandle = System::IntPtr;
 using JValue = UnityEngine::jvalue;
 
-constexpr std::uint32_t kMagic = 0x53534448U; // "SSDH"
-// Version two adds TYPE_AUDIO. Rejecting a version-one helper is intentional:
-// silently connecting to an older video-only APK would produce a Discord
-// stream that appears healthy but has no sound.
-constexpr std::uint8_t kProtocolVersion = 2;
+constexpr std::uint32_t kMagic = 0x544D5250U; // "TMRP"
+constexpr std::uint8_t kProtocolVersion = 1;
 constexpr std::uint8_t kHelloMessage = 1;
 constexpr std::uint8_t kVideoMessage = 2;
 constexpr std::uint8_t kHeartbeatMessage = 3;
@@ -197,7 +194,7 @@ DiscordHelperAvailability QueryDiscordHelperAvailabilityImpl() noexcept {
                 "Discord helper package check could not resolve the Android package query");
             return DiscordHelperAvailability::Unknown;
         }
-        const auto packageName = Jni::NewStringUTF("com.saberstage.helper");
+        const auto packageName = Jni::NewStringUTF("com.loud160.tcpmediareceiver");
         if (IsNull(packageName) || ClearJniException()) {
             Logging::Logger.error(
                 "Discord helper package check could not allocate the package name");
@@ -212,10 +209,10 @@ DiscordHelperAvailability QueryDiscordHelperAvailabilityImpl() noexcept {
         }
         if (IsNull(launchIntent)) {
             // Android 11+ returns null when Beat Saber has no <queries> entry,
-            // even for the installed, exported SaberStage Helper. Do not send
+            // even for the installed, exported TCP Media Receiver. Do not send
             // the user back through installation on this ambiguous result.
             Logging::Logger.warn(
-                "Android PackageManager did not expose SaberStage Helper; "
+                "Android PackageManager did not expose TCP Media Receiver; "
                 "the explicit helper launch will verify availability");
             return DiscordHelperAvailability::Unknown;
         }
@@ -265,6 +262,33 @@ bool LaunchHelperActivity(
         if (IsNull(activity) || ClearJniException())
             return fail("Beat Saber's Android activity is unavailable.");
 
+        // Launch 2D panels through the application Context rather than Beat
+        // Saber's Activity token. Horizon otherwise records the immersive
+        // activity as the source task and can finish the receiver panel while
+        // switching focus back to the game instead of merely backgrounding it.
+        const auto activityClass = Jni::GetObjectClass(activity);
+        const auto getApplicationContext = IsNull(activityClass)
+            ? JHandle{}
+            : Jni::GetMethodID(
+                  activityClass,
+                  "getApplicationContext",
+                  "()Landroid/content/Context;");
+        const auto applicationContext = IsNull(getApplicationContext)
+            ? JHandle{}
+            : Jni::CallObjectMethod(activity, getApplicationContext, nullptr);
+        const auto contextClass = IsNull(applicationContext)
+            ? JHandle{}
+            : Jni::GetObjectClass(applicationContext);
+        const auto startActivity = IsNull(contextClass)
+            ? JHandle{}
+            : Jni::GetMethodID(
+                  contextClass, "startActivity", "(Landroid/content/Intent;)V");
+        if (IsNull(activityClass) || IsNull(getApplicationContext) ||
+                IsNull(applicationContext) || IsNull(contextClass) ||
+                IsNull(startActivity) || ClearJniException()) {
+            return fail("Android could not resolve the application launch context.");
+        }
+
         const auto intentClass = Jni::FindClass("android/content/Intent");
         if (IsNull(intentClass) || ClearJniException())
             return fail("Android's activity launch API is unavailable.");
@@ -282,13 +306,8 @@ bool LaunchHelperActivity(
             intentClass, "addCategory", "(Ljava/lang/String;)Landroid/content/Intent;");
         const auto addFlags = Jni::GetMethodID(
             intentClass, "addFlags", "(I)Landroid/content/Intent;");
-        const auto activityClass = Jni::GetObjectClass(activity);
-        const auto startActivity = IsNull(activityClass)
-            ? JHandle{}
-            : Jni::GetMethodID(
-                  activityClass, "startActivity", "(Landroid/content/Intent;)V");
         if (IsNull(setClassName) || IsNull(setAction) || IsNull(addCategory) ||
-                IsNull(addFlags) || IsNull(activityClass) || IsNull(startActivity) ||
+                IsNull(addFlags) || IsNull(startActivity) ||
                 ClearJniException()) {
             return fail("Android could not resolve the Discord application launcher.");
         }
@@ -314,7 +333,8 @@ bool LaunchHelperActivity(
         Jni::CallObjectMethod(discordIntent, addFlags, {IntArgument(0x10000000)});
         if (ClearJniException())
             return fail("Android could not configure the Discord application launch.");
-        Jni::CallVoidMethod(activity, startActivity, {ObjectArgument(discordIntent)});
+        Jni::CallVoidMethod(
+            applicationContext, startActivity, {ObjectArgument(discordIntent)});
         const auto discordLaunchException = ConsumePendingJniException();
         if (discordLaunchException == PendingJniException::ActivityNotFound) {
             return fail("The Quest Discord app is not installed or its main activity is unavailable.");
@@ -329,18 +349,20 @@ bool LaunchHelperActivity(
         const auto intent = Jni::NewObject(intentClass, constructor, nullptr);
         if (IsNull(intent) || ClearJniException())
             return fail("Android could not create the helper launch request.");
-        const auto packageName = Jni::NewStringUTF("com.saberstage.helper");
-        const auto className = Jni::NewStringUTF("com.saberstage.helper.MainActivity");
+        const auto packageName = Jni::NewStringUTF("com.loud160.tcpmediareceiver");
+        const auto className = Jni::NewStringUTF("com.loud160.tcpmediareceiver.MainActivity");
         const auto action = Jni::NewStringUTF(
-            "com.saberstage.helper.action.START_SESSION");
+            "com.loud160.tcpmediareceiver.action.START_SESSION");
         const auto tokenKey = Jni::NewStringUTF("session_token");
         const auto tokenValue = Jni::NewStringUTF(std::string(token));
         const auto widthKey = Jni::NewStringUTF("video_width");
         const auto heightKey = Jni::NewStringUTF("video_height");
         const auto fpsKey = Jni::NewStringUTF("video_fps");
+        const auto localAudioVolumeKey = Jni::NewStringUTF("local_audio_volume_percent");
         if (IsNull(packageName) || IsNull(className) || IsNull(action) ||
                 IsNull(tokenKey) || IsNull(tokenValue) || IsNull(widthKey) ||
-                IsNull(heightKey) || IsNull(fpsKey) || ClearJniException())
+                IsNull(heightKey) || IsNull(fpsKey) || IsNull(localAudioVolumeKey) ||
+                ClearJniException())
             return fail("Android could not prepare the helper session.");
 
         const auto putString = Jni::GetMethodID(
@@ -363,22 +385,26 @@ bool LaunchHelperActivity(
             intent, putInteger, {ObjectArgument(heightKey), IntArgument(height)});
         Jni::CallObjectMethod(
             intent, putInteger, {ObjectArgument(fpsKey), IntArgument(framesPerSecond)});
+        // Beat Saber already renders this audio locally. The receiver keeps
+        // it available to playback capture without monitoring a second copy.
+        Jni::CallObjectMethod(
+            intent, putInteger, {ObjectArgument(localAudioVolumeKey), IntArgument(0)});
         // A separate task is required so Android 14's single-app share picker
-        // sees SaberStage Camera independently from Beat Saber.
+        // sees TCP Media Receiver independently from Beat Saber.
         Jni::CallObjectMethod(intent, addFlags, {IntArgument(0x10000000)});
         if (ClearJniException())
             return fail("Android could not configure the helper launch request.");
 
-        Jni::CallVoidMethod(activity, startActivity, {ObjectArgument(intent)});
+        Jni::CallVoidMethod(applicationContext, startActivity, {ObjectArgument(intent)});
         const auto launchException = ConsumePendingJniException();
         if (launchException == PendingJniException::ActivityNotFound) {
             if (helperAvailability) {
                 *helperAvailability = DiscordHelperAvailability::NotInstalled;
             }
-            return fail("SaberStage Helper is not installed or its camera activity is unavailable.");
+            return fail("TCP Media Receiver is not installed or its camera activity is unavailable.");
         }
         if (launchException != PendingJniException::None) {
-            return fail("Android rejected the SaberStage Camera activity launch. Details were written to the SaberStage log.");
+            return fail("Android rejected the TCP Media Receiver activity launch. Details were written to the SaberStage log.");
         }
         if (helperAvailability) {
             *helperAvailability = DiscordHelperAvailability::Installed;
@@ -387,7 +413,7 @@ bool LaunchHelperActivity(
     } catch (...) {
         ClearJniException();
         if (error) {
-            *error = "SaberStage Camera could not be opened. Install the SaberStage Helper APK first.";
+            *error = "TCP Media Receiver could not be opened. Install the TCP Media Receiver APK first.";
         }
         return false;
     }
@@ -609,7 +635,7 @@ public:
             decoderStatus_.clear();
         }
         token_ = CreateSessionToken();
-        SetStatus(DiscordScreenState::Launching, "Opening SaberStage Camera on Android...");
+        SetStatus(DiscordScreenState::Launching, "Opening TCP Media Receiver on Android...");
         if (!LaunchHelperActivity(
                 token_,
                 width_,
@@ -621,7 +647,7 @@ public:
                 DiscordScreenState::Failed,
                 error && !error->empty()
                     ? *error
-                    : "SaberStage Helper is not installed or could not be opened.");
+                    : "TCP Media Receiver is not installed or could not be opened.");
             return false;
         }
         stopRequested_.store(false, std::memory_order_release);
@@ -797,11 +823,11 @@ private:
         try {
             SetStatus(
                 DiscordScreenState::Connecting,
-                "Waiting for SaberStage Helper to accept the camera session...");
+                "Waiting for TCP Media Receiver to accept the camera session...");
             const auto initialDeadline = std::chrono::steady_clock::now() + kInitialConnectTimeout;
             if (!ConnectUntil(initialDeadline, false)) {
                 if (!stopRequested_.load(std::memory_order_acquire)) {
-                    Fail("SaberStage Helper did not accept the camera session. Confirm that the helper APK is installed and open.");
+                    Fail("TCP Media Receiver did not accept the camera session. Confirm that the receiver APK is installed and open.");
                 }
                 return;
             }
@@ -857,7 +883,7 @@ private:
                 if (!ConnectUntil(
                         std::chrono::steady_clock::now() + kReconnectTimeout, true)) {
                     if (!stopRequested_.load(std::memory_order_acquire)) {
-                        Fail("Connection to SaberStage Helper was lost and could not be restored.");
+                        Fail("Connection to TCP Media Receiver was lost and could not be restored.");
                     }
                     return;
                 }
@@ -883,14 +909,14 @@ private:
         if (reconnecting) {
             SetStatus(
                 DiscordScreenState::Reconnecting,
-                "Camera connection interrupted; reconnecting to SaberStage Helper...");
+                "Camera connection interrupted; reconnecting to TCP Media Receiver...");
         }
         while (!stopRequested_.load(std::memory_order_acquire) &&
                std::chrono::steady_clock::now() < deadline) {
             if (ConnectAndAuthenticate()) {
                 SetStatus(
                     DiscordScreenState::Live,
-                    "SaberStage Camera is ready. Select it in Discord's screen-source picker.");
+                    "TCP Media Receiver is ready. Select it in Discord's screen-source picker.");
                 return true;
             }
             std::unique_lock lock(queueMutex_);
@@ -952,18 +978,16 @@ private:
         if (type != kAckMessage) {
             if (type == kErrorMessage) {
                 Logging::Logger.error(
-                    "SaberStage Helper rejected the camera session: {}",
+                    "TCP Media Receiver rejected the camera session: {}",
                     std::string(payload.begin(), payload.end()));
             }
             CloseSocket();
             return false;
         }
-        // Protocol v2 helpers historically returned only "ready". Newer
-        // helpers append one human-readable decoder line after a newline, so
-        // accepting the old payload preserves compatibility while allowing
-        // SaberStage to display the exact MediaCodec chosen by Android.
+        // TMRP v1 returns a fixed readiness/version prefix followed by
+        // optional human-readable diagnostics.
         const std::string acknowledgement(payload.begin(), payload.end());
-        constexpr const char* kReadyPrefix = "ready\n";
+        constexpr const char* kReadyPrefix = "READY\nTMRP/1\n";
         std::string decoderStatus;
         if (acknowledgement.rfind(kReadyPrefix, 0) == 0) {
             decoderStatus = acknowledgement.substr(std::strlen(kReadyPrefix));
@@ -975,7 +999,7 @@ private:
                 decoderStatus.end());
         }
         if (!decoderStatus.empty()) {
-            Logging::Logger.info("SaberStage Helper reported {}", decoderStatus);
+            Logging::Logger.info("TCP Media Receiver reported {}", decoderStatus);
         }
         {
             std::lock_guard lock(statusMutex_);

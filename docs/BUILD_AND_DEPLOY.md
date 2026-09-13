@@ -94,22 +94,22 @@ The private log files should be created at:
 
 Device deployment is development-only. Keep a copy of logs and QMOD hash with every smoke result.
 
-## Optional Discord screen-source helper
+## Optional Discord screen-source receiver
 
 Discord integration requires a separate Android APK because a native library
 inside Beat Saber's process cannot register another app window with Android's
-single-app sharing picker. Build `SaberStage-Helper` from its own repository and
-install the resulting `SaberStage-Helper.apk` once. The helper package is
-`com.saberstage.helper`; it is not bundled into the QMOD and is not a Beat Saber
+single-app sharing picker. Build `TCP-Media-Receiver` from its own repository and
+install the resulting `TCP-Media-Receiver.apk` once. The receiver package is
+`com.loud160.tcpmediareceiver`; it is not bundled into the QMOD and is not a Beat Saber
 mod dependency.
 
-The **Live Stream** tab detects an absent helper and offers the stable newest-
-release download for `SaberStage-Helper.apk`, followed by Quest Package Manager
-and Unknown Sources instructions. Installing the helper and proving that Discord captures its window
+The **Live Stream** tab detects an absent receiver and offers the stable newest-
+release download for `TCP-Media-Receiver.apk`, followed by Quest Package Manager
+and Unknown Sources instructions. Installing the receiver and proving that Discord captures its window
 are separate device gates; neither the SaberStage native build nor APK signature
 verification proves the on-headset Discord path.
 
-The helper APK opts into Android playback capture and must be rebuilt together
-with the mod whenever the loopback protocol changes. Protocol version 2 adds
-the mixed game/microphone/TTS PCM stream; a version-1 helper is intentionally
-rejected rather than allowing a healthy-looking silent Discord source.
+The receiver APK opts into Android playback capture. SaberStage uses TCP Media
+Receiver Protocol version 1 (`TMRP`) for H.264 video and the mixed
+game/microphone/TTS PCM stream. Protocol changes must preserve version-1
+compatibility or update the mod and receiver together.

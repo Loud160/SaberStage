@@ -1582,6 +1582,14 @@ class RepositoryInvariantTests(unittest.TestCase):
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        receiver_docs = [
+            ROOT / "README.md",
+            ROOT / "docs/BUILD_AND_DEPLOY.md",
+            ROOT / "docs/CHAT_AND_DISCORD_INTEGRATION.md",
+            ROOT / "docs/DISCORD_SCREEN_SOURCE.md",
+            ROOT / "docs/STREAMING_ARCHITECTURE.md",
+            ROOT / "docs/planning/24_FUTURE_HORIZON_OS_VIRTUAL_CAMERA_PUBLISHER.md",
+        ]
 
         self.assertIn("StartCapture(error, true, false, true, &recording)", controller)
         self.assertIn("SameVideoProfile(activeProfileSettings_, recording)", controller)
@@ -1589,11 +1597,11 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("discordScreenSink_->SubmitAudio(", controller)
         self.assertIn("CreatePersistentAudioCapture();", controller)
         self.assertIn("kMaximumQueuedBytes", sink)
-        self.assertIn("kProtocolVersion = 2", sink)
+        self.assertIn("kProtocolVersion = 1", sink)
         self.assertIn("kAudioMessage = 7", sink)
         self.assertIn("kSignedPcm16Format", sink)
         self.assertIn("decoderStatus", sink)
-        self.assertIn('constexpr const char* kReadyPrefix = "ready\\n"', sink)
+        self.assertIn('constexpr const char* kReadyPrefix = "READY\\nTMRP/1\\n"', sink)
         self.assertIn("std::deque<QueuedPacket>", sink)
         self.assertIn("TYPE_STOP", sink)
         self.assertIn("Let the worker send TYPE_STOP", sink)
@@ -1605,20 +1613,41 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("getLaunchIntentForPackage", sink)
         self.assertIn('Jni::NewStringUTF("com.discord")', sink)
         self.assertIn('Jni::NewStringUTF("com.discord.main.MainDefault")', sink)
+        self.assertIn('"getApplicationContext"', sink)
+        self.assertIn(
+            "Jni::CallVoidMethod(applicationContext, startActivity",
+            sink,
+        )
+        self.assertIn('Jni::NewStringUTF("local_audio_volume_percent")', sink)
+        self.assertIn("ObjectArgument(localAudioVolumeKey), IntArgument(0)", sink)
+        self.assertNotIn(
+            "Jni::CallVoidMethod(activity, startActivity",
+            sink,
+        )
         self.assertLess(
             sink.index('Jni::NewStringUTF("com.discord.main.MainDefault")'),
-            sink.index('Jni::NewStringUTF("com.saberstage.helper.MainActivity")'),
+            sink.index('Jni::NewStringUTF("com.loud160.tcpmediareceiver.MainActivity")'),
         )
-        self.assertIn("Android PackageManager did not expose SaberStage Helper", sink)
+        self.assertIn("Android PackageManager did not expose TCP Media Receiver", sink)
         self.assertIn("android/content/ActivityNotFoundException", sink)
         self.assertIn("ConsumePendingJniException", sink)
         self.assertIn("StartDiscordScreen(&error, &launchAvailability)", menu)
         self.assertIn('text << "\\n" << snapshot.decoderStatus', menu)
-        self.assertIn("releases/latest/download/SaberStage-Helper.apk", menu)
+        self.assertIn("releases/latest/download/TCP-Media-Receiver.apk", menu)
         self.assertIn("Quest Package Manager", menu)
         self.assertIn("Unknown Sources", menu)
         self.assertIn("broadcast::CanStop(discord.state)", controller)
         self.assertIn("if (afk)", controller)
+        for path in receiver_docs:
+            documentation = path.read_text(encoding="utf-8")
+            normalized_documentation = " ".join(documentation.replace("-", " ").split())
+            self.assertIn("TCP Media Receiver", normalized_documentation, str(path))
+            for legacy_name in (
+                "SaberStage Helper",
+                "SaberStage-Helper",
+                "com.saberstage.helper",
+            ):
+                self.assertNotIn(legacy_name, documentation, str(path))
 
     def test_livestream_wake_guard_is_scoped_and_restores_previous_timeout(self):
         header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8")
