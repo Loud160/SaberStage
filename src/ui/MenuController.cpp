@@ -192,7 +192,7 @@ constexpr std::string_view kDiscordHelperApkName = "TCP-Media-Receiver.apk";
 // Fixed page slots keep feature code and persistent Unity objects stable while
 // the visible tab strip changes with Record/Stream mode and microphone state.
 // Slot 5 was the removed Overview page and intentionally remains unused so the
-// mature Audio, TTS, speed-test, and Discord pages do not need risky reindexing.
+// mature Audio, TTS, and speed-test pages do not need risky reindexing.
 constexpr int kCenterGeneralPage = 0;
 constexpr int kCenterTwitchPage = 1;
 constexpr int kCenterKickPage = 2;
@@ -201,7 +201,6 @@ constexpr int kCenterCustomPage = 4;
 constexpr int kCenterAudioPage = 6;
 constexpr int kCenterTtsPage = 7;
 constexpr int kCenterConfigureStreamPage = 8;
-constexpr int kCenterLiveStreamPage = 9;
 constexpr std::string_view kDiscordHelperLatestReleaseUrl =
     "https://github.com/Loud160/TCP-Media-Receiver/releases/latest/download/TCP-Media-Receiver.apk";
 
@@ -2326,7 +2325,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         [](auto* page) { return page == nullptr; });
     if (missingPage) {
         Logging::Logger.error(
-            "Could not create all ten center-panel tab pages");
+            "Could not create all nine center-panel tab pages");
         return;
     }
 
@@ -4126,46 +4125,6 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         queueLimitColumnWidth), initialTts.staleAfterSeconds, false);
 
     auto* configureStreamPage = active_->centerDebugTabContentRoots_[8];
-    auto* liveStreamPage = active_->centerDebugTabContentRoots_[9];
-    auto* discordSection = makeSection(
-        liveStreamPage, "Discord Live Stream");
-    makeStatus(
-        discordSection,
-        "Uses the separate TCP Media Receiver app to present the Primary third-person camera and SaberStage's stream-audio mix to Discord. The button opens Discord first and TCP Media Receiver second so both remain available. Select the existing Discord panel, choose TCP Media Receiver in its app-sharing picker, enable application audio, then return to Beat Saber.",
-        16.0F);
-    auto [discordActionRow, discordActionWidth] = makePaddedRow(
-        discordSection, 2, 9.5F);
-    auto* discordStartSlot = makeCenteredControlSlot(
-        discordActionRow->get_gameObject(), discordActionWidth, 9.5F);
-    active_->startDiscordScreenButton_ = WithHint(BSML::Lite::CreateUIButton(
-        discordStartSlot, "Discord Live Steam", [] {
-            if (active_) active_->HandleDiscordLiveStreamAction();
-        }),
-        "Checks for TCP Media Receiver, opens Discord before the source window, starts the session-only service, and feeds the existing hardware-encoded Primary camera plus mixed stream audio to the Discord-selectable app window.");
-    fitActionButton(active_->startDiscordScreenButton_, 45.0F);
-    if (auto* icon = CreateRecordingPanelButtonIcon(
-            active_->startDiscordScreenButton_,
-            EmbeddedRecordingPanelIcons().discord,
-            "Discord Live Stream Icon")) {
-        auto rect = icon->get_rectTransform();
-        rect->set_anchoredPosition({-18.0F, 0.0F});
-        rect->set_sizeDelta({4.3F, 4.3F});
-    }
-    auto* discordStopSlot = makeCenteredControlSlot(
-        discordActionRow->get_gameObject(), discordActionWidth, 9.5F);
-    active_->stopDiscordScreenButton_ = WithHint(BSML::Lite::CreateUIButton(
-        discordStopSlot, "Stop Discord Source", [] {
-            if (!active_) return;
-            active_->root_.Recording().StopDiscordScreen();
-            active_->RefreshDiscordScreenControls();
-            active_->RefreshRecordingStatus();
-        }),
-        "Stops the helper feed and releases its camera demand when no recording or Twitch stream still needs it.");
-    fitActionButton(active_->stopDiscordScreenButton_, 36.0F);
-    active_->discordScreenStatusText_ = makeStatus(
-        discordSection,
-        "Stopped. Press Discord Live Steam to check or start TCP Media Receiver.",
-        16.0F);
 
     auto* connectionSection = makeSection(
         configureStreamPage, "Internet Connection Quality");
@@ -4195,7 +4154,6 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
 
     active_->RefreshRecordingModeControls(true);
     active_->RefreshOutputProfileControls(true);
-    active_->RefreshDiscordScreenControls();
 }
 
 void MenuController::TickRuntimePanels() noexcept {
@@ -4883,11 +4841,6 @@ void MenuController::ShowCenterDebugTab(int index) {
     }
     UnityEngine::Canvas::ForceUpdateCanvases();
     if (selectedCenterDebugTab_ == kCenterAudioPage) RefreshAudioMeter();
-    if (selectedCenterDebugTab_ == kCenterLiveStreamPage) {
-        discordHelperAvailability_ =
-            broadcast::QueryDiscordHelperAvailability();
-        RefreshDiscordScreenControls();
-    }
 }
 
 void MenuController::RebuildCenterTabStrip() {
@@ -4918,7 +4871,6 @@ void MenuController::RebuildCenterTabStrip() {
     if (microphoneEnabled) addTab("Audio", kCenterAudioPage);
     if (streamMode) addTab("Chat TTS", kCenterTtsPage);
     addTab("Configure Stream", kCenterConfigureStreamPage);
-    addTab("Live Stream", kCenterLiveStreamPage);
 
     // Translate the segmented control's compact visible index back into the
     // stable page slot. Stable page slots let each page keep its existing UI

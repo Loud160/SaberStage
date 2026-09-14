@@ -8,7 +8,7 @@ SaberStage is one clean-room Quest-native product: a Camera2-familiar third-pers
 
 1. **Stage 1:** one independently rendered camera, movable HMD-only preview, synchronized local recording, and Quest 2 hardening.
 2. **Stage 2:** one versioned Wi-Fi/USB protocol, Avalonia viewing/recording, receiver/TV experiments, and OBS handoff.
-3. **Stage 3:** compositor/scenes, direct livestreaming, chat, and only Discord features supported by public APIs.
+3. **Stage 3:** compositor/scenes, direct livestreaming, chat, and supported public service integrations.
 
 Later sections get stable service and configuration boundaries now, but no nonfunctional controls appear in the UI.
 
@@ -144,7 +144,7 @@ in addition to its runtime catches.
 
 ## Unresolved device/API questions
 
-Before Stage 1 media implementation: confirm the exact Quest 2 Vulkan texture-to-encoder-surface bridge, encoder profiles/levels/resolutions, simultaneous codec limits, Unity audio tap point, AudioTrack/AAC path, sustained thermal cost, storage behavior, and long-session A/V drift. Before later stages: validate USB transport under Android application constraints, receiver latency/device coverage, OAuth/deep-link behavior in a patched app, and whether Android Keystore aliases remain stable across Beat Saber updates/repatching. Discord video injection is currently classified unsupported, not unresolved.
+Before Stage 1 media implementation: confirm the exact Quest 2 Vulkan texture-to-encoder-surface bridge, encoder profiles/levels/resolutions, simultaneous codec limits, Unity audio tap point, AudioTrack/AAC path, sustained thermal cost, storage behavior, and long-session A/V drift. Before later stages: validate USB transport under Android application constraints, receiver latency/device coverage, OAuth/deep-link behavior in a patched app, and whether Android Keystore aliases remain stable across Beat Saber updates/repatching.
 
 ## Primary sources
 

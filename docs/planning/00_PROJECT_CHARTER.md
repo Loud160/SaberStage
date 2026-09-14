@@ -13,7 +13,7 @@ The player must continue to play Beat Saber normally through the headset's first
 5. lightweight Beat-Saber-specific broadcast composition features similar to the useful parts of OBS;
 6. direct livestreaming from Quest to services such as Twitch, YouTube, or a custom RTMP/RTMPS endpoint;
 7. in-game stream-chat display;
-8. integration with a **local Discord client running on the Quest** where supported, including chat/status integration and, only if technically feasible through supported/current APIs, using the selected third-person broadcast view as a Discord livestream source.
+8. supported chat/status integration with a **local Discord client running on the Quest** where practical through public APIs.
 
 The optional **SaberStage Companion** will be written in **C#/.NET with Avalonia** and must run on:
 
@@ -209,8 +209,7 @@ The long-term system should conceptually look like:
 
 Additional control/data integrations:
     ├── Twitch/YouTube chat → in-game chat panel
-    ├── future Discord chat/status integration
-    └── future Discord video integration if technically feasible
+    └── future Discord chat/status integration
 ```
 
 No output mode should require a PC unless that output mode explicitly targets the desktop companion/OBS. The companion is an optional receiver/offload path, never a requirement for native Quest gameplay or local recording.
@@ -219,7 +218,7 @@ No output mode should require a PC unless that output mode explicitly targets th
 
 # One camera/compositor, multiple outputs
 
-Do not create separate camera systems for recording, companion streaming, TV output, direct livestreaming, or Discord video.
+Do not create separate camera systems for recording, companion streaming, TV output, or direct livestreaming.
 
 Conceptually:
 
@@ -234,8 +233,7 @@ EncodedPacketFanout
    ├── LocalRecordingSink
    ├── CompanionStreamingSink
    ├── TvReceiverSink (if supported)
-   ├── DirectLivestreamSink
-   └── DiscordMediaSink (only if supported)
+   └── DirectLivestreamSink
 ```
 
 When output requirements are codec-compatible, one hardware encode should feed multiple sinks.
@@ -277,8 +275,7 @@ ApplicationRoot
  │                ├── LocalRecordingSink
  │                ├── CompanionStreamingSink
  │                ├── TvReceiverSink
- │                ├── DirectLivestreamSink
- │                └── SupportedDiscordMediaSink
+ │                └── DirectLivestreamSink
  ├── ChatService
  │    ├── TwitchChatProvider
  │    ├── YouTubeChatProvider
@@ -666,58 +663,14 @@ Possible goals include:
 - Discord status/presence;
 - selected Discord chat/messages surfaced in the in-game panel where permitted;
 - stream/session status;
-- eventually using the third-person broadcast camera as the video source for a Discord livestream.
-
-However, **do not assume that a normal Android/Quest Discord client exposes an API for arbitrary external video-source injection.**
 
 Before implementation Codex must research current:
 
 - Discord Android/Quest client capabilities;
 - Discord public SDK/API capabilities;
-- Quest/Horizon OS media-sharing APIs;
-- Android MediaProjection/virtual-display/camera-source capabilities;
-- whether a third-party app can legally/technically present a synthetic video source to Discord without root, unsupported hooks, or invasive client modification;
 - Discord terms/policies relevant to automated client control or modified-client behavior.
 
-If supported public APIs cannot feed the broadcast camera into Discord:
-
-- do not hook/patch/modify the Discord APK;
-- do not use self-bot/private-user-token techniques;
-- do not invent an unsafe unsupported solution;
-- document the limitation;
-- evaluate whether a standards-based local stream or future companion can provide an acceptable alternative.
-
 The core camera/encoder architecture must not depend on Discord-specific behavior.
-
----
-
-# Future Discord video source goal
-
-If a supported mechanism exists, the desired media path is:
-
-```text
-Broadcast Camera / Compositor
-            ↓
-      Hardware Encoder
-            ↓
-     Discord-Compatible
-       Media Bridge
-            ↓
- Local Discord Client on Quest
-            ↓
-        Discord Live
-```
-
-Prefer reusing the same broadcast camera and capture timeline.
-
-Do not render another third-person camera solely for Discord if the existing broadcast frame can be reused.
-
-If Discord requires raw frames or a different codec/path:
-
-- quantify the cost;
-- protect gameplay;
-- avoid CPU readback if possible;
-- do not silently start an expensive second media pipeline.
 
 ---
 
@@ -916,7 +869,7 @@ native invalid state
 → prevent before unsafe call
 ```
 
-A recorder/stream/chat/Discord integration failure must not crash Beat Saber if it can reasonably be isolated.
+A recorder, stream, chat, or service-integration failure must not crash Beat Saber if it can reasonably be isolated.
 
 ---
 
@@ -951,7 +904,6 @@ Never log:
 
 - stream keys;
 - OAuth tokens;
-- Discord tokens;
 - private credentials.
 
 Do not emit huge per-frame logs by default.
@@ -1015,7 +967,6 @@ Also use current official documentation for:
 - EGL/input Surface;
 - TLS/networking;
 - Twitch/YouTube ingest/chat APIs;
-- Discord public SDK/API documentation;
 - Quest/Horizon OS/OpenXR tracking/recenter behavior.
 
 ---
@@ -1038,7 +989,7 @@ Also use current official documentation for:
 14. Desktop companion must be cross-platform by design.
 15. Direct Quest livestreaming must not require the desktop companion.
 16. Chat integration must not leak credentials or block gameplay.
-17. Discord integration must use supported/public mechanisms; do not patch the Discord client.
+17. External service integrations must use supported public mechanisms.
 18. Keep style/comments consistent.
 19. After every phase, summarize changed files, decisions, tests, device results, risks, and the exact next step.
 20. Implement one user camera first, but preserve stable identity and ownership seams for additional cameras later.
@@ -1056,6 +1007,6 @@ Do not think of this as:
 
 Think of it as:
 
-> **SaberStage: a Camera2-familiar native Quest camera whose first useful release records third-person gameplay locally, whose next stage streams that view to cross-platform companions and compatible receivers, and whose final stage provides Quest-native broadcast scenes, direct livestreaming, chat, and supported Discord integration.**
+> **SaberStage: a Camera2-familiar native Quest camera whose first useful release records third-person gameplay locally, whose next stage streams that view to cross-platform companions and compatible receivers, and whose final stage provides Quest-native broadcast scenes, direct livestreaming, and chat.**
 
 Camera2 is a deliberate behavioral and UX reference. SaberStage must be independently implemented around Quest constraints while preserving the familiar, full-control, set-it-and-forget-it experience from the beginning.

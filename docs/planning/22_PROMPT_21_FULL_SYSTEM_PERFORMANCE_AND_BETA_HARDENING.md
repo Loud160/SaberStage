@@ -80,6 +80,6 @@ Test at minimum:
 
 Update README, support documentation, limitations, and acceptance evidence to describe only behavior actually verified on the relevant platform and device.
 
-Do not claim Discord video injection, broad TV compatibility, 1080p60, simultaneous outputs, or macOS/Linux behavior without direct evidence.
+Do not claim broad TV compatibility, 1080p60, simultaneous outputs, or macOS/Linux behavior without direct evidence.
 
 Finish with changed files, architectural decisions, tests, device results, media validation, performance measurements, known risks, and any intentionally deferred acceptance criteria.

@@ -34,28 +34,21 @@ Verify current:
 - Quest/OpenXR recenter/reference-space behavior;
 - Android secure credential storage options;
 - local Discord client availability/capabilities on Quest;
-- current Discord public SDK/API capabilities relevant to presence, chat, voice/video, streaming, screen share, or external video-source injection;
-- whether Android/Horizon OS provides a supported way for one app to present an arbitrary synthetic video source to Discord;
+- current Discord public SDK/API capabilities relevant to presence and chat;
 - standards-based or receiver-app approaches for sending SaberStage's selected third-person view to common TVs without Meta's Windows software.
 
 Do not copy source implementation from another camera or recording mod.
 
 ## Discord feasibility must be explicit
 
-Do not assume the third-person camera can be injected into the Quest Discord client.
-
-Determine whether this is possible using supported/public mechanisms.
-
-Explicitly distinguish:
+Explicitly distinguish supported public capabilities for:
 
 - Discord presence/status integration;
 - Discord message/chat integration;
 - launching/deep-linking Discord;
-- consuming Discord data;
-- feeding third-person video into Discord;
-- controlling Discord livestreaming.
+- consuming Discord data.
 
-If arbitrary video-source injection would require:
+Reject any integration that requires:
 
 - modifying Discord;
 - private APIs;
@@ -65,7 +58,7 @@ If arbitrary video-source injection would require:
 
 mark that approach rejected.
 
-Document supported alternatives.
+Document supported public alternatives.
 
 ## Create documents
 
@@ -159,7 +152,7 @@ Define three delivery stages:
 
 1. camera, movable preview, synchronized local recording, and first-release Quest 2 hardening;
 2. versioned Wi-Fi/USB transport, cross-platform companion viewing/recording, TV-output feasibility, and OBS handoff;
-3. Quest-native compositor/scenes, direct livestreaming, chat, and only supported Discord capabilities.
+3. Quest-native compositor/scenes, direct livestreaming, chat, and supported public service capabilities.
 
 Behavioral and workflow familiarity with Camera2 is intentional. Clean-room means independently engineered source and internals; it does not require inventing an unfamiliar user experience.
 

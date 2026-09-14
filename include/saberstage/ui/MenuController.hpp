@@ -181,8 +181,8 @@ private:
     // roots let the debug colors expose both bounds while tab visibility and
     // native scroll layout remain independently controlled.
     HMUI::TextSegmentedControl* centerDebugTabs_ = nullptr;
-    std::array<UnityEngine::GameObject*, 10> centerDebugTabViewRoots_{};
-    std::array<UnityEngine::GameObject*, 10> centerDebugTabContentRoots_{};
+    std::array<UnityEngine::GameObject*, 9> centerDebugTabViewRoots_{};
+    std::array<UnityEngine::GameObject*, 9> centerDebugTabContentRoots_{};
     // The center-menu and movable-panel switches are two views of the same
     // persisted recording mode. Programmatic synchronization uses Unity's
     // guarded callback path so changing either switch cannot recurse while the

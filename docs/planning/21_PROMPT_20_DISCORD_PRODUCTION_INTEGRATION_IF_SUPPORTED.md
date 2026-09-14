@@ -13,32 +13,11 @@ For capabilities proven supported:
 - secure tokens/credentials;
 - reconnect automatically where appropriate;
 - provide clear disconnect/reset;
-- never allow Discord failures to affect recording/streaming/gameplay.
+- never allow provider failures to affect recording, streaming, or gameplay.
 
 If Discord messages can legally/technically be consumed, allow them to appear in the same HMD chat panel through a `DiscordChatProvider`.
 
 Provider-specific behavior must not leak into the panel implementation.
-
-## Discord video streaming
-
-Only if a supported method exists for feeding the broadcast camera to a local Discord client:
-
-- reuse the existing broadcast camera/compositor;
-- preserve the selected scene;
-- reuse the capture timeline;
-- reuse encoded media where compatible;
-- avoid second full scene render;
-- avoid CPU readback where possible;
-- implement bounded buffering;
-- isolate Discord failure;
-- preserve local recording/direct streaming.
-
-If Discord requires a materially different codec/resolution path:
-
-- validate hardware capability;
-- measure Quest 2 cost;
-- do not silently start a second encoder;
-- expose clear limitations.
 
 ## Set-it-and-forget-it
 

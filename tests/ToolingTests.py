@@ -1122,8 +1122,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("constexpr int kCenterAudioPage = 6", menu)
         self.assertIn("constexpr int kCenterTtsPage = 7", menu)
         self.assertNotIn('"Overview"', menu)
-        self.assertIn("std::array<UnityEngine::GameObject*, 10> centerDebugTabViewRoots_", header)
-        self.assertIn("std::array<UnityEngine::GameObject*, 10> centerDebugTabContentRoots_", header)
+        self.assertIn("std::array<UnityEngine::GameObject*, 9> centerDebugTabViewRoots_", header)
+        self.assertIn("std::array<UnityEngine::GameObject*, 9> centerDebugTabContentRoots_", header)
         self.assertIn("std::vector<int> visibleCenterTabPageIndices_", header)
         self.assertIn("generalRecordingModeToggle_", header)
         self.assertIn('makeSection(generalPage, "Recording Control Mode")', menu)
@@ -1582,15 +1582,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
         menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
-        receiver_docs = [
-            ROOT / "README.md",
-            ROOT / "docs/BUILD_AND_DEPLOY.md",
-            ROOT / "docs/CHAT_AND_DISCORD_INTEGRATION.md",
-            ROOT / "docs/DISCORD_SCREEN_SOURCE.md",
-            ROOT / "docs/STREAMING_ARCHITECTURE.md",
-            ROOT / "docs/planning/24_FUTURE_HORIZON_OS_VIRTUAL_CAMERA_PUBLISHER.md",
-        ]
-
         self.assertIn("StartCapture(error, true, false, true, &recording)", controller)
         self.assertIn("SameVideoProfile(activeProfileSettings_, recording)", controller)
         self.assertIn("discordScreenSink_->SubmitVideo(packet)", controller)
@@ -1605,9 +1596,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("std::deque<QueuedPacket>", sink)
         self.assertIn("TYPE_STOP", sink)
         self.assertIn("Let the worker send TYPE_STOP", sink)
-        self.assertIn('"Live Stream"', menu)
-        self.assertIn('"Discord Live Steam"', menu)
-        self.assertIn('"Stop Discord Source"', menu)
+        self.assertNotIn("constexpr int kCenterLiveStreamPage", menu)
+        self.assertNotIn('addTab("Live Stream"', menu)
+        self.assertNotIn('liveStreamPage, "Discord Live Stream"', menu)
         self.assertIn("RefreshDiscordScreenControls();", menu)
         self.assertIn("QueryDiscordHelperAvailability", sink)
         self.assertIn("getLaunchIntentForPackage", sink)
@@ -1638,16 +1629,6 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("Unknown Sources", menu)
         self.assertIn("broadcast::CanStop(discord.state)", controller)
         self.assertIn("if (afk)", controller)
-        for path in receiver_docs:
-            documentation = path.read_text(encoding="utf-8")
-            normalized_documentation = " ".join(documentation.replace("-", " ").split())
-            self.assertIn("TCP Media Receiver", normalized_documentation, str(path))
-            for legacy_name in (
-                "SaberStage Helper",
-                "SaberStage-Helper",
-                "com.saberstage.helper",
-            ):
-                self.assertNotIn(legacy_name, documentation, str(path))
 
     def test_livestream_wake_guard_is_scoped_and_restores_previous_timeout(self):
         header = (ROOT / "include/saberstage/recording/RecordingController.hpp").read_text(encoding="utf-8")

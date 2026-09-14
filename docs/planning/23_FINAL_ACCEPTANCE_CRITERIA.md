@@ -58,8 +58,6 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 ✓ Twitch/YouTube chat can be displayed in an HMD-only panel.
 ✓ Chat restores/reconnects without repeated placement or setup.
 ✓ Discord integration uses only supported/public mechanisms.
-✓ If Quest-local Discord video injection is supported, it reuses the selected SaberStage camera/scene without a second full scene render.
-✓ If Discord video injection is unsupported, the limitation is documented and no private API, client patch, self-bot, or unsafe workaround is used.
 ✓ Full-system Quest 2 stress and repeated-session tests pass for every supported combination.
 ```
 
