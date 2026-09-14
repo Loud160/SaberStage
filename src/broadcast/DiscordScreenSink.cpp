@@ -7,10 +7,9 @@
 // see LICENSE and LICENSE-ADDITIONAL-TERMS.md.
 
 // File responsibility:
-// - Opens Discord before launching the selectable TCP Media Receiver activity.
-//   Meta's 2D window manager removes an existing sideloaded panel when Discord
-//   is launched from the Quest library; opening the source last keeps both
-//   tasks alive so Discord's single-app picker can enumerate the helper.
+// - Opens Discord and the selectable receiver as independent app panels.
+//   Successful Android launches do not prove that Horizon
+//   will retain both windows when the user subsequently switches apps.
 // - Transfers bounded H.264 Annex-B access units and mixed signed 16-bit PCM over
 //   authenticated TCP loopback for Android app-window video/audio capture.
 
@@ -50,8 +49,15 @@ using Jni = UnityEngine::AndroidJNI;
 using JHandle = System::IntPtr;
 using JValue = UnityEngine::jvalue;
 
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+// The original installed APK uses SSDH v2. Only switch the endpoint and wire
+// identity for this diagnostic; the encoded camera/audio payloads are shared.
+constexpr std::uint32_t kMagic = 0x53534448U; // "SSDH"
+constexpr std::uint8_t kProtocolVersion = 2;
+#else
 constexpr std::uint32_t kMagic = 0x544D5250U; // "TMRP"
 constexpr std::uint8_t kProtocolVersion = 1;
+#endif
 constexpr std::uint8_t kHelloMessage = 1;
 constexpr std::uint8_t kVideoMessage = 2;
 constexpr std::uint8_t kHeartbeatMessage = 3;
@@ -194,7 +200,11 @@ DiscordHelperAvailability QueryDiscordHelperAvailabilityImpl() noexcept {
                 "Discord helper package check could not resolve the Android package query");
             return DiscordHelperAvailability::Unknown;
         }
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+        const auto packageName = Jni::NewStringUTF("com.saberstage.helper");
+#else
         const auto packageName = Jni::NewStringUTF("com.loud160.tcpmediareceiver");
+#endif
         if (IsNull(packageName) || ClearJniException()) {
             Logging::Logger.error(
                 "Discord helper package check could not allocate the package name");
@@ -248,7 +258,7 @@ bool LaunchHelperActivity(
         };
         LocalFrame frame;
         if (!frame.Active()) {
-            if (error) *error = "Android could not reserve references for the helper launch.";
+            if (error) *error = "Android could not reserve references for the Discord launch.";
             return false;
         }
         const auto unityPlayerClass = Jni::FindClass("com/unity3d/player/UnityPlayer");
@@ -262,17 +272,16 @@ bool LaunchHelperActivity(
         if (IsNull(activity) || ClearJniException())
             return fail("Beat Saber's Android activity is unavailable.");
 
-        // Launch 2D panels through the application Context rather than Beat
-        // Saber's Activity token. Horizon otherwise records the immersive
-        // activity as the source task and can finish the receiver panel while
-        // switching focus back to the game instead of merely backgrounding it.
+        // A receiver is an independent panel, not an immersive-app task owned
+        // by Beat Saber. The 2026-09-13 trace shows the Activity-token launch
+        // entering Horizon's Exclusive desktop; switching to the normal app
+        // desktop then removes its root task before the receiver can react.
+        // Use the standalone context plus explicit multi-panel intent flags.
         const auto activityClass = Jni::GetObjectClass(activity);
         const auto getApplicationContext = IsNull(activityClass)
             ? JHandle{}
             : Jni::GetMethodID(
-                  activityClass,
-                  "getApplicationContext",
-                  "()Landroid/content/Context;");
+                  activityClass, "getApplicationContext", "()Landroid/content/Context;");
         const auto applicationContext = IsNull(getApplicationContext)
             ? JHandle{}
             : Jni::CallObjectMethod(activity, getApplicationContext, nullptr);
@@ -286,15 +295,21 @@ bool LaunchHelperActivity(
         if (IsNull(activityClass) || IsNull(getApplicationContext) ||
                 IsNull(applicationContext) || IsNull(contextClass) ||
                 IsNull(startActivity) || ClearJniException()) {
-            return fail("Android could not resolve the application launch context.");
+            return fail("Android could not resolve the independent panel launch context.");
         }
+
+        // NEW_TASK | MULTIPLE_TASK | LAUNCH_ADJACENT is the Horizon OS
+        // multi-panel contract. NEW_TASK alone leaves placement up to the
+        // immersive launch path. Both target activities are singleTask, so
+        // Android still resolves an existing instance of each target.
+        constexpr std::int32_t kIndependentPanelFlags = 0x10000000 | 0x08000000 | 0x00001000;
 
         const auto intentClass = Jni::FindClass("android/content/Intent");
         if (IsNull(intentClass) || ClearJniException())
             return fail("Android's activity launch API is unavailable.");
         const auto constructor = Jni::GetMethodID(intentClass, "<init>", "()V");
         if (IsNull(constructor) || ClearJniException())
-            return fail("Android could not resolve the helper launch request constructor.");
+            return fail("Android could not resolve the Discord launch request constructor.");
 
         const auto setClassName = Jni::GetMethodID(
             intentClass,
@@ -330,11 +345,10 @@ bool LaunchHelperActivity(
         Jni::CallObjectMethod(discordIntent, setAction, {ObjectArgument(mainAction)});
         Jni::CallObjectMethod(
             discordIntent, addCategory, {ObjectArgument(launcherCategory)});
-        Jni::CallObjectMethod(discordIntent, addFlags, {IntArgument(0x10000000)});
+        Jni::CallObjectMethod(discordIntent, addFlags, {IntArgument(kIndependentPanelFlags)});
         if (ClearJniException())
             return fail("Android could not configure the Discord application launch.");
-        Jni::CallVoidMethod(
-            applicationContext, startActivity, {ObjectArgument(discordIntent)});
+        Jni::CallVoidMethod(applicationContext, startActivity, {ObjectArgument(discordIntent)});
         const auto discordLaunchException = ConsumePendingJniException();
         if (discordLaunchException == PendingJniException::ActivityNotFound) {
             return fail("The Quest Discord app is not installed or its main activity is unavailable.");
@@ -343,16 +357,21 @@ bool LaunchHelperActivity(
             return fail("Android rejected the Discord application launch. Details were written to the SaberStage log.");
         }
 
-        // Launch the source second. This ordering is required on Horizon OS:
-        // opening Discord from the library after the helper is visible removes
-        // the helper's root task before Discord builds its share-source list.
+        // Preserve the original Discord-first launch sequence. A JNI local
+        // frame manages references; it does not serialize Horizon placement.
         const auto intent = Jni::NewObject(intentClass, constructor, nullptr);
         if (IsNull(intent) || ClearJniException())
             return fail("Android could not create the helper launch request.");
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+        const auto packageName = Jni::NewStringUTF("com.saberstage.helper");
+        const auto className = Jni::NewStringUTF("com.saberstage.helper.MainActivity");
+        const auto action = Jni::NewStringUTF("com.saberstage.helper.action.START_SESSION");
+#else
         const auto packageName = Jni::NewStringUTF("com.loud160.tcpmediareceiver");
         const auto className = Jni::NewStringUTF("com.loud160.tcpmediareceiver.MainActivity");
         const auto action = Jni::NewStringUTF(
             "com.loud160.tcpmediareceiver.action.START_SESSION");
+#endif
         const auto tokenKey = Jni::NewStringUTF("session_token");
         const auto tokenValue = Jni::NewStringUTF(std::string(token));
         const auto widthKey = Jni::NewStringUTF("video_width");
@@ -387,14 +406,18 @@ bool LaunchHelperActivity(
             intent, putInteger, {ObjectArgument(fpsKey), IntArgument(framesPerSecond)});
         // Beat Saber already renders this audio locally. The receiver keeps
         // it available to playback capture without monitoring a second copy.
+#if !defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
         Jni::CallObjectMethod(
             intent, putInteger, {ObjectArgument(localAudioVolumeKey), IntArgument(0)});
+#endif
         // A separate task is required so Android 14's single-app share picker
         // sees TCP Media Receiver independently from Beat Saber.
-        Jni::CallObjectMethod(intent, addFlags, {IntArgument(0x10000000)});
+        Jni::CallObjectMethod(intent, addFlags, {IntArgument(kIndependentPanelFlags)});
         if (ClearJniException())
             return fail("Android could not configure the helper launch request.");
 
+        Logging::Logger.info(
+            "Launching receiver as independent adjacent panel (application context; flags=0x18001000)");
         Jni::CallVoidMethod(applicationContext, startActivity, {ObjectArgument(intent)});
         const auto launchException = ConsumePendingJniException();
         if (launchException == PendingJniException::ActivityNotFound) {
@@ -413,7 +436,7 @@ bool LaunchHelperActivity(
     } catch (...) {
         ClearJniException();
         if (error) {
-            *error = "TCP Media Receiver could not be opened. Install the TCP Media Receiver APK first.";
+            *error = "Discord or TCP Media Receiver could not be opened. Install the TCP Media Receiver APK first.";
         }
         return false;
     }
@@ -635,7 +658,13 @@ public:
             decoderStatus_.clear();
         }
         token_ = CreateSessionToken();
-        SetStatus(DiscordScreenState::Launching, "Opening TCP Media Receiver on Android...");
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+        SetStatus(DiscordScreenState::Launching, "Opening original SaberStage Camera (comparison build)...");
+        Logging::Logger.info("Discord source comparison: original com.saberstage.helper, SSDH v2");
+#else
+        SetStatus(DiscordScreenState::Launching, "Opening Discord and TCP Media Receiver...");
+        Logging::Logger.info("Discord source: com.loud160.tcpmediareceiver, TMRP v1");
+#endif
         if (!LaunchHelperActivity(
                 token_,
                 width_,
@@ -651,7 +680,24 @@ public:
             return false;
         }
         stopRequested_.store(false, std::memory_order_release);
-        worker_ = std::thread([this] { Run(); });
+        try {
+            worker_ = std::thread([this] { Run(); });
+        } catch (const std::exception& exception) {
+            stopRequested_.store(true, std::memory_order_release);
+            const std::string failure =
+                std::string("The Discord camera connection worker could not start: ") +
+                exception.what();
+            SetStatus(DiscordScreenState::Failed, failure);
+            Logging::Logger.error("{}", failure);
+            return false;
+        } catch (...) {
+            stopRequested_.store(true, std::memory_order_release);
+            const std::string failure =
+                "The Discord camera connection worker could not start.";
+            SetStatus(DiscordScreenState::Failed, failure);
+            Logging::Logger.error("{}", failure);
+            return false;
+        }
         return true;
     }
 
@@ -916,7 +962,11 @@ private:
             if (ConnectAndAuthenticate()) {
                 SetStatus(
                     DiscordScreenState::Live,
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+                    "Original SaberStage Camera is ready (comparison build). Select it in Discord.");
+#else
                     "TCP Media Receiver is ready. Select it in Discord's screen-source picker.");
+#endif
                 return true;
             }
             std::unique_lock lock(queueMutex_);
@@ -984,10 +1034,14 @@ private:
             CloseSocket();
             return false;
         }
-        // TMRP v1 returns a fixed readiness/version prefix followed by
-        // optional human-readable diagnostics.
+        // Each selected protocol's readiness prefix is followed by optional
+        // decoder diagnostics; keep the original APK visible in comparisons.
         const std::string acknowledgement(payload.begin(), payload.end());
+#if defined(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+        constexpr const char* kReadyPrefix = "ready\n";
+#else
         constexpr const char* kReadyPrefix = "READY\nTMRP/1\n";
+#endif
         std::string decoderStatus;
         if (acknowledgement.rfind(kReadyPrefix, 0) == 0) {
             decoderStatus = acknowledgement.substr(std::strlen(kReadyPrefix));

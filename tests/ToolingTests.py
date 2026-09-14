@@ -1578,6 +1578,24 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("Going live does not start or save a local recording", menu)
         self.assertNotIn("starts a local safety recording", menu)
 
+    def test_original_helper_baseline_is_explicit_and_default_off(self):
+        cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
+        build = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
+        sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
+        self.assertIn(
+            'option(SABERSTAGE_ORIGINAL_HELPER_BASELINE "Diagnostic only: target the installed original SaberStage Helper" OFF)',
+            cmake,
+        )
+        self.assertIn("if ($OriginalHelperBaseline) { 'ON' } else { 'OFF' }", build)
+        self.assertIn("-DSABERSTAGE_ORIGINAL_HELPER_BASELINE=$originalHelperOption", build)
+        self.assertIn('0x53534448U; // "SSDH"', sink)
+        self.assertIn("kProtocolVersion = 2;", sink)
+        self.assertIn('Jni::NewStringUTF("com.saberstage.helper.MainActivity")', sink)
+        self.assertIn('Jni::NewStringUTF("com.saberstage.helper.action.START_SESSION")', sink)
+        self.assertIn('0x544D5250U; // "TMRP"', sink)
+        self.assertIn("kProtocolVersion = 1;", sink)
+        self.assertIn("original SaberStage Camera (comparison build)", sink)
+
     def test_discord_screen_source_reuses_one_bounded_hardware_encode(self):
         controller = (ROOT / "src/recording/RecordingController.cpp").read_text(encoding="utf-8")
         sink = (ROOT / "src/broadcast/DiscordScreenSink.cpp").read_text(encoding="utf-8")
@@ -1604,17 +1622,23 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("getLaunchIntentForPackage", sink)
         self.assertIn('Jni::NewStringUTF("com.discord")', sink)
         self.assertIn('Jni::NewStringUTF("com.discord.main.MainDefault")', sink)
-        self.assertIn('"getApplicationContext"', sink)
+        self.assertIn("bool LaunchHelperActivity", sink)
+        self.assertNotIn("bool LaunchDiscordActivity", sink)
+        self.assertNotIn("bool LaunchReceiverActivity", sink)
+        self.assertNotIn("kPanelLaunchSettleDelay", sink)
+        self.assertNotIn("receiverLaunchDue_", sink)
+        self.assertNotIn("void DiscordScreenSink::Tick() noexcept", sink)
+        self.assertNotIn("discordScreenSink_->Tick();", controller)
         self.assertIn(
             "Jni::CallVoidMethod(applicationContext, startActivity",
             sink,
         )
         self.assertIn('Jni::NewStringUTF("local_audio_volume_percent")', sink)
         self.assertIn("ObjectArgument(localAudioVolumeKey), IntArgument(0)", sink)
-        self.assertNotIn(
-            "Jni::CallVoidMethod(activity, startActivity",
-            sink,
-        )
+        self.assertIn('"getApplicationContext"', sink)
+        self.assertIn("kIndependentPanelFlags = 0x10000000 | 0x08000000 | 0x00001000", sink)
+        self.assertEqual(sink.count("IntArgument(kIndependentPanelFlags)"), 2)
+        self.assertNotIn("Jni::CallVoidMethod(activity, startActivity", sink)
         self.assertLess(
             sink.index('Jni::NewStringUTF("com.discord.main.MainDefault")'),
             sink.index('Jni::NewStringUTF("com.loud160.tcpmediareceiver.MainActivity")'),

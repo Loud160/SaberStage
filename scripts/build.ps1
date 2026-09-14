@@ -11,7 +11,7 @@
 # - All one-click and manual paths converge here so they produce the same native binary.
 
 [CmdletBinding()]
-param([switch]$Clean)
+param([switch]$Clean, [switch]$OriginalHelperBaseline)
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
@@ -41,8 +41,12 @@ try {
         Remove-Item -LiteralPath (Join-Path $repo 'build') -Recurse -Force
     }
 
+    # Explicitly reset this option on ordinary builds so a previous diagnostic
+    # configure cannot silently redirect a subsequent release to the old APK.
+    $originalHelperOption = if ($OriginalHelperBaseline) { 'ON' } else { 'OFF' }
     & $cmake -S $repo -B (Join-Path $repo 'build') -G Ninja `
         -DCMAKE_BUILD_TYPE=Release `
+        "-DSABERSTAGE_ORIGINAL_HELPER_BASELINE=$originalHelperOption" `
         "-DCMAKE_ANDROID_NDK=$ndk" `
         -DANDROID_ABI=arm64-v8a `
         -DANDROID_PLATFORM=android-29 `

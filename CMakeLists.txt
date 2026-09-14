@@ -13,6 +13,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 option(SABERSTAGE_HOST_TESTS "Build only platform-neutral SaberStage tests" OFF)
+option(SABERSTAGE_ORIGINAL_HELPER_BASELINE "Diagnostic only: target the installed original SaberStage Helper" OFF)
 
 if(SABERSTAGE_HOST_TESTS)
     project(SaberStageHostTests LANGUAGES CXX)
@@ -136,6 +137,14 @@ file(GLOB_RECURSE INLINE_HOOK_C CONFIGURE_DEPENDS ${EXTERN_DIR}/includes/beatsab
 file(GLOB_RECURSE INLINE_HOOK_CPP CONFIGURE_DEPENDS ${EXTERN_DIR}/includes/beatsaber-hook/shared/inline-hook/*.cpp)
 
 add_library(${COMPILE_ID} SHARED ${SABERSTAGE_SOURCES} ${INLINE_HOOK_C} ${INLINE_HOOK_CPP})
+
+# Only the sender's endpoint/protocol identity changes for an on-device A/B
+# comparison. Keep the normal camera, encoder, UI, and transport unchanged.
+if(SABERSTAGE_ORIGINAL_HELPER_BASELINE)
+    set_property(SOURCE src/broadcast/DiscordScreenSink.cpp APPEND PROPERTY
+        COMPILE_DEFINITIONS SABERSTAGE_ORIGINAL_HELPER_BASELINE=1)
+    message(WARNING "Diagnostic build: Discord source targets the original SaberStage Helper APK")
+endif()
 target_include_directories(${COMPILE_ID} PRIVATE
     include
     src
