@@ -70,7 +70,7 @@ Preserve a generic subject/anchor concept for future:
 - waist/root;
 - other generic scene anchors.
 
-Keep encoding, networking, chat, and Discord out of the camera implementation.
+Keep encoding, networking, and chat out of the camera implementation.
 
 The camera may expose generic subject and visibility interfaces for other scene content, but it must not own that content.
 

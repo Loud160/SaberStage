@@ -19,7 +19,7 @@ Review:
 - per-sink bounded queues and failure isolation;
 - Wi-Fi/USB/TV/OBS reconnect behavior;
 - stream reconnect and credential storage;
-- chat and any supported Discord authentication/reconnect;
+- chat authentication and reconnect behavior;
 - compositor source lifetime and scene switching;
 - configuration versioning, migration, reset behavior, and atomic save;
 - repeated-session memory growth;
@@ -44,9 +44,8 @@ I. compositor overlays and scene changes;
 J. direct livestream;
 K. local recording plus direct livestream when one encode can safely feed both;
 L. chat panel;
-M. any supported Discord integration;
-N. hardware-decoded video mod concurrently;
-O. heavy Chroma/Noodle/particle map;
+M. hardware-decoded video mod concurrently;
+N. heavy Chroma/Noodle/particle map;
 P. the heaviest supported combination of recording, output, compositor, and chat.
 
 Capture HMD frame timing, broadcast FPS, dropped frames, encoder pressure, per-sink queue depth, file/network throughput, A/V drift, memory, CPU/GPU indicators, and sustained thermal behavior.

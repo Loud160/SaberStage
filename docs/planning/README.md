@@ -42,9 +42,7 @@ The companion receives native Quest gameplay. It does not run Beat Saber, requir
 15. Lightweight Quest-native broadcast compositor and scenes
 16. Direct Quest livestreaming
 17. In-game Twitch/YouTube chat panel
-18. Discord feasibility study
-19. Production Discord integration only for capabilities proven supported
-20. Full-system Quest 2 performance and beta hardening
+18. Full-system Quest 2 performance and beta hardening
 
 ## Product principles
 
@@ -59,6 +57,5 @@ The companion receives native Quest gameplay. It does not run Beat Saber, requir
 - The optional desktop companion remains cross-platform and independent of Meta's Windows runtime.
 - TV output uses the selected SaberStage view rather than the HMD mirror when technically possible.
 - Chat belongs in an HMD-only panel by default.
-- Discord integration uses supported/public mechanisms only; never patch or modify Discord.
 - Camera, preview, output, and broadcast configuration should be set once and restore automatically.
 - Design the menu and settings architecture for the complete product from the start without exposing fake or nonfunctional controls.

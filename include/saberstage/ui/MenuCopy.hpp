@@ -26,7 +26,7 @@ inline constexpr std::string_view kScaffoldDescription =
     "Not implemented yet:\n"
     "Camera, preview, and recording\n"
     "Companion and broadcast\n"
-    "Chat and Discord";
+    "Chat";
 
 inline constexpr std::string_view kResetButton = "Reset general settings";
 inline constexpr std::string_view kFactoryResetButton = "Factory reset SaberStage";

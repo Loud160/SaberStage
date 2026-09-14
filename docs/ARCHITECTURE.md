@@ -34,7 +34,6 @@ ApplicationRoot (created once from late_load; game-thread owned)
 |           |-- TvReceiverSink
 |           `-- DirectLivestreamSink
 |-- ChatService
-|-- SupportedDiscordIntegration
 |-- Diagnostics
 `-- UI
 ```
@@ -139,7 +138,7 @@ in addition to its runtime catches.
 - Reject an alternate recording-backend dependency: local recording and streaming share SaberStage's one Direct FFmpeg/MediaCodec implementation.
 - Reject CPU readback/software H.264 as a production fallback.
 - Reject a separate camera or encoder per destination.
-- Reject modifying Discord, self-bots, user tokens, private APIs, root, or unsupported hooks.
+- Reject modifying third-party clients, private APIs, root, or unsupported hooks.
 - Reject direct Unity access from codec/network/chat workers and unbounded queues.
 
 ## Unresolved device/API questions

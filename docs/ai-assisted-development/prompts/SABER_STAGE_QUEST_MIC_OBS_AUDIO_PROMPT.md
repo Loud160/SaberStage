@@ -138,7 +138,7 @@ Do not hook unrelated input systems if a clean existing path exists.
 
 # 6. Voice activation / noise gate
 
-Implement OBS/Discord-style voice activation using signal level.
+Implement OBS-style voice activation using signal level.
 
 Do not attempt speech recognition.
 

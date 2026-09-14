@@ -12,8 +12,7 @@ The player must continue to play Beat Saber normally through the headset's first
 4. direct third-person viewing on compatible TVs/receivers where a practical supported approach exists;
 5. lightweight Beat-Saber-specific broadcast composition features similar to the useful parts of OBS;
 6. direct livestreaming from Quest to services such as Twitch, YouTube, or a custom RTMP/RTMPS endpoint;
-7. in-game stream-chat display;
-8. supported chat/status integration with a **local Discord client running on the Quest** where practical through public APIs.
+7. in-game stream-chat display.
 
 The optional **SaberStage Companion** will be written in **C#/.NET with Avalonia** and must run on:
 
@@ -120,8 +119,7 @@ Verify current:
 - Android NDK/toolchain;
 - Quest graphics backend(s);
 - Android media APIs;
-- networking/TLS libraries appropriate to Quest;
-- Discord/Quest capabilities relevant to local-client integration.
+- networking/TLS libraries appropriate to Quest.
 
 Do not blindly reuse versions from older mods.
 
@@ -168,7 +166,6 @@ After the capture and remote-output foundations are stable:
 - add Quest-native broadcast scenes and lightweight OBS-like production controls;
 - add direct Quest livestreaming;
 - add in-HMD stream chat;
-- research and implement only supported Discord capabilities;
 - perform full-system Quest 2 hardening.
 
 The UI and configuration architecture must anticipate all three stages from the beginning. Unfinished features must not appear as fake controls, but completed later sections must fit naturally rather than feeling bolted on.
@@ -207,9 +204,8 @@ The long-term system should conceptually look like:
                     ▼            ▼
              Desktop Record     OBS
 
-Additional control/data integrations:
-    ├── Twitch/YouTube chat → in-game chat panel
-    └── future Discord chat/status integration
+Additional control/data integration:
+    └── Twitch/YouTube chat → in-game chat panel
 ```
 
 No output mode should require a PC unless that output mode explicitly targets the desktop companion/OBS. The companion is an optional receiver/offload path, never a requirement for native Quest gameplay or local recording.
@@ -278,9 +274,7 @@ ApplicationRoot
  │                └── DirectLivestreamSink
  ├── ChatService
  │    ├── TwitchChatProvider
- │    ├── YouTubeChatProvider
- │    └── FutureDiscordChatProvider
- ├── FutureDiscordIntegration
+ │    └── YouTubeChatProvider
  ├── Diagnostics
  └── UI
 ```
@@ -312,7 +306,6 @@ It must not own:
 - MP4 writing;
 - sockets;
 - stream credentials;
-- Discord state;
 - MediaCodec drain threads.
 
 The HMD cameras must remain independent.
@@ -491,7 +484,6 @@ Every persistent subsystem needs a clear reset path:
 - Reset Broadcast Scene
 - Reset Chat Panel
 - Clear/Change Stream Credentials
-- Reset Discord Integration
 - Factory Reset Mod
 
 No initial setup decision may become an irreversible hidden state.
@@ -651,26 +643,6 @@ Requirements:
 - chat should reconnect automatically on later launches when appropriate, without forcing the user through setup again.
 
 Authentication tokens must be treated as secrets and never written to ordinary logs.
-
----
-
-# Discord integration — research before implementation
-
-A later phase should integrate useful features with a **local Discord client running on the Quest**, if the current Quest/Horizon OS and Discord APIs make this possible safely.
-
-Possible goals include:
-
-- Discord status/presence;
-- selected Discord chat/messages surfaced in the in-game panel where permitted;
-- stream/session status;
-
-Before implementation Codex must research current:
-
-- Discord Android/Quest client capabilities;
-- Discord public SDK/API capabilities;
-- Discord terms/policies relevant to automated client control or modified-client behavior.
-
-The core camera/encoder architecture must not depend on Discord-specific behavior.
 
 ---
 

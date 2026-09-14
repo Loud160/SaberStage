@@ -33,32 +33,9 @@ Verify current:
 - Replay;
 - Quest/OpenXR recenter/reference-space behavior;
 - Android secure credential storage options;
-- local Discord client availability/capabilities on Quest;
-- current Discord public SDK/API capabilities relevant to presence and chat;
 - standards-based or receiver-app approaches for sending SaberStage's selected third-person view to common TVs without Meta's Windows software.
 
 Do not copy source implementation from another camera or recording mod.
-
-## Discord feasibility must be explicit
-
-Explicitly distinguish supported public capabilities for:
-
-- Discord presence/status integration;
-- Discord message/chat integration;
-- launching/deep-linking Discord;
-- consuming Discord data.
-
-Reject any integration that requires:
-
-- modifying Discord;
-- private APIs;
-- self-bot/user-token automation;
-- root;
-- unsupported hooking;
-
-mark that approach rejected.
-
-Document supported public alternatives.
 
 ## Create documents
 
@@ -72,7 +49,6 @@ docs/RECORDING_PIPELINE.md
 docs/STREAMING_ARCHITECTURE.md
 docs/BROADCAST_COMPOSITOR.md
 docs/TV_OUTPUT_FEASIBILITY.md
-docs/CHAT_AND_DISCORD_INTEGRATION.md
 docs/TRACKING_AND_RECENTER.md
 docs/LIFETIME_AND_THREADING.md
 docs/TEST_PLAN.md
@@ -107,7 +83,6 @@ docs/TEST_PLAN.md
 - chat provider abstraction;
 - HMD chat panel;
 - stream credential storage;
-- Discord integration boundary;
 - Avalonia companion boundary;
 - companion-side viewing and recording;
 - TV/receiver output boundary;

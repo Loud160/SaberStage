@@ -54,5 +54,4 @@ The packet abstraction must already be suitable for future:
 
 - MP4 sink;
 - RTMP/RTMPS sink;
-- Wi-Fi/USB sink;
-- Discord-compatible bridge if a supported mechanism later exists.
+- Wi-Fi/USB sink.

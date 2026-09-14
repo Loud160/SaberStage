@@ -57,14 +57,13 @@ Acceptance is staged. Later product goals do not prevent an earlier stage from b
 ✓ Local recording and direct streaming share one encode when profiles are compatible.
 ✓ Twitch/YouTube chat can be displayed in an HMD-only panel.
 ✓ Chat restores/reconnects without repeated placement or setup.
-✓ Discord integration uses only supported/public mechanisms.
 ✓ Full-system Quest 2 stress and repeated-session tests pass for every supported combination.
 ```
 
 ## Architecture and product acceptance
 
 ```text
-✓ Camera, preview, compositor, capture, output, chat, and Discord responsibilities remain separated.
+✓ Camera, preview, compositor, capture, output, and chat responsibilities remain separated.
 ✓ One camera/compositor and encoded-media architecture feeds compatible sinks.
 ✓ No unbounded queue or uncontrolled hot-path allocation is accepted.
 ✓ Gameplay is favored over capture or receiver quality under overload.

@@ -23,7 +23,7 @@ Use current verified Quest Beat Saber tooling and dependency versions.
 - build instructions;
 - development deployment instructions;
 - host-test target for platform-neutral logic;
-- no camera/preview/encoder/network/chat/Discord implementation yet.
+- no camera, preview, encoder, network, or chat implementation yet.
 
 At this scaffold stage the license decision was intentionally deferred. The
 owner later selected GPL-3.0-only with the repository's additional GPLv3
