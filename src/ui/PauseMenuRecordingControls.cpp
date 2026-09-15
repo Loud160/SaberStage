@@ -53,7 +53,7 @@ void PauseMenuRecordingControls::Bind(app::ApplicationRoot* root) noexcept {
 }
 
 void PauseMenuRecordingControls::CreateUi(GlobalNamespace::PauseMenuManager* pauseMenu) {
-    if (primaryButton_ || stopButton_ || !pauseMenu || !root_) return;
+    if (primaryButton_ || stopButton_ || !pauseMenu || !root_ || !root_->RuntimeEnabled()) return;
 
     auto parent = pauseMenu->__cordl_internal_get__pauseContainerTransform();
     if (!parent) {
@@ -98,7 +98,7 @@ void PauseMenuRecordingControls::ForgetUi() noexcept {
 }
 
 void PauseMenuRecordingControls::PrimaryAction() {
-    if (!root_) return;
+    if (!root_ || !root_->RuntimeEnabled()) return;
 
     const auto snapshot = root_->Recording().Snapshot();
     std::string error;
@@ -114,13 +114,17 @@ void PauseMenuRecordingControls::PrimaryAction() {
 }
 
 void PauseMenuRecordingControls::StopAction() {
-    if (!root_) return;
+    if (!root_ || !root_->RuntimeEnabled()) return;
     root_->Recording().Stop("Stopped from Beat Saber pause menu");
     Refresh();
 }
 
 void PauseMenuRecordingControls::Refresh() {
-    if (!root_) return;
+    if (!root_ || !root_->RuntimeEnabled()) {
+        if (primaryButton_) primaryButton_->set_interactable(false);
+        if (stopButton_) stopButton_->set_interactable(false);
+        return;
+    }
     const auto snapshot = root_->Recording().Snapshot();
 
     if (primaryButton_) {

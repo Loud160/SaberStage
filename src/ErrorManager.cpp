@@ -26,11 +26,19 @@
 #include "custom-types/shared/delegate.hpp"
 
 #include <cstdint>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <stdexcept>
 
 namespace saberstage {
 namespace {
+
+constexpr auto kCircuitBreakerWindow = std::chrono::minutes(3);
+const std::filesystem::path kCrashOperationMarker{
+    "/sdcard/ModData/com.beatgames.beatsaber/Mods/SaberStage/Logs/"
+    "native-operation.in-progress"};
 
 struct DialogTarget {
     SafePtrUnity<HMUI::FlowCoordinator> host;
@@ -154,6 +162,7 @@ void ErrorManager::ReportInternal(
     std::string_view context,
     std::string_view detail,
     std::source_location source) noexcept {
+    bool tripCircuitBreaker = false;
     try {
         Logging::Logger.error(
             "Internal failure in {} at {}:{} ({}): {}",
@@ -162,15 +171,36 @@ void ErrorManager::ReportInternal(
             source.line(),
             source.function_name(),
             detail);
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::scoped_lock lock(mutex_);
+            if (!circuitBreakerTripped_ &&
+                    lastInternalFailure_.time_since_epoch().count() != 0 &&
+                    now - lastInternalFailure_ <= kCircuitBreakerWindow) {
+                circuitBreakerTripped_ = true;
+                circuitBreakerDisableRequested_ = true;
+                tripCircuitBreaker = true;
+            }
+            lastInternalFailure_ = now;
+        }
     } catch (...) {
         // Native Logger Quest is already fail-open. This final boundary avoids
         // turning an allocation failure while describing the original problem
         // into a second exception.
     }
+    if (tripCircuitBreaker) {
+        Logging::Logger.critical(
+            "SaberStage circuit breaker tripped after repeated internal failures; runtime disable requested");
+        ReportUserVisible(
+            "SaberStage was disabled",
+            "SaberStage detected repeated internal errors and disabled all of its functionality to protect Beat Saber. Your settings were not changed other than the master enable state.\n\nCheck the SaberStage log for the exact failure details before turning the mod back on.");
+    }
 }
 
 void ErrorManager::ReportUserVisible(std::string title, std::string detail) noexcept {
     try {
+        title = LoggerFacade::SanitizeDiagnosticText(std::move(title));
+        detail = LoggerFacade::SanitizeDiagnosticText(std::move(detail));
         Logging::Logger.error("{}: {}", title, detail);
         std::scoped_lock lock(mutex_);
         // One current explanation is useful; a queue of stale modals is not.
@@ -191,6 +221,87 @@ void ErrorManager::NotifyMainFlowActivated() noexcept {
         uiDiscoveryReady_ = true;
     } catch (...) {
         RecordDialogFailure("could not record main-menu UI readiness");
+    }
+}
+
+void ErrorManager::SetGameplayActive(bool active) noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        gameplayActive_ = active;
+    } catch (...) {
+        RecordDialogFailure("could not update gameplay state");
+    }
+}
+
+void ErrorManager::SetCircuitBreakerHandler(std::function<void()> handler) noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        circuitBreakerHandler_ = std::move(handler);
+    } catch (...) {
+        RecordDialogFailure("could not bind the circuit-breaker disable handler");
+    }
+}
+
+void ErrorManager::ResetCircuitBreaker() noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        circuitBreakerTripped_ = false;
+        circuitBreakerDisableRequested_ = false;
+        lastInternalFailure_ = {};
+    } catch (...) {
+        RecordDialogFailure("could not reset the circuit breaker");
+    }
+}
+
+bool ErrorManager::CircuitBreakerTripped() const noexcept {
+    try {
+        std::scoped_lock lock(mutex_);
+        return circuitBreakerTripped_;
+    } catch (...) {
+        return true;
+    }
+}
+
+void ErrorManager::BeginCrashSensitiveOperation(std::string_view context) noexcept {
+    try {
+        std::filesystem::create_directories(kCrashOperationMarker.parent_path());
+        std::ofstream marker(kCrashOperationMarker, std::ios::trunc);
+        marker << context;
+        marker.flush();
+        Logging::Logger.Flush();
+    } catch (...) {
+        Logging::Logger.error(
+            "Could not arm SaberStage's native-operation crash marker");
+    }
+}
+
+void ErrorManager::FinishCrashSensitiveOperation() noexcept {
+    try {
+        std::error_code error;
+        std::filesystem::remove(kCrashOperationMarker, error);
+        if (error) {
+            Logging::Logger.warn(
+                "Could not clear SaberStage's native-operation crash marker: {}",
+                error.message());
+        }
+    } catch (...) {
+        Logging::Logger.error(
+            "Could not clear SaberStage's native-operation crash marker");
+    }
+}
+
+std::optional<std::string> ErrorManager::ConsumeInterruptedCrashOperation() noexcept {
+    try {
+        if (!std::filesystem::exists(kCrashOperationMarker)) return std::nullopt;
+        std::ifstream marker(kCrashOperationMarker);
+        std::string context;
+        std::getline(marker, context);
+        FinishCrashSensitiveOperation();
+        if (context.empty()) context = "an unknown crash-sensitive operation";
+        return context;
+    } catch (...) {
+        FinishCrashSensitiveOperation();
+        return std::string("an operation whose marker could not be read");
     }
 }
 
@@ -259,10 +370,30 @@ void ErrorManager::TickMainThread() noexcept {
 }
 
 void ErrorManager::TickMainThreadImpl() {
+    std::function<void()> disableHandler;
+    {
+        std::scoped_lock lock(mutex_);
+        if (circuitBreakerDisableRequested_ && circuitBreakerHandler_) {
+            circuitBreakerDisableRequested_ = false;
+            disableHandler = circuitBreakerHandler_;
+        }
+    }
+    if (disableHandler) {
+        try {
+            disableHandler();
+        } catch (const std::exception& exception) {
+            Logging::Logger.critical(
+                "Circuit-breaker runtime shutdown failed: {}", exception.what());
+        } catch (...) {
+            Logging::Logger.critical(
+                "Circuit-breaker runtime shutdown failed with an unknown native error");
+        }
+    }
+
     bool shouldResolveTarget = false;
     {
         std::scoped_lock lock(mutex_);
-        shouldResolveTarget = uiDiscoveryReady_ &&
+        shouldResolveTarget = uiDiscoveryReady_ && !gameplayActive_ &&
             (dialogVisible_ || pendingDialog_.has_value());
     }
     if (!shouldResolveTarget) return;

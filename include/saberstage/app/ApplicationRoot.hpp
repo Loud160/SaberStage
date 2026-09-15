@@ -59,6 +59,8 @@ public:
     // lifecycle callback cannot observe only part of the service graph.
     bool Start();
     void Stop() noexcept;
+    [[nodiscard]] bool RuntimeEnabled() const noexcept;
+    bool SetModEnabled(bool enabled, std::string* error = nullptr) noexcept;
     settings::SettingsService& Settings() noexcept;
     camera::CameraManager& Camera() noexcept;
     preview::PreviewManager& Preview() noexcept;
@@ -68,7 +70,12 @@ public:
     network::CloudflareSpeedTest& ConnectionTest() noexcept;
 
 private:
+    bool StartRuntimeFeatures(std::string* error = nullptr) noexcept;
+    void StopRuntimeFeatures() noexcept;
+    void DisableFromCircuitBreaker() noexcept;
+
     bool started_ = false;
+    bool runtimeEnabled_ = false;
     settings::SettingsService settings_;
     std::unique_ptr<camera::CameraManager> camera_;
     std::unique_ptr<preview::PreviewManager> preview_;

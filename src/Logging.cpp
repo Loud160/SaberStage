@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <regex>
 
 namespace {
 
@@ -66,13 +67,60 @@ void LoggerFacade::Emit(
     std::string message,
     NativeLoggerQuest::LogSource source) noexcept {
     auto& logger = NativeLoggerQuest::NativeLogger::Instance();
-    logger.Log(severity, std::move(message), source);
+    logger.Log(severity, SanitizeDiagnosticText(std::move(message)), source);
     if (severity == NativeLoggerQuest::LogSeverity::Critical) {
         // Critical startup/hook failures may be followed immediately by an
         // abort. Give the writer one small bounded chance to preserve the tail
         // without turning a crash path into an unbounded wait.
         logger.Flush(std::chrono::milliseconds(100));
     }
+}
+
+std::string LoggerFacade::SanitizeDiagnosticText(std::string message) noexcept {
+    try {
+        // IP addresses are not useful in a SaberStage support log. Redact both
+        // common IPv4 values and full/abbreviated IPv6-looking sequences.
+        message = std::regex_replace(
+            message,
+            std::regex(R"(\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)"),
+            "[redacted-ip]");
+        message = std::regex_replace(
+            message,
+            std::regex(R"(\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{0,4}\b)"),
+            "[redacted-ip]");
+
+        // Libraries sometimes include query parameters or HTTP-style header
+        // values in their exception text. Preserve the field name so the log
+        // remains diagnostic while removing the credential itself.
+        message = std::regex_replace(
+            message,
+            std::regex(
+                R"(((?:authorization)\s*(?:=|:)\s*(?:bearer\s+)?)[^\s&,;]+)",
+                std::regex_constants::icase),
+            "$1[redacted]");
+        message = std::regex_replace(
+            message,
+            std::regex(
+                R"((\bbearer\s+)[A-Za-z0-9._~+/=-]+)",
+                std::regex_constants::icase),
+            "$1[redacted]");
+        message = std::regex_replace(
+            message,
+            std::regex(
+                R"(((?:stream[_-]?key|access[_-]?token|refresh[_-]?token|oauth)\s*(?:=|:)\s*)[^\s&,;]+)",
+                std::regex_constants::icase),
+            "$1[redacted]");
+        message = std::regex_replace(
+            message,
+            std::regex(R"(\blive_[A-Za-z0-9_-]{12,}\b)"),
+            "[redacted-stream-key]");
+    } catch (...) {
+        // A scrubber failure must never replace the original application
+        // failure. Return a safe fixed message rather than risk leaking the
+        // unredacted diagnostic text.
+        return "SaberStage diagnostic text was withheld because redaction failed";
+    }
+    return message;
 }
 
 void LoggerFacade::ReportFormattingFailure(const char* detail) noexcept {

@@ -85,6 +85,9 @@ public:
 
     void Register();
     void TickRuntimePanels() noexcept;
+    // Keeps the recovery UI alive while tearing down or recreating every
+    // feature-facing surface behind the master switch.
+    void ApplyModEnabledState(bool enabled) noexcept;
 
 private:
     std::unique_ptr<ChatControls> chatControls_;
@@ -165,7 +168,9 @@ private:
     void ShowConnectionTestConsent();
     void ResolveConnectionTestConsent(bool accepted);
     void RefreshConnectionTestUi();
-    void ShowConnectionTestResults();
+    void ShowConnectionTestResults(bool preferSavedResult = false);
+    void ShowMasterDisableConfirmation();
+    void ResolveMasterDisableConfirmation(bool disable);
     void RefreshDiscordScreenControls();
     void HandleDiscordLiveStreamAction();
     void ShowDiscordHelperInstallPrompt();
@@ -188,9 +193,13 @@ private:
     // guarded callback path so changing either switch cannot recurse while the
     // stock toggle still performs its complete visual transition.
     BSML::ToggleSetting* generalRecordingModeToggle_ = nullptr;
+    BSML::ToggleSetting* masterEnabledToggle_ = nullptr;
+    UnityEngine::GameObject* generalFeatureContentRoot_ = nullptr;
+    BSML::ModalView* masterDisableConfirmationModal_ = nullptr;
     int centerTabStripSignature_ = -1;
     std::vector<int> visibleCenterTabPageIndices_;
     bool synchronizingRecordingModeControls_ = false;
+    bool synchronizingMasterEnabled_ = false;
     UnityEngine::GameObject* generalLocalRecordingContentRoot_ = nullptr;
     std::array<BSML::DropdownListSetting*, 10> generalEncodingDropdowns_{};
     TMPro::TextMeshProUGUI* audioInputStatusText_ = nullptr;
@@ -219,6 +228,7 @@ private:
     TMPro::TextMeshProUGUI* connectionTestTabSummaryText_ = nullptr;
     TMPro::TextMeshProUGUI* connectionTestProgressText_ = nullptr;
     TMPro::TextMeshProUGUI* connectionTestResultsText_ = nullptr;
+    UnityEngine::UI::Button* connectionTestShowResultsButton_ = nullptr;
     TMPro::TextMeshProUGUI* discordScreenStatusText_ = nullptr;
     BSML::ModalView* discordHelperInstallModal_ = nullptr;
     BSML::ModalView* discordHelperInstructionsModal_ = nullptr;

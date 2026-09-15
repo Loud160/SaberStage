@@ -13,7 +13,9 @@
 #pragma once
 
 #include <exception>
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <source_location>
@@ -41,6 +43,13 @@ public:
     // incomplete IL2CPP metadata and must not be queried, even from Unity's
     // main thread.
     void NotifyMainFlowActivated() noexcept;
+    void SetGameplayActive(bool active) noexcept;
+    void SetCircuitBreakerHandler(std::function<void()> handler) noexcept;
+    void ResetCircuitBreaker() noexcept;
+    [[nodiscard]] bool CircuitBreakerTripped() const noexcept;
+    void BeginCrashSensitiveOperation(std::string_view context) noexcept;
+    void FinishCrashSensitiveOperation() noexcept;
+    [[nodiscard]] std::optional<std::string> ConsumeInterruptedCrashOperation() noexcept;
     void TickMainThread() noexcept;
 
     template <typename Function>
@@ -76,7 +85,7 @@ private:
     void Release(std::uint64_t generation, bool requeue) noexcept;
     void RecordDialogFailure(std::string_view detail) noexcept;
 
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::optional<std::pair<std::string, std::string>> pendingDialog_;
     std::optional<std::pair<std::string, std::string>> activeDialog_;
     std::uint64_t dialogGeneration_ = 0;
@@ -84,6 +93,11 @@ private:
     bool dialogVisible_ = false;
     bool dialogAcknowledged_ = false;
     bool dialogFailureLogged_ = false;
+    bool gameplayActive_ = false;
+    bool circuitBreakerTripped_ = false;
+    bool circuitBreakerDisableRequested_ = false;
+    std::chrono::steady_clock::time_point lastInternalFailure_{};
+    std::function<void()> circuitBreakerHandler_;
 };
 
 } // namespace saberstage

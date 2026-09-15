@@ -262,6 +262,30 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("PauseMenuManager::Start SaberStage UI creation", main)
         self.assertIn("PauseMenuManager::OnDestroy SaberStage cleanup", main)
 
+    def test_master_disable_and_circuit_breaker_preserve_recovery_ui(self):
+        manager = (ROOT / "src/ErrorManager.cpp").read_text(encoding="utf-8")
+        logging = (ROOT / "src/Logging.cpp").read_text(encoding="utf-8")
+        application = (ROOT / "src/app/ApplicationRoot.cpp").read_text(encoding="utf-8")
+        menu = (ROOT / "src/ui/MenuController.cpp").read_text(encoding="utf-8")
+        flow = (ROOT / "src/ui/MenuFlowCoordinator.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("std::chrono::minutes(3)", manager)
+        self.assertIn("circuitBreakerDisableRequested_ = true", manager)
+        self.assertIn("native-operation.in-progress", manager)
+        self.assertIn("ConsumeInterruptedCrashOperation", application)
+        self.assertIn("StartRuntimeFeatures", application)
+        self.assertIn("StopRuntimeFeatures", application)
+        self.assertIn("general.modEnabled = false", application)
+        self.assertIn('"Enable SaberStage"', menu)
+        self.assertIn("generalFeatureContentRoot_->SetActive(enabled)", menu)
+        self.assertIn('std::vector<std::string_view> tabNames{"General"}', menu)
+        self.assertIn("SetLeftScreenViewController", flow)
+        self.assertIn("SetRightScreenViewController", flow)
+        self.assertIn("SetBottomScreenViewController", flow)
+        self.assertIn("[redacted-stream-key]", logging)
+        self.assertIn("[redacted-ip]", logging)
+        self.assertIn("bearer\\s+", logging)
+
     def test_continuous_ui_edits_use_coalesced_settings_persistence(self):
         header = (ROOT / "include/saberstage/settings/SettingsService.hpp").read_text(encoding="utf-8")
         service = (ROOT / "src/settings/SettingsService.cpp").read_text(encoding="utf-8")
@@ -871,10 +895,10 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("tabsRect->set_anchoredPosition({0.0F, -1.5F})", source)
         self.assertIn("scroll->set_sizeDelta({0.0F, -13.0F})", source)
         self.assertIn("ProvideInitialViewControllers", flow)
-        self.assertRegex(
-            flow,
-            r"ProvideInitialViewControllers\(\s*settingsViewController,\s*cameraListViewController,\s*recordingViewController,\s*previewViewController,\s*nullptr",
-        )
+        self.assertIn("enabled ? cameraListViewController : nullptr", flow)
+        self.assertIn("enabled ? recordingViewController : nullptr", flow)
+        self.assertIn("enabled ? previewViewController : nullptr", flow)
+        self.assertIn("RefreshMenuRuntimeVisibility", flow)
         self.assertIn("ExplicitRegister", flow)
         self.assertNotIn("Register::AutoRegister", flow)
         self.assertIn('SetTitle("SaberStage | Primary"', flow)
@@ -886,7 +910,7 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("BuildPreviewPanel", source)
         self.assertIn("RawImageTag", source)
         self.assertIn('"Camera", "Place", "Motion", "Preview"', source)
-        self.assertIn("SetEditorPreviewActive(true)", flow)
+        self.assertIn("SetEditorPreviewActive(enabled)", flow)
         self.assertNotIn("RelocateNativeMainScreen", flow)
 
     def test_recording_uses_primary_camera_and_a_real_mp4_finalization_path(self):
@@ -1126,7 +1150,9 @@ class RepositoryInvariantTests(unittest.TestCase):
         self.assertIn("std::array<UnityEngine::GameObject*, 9> centerDebugTabContentRoots_", header)
         self.assertIn("std::vector<int> visibleCenterTabPageIndices_", header)
         self.assertIn("generalRecordingModeToggle_", header)
-        self.assertIn('makeSection(generalPage, "Recording Control Mode")', menu)
+        self.assertIn('"Recording Control Mode")', menu)
+        self.assertIn('"Enable SaberStage"', menu)
+        self.assertIn("generalFeatureContentRoot_->SetActive(enabled)", menu)
         self.assertIn('recordingModeRow->get_transform(), "Record"', menu)
         self.assertIn('recordingModeRow->get_transform(), "Stream"', menu)
         self.assertIn('"Gameplay Only"', menu)
@@ -1154,8 +1180,8 @@ class RepositoryInvariantTests(unittest.TestCase):
         )[1].split("void MenuController::RefreshLivestreamDestinationVisibility", 1)[0]
         self.assertIn('std::vector<std::string_view> tabNames{"General"}', tab_strip)
         self.assertIn('addTab("Twitch", kCenterTwitchPage)', tab_strip)
-        self.assertIn('if (microphoneEnabled) addTab("Audio", kCenterAudioPage)', tab_strip)
-        self.assertIn('if (streamMode) addTab("Chat TTS", kCenterTtsPage)', tab_strip)
+        self.assertIn('if (modEnabled && microphoneEnabled) addTab("Audio", kCenterAudioPage)', tab_strip)
+        self.assertIn('if (modEnabled && streamMode) addTab("Chat TTS", kCenterTtsPage)', tab_strip)
         self.assertIn("visibleCenterTabPageIndices_[visibleIndex]", tab_strip)
 
     def test_recording_panel_retains_unused_icon_variants_and_guards_white_fallback(self):

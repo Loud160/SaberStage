@@ -48,6 +48,11 @@ public:
     void Flush() const noexcept;
     void Shutdown() const noexcept;
 
+    // Use the same defensive scrubber for diagnostics that will be displayed
+    // to a user. This prevents an HTTP library from reflecting an endpoint,
+    // IP address, or credential into either a log record or an error popup.
+    [[nodiscard]] static std::string SanitizeDiagnosticText(std::string message) noexcept;
+
     template <typename... Args>
     void debug(const LogFormatString<std::type_identity_t<Args>...>& format, Args&&... args) const noexcept {
         FormatAndEmit(NativeLoggerQuest::LogSeverity::Debug, format, std::forward<Args>(args)...);
@@ -74,6 +79,10 @@ public:
     }
 
 private:
+    // All first-party records pass through one final scrub before they reach
+    // logcat or the on-device file. This is defense in depth for exception
+    // strings produced by HTTP/RTMP libraries, which may echo endpoints,
+    // tokens, or device addresses even when the call site did not request it.
     template <typename... Args>
     void FormatAndEmit(
         NativeLoggerQuest::LogSeverity severity,

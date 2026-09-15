@@ -113,6 +113,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
@@ -192,7 +193,7 @@ constexpr std::string_view kDiscordHelperApkName = "TCP-Media-Receiver.apk";
 // Fixed page slots keep feature code and persistent Unity objects stable while
 // the visible tab strip changes with Record/Stream mode and microphone state.
 // Slot 5 was the removed Overview page and intentionally remains unused so the
-// mature Audio, TTS, and speed-test pages do not need risky reindexing.
+// mature Audio and TTS pages do not need risky reindexing.
 constexpr int kCenterGeneralPage = 0;
 constexpr int kCenterTwitchPage = 1;
 constexpr int kCenterKickPage = 2;
@@ -200,7 +201,6 @@ constexpr int kCenterYouTubePage = 3;
 constexpr int kCenterCustomPage = 4;
 constexpr int kCenterAudioPage = 6;
 constexpr int kCenterTtsPage = 7;
-constexpr int kCenterConfigureStreamPage = 8;
 constexpr std::string_view kDiscordHelperLatestReleaseUrl =
     "https://github.com/Loud160/TCP-Media-Receiver/releases/latest/download/TCP-Media-Receiver.apk";
 
@@ -961,14 +961,26 @@ network::SpeedTestResults SavedConnectionTestResults(
     return results;
 }
 
+std::string SavedConnectionTestDateTime(std::int64_t unixSeconds) {
+    if (unixSeconds <= 0) return "Date and time unavailable";
+    const auto raw = static_cast<std::time_t>(unixSeconds);
+    const auto* local = std::localtime(&raw);
+    if (!local) return "Date and time unavailable";
+    std::ostringstream text;
+    text << std::put_time(local, "%Y-%m-%d %I:%M %p");
+    return text.str();
+}
+
 } // namespace
 
 MenuController* MenuController::active_ = nullptr;
 
 MenuController::MenuController(app::ApplicationRoot& root) : root_(root) {
-    root_.Recording().SetStatusChangedHandler([] {
-        if (active_ != nullptr) active_->RefreshRecordingStatus();
-    });
+    if (root_.RuntimeEnabled()) {
+        root_.Recording().SetStatusChangedHandler([] {
+            if (active_ != nullptr) active_->RefreshRecordingStatus();
+        });
+    }
 }
 MenuController::~MenuController() noexcept {
     // Stop callbacks from discovering a half-destroyed controller before any
@@ -986,7 +998,7 @@ MenuController::~MenuController() noexcept {
             if (IsAlive(page)) (void)ReleaseSliderRegistrations(page, "center menu shutdown");
     });
     errors.Guard("clearing recording UI callbacks", [this] {
-        root_.Recording().SetStatusChangedHandler({});
+        if (root_.RuntimeEnabled()) root_.Recording().SetStatusChangedHandler({});
     });
     errors.Guard("destroying floating recording controls", [this] {
         DestroyRecordingWorldPanel();
@@ -1005,7 +1017,7 @@ MenuController::~MenuController() noexcept {
     });
     menuRuntimeDriverObject_ = nullptr;
     errors.Guard("detaching the docked camera preview", [this] {
-        root_.Preview().DetachDockedPreview();
+        if (root_.RuntimeEnabled()) root_.Preview().DetachDockedPreview();
     });
 }
 
@@ -1798,10 +1810,12 @@ void MenuController::ResolveConnectionTestConsent(bool accepted) {
     connectionTestCompletionShown_ = false;
     connectionTestDisplayedRevision_ = 0;
     if (!root_.ConnectionTest().Start(&error)) {
+        const auto safeError = LoggerFacade::SanitizeDiagnosticText(error);
         Logging::Logger.error("Cloudflare connection test did not start: {}", error);
         if (IsAlive(connectionTestProgressModal_)) connectionTestProgressModal_->Hide();
         if (IsAlive(connectionTestTabSummaryText_)) {
-            connectionTestTabSummaryText_->set_text("Connection test could not start:\n" + error);
+            connectionTestTabSummaryText_->set_text(
+                "Connection test could not start:\n" + safeError);
         }
         return;
     }
@@ -1809,7 +1823,7 @@ void MenuController::ResolveConnectionTestConsent(bool accepted) {
     RefreshConnectionTestUi();
 }
 
-void MenuController::ShowConnectionTestResults() {
+void MenuController::ShowConnectionTestResults(bool preferSavedResult) {
     if (!IsAlive(settingsView_)) return;
     const auto snapshot = root_.ConnectionTest().Snapshot();
     if (!IsAlive(connectionTestResultsModal_)) {
@@ -1850,13 +1864,27 @@ void MenuController::ShowConnectionTestResults() {
         ConfigureLayout(close, 28.0F, 7.0F, 0.0F, 0.0F);
     }
     if (!IsAlive(connectionTestResultsText_)) return;
-    if (snapshot.stage == network::SpeedTestStage::Complete) {
+    const auto& saved = root_.Settings().Get().connectionTest;
+    if (preferSavedResult && saved.hasResult) {
         connectionTestResultsText_->set_text(
-            ConnectionTestResultsText(snapshot.results));
+            "<color=#8D99A8>Saved " +
+            SavedConnectionTestDateTime(saved.testedAtUnixSeconds) +
+            "</color>\n\n" +
+            ConnectionTestResultsText(SavedConnectionTestResults(saved)));
+    } else if (preferSavedResult) {
+        connectionTestResultsText_->set_text(
+            "<b>No Saved Connection Test</b>\n\nRun Check Internet Upload Speed to measure and save this connection's sustained upload capacity.");
+    } else if (snapshot.stage == network::SpeedTestStage::Complete) {
+        connectionTestResultsText_->set_text(
+            "<color=#8D99A8>Saved " +
+            SavedConnectionTestDateTime(saved.testedAtUnixSeconds) +
+            "</color>\n\n" + ConnectionTestResultsText(snapshot.results));
     } else {
+        const auto safeFailure = LoggerFacade::SanitizeDiagnosticText(
+            snapshot.error.empty() ? snapshot.status : snapshot.error);
         connectionTestResultsText_->set_text(
             "<b>Connection Test Failed</b>\n\n" +
-            (snapshot.error.empty() ? snapshot.status : snapshot.error) +
+            safeFailure +
             "\n\nNo bandwidth limit was changed.");
     }
     connectionTestResultsModal_->Show();
@@ -1875,8 +1903,9 @@ void MenuController::RefreshConnectionTestUi() {
         rect->set_sizeDelta(size);
     }
     if (IsAlive(connectionTestProgressText_)) {
+        const auto safeStatus = LoggerFacade::SanitizeDiagnosticText(snapshot.status);
         connectionTestProgressText_->set_text(
-            snapshot.status + "\n" +
+            safeStatus + "\n" +
             std::to_string(static_cast<int>(std::lround(
                 std::clamp(snapshot.progress, 0.0F, 1.0F) * 100.0F))) + "% complete");
     }
@@ -1914,6 +1943,9 @@ void MenuController::RefreshConnectionTestUi() {
                 "Saved Cloudflare connection test; sustained upload {:.2f} Mbps will be checked before every livestream",
                 snapshot.results.uploadMegabitsPerSecond);
         }
+        if (IsAlive(connectionTestShowResultsButton_)) {
+            connectionTestShowResultsButton_->set_interactable(true);
+        }
         if (IsAlive(connectionTestTabSummaryText_)) {
             connectionTestTabSummaryText_->set_text(
                 ConnectionTestResultsText(snapshot.results, true));
@@ -1926,8 +1958,10 @@ void MenuController::RefreshConnectionTestUi() {
     } else if (snapshot.stage == network::SpeedTestStage::Failed ||
                snapshot.stage == network::SpeedTestStage::Cancelled) {
         if (IsAlive(connectionTestTabSummaryText_)) {
-            connectionTestTabSummaryText_->set_text(
+            const auto safeFailure = LoggerFacade::SanitizeDiagnosticText(
                 snapshot.error.empty() ? snapshot.status : snapshot.error);
+            connectionTestTabSummaryText_->set_text(
+                safeFailure);
         }
         if (IsAlive(connectionTestProgressModal_)) connectionTestProgressModal_->Hide();
         if (!connectionTestCompletionShown_) {
@@ -1935,7 +1969,8 @@ void MenuController::RefreshConnectionTestUi() {
             ShowConnectionTestResults();
         }
     } else if (IsAlive(connectionTestTabSummaryText_)) {
-        connectionTestTabSummaryText_->set_text(snapshot.status);
+        connectionTestTabSummaryText_->set_text(
+            LoggerFacade::SanitizeDiagnosticText(snapshot.status));
     }
 }
 
@@ -2169,7 +2204,11 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->centerTabStripSignature_ = -1;
     active_->visibleCenterTabPageIndices_.clear();
     active_->synchronizingRecordingModeControls_ = false;
+    active_->synchronizingMasterEnabled_ = false;
     active_->generalRecordingModeToggle_ = nullptr;
+    active_->masterEnabledToggle_ = nullptr;
+    active_->generalFeatureContentRoot_ = nullptr;
+    active_->masterDisableConfirmationModal_ = nullptr;
     active_->generalLocalRecordingContentRoot_ = nullptr;
     active_->generalEncodingDropdowns_.fill(nullptr);
     active_->livestreamConfigurationControls_.clear();
@@ -2214,6 +2253,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     active_->connectionTestTabSummaryText_ = nullptr;
     active_->connectionTestProgressText_ = nullptr;
     active_->connectionTestResultsText_ = nullptr;
+    active_->connectionTestShowResultsButton_ = nullptr;
     active_->discordScreenStatusText_ = nullptr;
     active_->discordHelperInstallModal_ = nullptr;
     active_->discordHelperInstructionsModal_ = nullptr;
@@ -2898,7 +2938,47 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     };
 
     auto* generalPage = active_->centerDebugTabContentRoots_[0];
-    auto* recordingModeSection = makeSection(generalPage, "Recording Control Mode");
+    auto [masterRow, masterWidth] = makePaddedRow(generalPage, 1, 10.0F);
+    active_->masterEnabledToggle_ = WithHint(BSML::Lite::CreateToggle(
+        masterRow->get_gameObject(), "Enable SaberStage",
+        active_->root_.Settings().Get().general.modEnabled,
+        [](bool enabled) {
+            if (!active_ || active_->synchronizingMasterEnabled_) return;
+            if (!enabled) {
+                // Confirmation owns the state change. Restore the stock toggle
+                // immediately so Cancel never leaves the visual switch lying.
+                active_->ApplyModEnabledState(true);
+                ErrorManager::Instance().Guard(
+                    "opening the SaberStage master-disable confirmation",
+                    [] {
+                        if (active_) active_->ShowMasterDisableConfirmation();
+                    },
+                    "SaberStage menu error",
+                    "SaberStage could not open the disable confirmation. It remains enabled and your settings were not changed.");
+                return;
+            }
+            std::string error;
+            if (!active_->root_.SetModEnabled(true, &error)) {
+                active_->ApplyModEnabledState(false);
+                ErrorManager::Instance().ReportUserVisible(
+                    "SaberStage could not be enabled",
+                    "SaberStage could not safely start all runtime systems. It remains disabled and your settings were preserved.\n\n" + error);
+            }
+        }),
+        "Master SaberStage power switch. Turning it off stops every SaberStage feature without resetting camera, recording, stream, chat, TTS, audio, or credential settings.");
+    fitInlineToggleSetting(active_->masterEnabledToggle_, masterWidth);
+
+    auto* generalFeatureLayout = BSML::Lite::CreateVerticalLayoutGroup(
+        generalPage->get_transform());
+    generalFeatureLayout->set_spacing(1.35F);
+    generalFeatureLayout->set_childControlWidth(true);
+    generalFeatureLayout->set_childControlHeight(true);
+    generalFeatureLayout->set_childForceExpandWidth(true);
+    generalFeatureLayout->set_childForceExpandHeight(false);
+    active_->generalFeatureContentRoot_ = generalFeatureLayout->get_gameObject();
+
+    auto* recordingModeSection = makeSection(
+        active_->generalFeatureContentRoot_, "Recording Control Mode");
     auto [recordingModeRow, recordingModeWidth] = makePaddedRow(
         recordingModeSection, 1, 10.0F);
     (void)recordingModeWidth;
@@ -2907,7 +2987,7 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         recordingModeRow->get_transform(), "Record", kCenterControlLabelTextSize);
     recordModeLabel->set_alignment(TMPro::TextAlignmentOptions::MidlineRight);
     recordModeLabel->set_enableWordWrapping(false);
-    ConfigureLayout(recordModeLabel, 30.0F, 8.5F, 0.0F, 0.0F);
+    ConfigureLayout(recordModeLabel, 18.0F, 8.5F, 0.0F, 0.0F);
     active_->generalRecordingModeToggle_ = fitBareToggle(
         BSML::Lite::CreateToggle(
             recordingModeRow->get_gameObject(), "",
@@ -2921,13 +3001,19 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         recordingModeRow->get_transform(), "Stream", kCenterControlLabelTextSize);
     streamModeLabel->set_alignment(TMPro::TextAlignmentOptions::MidlineLeft);
     streamModeLabel->set_enableWordWrapping(false);
-    ConfigureLayout(streamModeLabel, 30.0F, 8.5F, 0.0F, 0.0F);
+    ConfigureLayout(streamModeLabel, 18.0F, 8.5F, 0.0F, 0.0F);
+    auto* resetPanelLabel = BSML::Lite::CreateText(
+        recordingModeRow->get_transform(), "Reset Control Panel",
+        kCenterControlLabelTextSize);
+    resetPanelLabel->set_alignment(TMPro::TextAlignmentOptions::MidlineRight);
+    resetPanelLabel->set_enableWordWrapping(false);
+    ConfigureLayout(resetPanelLabel, 28.0F, 8.5F, 0.0F, 0.0F);
     makeResetGlyphButton(recordingModeRow->get_gameObject(), [] {
         if (active_) active_->ResetRecordingWorldPanelPose();
     }, "Moves the always-visible floating recording controls back to their default reachable position.");
 
     active_->generalLocalRecordingContentRoot_ = makeSection(
-        generalPage, "Local Recording Behavior");
+        active_->generalFeatureContentRoot_, "Local Recording Behavior");
     auto [localBehaviorRow, localBehaviorWidth] = makePaddedRow(
         active_->generalLocalRecordingContentRoot_, 1, 10.0F);
     auto* gameplayOnly = WithHint(BSML::Lite::CreateToggle(
@@ -2972,7 +3058,31 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         return setting;
     };
 
-    auto* videoSection = makeSection(generalPage, "Video Output");
+    auto* connectionSection = makeSection(
+        active_->generalFeatureContentRoot_, "Internet Connection Quality");
+    auto [connectionActionRow, connectionActionWidth] = makePaddedRow(
+        connectionSection, 2, 10.0F);
+    const auto connectionButtonWidth = connectionActionWidth;
+    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
+        connectionActionRow->get_transform(), "Check Internet Upload Speed", [] {
+            if (active_) active_->ShowConnectionTestConsent();
+        }),
+        "Shows a privacy and data-use notice before running the user-requested Cloudflare connection test. The test never starts automatically."),
+        connectionButtonWidth);
+    active_->connectionTestShowResultsButton_ = fitActionButton(WithHint(
+        BSML::Lite::CreateUIButton(
+            connectionActionRow->get_transform(), "Show Results", [] {
+                if (active_) active_->ShowConnectionTestResults(true);
+            }),
+        "Shows the complete last saved connection test, including its date, time, sustained and peak speeds, latency, jitter, duration, and stream guidance."),
+        connectionButtonWidth);
+    if (IsAlive(active_->connectionTestShowResultsButton_)) {
+        active_->connectionTestShowResultsButton_->set_interactable(
+            active_->root_.Settings().Get().connectionTest.hasResult);
+    }
+
+    auto* videoSection = makeSection(
+        active_->generalFeatureContentRoot_, "Video Output");
     auto [videoRow, videoColumnWidth] = makePaddedRow(videoSection, 3, 14.0F);
     auto resolutionTile = makeSettingTile(
         videoRow->get_gameObject(), videoColumnWidth, "Resolution");
@@ -3137,7 +3247,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }), "Controls how often the stream creates a full recovery frame. Two seconds is the compatible streaming default."),
         directFormatColumnWidth), 8);
 
-    auto* audioEncodingSection = makeSection(generalPage, "Audio Encoding");
+    auto* audioEncodingSection = makeSection(
+        active_->generalFeatureContentRoot_, "Audio Encoding");
     auto [audioEncodingRow, audioEncodingColumnWidth] = makePaddedRow(
         audioEncodingSection, 3, 14.0F);
     auto audioBitrateTile = makeSettingTile(
@@ -3176,7 +3287,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }), "Enables Quest microphone capture and reveals the Audio tab for the selected Record or Stream profile."),
         audioEncodingColumnWidth, 0.0F);
 
-    auto* sharedPanelSection = makeSection(generalPage, "Shared Stream Panels");
+    auto* sharedPanelSection = makeSection(
+        active_->generalFeatureContentRoot_, "Shared Stream Panels");
     auto [sharedPanelRow, sharedPanelColumnWidth] = makePaddedRow(
         sharedPanelSection, 3, 14.0F);
     auto showChatTile = makeSettingTile(
@@ -3214,7 +3326,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         sharedPanelColumnWidth, 0.0F);
 
     const auto& streamSettings = active_->root_.Settings().Get().broadcast;
-    auto* reliabilitySection = makeSection(generalPage, "Stream Reliability");
+    auto* reliabilitySection = makeSection(
+        active_->generalFeatureContentRoot_, "Stream Reliability");
     auto [reliabilityRow, reliabilityColumnWidth] = makePaddedRow(
         reliabilitySection, 3, 14.0F);
     auto keepAwakeTile = makeSettingTile(
@@ -3263,7 +3376,8 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
     RememberSelectables(
         reconnectAttemptsDropdown, active_->livestreamConfigurationControls_);
 
-    auto* afkSection = makeSection(generalPage, "Paused Stream Screen");
+    auto* afkSection = makeSection(
+        active_->generalFeatureContentRoot_, "Paused Stream Screen");
     active_->afkSelectionText_ = makeStatus(
         afkSection, "Pause screen: built-in SaberStage AFK image", 7.0F);
     auto [afkRow, afkColumnWidth] = makePaddedRow(afkSection, 2, 10.0F);
@@ -3381,7 +3495,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         RememberSelectables(pasteServer, active_->livestreamConfigurationControls_);
         auto* serverInput = WithHint(BSML::Lite::CreateStringSetting(
             serverTile.controls->get_gameObject(), "",
-            active_->root_.Recording().StreamServerUrl(provider)),
+            active_->root_.RuntimeEnabled()
+                ? active_->root_.Recording().StreamServerUrl(provider)
+                : initialDestination.serverUrl),
             "Enter this service's RTMP or RTMPS ingest address. Press Set to choose session-only or durable storage.");
         active_->livestreamServerInputs_[index] = serverInput;
         ConfigureRightPanelInput(serverInput, 2048, serverWidth - 28.0F);
@@ -3405,7 +3521,9 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         RememberSelectables(pasteKey, active_->livestreamConfigurationControls_);
         auto* keyInput = WithHint(BSML::Lite::CreateStringSetting(
             keyTile.controls->get_gameObject(), "",
-            active_->root_.Recording().StreamKey(provider),
+            active_->root_.RuntimeEnabled()
+                ? active_->root_.Recording().StreamKey(provider)
+                : initialDestination.streamKey,
             [provider](StringW) {
                 if (active_) active_->RefreshLivestreamKeyDisplay(provider);
             }), "The private key for only this service. It is masked, never logged, and redacted from support archives.");
@@ -4124,36 +4242,110 @@ void MenuController::BuildSettingsPanel(HMUI::ViewController* view) {
         }), "Skips queued speech that is too old to be useful after a burst of chat."),
         queueLimitColumnWidth), initialTts.staleAfterSeconds, false);
 
-    auto* configureStreamPage = active_->centerDebugTabContentRoots_[8];
-
-    auto* connectionSection = makeSection(
-        configureStreamPage, "Internet Connection Quality");
-    makeStatus(
-        connectionSection,
-        "Run an explicit Cloudflare edge test before streaming. The test measures sustained download and upload speed using transfers much larger than a burst test, plus latency and jitter. It may use up to 200 MB of data.",
-        13.0F);
-    auto [connectionActionRow, connectionActionWidth] = makePaddedRow(
-        connectionSection, 1, 9.5F);
-    auto* connectionActionSlot = makeCenteredControlSlot(
-        connectionActionRow->get_gameObject(), connectionActionWidth, 9.5F);
-    fitActionButton(WithHint(BSML::Lite::CreateUIButton(
-        connectionActionSlot, "Run Cloudflare Test", [] {
-            if (active_) active_->ShowConnectionTestConsent();
-        }),
-        "Shows a privacy and data-use notice before sending any test traffic. The test never starts automatically."),
-        40.0F);
-    auto* resultSection = makeSection(configureStreamPage, "Latest Saved Result");
-    const auto& savedConnectionTest = active_->root_.Settings().Get().connectionTest;
-    active_->connectionTestTabSummaryText_ = makeStatus(
-        resultSection,
-        savedConnectionTest.hasResult
-            ? ConnectionTestResultsText(
-                  SavedConnectionTestResults(savedConnectionTest), true)
-            : "No saved connection test result. No measured upload bitrate limit is active.",
-        27.0F);
-
     active_->RefreshRecordingModeControls(true);
     active_->RefreshOutputProfileControls(true);
+    active_->ApplyModEnabledState(active_->root_.RuntimeEnabled());
+}
+
+void MenuController::ShowMasterDisableConfirmation() {
+    if (!IsAlive(settingsView_)) return;
+    if (!IsAlive(masterDisableConfirmationModal_)) {
+        masterDisableConfirmationModal_ = BSML::Lite::CreateModal(
+            settingsView_, {76.0F, 43.0F}, nullptr, true);
+        if (!IsAlive(masterDisableConfirmationModal_)) {
+            throw std::runtime_error(
+                "could not create the SaberStage master-disable confirmation dialog");
+        }
+        auto* layout = BSML::Lite::CreateVerticalLayoutGroup(
+            masterDisableConfirmationModal_->get_transform());
+        layout->set_spacing(2.0F);
+        layout->set_childControlWidth(true);
+        layout->set_childControlHeight(true);
+        layout->set_childForceExpandWidth(true);
+        layout->set_childForceExpandHeight(false);
+        auto* explanation = BSML::Lite::CreateText(
+            layout->get_transform(),
+            "<b>Disable SaberStage?</b>\n\nAll camera, preview, recording, streaming, chat, TTS, and audio functionality will stop. Your settings, stream configuration, and credentials will not be altered.",
+            3.15F, {0.0F, 0.0F}, {68.0F, 27.0F});
+        explanation->set_enableWordWrapping(true);
+        explanation->set_alignment(TMPro::TextAlignmentOptions::Center);
+        ConfigureLayout(explanation, 68.0F, 27.0F, 1.0F);
+        auto* actions = BSML::Lite::CreateHorizontalLayoutGroup(
+            layout->get_transform());
+        actions->set_spacing(4.0F);
+        actions->set_childAlignment(UnityEngine::TextAnchor::MiddleCenter);
+        actions->set_childControlWidth(false);
+        actions->set_childForceExpandWidth(false);
+        auto* cancel = BSML::Lite::CreateUIButton(
+            actions->get_transform(), "Cancel", [] {
+                if (active_) active_->ResolveMasterDisableConfirmation(false);
+            });
+        auto* disable = BSML::Lite::CreateUIButton(
+            actions->get_transform(), "Disable SaberStage", [] {
+                if (active_) active_->ResolveMasterDisableConfirmation(true);
+            });
+        ConfigureLayout(cancel, 26.0F, 7.0F, 0.0F, 0.0F);
+        ConfigureLayout(disable, 34.0F, 7.0F, 0.0F, 0.0F);
+    }
+    masterDisableConfirmationModal_->Show();
+}
+
+void MenuController::ResolveMasterDisableConfirmation(bool disable) {
+    ErrorManager::Instance().Guard(
+        "resolving the SaberStage master-disable confirmation",
+        [this, disable] {
+            if (IsAlive(masterDisableConfirmationModal_)) {
+                masterDisableConfirmationModal_->Hide();
+            }
+            if (!disable) {
+                ApplyModEnabledState(true);
+                return;
+            }
+            std::string error;
+            if (!root_.SetModEnabled(false, &error)) {
+                ApplyModEnabledState(true);
+                ErrorManager::Instance().ReportUserVisible(
+                    "SaberStage could not be disabled",
+                    "SaberStage could not save or complete the master disable operation. No settings were intentionally changed.\n\n" + error);
+            }
+        },
+        "SaberStage could not be disabled",
+        "SaberStage could not complete the master disable operation. It remains enabled and your settings were preserved.");
+}
+
+void MenuController::ApplyModEnabledState(bool enabled) noexcept {
+    ErrorManager::Instance().Guard(
+        "applying SaberStage master enable state to the UI",
+        [this, enabled] {
+            if (!synchronizingMasterEnabled_ && IsAlive(masterEnabledToggle_) &&
+                    IsAlive(masterEnabledToggle_->toggle)) {
+                synchronizingMasterEnabled_ = true;
+                masterEnabledToggle_->currentValue = enabled;
+                if (masterEnabledToggle_->toggle->get_isOn() != enabled) {
+                    masterEnabledToggle_->toggle->set_isOn(enabled);
+                }
+                synchronizingMasterEnabled_ = false;
+            }
+            if (IsAlive(generalFeatureContentRoot_)) {
+                generalFeatureContentRoot_->SetActive(enabled);
+            }
+            if (!enabled) {
+                selectedCenterDebugTab_ = kCenterGeneralPage;
+                DestroyRecordingWorldPanel();
+                DestroyChatWorldPanel();
+                // These helpers retain provider-owned image assets and action
+                // callbacks. Release them before ApplicationRoot tears down
+                // TwitchService so re-enabling cannot reuse dangling state.
+                chatControls_.reset();
+                richChat_.reset();
+            } else {
+                root_.Recording().SetStatusChangedHandler([] {
+                    if (active_ != nullptr) active_->RefreshRecordingStatus();
+                });
+            }
+            RebuildCenterTabStrip();
+            RefreshMenuRuntimeVisibility(enabled);
+        });
 }
 
 void MenuController::TickRuntimePanels() noexcept {
@@ -4171,6 +4363,11 @@ void MenuController::TickRuntimePanels() noexcept {
     } else if (!deferredSaveError.empty() || !lastDeferredSettingsSaveError_.empty()) {
         lastDeferredSettingsSaveError_.clear();
     }
+
+    // Settings persistence and the recovery switch stay alive while disabled;
+    // all camera, encoder, network, chat, TTS, audio, and movable-panel work is
+    // gated here before a torn-down runtime object can be reached.
+    if (!root_.RuntimeEnabled()) return;
 
     root_.Twitch().Tick();
     RefreshConnectionTestUi();
@@ -4470,7 +4667,7 @@ void MenuController::BuildRecordingPanel(HMUI::ViewController* view) {
 }
 
 void MenuController::SetEditorPreviewActive(bool active) {
-    if (active_ == nullptr) return;
+    if (active_ == nullptr || !active_->root_.RuntimeEnabled()) return;
     if (active) active_->root_.Preview().AttachDockedPreview(active_->dockedPreviewImage_);
     else active_->root_.Preview().DetachDockedPreview();
 }
@@ -4850,6 +5047,7 @@ void MenuController::RebuildCenterTabStrip() {
     const bool streamMode = document.recording.worldControlsStreamMode;
     const bool microphoneEnabled =
         SelectedOutputProfile(document).microphoneEnabled;
+    const bool modEnabled = root_.RuntimeEnabled();
 
     if (IsAlive(centerDebugTabs_)) {
         UnityEngine::Object::Destroy(centerDebugTabs_->get_gameObject());
@@ -4862,15 +5060,14 @@ void MenuController::RebuildCenterTabStrip() {
         tabNames.push_back(name);
         visibleCenterTabPageIndices_.push_back(pageIndex);
     };
-    if (streamMode) {
+    if (modEnabled && streamMode) {
         addTab("Twitch", kCenterTwitchPage);
         addTab("Kick", kCenterKickPage);
         addTab("YouTube", kCenterYouTubePage);
         addTab("Custom", kCenterCustomPage);
     }
-    if (microphoneEnabled) addTab("Audio", kCenterAudioPage);
-    if (streamMode) addTab("Chat TTS", kCenterTtsPage);
-    addTab("Configure Stream", kCenterConfigureStreamPage);
+    if (modEnabled && microphoneEnabled) addTab("Audio", kCenterAudioPage);
+    if (modEnabled && streamMode) addTab("Chat TTS", kCenterTtsPage);
 
     // Translate the segmented control's compact visible index back into the
     // stable page slot. Stable page slots let each page keep its existing UI
@@ -4904,7 +5101,7 @@ void MenuController::RebuildCenterTabStrip() {
     tabsRect->set_anchoredPosition({0.0F, -1.5F});
     tabsRect->set_sizeDelta({-4.0F, 7.0F});
     centerTabStripSignature_ = (streamMode ? 1 : 0) |
-        (microphoneEnabled ? 2 : 0);
+        (microphoneEnabled ? 2 : 0) | (modEnabled ? 4 : 0);
 
     int pageIndex = selectedCenterDebugTab_;
     const auto selected = std::find(
@@ -4969,7 +5166,7 @@ void MenuController::RefreshRecordingModeControls(bool forceTabStripRebuild) {
     }
 
     const int requestedTabStripSignature = (streamMode ? 1 : 0) |
-        (microphoneEnabled ? 2 : 0);
+        (microphoneEnabled ? 2 : 0) | (root_.RuntimeEnabled() ? 4 : 0);
     if (forceTabStripRebuild ||
             centerTabStripSignature_ != requestedTabStripSignature ||
             !IsAlive(centerDebugTabs_)) {
@@ -7151,7 +7348,9 @@ void MenuController::EnsureChatWorldPanelResizeHandle() {
 void MenuController::DestroyChatWorldPanelResizeHandle() noexcept {
     if (IsAlive(chatWorldPanelResizeHandleScreen_)) {
         auto* object = chatWorldPanelResizeHandleScreen_->get_gameObject().ptr();
-        root_.Preview().UnregisterCaptureExcludedRoot(object);
+        if (root_.RuntimeEnabled()) {
+            root_.Preview().UnregisterCaptureExcludedRoot(object);
+        }
         UnityEngine::Object::Destroy(object);
     }
     chatWorldPanelResizeHandleScreen_ = nullptr;
@@ -7221,11 +7420,13 @@ void MenuController::DestroyChatWorldPanel() noexcept {
     chatWorldPanelDiagnostics_.Reset();
     chatWorldPanelInnerContent_ = nullptr;
     chatWorldPanelScrollGeometry_ = {};
-    root_.Twitch().SetChatEnabled(false);
+    if (root_.RuntimeEnabled()) root_.Twitch().SetChatEnabled(false);
     DestroyChatWorldPanelResizeHandle();
     if (IsAlive(chatWorldPanelScreen_)) {
         auto* screenObject = chatWorldPanelScreen_->get_gameObject().ptr();
-        root_.Preview().UnregisterCaptureExcludedRoot(screenObject);
+        if (root_.RuntimeEnabled()) {
+            root_.Preview().UnregisterCaptureExcludedRoot(screenObject);
+        }
         UnityEngine::Object::Destroy(screenObject);
     }
     chatWorldPanelScreen_ = nullptr;

@@ -93,7 +93,9 @@ MAKE_HOOK_MATCH(
     // runtime may exist from late_load onward so startup failures can be
     // queued, but it must not ask BSML for this coordinator while GameLoader
     // is still constructing IL2CPP and menu-flow metadata.
-    saberstage::ErrorManager::Instance().NotifyMainFlowActivated();
+    auto& errors = saberstage::ErrorManager::Instance();
+    errors.SetGameplayActive(false);
+    errors.NotifyMainFlowActivated();
 }
 
 MAKE_HOOK_MATCH(
@@ -102,6 +104,7 @@ MAKE_HOOK_MATCH(
     void,
     GlobalNamespace::PauseMenuManager* self) {
     PauseMenuManager_Start(self);
+    if (!g_application || !g_application->RuntimeEnabled()) return;
     saberstage::ErrorManager::Instance().Guard(
         "PauseMenuManager::Start SaberStage UI creation",
         [self] { saberstage::ui::PauseMenuRecordingControls::Instance().CreateUi(self); },
@@ -116,6 +119,7 @@ MAKE_HOOK_MATCH(
     void,
     GlobalNamespace::PauseMenuManager* self) {
     PauseMenuManager_ShowMenu(self);
+    if (!g_application || !g_application->RuntimeEnabled()) return;
     saberstage::ErrorManager::Instance().Guard(
         "PauseMenuManager::ShowMenu SaberStage callback",
         [] { saberstage::ui::PauseMenuRecordingControls::Instance().MenuShown(); });
@@ -143,6 +147,7 @@ MAKE_HOOK_MATCH(
     GlobalNamespace::EnvironmentsListModel* environmentsListModel) {
     StandardLevelScenesTransitionSetupDataSO_InitEnvironmentInfo(
         self, overrideEnvironmentSettings, environmentsListModel);
+    if (!g_application || !g_application->RuntimeEnabled()) return;
     try {
         auto* level = self ? self->get_beatmapLevel() : nullptr;
         if (!level) return;
@@ -185,6 +190,7 @@ MAKE_HOOK_MATCH(
     void,
     GlobalNamespace::GameplayCoreSceneSetupData* self) {
     GameplayCoreSceneSetupData_LoadTransformedBeatmapData(self);
+    if (!g_application || !g_application->RuntimeEnabled()) return;
     try {
         if (!self) return;
         auto* fileData = il2cpp_utils::try_cast<GlobalNamespace::FileSystemBeatmapLevelData>(
@@ -212,6 +218,8 @@ MAKE_HOOK_MATCH(
     GlobalNamespace::AudioTimeSyncController* self,
     float startTimeOffset) {
     AudioTimeSyncController_StartSong(self, startTimeOffset);
+    saberstage::ErrorManager::Instance().SetGameplayActive(true);
+    if (!g_application || !g_application->RuntimeEnabled()) return;
     try {
         std::optional<saberstage::broadcast::MapAnnouncement> announcement;
         {
@@ -253,7 +261,7 @@ MAKE_HOOK_MATCH(
     GlobalNamespace::LevelCompletionResults* results) {
     // Preserve Beat Saber's completion even if request persistence fails.
     saberstage::ErrorManager::Instance().Guard("recording requested-map outcome", [results] {
-        if (!g_application || !results) return;
+        if (!g_application || !g_application->RuntimeEnabled() || !results) return;
         using Action = saberstage::broadcast::RequestAction;
         const auto state = results->levelEndStateType;
         g_application->Twitch().Requests().GameplayFinished(
@@ -261,6 +269,7 @@ MAKE_HOOK_MATCH(
             state == GlobalNamespace::LevelCompletionResults::LevelEndStateType::Failed ? Action::Failed : Action::Quit);
     });
     StandardLevelScenesTransitionSetupDataSO_Finish(self, results);
+    saberstage::ErrorManager::Instance().SetGameplayActive(false);
 }
 
 } // namespace

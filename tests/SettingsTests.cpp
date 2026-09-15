@@ -50,6 +50,7 @@ int main() {
 
     const auto defaults = Defaults();
     Check(defaults.schemaVersion == kCurrentSchemaVersion, "defaults use current schema");
+    Check(defaults.general.modEnabled, "SaberStage master switch defaults on");
     Check(defaults.camera.profiles.size() == 1, "Prompt 3 persists exactly one camera profile");
     Check(defaults.camera.Primary().profileId == "primary", "defaults keep stable primary camera identity");
     Check(!defaults.camera.Primary().anchoredFloatEnabled, "anchored float defaults off");
@@ -468,6 +469,7 @@ int main() {
     first.Edit().connectionTest.peakDownloadMegabitsPerSecond = 401.0F;
     first.Edit().connectionTest.peakUploadMegabitsPerSecond = 22.5F;
     first.Edit().connectionTest.latencyMilliseconds = 17.0F;
+    first.Edit().general.modEnabled = false;
     first.Edit().connectionTest.jitterMilliseconds = 2.5F;
     first.Edit().connectionTest.durationSeconds = 28.0F;
     first.Edit().connectionTest.testedAtUnixSeconds = 1'800'000'123;
@@ -497,6 +499,8 @@ int main() {
     SettingsService second(path);
     const auto secondLoad = second.Load();
     Check(secondLoad.loadedExisting, "existing settings load");
+    Check(!second.Get().general.modEnabled,
+          "master disable state survives restart without resetting settings");
     Check(second.Get().camera.Primary().fovDegrees == 92.0F, "saved value survives restart");
     Check(second.Get().camera.Primary().position.x == 1.0F && second.Get().camera.Primary().position.z == -4.0F,
           "camera profile placement survives restart");

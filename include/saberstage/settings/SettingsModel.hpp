@@ -23,7 +23,7 @@
 
 namespace saberstage::settings {
 
-inline constexpr std::uint32_t kCurrentSchemaVersion = 38;
+inline constexpr std::uint32_t kCurrentSchemaVersion = 39;
 // Twitch Client IDs identify an application and are public by design. Keep
 // SaberStage's registered ID in one place so every installation authorizes
 // the same application without asking users to register their own.
@@ -102,6 +102,10 @@ enum class Subsystem {
 };
 
 struct GeneralSettings {
+    // This is a master runtime gate, not a settings reset. Every subsystem
+    // keeps its saved configuration while SaberStage is disabled so a user or
+    // the circuit breaker can make the mod inert without destroying setup.
+    bool modEnabled = true;
     bool diagnosticsEnabled = true;
 };
 

@@ -29,6 +29,13 @@ DECLARE_CLASS_CODEGEN(saberstage::ui, MenuFlowCoordinator, HMUI::FlowCoordinator
     DECLARE_INSTANCE_FIELD(HMUI::ViewController*, cameraListViewController);
     DECLARE_INSTANCE_FIELD(HMUI::ViewController*, previewViewController);
     DECLARE_INSTANCE_FIELD(HMUI::ViewController*, recordingViewController);
+    DECLARE_INSTANCE_FIELD(bool, featurePanelsBuilt);
+
+    // Re-presents the already-open flow with or without the feature panels.
+    // Keeping this as an instance method is important: HMUI's presentation
+    // API is protected, so a free helper must not reach through the generated
+    // coordinator fields or the base-class access boundary.
+    DECLARE_INSTANCE_METHOD(void, ApplyRuntimeVisibility, bool enabled);
 
     DECLARE_OVERRIDE_METHOD_MATCH(
         void,
@@ -58,5 +65,8 @@ namespace saberstage::ui {
 // Registration is separated from object creation because custom-types requires
 // every generated type to be registered before Beat Saber instantiates it.
 void RegisterMenuFlowCoordinatorType();
+// Applies the master runtime state to an already-open menu. The coordinator
+// remains registered while disabled so General can expose the recovery switch.
+void RefreshMenuRuntimeVisibility(bool enabled) noexcept;
 
 } // namespace saberstage::ui

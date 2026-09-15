@@ -390,7 +390,13 @@ bool Decode(std::string_view json, SettingsDocument& settings, std::uint32_t& so
 
     if (const auto* general = Member(document, "general")) {
         if (!general->IsObject()) repaired = true;
-        else settings.general.diagnosticsEnabled = Bool(*general, "diagnosticsEnabled", settings.general.diagnosticsEnabled, repaired);
+        else {
+            settings.general.modEnabled = Bool(
+                *general, "modEnabled", settings.general.modEnabled, repaired);
+            settings.general.diagnosticsEnabled = Bool(
+                *general, "diagnosticsEnabled",
+                settings.general.diagnosticsEnabled, repaired);
+        }
     }
     if (const auto* cameraObject = Member(document, "camera")) {
         if (!cameraObject->IsObject()) repaired = true;
@@ -735,6 +741,7 @@ std::string Encode(const SettingsDocument& settings) {
     document.AddMember("schemaVersion", settings.schemaVersion, allocator);
 
     Value general(rapidjson::kObjectType);
+    general.AddMember("modEnabled", settings.general.modEnabled, allocator);
     general.AddMember("diagnosticsEnabled", settings.general.diagnosticsEnabled, allocator);
     document.AddMember("general", general, allocator);
 

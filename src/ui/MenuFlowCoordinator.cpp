@@ -14,6 +14,7 @@
 
 #include "saberstage/Logging.hpp"
 #include "saberstage/ErrorManager.hpp"
+#include "saberstage/app/ApplicationRoot.hpp"
 #include "saberstage/ui/MenuController.hpp"
 
 #include "bsml/shared/Helpers/creation.hpp"
@@ -22,6 +23,9 @@
 DEFINE_TYPE(saberstage::ui, MenuFlowCoordinator);
 
 namespace saberstage::ui {
+namespace {
+MenuFlowCoordinator* activeCoordinator = nullptr;
+}
 
 void RegisterMenuFlowCoordinatorType() {
     // Register only SaberStage's own pending type. AutoRegister would also
@@ -43,25 +47,32 @@ void MenuFlowCoordinator::DidActivate(
             // title and Back action. The left controller is camera controls.
             SetTitle("SaberStage | Primary", HMUI::ViewController::AnimationType::None);
             set_showBackButton(true);
+            activeCoordinator = this;
 
             if (firstActivation) {
                 settingsViewController = BSML::Helpers::CreateViewController();
                 cameraListViewController = BSML::Helpers::CreateViewController();
                 previewViewController = BSML::Helpers::CreateViewController();
                 recordingViewController = BSML::Helpers::CreateViewController();
+                featurePanelsBuilt = false;
                 MenuController::BuildSettingsPanel(settingsViewController);
+            }
+            const bool enabled = MenuController::active_ != nullptr &&
+                MenuController::active_->root_.RuntimeEnabled();
+            if (enabled && !featurePanelsBuilt) {
                 MenuController::BuildCameraListPanel(cameraListViewController);
                 MenuController::BuildPreviewPanel(previewViewController);
                 MenuController::BuildRecordingPanel(recordingViewController);
+                featurePanelsBuilt = true;
             }
 
             ProvideInitialViewControllers(
                 settingsViewController,
-                cameraListViewController,
-                recordingViewController,
-                previewViewController,
+                enabled ? cameraListViewController : nullptr,
+                enabled ? recordingViewController : nullptr,
+                enabled ? previewViewController : nullptr,
                 nullptr);
-            MenuController::SetEditorPreviewActive(true);
+            MenuController::SetEditorPreviewActive(enabled);
             Logging::Logger.info("Opened SaberStage with the native left-side menu controls");
         },
         "SaberStage menu error",
@@ -76,6 +87,42 @@ void MenuFlowCoordinator::DidDeactivate(bool removedFromHierarchy, bool screenSy
             (void)screenSystemDisabling;
             MenuController::SetEditorPreviewActive(false);
         });
+    if (activeCoordinator == this) activeCoordinator = nullptr;
+}
+
+void MenuFlowCoordinator::ApplyRuntimeVisibility(bool enabled) {
+    if (!get_isActivated()) return;
+    if (enabled && !featurePanelsBuilt) {
+        MenuController::BuildCameraListPanel(cameraListViewController);
+        MenuController::BuildPreviewPanel(previewViewController);
+        MenuController::BuildRecordingPanel(recordingViewController);
+        featurePanelsBuilt = true;
+    }
+    // ProvideInitialViewControllers is only safe while HMUI is establishing a
+    // new flow. Once the menu is visible, update each optional surface through
+    // its dedicated setter so the retained center controller and Back stack are
+    // not reinitialized underneath the master-switch callback.
+    SetLeftScreenViewController(
+        enabled ? cameraListViewController : nullptr,
+        HMUI::ViewController::AnimationType::None);
+    SetRightScreenViewController(
+        enabled ? recordingViewController : nullptr,
+        HMUI::ViewController::AnimationType::None);
+    SetBottomScreenViewController(
+        enabled ? previewViewController : nullptr,
+        HMUI::ViewController::AnimationType::None);
+    MenuController::SetEditorPreviewActive(enabled);
+}
+
+void RefreshMenuRuntimeVisibility(bool enabled) noexcept {
+    ErrorManager::Instance().Guard(
+        "updating SaberStage side-menu visibility",
+        [enabled] {
+            auto* coordinator = activeCoordinator;
+            if (coordinator) coordinator->ApplyRuntimeVisibility(enabled);
+        },
+        "SaberStage menu error",
+        "SaberStage changed its master state, but could not update every side panel. Details were written to the SaberStage log.");
 }
 
 void MenuFlowCoordinator::BackButtonWasPressed(HMUI::ViewController*) {
